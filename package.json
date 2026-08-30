@@ -1,0 +1,21 @@
+{
+  "name": "dsp-nebula-control",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A safety-first control plane for Dyson Sphere Program and Nebula multiplayer servers.",
+  "scripts": {
+    "install:all": "npm install --prefix apps/api && npm install --prefix apps/web",
+    "build": "npm --prefix apps/web run build && npm --prefix apps/api run build",
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm --prefix apps/api run dev\" \"npm --prefix apps/web run dev\"",
+    "test": "npm --prefix apps/api run test && npm --prefix apps/web run test",
+    "typecheck": "npm --prefix apps/api run typecheck && npm --prefix apps/web run typecheck",
+    "check": "npm run typecheck && npm test && npm run build",
+    "hash-password": "npm --prefix apps/api run hash-password --"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
