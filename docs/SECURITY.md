@@ -7,6 +7,8 @@
 - A TLS reverse proxy is responsible for public transport security.
 - The Windows provider may read the configured game root but cannot execute an
   arbitrary command supplied by a request.
+- Collector output is constrained by a strict schema and contains summarized
+  health fields only; raw paths and log lines never cross the provider boundary.
 - Steam credentials are outside Dyson Control. The product must never ask for,
   persist, or echo a Steam password or guard code.
 
@@ -28,6 +30,7 @@ The project does not expose:
 
 - arbitrary shell or PowerShell execution;
 - raw filesystem paths through the public API;
+- raw game, mod, player, or scheduled-task log content;
 - a generic file writer;
 - Steam login automation;
 - unverified Mod downloads;

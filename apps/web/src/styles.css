@@ -270,8 +270,8 @@ td { color: #bac8d4; }
   .mobile-nav-backdrop { position: fixed; inset: var(--topbar) 0 0 0; z-index: 18; display: block; border: 0; background: rgba(1,7,12,.72); }
   .workspace { padding-left: 10px; padding-right: 10px; }
   .page-heading, .feature-heading { align-items: flex-start; flex-direction: column; }
-  .heading-actions { width: 100%; overflow-x: auto; }
-  .heading-actions button { min-width: 84px; }
+  .heading-actions { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; overflow: visible; }
+  .heading-actions button, .heading-actions .more-action { width: 100%; min-width: 0; white-space: nowrap; }
   .status-strip, .metrics-grid { grid-template-columns: 1fr; }
   .metric { height: 108px; }
   .console-panel > header { height: auto; min-height: 45px; align-items: flex-start; flex-direction: column; padding-block: 9px; }

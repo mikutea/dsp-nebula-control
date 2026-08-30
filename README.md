@@ -9,8 +9,9 @@ compatibility, paired `.dsv` + `.server` saves, locked mod sets, staged updates,
 client/server parity, and rollback-oriented operations.
 
 > Project status: `0.1.0` foundation. The current release provides an
-> authenticated dashboard, a demo provider, a Windows read-only status
-> provider, tracked refresh jobs, and a deliberately disabled mutation surface.
+> authenticated dashboard, a demo provider, a validated Windows read-only
+> inventory provider, tracked refresh jobs, and a deliberately disabled
+> mutation surface.
 
 ![Dyson Control dashboard](design/dashboard-implementation-v1.png)
 
@@ -67,6 +68,27 @@ Open `http://127.0.0.1:5173`. The development server proxies API calls to
 `http://127.0.0.1:13010`.
 
 The demo provider never touches a real game process or save.
+
+## Windows read-only inventory
+
+The allowlisted Windows collector validates the managed `DSPGAME.exe` against
+the configured project root and returns bounded summaries rather than raw host
+data. The current inventory includes:
+
+- sampled DSP CPU cores, private/working-set memory, thread count, priority,
+  start time, uptime, and the configured UPS argument;
+- guest logical processors, processor groups, CPU load, and memory capacity;
+- DSP, Nebula, and BepInEx versions plus safe compatibility warning codes from
+  the current BepInEx startup log;
+- the active Nebula `.dsv` + `.server` pair, sizes, last-save time, and the
+  presence of a paired backup and manifest;
+- scheduled-task summaries, configured-root availability, global SMB mapping
+  health, and local TCP listener health.
+
+The API does not return executable paths, project paths, log lines, task names,
+player identities, public endpoints, or credentials. Provider JSON is checked
+against a strict runtime schema before it is cached or sent to the browser.
+Lifecycle capabilities stay false even if an older host task happens to exist.
 
 ## Production configuration
 

@@ -9,13 +9,26 @@ export interface ServerStatus {
     processId: number | null
     processCoresUsed: number | null
     workingSetGiB: number | null
+    privateMemoryGiB: number | null
     threadCount: number | null
+    priority: string | null
+    startedAt: string | null
+    uptimeSeconds: number | null
+  }
+  host: {
+    logicalProcessors: number | null
+    processorGroups: number | null
+    cpuPercent: number | null
+    memoryTotalGiB: number | null
+    memoryFreeGiB: number | null
   }
   versions: {
     dsp: string | null
     nebula: string | null
     bepInEx: string | null
     compatible: boolean | null
+    gameLoaded: boolean | null
+    warnings: Array<'mod-bepinex-target-mismatch' | 'game-load-incomplete'>
   }
   save: {
     name: string | null
@@ -23,6 +36,18 @@ export interface ServerStatus {
     serverPresent: boolean
     consistent: boolean
     lastSavedAt: string | null
+    dsvSizeMiB: number | null
+    serverSizeKiB: number | null
+    latestBackupAt: string | null
+    backupManifestPresent: boolean
+    backupPairPresent: boolean
+  }
+  automation: {
+    serverTask: ScheduledTaskStatus
+    stopTask: ScheduledTaskStatus
+    storageTask: ScheduledTaskStatus
+    projectRootAvailable: boolean
+    globalMappingAvailable: boolean | null
   }
   connections: Array<{
     id: 'game-port' | 'public-wss'
@@ -36,6 +61,12 @@ export interface ServerStatus {
     gracefulStop: boolean
     restart: boolean
   }
+}
+
+export interface ScheduledTaskStatus {
+  state: 'running' | 'ready' | 'disabled' | 'queued' | 'unknown' | null
+  lastResult: number | null
+  lastRunAt: string | null
 }
 
 export interface JobRecord {

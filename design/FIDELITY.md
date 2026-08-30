@@ -20,6 +20,9 @@ user-selected first concept from 2026-08-29.
    of the overview.
 7. Typography, square borders, restrained shadows, dark surfaces, and cyan
    accents stay within the original operations-console visual language.
+8. Real private-memory, uptime, backup, task, processor-group, and storage
+   summaries reuse the existing density and component hierarchy rather than
+   adding a second dashboard style.
 
 ## Intentional deviations
 
@@ -31,11 +34,12 @@ user-selected first concept from 2026-08-29.
   role checks, audit records, and rollback behavior are verified.
 - Version values are fictional demonstration fixtures; update availability is
   never fabricated.
-- At 620 px and below, the left rail becomes an accessible navigation drawer.
+- At 620 px and below, the left rail becomes an accessible navigation drawer
+  and lifecycle controls form a legible 2 x 2 action grid.
 
 ## Browser QA baseline
 
 - Desktop capture: 1536 x 1024, no horizontal or vertical page overflow.
 - Tablet check: 900 x 900, no horizontal overflow; content stacks vertically.
-- Mobile check: 620 x 900, no horizontal overflow; all modules remain reachable
-  through the navigation drawer.
+- Mobile check: 390 x 844, no horizontal overflow; the 2 x 2 action grid does
+  not wrap labels and all modules remain reachable through the navigation drawer.

@@ -7,7 +7,7 @@ import {
   Square, TerminalSquare, Users, Wrench
 } from 'lucide-react'
 import { api, ApiError } from './api'
-import { formatDuration, relativeTime } from './format'
+import { formatDuration, formatUptime, relativeTime } from './format'
 import type { JobRecord, NavKey, ServerStatus } from './model'
 
 interface Session { name: string }
@@ -127,7 +127,7 @@ function ControlShell({ user, onLogout }: { user: Session; onLogout: () => void 
         {!status ? <div className="loading-state"><span className="spinner" />正在读取服务器状态…</div> :
           active === 'overview'
             ? <Overview status={status} jobs={jobs} refreshing={refreshing} onRefresh={refresh} provider={provider} />
-            : <FeatureWorkspace active={active} status={status} jobs={jobs} onRefresh={refresh} />}
+            : <FeatureWorkspace active={active} status={status} jobs={jobs} onRefresh={refresh} provider={provider} />}
       </main>
     </div>
   )
@@ -186,13 +186,13 @@ function Overview({ status, jobs, refreshing, onRefresh, provider }: {
       <StatusStrip status={status} />
       <div className="metrics-grid">
         <Metric title="CPU" value={status.runtime.processCoresUsed === null ? '—' : `${status.runtime.processCoresUsed.toFixed(1)} 核`} sub="进程平均占用" color="cyan" points="2,40 14,33 27,36 39,25 52,31 65,24 78,28 91,20 104,26 118,18" />
-        <Metric title="内存" value={status.runtime.workingSetGiB === null ? '—' : `${status.runtime.workingSetGiB} GB`} sub="DSP 工作集" color="cyan" points="2,38 14,37 27,36 39,36 52,35 65,35 78,34 91,34 104,33 118,33" />
+        <Metric title="内存" value={status.runtime.privateMemoryGiB === null ? '—' : `${status.runtime.privateMemoryGiB} GB`} sub="DSP 私有内存" color="cyan" points="2,38 14,37 27,36 39,36 52,35 65,35 78,34 91,34 104,33 118,33" />
         <Metric title="UPS" value={status.runtime.targetUps?.toString() ?? '—'} sub="目标模拟速率" color="green" points="2,26 14,21 27,30 39,17 52,25 65,18 78,23 91,16 104,24 118,20" />
         <Metric title="线程" value={status.runtime.threadCount?.toString() ?? '—'} sub="DSP 活跃线程" color="amber" points="2,34 14,28 27,32 39,22 52,30 65,25 78,31 91,23 104,29 118,26" />
-        <Metric title="进程" value={status.runtime.processId ? `PID ${status.runtime.processId}` : '未运行'} sub={status.state === 'running' ? '高性能调度' : '等待启动'} color="blue" points="2,38 14,32 27,34 39,27 52,30 65,23 78,27 91,20 104,25 118,19" />
+        <Metric title="进程" value={status.runtime.processId ? `PID ${status.runtime.processId}` : '未运行'} sub={status.state === 'running' ? `${status.runtime.priority ?? '默认'} 优先级` : '等待启动'} color="blue" points="2,38 14,32 27,34 39,27 52,30 65,23 78,27 91,20 104,25 118,19" />
       </div>
       <div className="operations-row">
-        <ConsolePanel />
+        <ConsolePanel demo={provider === 'demo'} />
         <DeploymentPanel status={status} onRefresh={onRefresh} />
       </div>
       <div className="bottom-row">
@@ -207,10 +207,10 @@ function StatusStrip({ status }: { status: ServerStatus }) {
   const items = [
     { label: '运行状态', value: stateLabel(status.state), sub: status.runtime.processId ? `PID: ${status.runtime.processId}` : '无活动进程', icon: Activity, tone: status.state === 'running' ? 'good' : 'muted' },
     { label: '游戏版本', value: status.versions.dsp ?? '待采集', sub: 'DSP Stable', icon: PackageCheck },
-    { label: 'Nebula 版本', value: status.versions.nebula ?? '待采集', sub: status.versions.compatible ? '兼容性已通过' : '兼容性待检查', icon: PlugZap },
+    { label: 'Nebula 版本', value: status.versions.nebula ?? '待采集', sub: compatibilityLabel(status), icon: PlugZap, tone: status.versions.warnings.length ? 'warn' : undefined },
     { label: '在线玩家', value: `${status.runtime.onlinePlayers ?? '—'} / ${status.runtime.maxPlayers ?? '—'}`, sub: '连接槽位', icon: Users },
-    { label: '运行时间', value: status.state === 'running' ? '正在运行' : '—', sub: `采集于 ${new Date(status.collectedAt).toLocaleTimeString('zh-CN')}`, icon: History },
-    { label: '游戏链路', value: status.connections.find((item) => item.id === 'game-port')?.status === 'healthy' ? '可达' : '待检查', sub: status.connections.find((item) => item.id === 'game-port')?.detail ?? '—', icon: PlugZap, tone: 'good' },
+    { label: '运行时间', value: status.state === 'running' ? formatUptime(status.runtime.uptimeSeconds) : '—', sub: `采集于 ${new Date(status.collectedAt).toLocaleTimeString('zh-CN')}`, icon: History },
+    { label: '游戏链路', value: status.connections.find((item) => item.id === 'game-port')?.status === 'healthy' ? '可达' : '待检查', sub: status.connections.find((item) => item.id === 'game-port')?.detail ?? '—', icon: PlugZap, tone: status.connections.find((item) => item.id === 'game-port')?.status === 'healthy' ? 'good' : 'warn' },
     { label: '存储状态', value: status.save.consistent ? '正常' : '不完整', sub: status.save.name ?? '未发现存档', icon: HardDrive, tone: status.save.consistent ? 'good' : 'warn' }
   ]
   return <section className="status-strip">{items.map(({ label, value, sub, icon: Icon, tone }) =>
@@ -223,18 +223,20 @@ function Metric({ title, value, sub, color, points }: { title: string; value: st
 }
 
 const demoLogs = [
-  ['INFO', 'Server', 'Server started. Listening on 0.0.0.0:8469'],
-  ['INFO', 'Nebula', 'Nebula websocket started on port 8469'],
-  ['INFO', 'World', 'Loaded save DSP_Main_Save'],
-  ['INFO', 'Player', "Player 'Orion' connected"],
-  ['INFO', 'Save', 'Autosave completed; paired save verified'],
-  ['WARN', 'Mods', 'Update preview available; activation is locked'],
-  ['INFO', 'Backup', 'Latest paired backup manifest verified']
+  ['16:58:11.421', 'INFO', 'Server', 'Server started. Listening on 0.0.0.0:8469'],
+  ['16:59:03.422', 'INFO', 'Nebula', 'Nebula websocket started on port 8469'],
+  ['17:00:14.423', 'INFO', 'World', 'Loaded save DSP_Main_Save'],
+  ['17:01:26.424', 'INFO', 'Player', "Player 'Orion' connected"],
+  ['17:02:31.425', 'INFO', 'Save', 'Autosave completed; paired save verified'],
+  ['17:03:41.426', 'WARN', 'Mods', 'Update preview available; activation is locked'],
+  ['17:04:11.427', 'INFO', 'Backup', 'Latest paired backup manifest verified']
 ]
 
-function ConsolePanel() {
+function ConsolePanel({ demo }: { demo: boolean }) {
   return <section className="panel console-panel"><header><h2>实时服务器控制台</h2><div className="console-tools"><select aria-label="日志级别"><option>全部级别</option></select><input aria-label="搜索日志" placeholder="搜索日志内容…" /><label><input type="checkbox" defaultChecked />自动滚动</label><button>清屏</button></div></header>
-    <div className="console-body" aria-label="演示控制台日志">{demoLogs.map(([level, source, message], index) => <div key={index}><time>16:{58 + index}:11.{String(421 + index).padStart(3, '0')}</time> <b className={level.toLowerCase()}>[{level}]</b> <em>[{source}]</em> {message}</div>)}</div>
+    <div className="console-body" aria-label={demo ? '演示控制台日志' : '控制台接入状态'}>{demo
+      ? demoLogs.map(([time, level, source, message], index) => <div key={index}><time>{time}</time> <b className={level.toLowerCase()}>[{level}]</b> <em>[{source}]</em> {message}</div>)
+      : <div><b className="warn">[SAFE]</b> <em>[Console]</em> 结构化日志与脱敏规则验证完成前，不读取或展示生产原始日志。</div>}</div>
     <div className="command-bar"><Code2 size={17} /><input disabled placeholder="命令入口将在权限与审计模块完成后启用" /><button disabled><Send size={16} />发送</button></div>
   </section>
 }
@@ -242,7 +244,7 @@ function ConsolePanel() {
 function DeploymentPanel({ status, onRefresh }: { status: ServerStatus; onRefresh: () => void }) {
   return <section className="panel deployment-panel"><header><h2>部署与版本</h2></header>
     <div className="version-list">
-      {[['游戏版本', status.versions.dsp], ['BepInEx', status.versions.bepInEx], ['Nebula', status.versions.nebula], ['依赖锁定状态', status.versions.compatible ? '已锁定' : '待校验']].map(([label, value]) =>
+      {[['游戏版本', status.versions.dsp], ['BepInEx', status.versions.bepInEx], ['Nebula', status.versions.nebula], ['运行兼容状态', compatibilityLabel(status)]].map(([label, value]) =>
         <div key={label}><span>{label}</span><strong>{value ?? '待采集'}</strong><Check size={15} /></div>)}
     </div>
     <div className="update-box"><div><strong>可用更新</strong><span>尚未执行在线检查</span></div><button onClick={onRefresh}><RefreshCw size={16} />刷新清单</button><p>更新只会进入预览；依赖、哈希、存档备份和回滚验证完成前无法激活。</p></div>
@@ -260,18 +262,18 @@ function TaskTable({ jobs }: { jobs: JobRecord[] }) {
 
 function SavePanel({ status }: { status: ServerStatus }) {
   return <section className="panel save-panel"><header><h2>存档与备份状态</h2></header>
-    <div className="save-columns"><div><span>当前存档</span><strong>{status.save.name ?? '未发现'}</strong><dl><div><dt>配对状态</dt><dd>{status.save.dsvPresent ? '.dsv' : '缺少 .dsv'} + {status.save.serverPresent ? '.server' : '缺少 .server'}</dd></div><div><dt>最后保存</dt><dd>{relativeTime(status.save.lastSavedAt)}</dd></div></dl></div>
-      <div><span>完整性</span><strong className={status.save.consistent ? 'green' : 'amber'}>{status.save.consistent ? '已成对验证' : '需要处理'}</strong><dl><div><dt>备份策略</dt><dd>启用前需配置</dd></div><div><dt>恢复权限</dt><dd>当前锁定</dd></div></dl></div></div>
+    <div className="save-columns"><div><span>当前存档</span><strong>{status.save.name ?? '未发现'}</strong><dl><div><dt>配对状态</dt><dd>{status.save.dsvPresent ? '.dsv' : '缺少 .dsv'} + {status.save.serverPresent ? '.server' : '缺少 .server'}</dd></div><div><dt>最后保存</dt><dd>{relativeTime(status.save.lastSavedAt)} · {status.save.dsvSizeMiB === null ? '大小未知' : `${status.save.dsvSizeMiB} MiB`}</dd></div></dl></div>
+      <div><span>完整性</span><strong className={status.save.consistent ? 'green' : 'amber'}>{status.save.consistent ? '已成对验证' : '需要处理'}</strong><dl><div><dt>最近备份</dt><dd>{status.save.backupPairPresent && status.save.backupManifestPresent ? relativeTime(status.save.latestBackupAt) : '尚无完整清单'}</dd></div><div><dt>恢复权限</dt><dd>当前锁定</dd></div></dl></div></div>
     <div className="save-actions"><button><FolderArchive size={17} />管理存档</button><button disabled><Database size={17} />立即备份</button></div>
   </section>
 }
 
-function FeatureWorkspace({ active, status, jobs, onRefresh }: { active: Exclude<NavKey, 'overview'>; status: ServerStatus; jobs: JobRecord[]; onRefresh: () => void }) {
+function FeatureWorkspace({ active, status, jobs, onRefresh, provider }: { active: Exclude<NavKey, 'overview'>; status: ServerStatus; jobs: JobRecord[]; onRefresh: () => void; provider: 'demo' | 'windows' }) {
   const definition = featureDefinitions[active]
   const Icon = definition.icon
   return <div className="feature-page page-enter">
     <div className="feature-heading"><div><span className="feature-icon"><Icon size={24} /></span><div><h1>{definition.title}</h1><p>{definition.description}</p></div></div><button className="more-action" onClick={onRefresh}><RefreshCw size={16} />刷新状态</button></div>
-    <div className="feature-layout"><section className="panel feature-primary"><header><h2>{definition.primaryTitle}</h2><span className="phase-label">{definition.phase}</span></header>{featureBody(active, status, jobs)}</section>
+    <div className="feature-layout"><section className="panel feature-primary"><header><h2>{definition.primaryTitle}</h2><span className="phase-label">{definition.phase}</span></header>{featureBody(active, status, jobs, provider)}</section>
       <aside className="panel feature-scope"><header><h2>管理范围</h2></header><ul>{definition.scope.map((item) => <li key={item}><Check size={15} />{item}</li>)}</ul><div className="safety-note"><ShieldCheck size={19} /><div><strong>安全门禁</strong><p>{definition.safety}</p></div></div></aside></div>
   </div>
 }
@@ -289,21 +291,40 @@ const featureDefinitions: Record<Exclude<NavKey, 'overview'>, { title: string; d
   tasks: { title: '任务与审计', description: '追踪每个读取、修改、更新、备份和回滚动作。', primaryTitle: '任务记录', phase: '基础已接入', icon: ClipboardList, scope: ['持久任务', '事件流', '操作人', '失败代码', '审计导出'], safety: '审计信息不记录密码、令牌、完整路径、玩家密钥或存档内容。' }
 }
 
-function featureBody(active: Exclude<NavKey, 'overview'>, status: ServerStatus, jobs: JobRecord[]) {
-  if (active === 'console') return <ConsolePanel />
+function featureBody(active: Exclude<NavKey, 'overview'>, status: ServerStatus, jobs: JobRecord[], provider: 'demo' | 'windows') {
+  if (active === 'console') return <ConsolePanel demo={provider === 'demo'} />
   if (active === 'tasks') return <TaskTable jobs={jobs} />
   if (active === 'players') return <div className="players-empty"><Users size={38} /><strong>{status.runtime.onlinePlayers ?? 0} 名玩家在线</strong><p>玩家身份接口尚未接入；当前不会显示或修改玩家数据。</p></div>
-  if (active === 'versions') return <DataRows rows={[["DSP", status.versions.dsp ?? '待采集'], ["Nebula", status.versions.nebula ?? '待采集'], ["BepInEx", status.versions.bepInEx ?? '待采集'], ["兼容性", status.versions.compatible ? '通过' : '待检查']]} />
+  if (active === 'versions') return <DataRows rows={[["DSP", status.versions.dsp ?? '待采集'], ["Nebula", status.versions.nebula ?? '待采集'], ["BepInEx", status.versions.bepInEx ?? '待采集'], ["游戏加载", status.versions.gameLoaded === true ? '已完成' : status.versions.gameLoaded === false ? '未完成' : '待检查'], ["兼容性", compatibilityLabel(status)]]} />
   if (active === 'mods') return <DataRows rows={[["模组锁状态", status.versions.compatible ? '依赖已锁定' : '待校验'], ["更新策略", '仅预览，不自动激活'], ["下载校验", 'SHA-256 + 清单'], ["客户端一致性", '等待 Profile 导出器']]} />
   if (active === 'saves') return <SavePanel status={status} />
-  if (active === 'server') return <DataRows rows={[["进程状态", stateLabel(status.state)], ["进程 ID", status.runtime.processId?.toString() ?? '—'], ["DSP 工作集", status.runtime.workingSetGiB === null ? '—' : `${status.runtime.workingSetGiB} GB`], ["线程数", status.runtime.threadCount?.toString() ?? '—'], ["游戏端口", status.connections[0]?.detail ?? '待检查']]} />
-  if (active === 'game') return <DataRows rows={[["实例", status.serverName], ["运行状态", stateLabel(status.state)], ["目标 UPS", status.runtime.targetUps?.toString() ?? '—'], ["在线玩家", `${status.runtime.onlinePlayers ?? '—'} / ${status.runtime.maxPlayers ?? '—'}`], ["写操作", '等待安全适配器验证']]} />
+  if (active === 'server') return <DataRows rows={[["进程状态", stateLabel(status.state)], ["进程 ID", status.runtime.processId?.toString() ?? '—'], ["DSP 私有内存", status.runtime.privateMemoryGiB === null ? '—' : `${status.runtime.privateMemoryGiB} GiB`], ["客户机内存", status.host.memoryTotalGiB === null ? '—' : `${status.host.memoryFreeGiB ?? '—'} / ${status.host.memoryTotalGiB} GiB 可用`], ["逻辑处理器", status.host.logicalProcessors === null ? '—' : `${status.host.logicalProcessors} · ${status.host.processorGroups ?? '—'} 个处理器组`], ["线程与优先级", `${status.runtime.threadCount ?? '—'} · ${status.runtime.priority ?? '—'}`], ["开服任务", taskStateLabel(status.automation.serverTask.state)], ["停止任务上次结果", status.automation.stopTask.lastResult === null ? '未采集 · 写操作保持锁定' : `${status.automation.stopTask.lastResult} · 写操作保持锁定`], ["共享存储", storageStateLabel(status)], ["游戏端口", status.connections[0]?.detail ?? '待检查']]} />
+  if (active === 'game') return <DataRows rows={[["实例", status.serverName], ["运行状态", stateLabel(status.state)], ["运行时间", formatUptime(status.runtime.uptimeSeconds)], ["目标 UPS", status.runtime.targetUps?.toString() ?? '—'], ["加载状态", status.versions.gameLoaded ? '游戏存档已加载' : '待确认'], ["在线玩家", `${status.runtime.onlinePlayers ?? '—'} / ${status.runtime.maxPlayers ?? '—'}`], ["写操作", '等待安全适配器验证']]} />
   if (active === 'config') return <DataRows rows={[["游戏配置", '只读 Schema 草案'], ["Nebula 配置", '机密字段不回显'], ["性能配置", `目标 UPS ${status.runtime.targetUps ?? '—'}`], ["网络配置", '端点由部署层提供'], ["变更策略", '差异预览 + 回滚快照']]} />
   return <DataRows rows={[["Profile", '尚未生成'], ["服务端锁", '等待模组解析器'], ["游戏文件", '永不打包'], ["敏感信息", '永不导出'], ["交付格式", 'Thunderstore Profile + 安装说明']]} />
 }
 
 function DataRows({ rows }: { rows: string[][] }) {
   return <div className="data-rows">{rows.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong><Check size={16} /></div>)}</div>
+}
+
+function compatibilityLabel(status: ServerStatus): string {
+  if (status.versions.gameLoaded && status.versions.warnings.length > 0) return '游戏已加载 · 有版本警告'
+  if (status.versions.compatible) return '运行兼容性已验证'
+  if (status.versions.gameLoaded === false) return '游戏尚未完成加载'
+  return '兼容性待检查'
+}
+
+function taskStateLabel(state: ServerStatus['automation']['serverTask']['state']): string {
+  if (state === null) return '未发现'
+  return ({ running: '运行中', ready: '就绪', disabled: '已禁用', queued: '已排队', unknown: '未知' })[state]
+}
+
+function storageStateLabel(status: ServerStatus): string {
+  if (!status.automation.projectRootAvailable) return '项目根目录不可用'
+  if (status.automation.globalMappingAvailable === true) return '全局 SMB 映射正常'
+  if (status.automation.globalMappingAvailable === false) return '全局 SMB 映射异常'
+  return '项目根目录可用'
 }
 
 function stateLabel(state: ServerStatus['state']): string {

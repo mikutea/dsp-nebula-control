@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { ServerStatus, StatusProvider } from '../domain.js'
+import { serverStatusSchema, type ServerStatus, type StatusProvider } from '../domain.js'
 
 export interface WindowsProviderOptions {
   projectRoot: string
@@ -22,7 +22,7 @@ export class WindowsProvider implements StatusProvider {
     this.#assertInsideScriptRoot(scriptPath)
     await fs.access(scriptPath)
     const output = await this.#runPowerShell(scriptPath)
-    const parsed = JSON.parse(output) as ServerStatus
+    const parsed = serverStatusSchema.parse(JSON.parse(output) as unknown)
     return {
       ...parsed,
       capabilities: { refresh: true, save: false, gracefulStop: false, restart: false }

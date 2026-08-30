@@ -14,3 +14,13 @@ export function relativeTime(iso: string | null, now = Date.now()): string {
   if (hours < 24) return `${hours} 小时前`
   return `${Math.round(hours / 24)} 天前`
 }
+
+export function formatUptime(seconds: number | null): string {
+  if (seconds === null) return '—'
+  const days = Math.floor(seconds / 86_400)
+  const hours = Math.floor((seconds % 86_400) / 3_600)
+  const minutes = Math.floor((seconds % 3_600) / 60)
+  if (days > 0) return `${days} 天 ${hours} 小时`
+  if (hours > 0) return `${hours} 小时 ${minutes} 分钟`
+  return `${minutes} 分钟`
+}
