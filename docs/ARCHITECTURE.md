@@ -20,7 +20,7 @@ Browser
   v
 Fastify control plane (loopback)
   |-- authentication and CSRF/origin checks
-  |-- durable SQLite jobs and audit records
+  |-- durable SQLite jobs used as the current audit record
   |-- status/event API
   |-- React production assets
   v
@@ -49,11 +49,20 @@ Initial Windows capabilities:
 Each capability is enabled only after its adapter has an integration test and a
 documented failure/rollback path.
 
+Lifecycle previews do not change capability negotiation. An authenticated
+preview request first creates a durable job, then calls one fixed provider
+method and one fixed PowerShell collector. The provider response is checked
+against a strict schema and forced back to `allowed: false` and
+`executionEnabled: false` before it reaches the API. See
+[LIFECYCLE.md](LIFECYCLE.md).
+
 ## Data model
 
-SQLite stores sessions, jobs, and audit events. Saves, packages, and backups stay
-outside the database and are referenced by opaque IDs plus hashes. Production
-paths are configuration, never API output.
+SQLite stores sessions and durable jobs. Jobs are the current persistent audit
+surface; server-sent events are transient notifications derived from those
+records. Saves, packages, and backups stay outside the database and are
+referenced by opaque IDs plus hashes. Production paths are configuration, never
+API output.
 
 ## Future update transaction
 

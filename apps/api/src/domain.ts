@@ -9,6 +9,41 @@ export interface ControlCapabilities {
   restart: boolean
 }
 
+export type LifecycleAction = 'save' | 'graceful-stop' | 'restart'
+export type LifecycleCheckStatus = 'pass' | 'warning' | 'block' | 'not-applicable'
+export type LifecycleCheckId =
+  | 'project-root' | 'managed-process' | 'pid-file' | 'save-pair' | 'backup-pair'
+  | 'server-task' | 'stop-task' | 'stop-task-principal' | 'stop-task-action'
+  | 'stop-task-result' | 'task-history' | 'receipt-channel' | 'save-trigger'
+  | 'execution-lock'
+export type LifecycleBlockerCode =
+  | 'project-root-unavailable' | 'managed-process-unverified' | 'pid-file-unverified'
+  | 'save-pair-incomplete' | 'backup-pair-unverified' | 'server-task-missing'
+  | 'stop-task-missing' | 'stop-task-principal-mismatch' | 'stop-task-not-interactive'
+  | 'stop-task-action-unallowlisted' | 'stop-task-last-result-failed'
+  | 'receipt-channel-missing' | 'save-trigger-unverified' | 'execution-disabled'
+
+export interface LifecycleCheck {
+  id: LifecycleCheckId
+  status: LifecycleCheckStatus
+  message: string
+}
+
+export interface LifecyclePreview {
+  collectedAt: string
+  action: LifecycleAction
+  mode: 'dry-run'
+  allowed: boolean
+  executionEnabled: boolean
+  checks: LifecycleCheck[]
+  blockers: LifecycleBlockerCode[]
+  rollback: {
+    strategy: 'no-op' | 'restart-from-same-save' | 'paired-save-backup'
+    ready: boolean
+    summary: string
+  }
+}
+
 export interface VersionInventory {
   dsp: string | null
   nebula: string | null
@@ -158,7 +193,45 @@ export const serverStatusSchema: z.ZodType<ServerStatus> = z.strictObject({
   })
 })
 
-export type JobKind = 'status.refresh' | 'game.save' | 'game.stop' | 'game.restart'
+const lifecycleActionSchema = z.enum(['save', 'graceful-stop', 'restart'])
+const lifecycleCheckIdSchema = z.enum([
+  'project-root', 'managed-process', 'pid-file', 'save-pair', 'backup-pair',
+  'server-task', 'stop-task', 'stop-task-principal', 'stop-task-action',
+  'stop-task-result', 'task-history', 'receipt-channel', 'save-trigger', 'execution-lock'
+])
+const lifecycleBlockerSchema = z.enum([
+  'project-root-unavailable', 'managed-process-unverified', 'pid-file-unverified',
+  'save-pair-incomplete', 'backup-pair-unverified', 'server-task-missing',
+  'stop-task-missing', 'stop-task-principal-mismatch', 'stop-task-not-interactive',
+  'stop-task-action-unallowlisted', 'stop-task-last-result-failed',
+  'receipt-channel-missing', 'save-trigger-unverified', 'execution-disabled'
+])
+
+export const lifecyclePreviewSchema: z.ZodType<LifecyclePreview> = z.strictObject({
+  collectedAt: z.string().datetime({ offset: true }),
+  action: lifecycleActionSchema,
+  mode: z.literal('dry-run'),
+  allowed: z.boolean(),
+  executionEnabled: z.boolean(),
+  checks: z.array(z.strictObject({
+    id: lifecycleCheckIdSchema,
+    status: z.enum(['pass', 'warning', 'block', 'not-applicable']),
+    message: z.string().min(1).max(256)
+  })).min(1).max(20),
+  blockers: z.array(lifecycleBlockerSchema).max(20),
+  rollback: z.strictObject({
+    strategy: z.enum(['no-op', 'restart-from-same-save', 'paired-save-backup']),
+    ready: z.boolean(),
+    summary: z.string().min(1).max(256)
+  })
+})
+
+export const lifecycleActionRequestSchema = z.strictObject({ action: lifecycleActionSchema })
+
+export type JobKind =
+  | 'status.refresh'
+  | 'game.save.preview' | 'game.stop.preview' | 'game.restart.preview'
+  | 'game.save' | 'game.stop' | 'game.restart'
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed'
 
 export interface JobRecord {
@@ -177,4 +250,5 @@ export interface JobRecord {
 export interface StatusProvider {
   readonly name: 'demo' | 'windows'
   collectStatus(): Promise<ServerStatus>
+  previewLifecycle(action: LifecycleAction): Promise<LifecyclePreview>
 }

@@ -33,6 +33,11 @@ native 1536 x 1024 review canvas.
 8. The original layout remains usable rather than decorative: headings, values,
    console text, warning states, and disabled lifecycle controls retain strong
    contrast over every background effect.
+9. The game-management implementation reuses the same dense panel grammar for
+   a five-field instance strip, three action-path modules, a double-bordered
+   preflight chamber, and a two-column evidence matrix. It avoids the rejected
+   isolated single-line treatment by keeping each relationship inside a
+   complete operational module.
 
 ## Above-the-fold copy comparison
 
@@ -60,6 +65,9 @@ native 1536 x 1024 review canvas.
 - At 620 px and below, the left rail becomes an accessible drawer and the four
   lifecycle actions become a legible 2 x 2 grid instead of shrinking the desktop
   arrangement.
+- The lifecycle screenshot is a separate game-management view rather than a
+  replacement for the accepted overview capture. All values and blocker results
+  in it come from the deterministic demo provider.
 
 ## Verified interaction path
 
@@ -71,13 +79,22 @@ native 1536 x 1024 review canvas.
 4. At 1536 x 1024, `服务器管理` displays 10 structured rows, including an amber
    warning for the deliberately locked stop workflow.
 5. Refresh remains functional; all mutation controls remain visibly locked.
+6. On `游戏管理`, run `停服预检`; the result shows three demo blockers,
+   a ready rollback baseline, a persisted audit marker, and 13 applicable
+   evidence rows without exposing host paths or commands.
+7. Open `任务与审计`; the completed preview appears as a durable job with its
+   actor, duration, and blocker count.
 
 ## Browser QA baseline
 
 - Desktop: 1536 x 1024, exact client/scroll width 1536, no page overflow.
 - Mobile: 390 x 844 viewport, exact client/scroll width 375 after browser
-  scrollbar allocation, no horizontal overflow, 2 x 2 action grid, and all 11
-  navigation items reachable through the drawer.
+  scrollbar allocation, no horizontal overflow, a single-column lifecycle
+  action stack, and all 11 navigation items reachable through the drawer. The
+  drawer closes after selection.
 - Demo overview: five telemetry panels, four filled area charts, 10 memory bars,
   four endpoint nodes, seven fictional console entries, and 11 navigation
   destinations.
+- Lifecycle desktop: exact 1536 x 1024 client and scroll dimensions, no page
+  overflow, three actionable dry-run paths, 13 applicable checks, and zero
+  browser console warnings or errors.

@@ -10,8 +10,8 @@ client/server parity, and rollback-oriented operations.
 
 > Project status: `0.1.0` foundation. The current release provides an
 > authenticated dashboard, a demo provider, a validated Windows read-only
-> inventory provider, tracked refresh jobs, and a deliberately disabled
-> mutation surface.
+> inventory provider, tracked refresh and lifecycle-preview jobs, and a
+> deliberately disabled mutation surface.
 
 ![Dyson Control dashboard](design/dashboard-implementation-dsp-inspired-v2.png)
 
@@ -90,6 +90,20 @@ player identities, public endpoints, or credentials. Provider JSON is checked
 against a strict runtime schema before it is cached or sent to the browser.
 Lifecycle capabilities stay false even if an older host task happens to exist.
 
+## Lifecycle dry-run preflight
+
+The game-management workspace can now preview `save`, `graceful-stop`, and
+`restart` safety chains. Each preview creates a durable job, validates fixed
+evidence checks, reports stable blocker codes, and leaves execution locked.
+The Windows preflight verifies exact process/PID identity, paired saves,
+schema-v1 backup manifests and SHA-256 hashes, scheduled-task prerequisites,
+the adapter allowlist, and receipt availability.
+
+![Dyson Control lifecycle preflight](design/game-lifecycle-preflight-desktop.png)
+
+See [docs/LIFECYCLE.md](docs/LIFECYCLE.md) for the complete contract and the
+requirements that must be met before any mutation route can exist.
+
 ## Production configuration
 
 Generate a password hash locally:
@@ -126,7 +140,7 @@ design         Accepted UI concept used as an implementation specification
 ## Roadmap
 
 1. Read-only inventory and connectivity checks.
-2. Verified save request and graceful shutdown adapter.
+2. Read-only lifecycle preflight, then a verified save and graceful-stop adapter.
 3. Atomic paired-save backup and guarded restore.
 4. Thunderstore dependency resolver, lock preview, staged update and rollback.
 5. Client profile/modpack export from the same server lock.

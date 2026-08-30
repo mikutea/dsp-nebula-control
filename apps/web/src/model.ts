@@ -71,7 +71,10 @@ export interface ScheduledTaskStatus {
 
 export interface JobRecord {
   id: string
-  kind: 'status.refresh' | 'game.save' | 'game.stop' | 'game.restart'
+  kind:
+    | 'status.refresh'
+    | 'game.save.preview' | 'game.stop.preview' | 'game.restart.preview'
+    | 'game.save' | 'game.stop' | 'game.restart'
   state: 'queued' | 'running' | 'succeeded' | 'failed'
   actor: string
   createdAt: string
@@ -80,6 +83,35 @@ export interface JobRecord {
   durationMs: number | null
   summary: string
   errorCode: string | null
+}
+
+export type LifecycleAction = 'save' | 'graceful-stop' | 'restart'
+export type LifecycleCheckStatus = 'pass' | 'warning' | 'block' | 'not-applicable'
+export type LifecycleCheckId =
+  | 'project-root' | 'managed-process' | 'pid-file' | 'save-pair' | 'backup-pair'
+  | 'server-task' | 'stop-task' | 'stop-task-principal' | 'stop-task-action'
+  | 'stop-task-result' | 'task-history' | 'receipt-channel' | 'save-trigger'
+  | 'execution-lock'
+export type LifecycleBlockerCode =
+  | 'project-root-unavailable' | 'managed-process-unverified' | 'pid-file-unverified'
+  | 'save-pair-incomplete' | 'backup-pair-unverified' | 'server-task-missing'
+  | 'stop-task-missing' | 'stop-task-principal-mismatch' | 'stop-task-not-interactive'
+  | 'stop-task-action-unallowlisted' | 'stop-task-last-result-failed'
+  | 'receipt-channel-missing' | 'save-trigger-unverified' | 'execution-disabled'
+
+export interface LifecyclePreview {
+  collectedAt: string
+  action: LifecycleAction
+  mode: 'dry-run'
+  allowed: boolean
+  executionEnabled: boolean
+  checks: Array<{ id: LifecycleCheckId; status: LifecycleCheckStatus; message: string }>
+  blockers: LifecycleBlockerCode[]
+  rollback: {
+    strategy: 'no-op' | 'restart-from-same-save' | 'paired-save-backup'
+    ready: boolean
+    summary: string
+  }
 }
 
 export type NavKey =

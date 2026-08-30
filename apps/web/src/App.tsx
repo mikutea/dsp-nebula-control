@@ -1,14 +1,17 @@
 import { FormEvent, useCallback, useEffect, useId, useMemo, useState, type ComponentType } from 'react'
 import {
   Activity, Archive, Boxes, Check, ChevronDown, CircleUserRound, ClipboardList,
-  CloudDownload, Code2, Copy, Cpu, Database, Download, FileCog, FolderArchive,
+  CircleMinus, CircleX, CloudDownload, Code2, Copy, Cpu, Database, Download, FileCog, FolderArchive,
   Gamepad2, Gauge, HardDrive, History, Home, Menu, MemoryStick, PackageCheck, Play,
-  PlugZap, RefreshCw, RotateCw, Save, Send, Server, Settings2, ShieldCheck,
-  Square, TerminalSquare, Users, Wrench
+  LockKeyhole, PlugZap, RefreshCw, RotateCw, Save, ScanSearch, Send, Server, Settings2,
+  ShieldCheck, Square, TerminalSquare, TriangleAlert, Undo2, Users, Wrench
 } from 'lucide-react'
 import { api, ApiError } from './api'
 import { formatDuration, formatUptime, relativeTime } from './format'
-import type { JobRecord, NavKey, ServerStatus } from './model'
+import type {
+  JobRecord, LifecycleAction, LifecycleCheckId, LifecycleCheckStatus, LifecyclePreview,
+  NavKey, ServerStatus
+} from './model'
 
 interface Session { name: string }
 
@@ -300,7 +303,7 @@ function FeatureWorkspace({ active, status, jobs, onRefresh, provider }: { activ
 }
 
 const featureDefinitions: Record<Exclude<NavKey, 'overview'>, { title: string; description: string; primaryTitle: string; phase: string; icon: ComponentType<{ size?: number }>; scope: string[]; safety: string }> = {
-  game: { title: '游戏管理', description: '统一管理 DSP 进程、Nebula 会话和安全生命周期。', primaryTitle: '游戏实例', phase: '只读已接入', icon: Gamepad2, scope: ['启动前检查', '保存请求', '优雅停服', '维护模式', '重启与回滚'], safety: '保存与优雅停服适配器完成集成测试前，写操作保持禁用。' },
+  game: { title: '游戏管理', description: '统一管理 DSP 进程、Nebula 会话和安全生命周期。', primaryTitle: '游戏实例', phase: '安全预检已接入', icon: Gamepad2, scope: ['启动前检查', '保存请求', '优雅停服', '维护模式', '重启与回滚'], safety: '只读预检会留下审计记录；独立保存确认、持久回执与执行适配器完成验证前，写操作保持禁用。' },
   console: { title: '实时控制台', description: '查看结构化日志、筛选事件并在审计保护下执行命令。', primaryTitle: '服务器输出', phase: '日志原型', icon: TerminalSquare, scope: ['日志流', '级别筛选', '全文搜索', '命令白名单', '输出下载'], safety: '不提供任意 PowerShell；控制台命令必须经过独立白名单和角色授权。' },
   players: { title: '玩家管理', description: '查看在线玩家、连接质量、身份与管理操作。', primaryTitle: '当前玩家', phase: '接口待接入', icon: Users, scope: ['在线列表', '延迟与连接', '踢出玩家', '封禁与解封', '维护通知'], safety: '玩家身份映射和操作回执可验证前，不开放踢出或封禁。' },
   versions: { title: '版本更新管理', description: '协调 DSP、Nebula、BepInEx 与兼容性门禁。', primaryTitle: '版本矩阵', phase: '清单已接入', icon: CloudDownload, scope: ['在线版本发现', '兼容性矩阵', '更新预览', '暂存安装', '激活与回滚'], safety: 'DSP 更新不会自动激活；Nebula 兼容性和回滚点必须先通过。' },
@@ -320,9 +323,125 @@ function featureBody(active: Exclude<NavKey, 'overview'>, status: ServerStatus, 
   if (active === 'mods') return <DataRows rows={[["模组锁状态", status.versions.compatible ? '依赖已锁定' : '待校验'], ["更新策略", '仅预览，不自动激活'], ["下载校验", 'SHA-256 + 清单'], ["客户端一致性", '等待 Profile 导出器']]} />
   if (active === 'saves') return <SavePanel status={status} />
   if (active === 'server') return <DataRows rows={[["进程状态", stateLabel(status.state)], ["进程 ID", status.runtime.processId?.toString() ?? '—'], ["DSP 私有内存", status.runtime.privateMemoryGiB === null ? '—' : `${status.runtime.privateMemoryGiB} GiB`], ["客户机内存", status.host.memoryTotalGiB === null ? '—' : `${status.host.memoryFreeGiB ?? '—'} / ${status.host.memoryTotalGiB} GiB 可用`], ["逻辑处理器", status.host.logicalProcessors === null ? '—' : `${status.host.logicalProcessors} · ${status.host.processorGroups ?? '—'} 个处理器组`], ["线程与优先级", `${status.runtime.threadCount ?? '—'} · ${status.runtime.priority ?? '—'}`], ["开服任务", taskStateLabel(status.automation.serverTask.state)], ["停止任务上次结果", status.automation.stopTask.lastResult === null ? '未采集 · 写操作保持锁定' : `${status.automation.stopTask.lastResult} · 写操作保持锁定`, status.automation.stopTask.lastResult === 0 ? 'good' : 'warn'], ["共享存储", storageStateLabel(status), status.automation.projectRootAvailable && status.automation.globalMappingAvailable !== false ? 'good' : 'warn'], ["游戏端口", gamePortDetail(status), status.connections.find((item) => item.id === 'game-port')?.status === 'healthy' ? 'good' : 'warn']]} />
-  if (active === 'game') return <DataRows rows={[["实例", status.serverName], ["运行状态", stateLabel(status.state)], ["运行时间", formatUptime(status.runtime.uptimeSeconds)], ["目标 UPS", status.runtime.targetUps?.toString() ?? '—'], ["加载状态", status.versions.gameLoaded ? '游戏存档已加载' : '待确认'], ["在线玩家", `${status.runtime.onlinePlayers ?? '—'} / ${status.runtime.maxPlayers ?? '—'}`], ["写操作", '等待安全适配器验证']]} />
+  if (active === 'game') return <GameLifecyclePanel status={status} />
   if (active === 'config') return <DataRows rows={[["游戏配置", '只读 Schema 草案'], ["Nebula 配置", '机密字段不回显'], ["性能配置", `目标 UPS ${status.runtime.targetUps ?? '—'}`], ["网络配置", '端点由部署层提供'], ["变更策略", '差异预览 + 回滚快照']]} />
   return <DataRows rows={[["Profile", '尚未生成'], ["服务端锁", '等待模组解析器'], ["游戏文件", '永不打包'], ["敏感信息", '永不导出'], ["交付格式", 'Thunderstore Profile + 安装说明']]} />
+}
+
+const lifecycleActions: Array<{
+  action: LifecycleAction
+  label: string
+  description: string
+  icon: ComponentType<{ size?: number }>
+}> = [
+  { action: 'save', label: '保存预检', description: '存档配对、备份与保存回执', icon: Save },
+  { action: 'graceful-stop', label: '停服预检', description: '进程身份、会话任务与停服回执', icon: Square },
+  { action: 'restart', label: '重启预检', description: '停服链、开服任务与回滚点', icon: RotateCw }
+]
+
+const lifecycleCheckLabels: Record<LifecycleCheckId, string> = {
+  'project-root': '共享项目目录',
+  'managed-process': 'DSP 受管进程',
+  'pid-file': 'PID 身份绑定',
+  'save-pair': '存档配对单元',
+  'backup-pair': '成对备份与清单',
+  'server-task': '开服计划任务',
+  'stop-task': '优雅停服任务',
+  'stop-task-principal': '会话与运行身份',
+  'stop-task-action': '停服脚本白名单',
+  'stop-task-result': '上次停服任务结果',
+  'task-history': '计划任务事件历史',
+  'receipt-channel': '持久生命周期回执',
+  'save-trigger': '独立保存确认',
+  'execution-lock': '执行总锁'
+}
+
+const lifecycleStatusLabels: Record<LifecycleCheckStatus, string> = {
+  pass: '通过', warning: '需关注', block: '阻断', 'not-applicable': '不适用'
+}
+
+function GameLifecyclePanel({ status }: { status: ServerStatus }) {
+  const [action, setAction] = useState<LifecycleAction>('graceful-stop')
+  const [preview, setPreview] = useState<LifecyclePreview | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const selected = lifecycleActions.find((item) => item.action === action)!
+
+  async function runPreview() {
+    setBusy(true); setError('')
+    try {
+      const result = await api.previewLifecycle(action)
+      setPreview(result.data.preview)
+    } catch (reason) {
+      setPreview(null)
+      setError(reason instanceof ApiError ? reason.message : '生命周期预检失败')
+    } finally { setBusy(false) }
+  }
+
+  return <div className="lifecycle-workspace">
+    <div className="lifecycle-instance-strip">
+      <div><span>受管实例</span><strong>{status.serverName}</strong></div>
+      <div><span>运行状态</span><strong className={status.state === 'running' ? 'green' : 'amber'}>{stateLabel(status.state)}</strong></div>
+      <div><span>运行时间</span><strong>{formatUptime(status.runtime.uptimeSeconds)}</strong></div>
+      <div><span>目标 UPS</span><strong>{status.runtime.targetUps ?? '—'}</strong></div>
+      <div><span>玩家会话</span><strong>{status.runtime.onlinePlayers ?? '—'} / {status.runtime.maxPlayers ?? '—'}</strong></div>
+    </div>
+
+    <section className="lifecycle-preflight" aria-labelledby="lifecycle-preflight-title">
+      <header>
+        <div><span className="preflight-mark"><ScanSearch size={19} /></span><div><h3 id="lifecycle-preflight-title">生命周期安全预检</h3><p>仅采集证据，不修改进程、任务、存档或配置</p></div></div>
+        <span className="dry-run-badge"><LockKeyhole size={12} />DRY RUN</span>
+      </header>
+
+      <div className="lifecycle-action-grid">
+        {lifecycleActions.map((item) => {
+          const Icon = item.icon
+          return <button key={item.action} className={item.action === action ? 'selected' : ''}
+            aria-pressed={item.action === action} onClick={() => { setAction(item.action); setPreview(null); setError('') }}>
+            <Icon size={18} /><span><strong>{item.label}</strong><small>{item.description}</small></span>
+          </button>
+        })}
+      </div>
+
+      <div className="preflight-command-row">
+        <div><span>当前路径</span><strong>{selected.label} / 只读证据链</strong></div>
+        <button className="preflight-run" disabled={busy} onClick={runPreview}>
+          {busy ? <RefreshCw className="spin" size={16} /> : <ScanSearch size={16} />}{busy ? '正在采集…' : '运行只读预检'}
+        </button>
+      </div>
+
+      {error && <div className="preflight-error" role="alert"><CircleX size={16} />{error}</div>}
+      {!preview && !error && <div className="preflight-empty">
+        <LockKeyhole size={25} /><div><strong>执行能力保持锁定</strong><p>选择路径并运行预检，系统会生成持久审计任务和固定阻断码。</p></div>
+      </div>}
+      {preview && <LifecyclePreviewResult preview={preview} />}
+    </section>
+  </div>
+}
+
+function LifecyclePreviewResult({ preview }: { preview: LifecyclePreview }) {
+  const activeChecks = preview.checks.filter((check) => check.status !== 'not-applicable')
+  return <div className="preflight-result" aria-live="polite">
+    <div className="preflight-result-summary">
+      <div className="gate-state locked"><LockKeyhole size={21} /><div><span>执行门禁</span><strong>保持锁定 · {preview.blockers.length} 项阻断</strong></div></div>
+      <div className={`rollback-state ${preview.rollback.ready ? 'ready' : 'blocked'}`}><Undo2 size={19} /><div><span>回滚基线</span><strong>{preview.rollback.ready ? '已就绪' : '尚未就绪'}</strong></div></div>
+      <div className="audit-state"><ShieldCheck size={19} /><div><span>审计记录</span><strong>已持久化</strong></div></div>
+    </div>
+    <div className="preflight-check-grid">
+      {activeChecks.map((check) => <div key={check.id} className={`preflight-check ${check.status}`}>
+        <LifecycleCheckIcon status={check.status} />
+        <span><strong>{lifecycleCheckLabels[check.id]}</strong><small>{lifecycleStatusLabels[check.status]}</small></span>
+      </div>)}
+    </div>
+    <p className="preflight-footnote"><LockKeyhole size={13} />本结果只是证据快照；它不会解锁保存、停服或重启操作。</p>
+  </div>
+}
+
+function LifecycleCheckIcon({ status }: { status: LifecycleCheckStatus }) {
+  if (status === 'pass') return <Check size={16} />
+  if (status === 'warning') return <TriangleAlert size={16} />
+  if (status === 'block') return <CircleX size={16} />
+  return <CircleMinus size={16} />
 }
 
 type DataRow = [label: string, value: string, tone?: 'good' | 'warn' | 'muted']

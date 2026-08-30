@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { serverStatusSchema, type ServerStatus, type StatusProvider } from '../domain.js'
+import {
+  lifecyclePreviewSchema, serverStatusSchema,
+  type LifecycleAction, type LifecyclePreview, type ServerStatus, type StatusProvider
+} from '../domain.js'
 
 export interface WindowsProviderOptions {
   projectRoot: string
@@ -18,15 +21,39 @@ export class WindowsProvider implements StatusProvider {
   }
 
   async collectStatus(): Promise<ServerStatus> {
-    const scriptPath = path.resolve(this.#options.scriptRoot, 'Get-DysonStatus.ps1')
-    this.#assertInsideScriptRoot(scriptPath)
-    await fs.access(scriptPath)
-    const output = await this.#runPowerShell(scriptPath)
+    const scriptPath = await this.#resolveScript('Get-DysonStatus.ps1')
+    const output = await this.#runPowerShell(scriptPath, ['-ProjectRoot', this.#options.projectRoot])
     const parsed = serverStatusSchema.parse(JSON.parse(output) as unknown)
     return {
       ...parsed,
       capabilities: { refresh: true, save: false, gracefulStop: false, restart: false }
     }
+  }
+
+  async previewLifecycle(action: LifecycleAction): Promise<LifecyclePreview> {
+    const scriptPath = await this.#resolveScript('Get-DysonLifecyclePreflight.ps1')
+    const output = await this.#runPowerShell(scriptPath, [
+      '-ProjectRoot', this.#options.projectRoot,
+      '-AllowedScriptRoot', this.#options.scriptRoot,
+      '-Action', action
+    ])
+    const parsed = lifecyclePreviewSchema.parse(JSON.parse(output) as unknown)
+    const blockers = parsed.blockers.includes('execution-disabled')
+      ? parsed.blockers
+      : [...parsed.blockers, 'execution-disabled' as const]
+    return {
+      ...parsed,
+      allowed: false,
+      executionEnabled: false,
+      blockers
+    }
+  }
+
+  async #resolveScript(fileName: 'Get-DysonStatus.ps1' | 'Get-DysonLifecyclePreflight.ps1'): Promise<string> {
+    const scriptPath = path.resolve(this.#options.scriptRoot, fileName)
+    this.#assertInsideScriptRoot(scriptPath)
+    await fs.access(scriptPath)
+    return scriptPath
   }
 
   #assertInsideScriptRoot(scriptPath: string): void {
@@ -36,11 +63,11 @@ export class WindowsProvider implements StatusProvider {
     }
   }
 
-  #runPowerShell(scriptPath: string): Promise<string> {
+  #runPowerShell(scriptPath: string, scriptArguments: string[]): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn('powershell.exe', [
         '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', scriptPath, '-ProjectRoot', this.#options.projectRoot
+        '-File', scriptPath, ...scriptArguments
       ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
       let stdout = ''
       let stderr = ''

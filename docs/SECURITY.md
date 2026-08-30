@@ -9,6 +9,9 @@
   arbitrary command supplied by a request.
 - Collector output is constrained by a strict schema and contains summarized
   health fields only; raw paths and log lines never cross the provider boundary.
+- Lifecycle preview accepts a fixed action enum, runs one fixed read-only
+  collector, and exposes only bounded check messages and stable blocker codes.
+  It always forces execution back to disabled at the provider boundary.
 - Steam credentials are outside Dyson Control. The product must never ask for,
   persist, or echo a Steam password or guard code.
 
@@ -35,6 +38,10 @@ The project does not expose:
 - Steam login automation;
 - unverified Mod downloads;
 - save restore or in-place update without backup and rollback.
+
+The dry-run lifecycle preview is not a mutation capability. Its successful job
+state means evidence collection completed; it does not mean the requested save,
+stop, or restart is safe or enabled. See [LIFECYCLE.md](LIFECYCLE.md).
 
 ## Reporting
 

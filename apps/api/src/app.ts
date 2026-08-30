@@ -13,6 +13,7 @@ import { AuthService } from './security/auth.js'
 import { ControlDatabase } from './storage/database.js'
 import { EventHub } from './services/event-hub.js'
 import { JobService } from './services/job-service.js'
+import { lifecycleActionRequestSchema } from './domain.js'
 
 const loginSchema = z.object({ password: z.string().min(1).max(512) })
 
@@ -101,6 +102,21 @@ export async function buildApplication(config: AppConfig): Promise<BuiltApplicat
   app.post('/api/v1/actions/refresh', { preHandler: auth.authenticate }, async (request, reply) => {
     const job = jobs.enqueueRefresh(request.actor ?? 'unknown')
     return reply.code(202).send({ data: job })
+  })
+
+  app.post('/api/v1/actions/lifecycle/preview', { preHandler: auth.authenticate }, async (request, reply) => {
+    const parsed = lifecycleActionRequestSchema.safeParse(request.body)
+    if (!parsed.success) {
+      return reply.code(400).send({ error: { code: 'INVALID_LIFECYCLE_ACTION', message: '生命周期预检请求无效' } })
+    }
+    try {
+      const result = await jobs.previewLifecycle(parsed.data.action, request.actor ?? 'unknown')
+      return reply.code(200).send({ data: result })
+    } catch {
+      return reply.code(503).send({
+        error: { code: 'LIFECYCLE_PREVIEW_FAILED', message: '生命周期只读预检暂不可用' }
+      })
+    }
   })
 
   app.get('/api/v1/events', { preHandler: auth.authenticate }, async (request, reply) => {

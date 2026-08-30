@@ -9,6 +9,9 @@ trend charts and memory histogram instead of isolated sparklines.
 
 `dashboard-implementation-dsp-inspired-v2.png` is the matching 1536 x 1024
 code-native implementation capture. It uses only fictional demonstration data.
+`game-lifecycle-preflight-desktop.png` is the matching 1536 x 1024
+game-management capture for the read-only lifecycle preflight. It also uses
+only the deterministic demo provider.
 
 Implementation invariants:
 

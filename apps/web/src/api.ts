@@ -1,4 +1,4 @@
-import type { JobRecord, ServerStatus } from './model'
+import type { JobRecord, LifecycleAction, LifecyclePreview, ServerStatus } from './model'
 
 export class ApiError extends Error {
   constructor(readonly status: number, message: string) { super(message) }
@@ -28,5 +28,10 @@ export const api = {
   logout: () => request<void>('/api/v1/auth/logout', { method: 'POST' }),
   status: () => request<{ data: ServerStatus; meta: { provider: 'demo' | 'windows' } }>('/api/v1/status'),
   jobs: () => request<{ data: JobRecord[] }>('/api/v1/jobs'),
-  refresh: () => request<{ data: JobRecord }>('/api/v1/actions/refresh', { method: 'POST' })
+  refresh: () => request<{ data: JobRecord }>('/api/v1/actions/refresh', { method: 'POST' }),
+  previewLifecycle: (action: LifecycleAction) => request<{
+    data: { job: JobRecord; preview: LifecyclePreview }
+  }>('/api/v1/actions/lifecycle/preview', {
+    method: 'POST', body: JSON.stringify({ action })
+  })
 }
