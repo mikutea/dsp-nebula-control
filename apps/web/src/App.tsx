@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState, type ComponentType } from 'react'
+import { FormEvent, useCallback, useEffect, useId, useMemo, useState, type ComponentType } from 'react'
 import {
   Activity, Archive, Boxes, Check, ChevronDown, CircleUserRound, ClipboardList,
   CloudDownload, Code2, Copy, Cpu, Database, Download, FileCog, FolderArchive,
@@ -186,7 +186,7 @@ function Overview({ status, jobs, refreshing, onRefresh, provider }: {
       <StatusStrip status={status} />
       <div className="metrics-grid">
         <Metric title="CPU" value={status.runtime.processCoresUsed === null ? '—' : `${status.runtime.processCoresUsed.toFixed(1)} 核`} sub="进程平均占用" color="cyan" points="2,40 14,33 27,36 39,25 52,31 65,24 78,28 91,20 104,26 118,18" />
-        <Metric title="内存" value={status.runtime.privateMemoryGiB === null ? '—' : `${status.runtime.privateMemoryGiB} GB`} sub="DSP 私有内存" color="cyan" points="2,38 14,37 27,36 39,36 52,35 65,35 78,34 91,34 104,33 118,33" />
+        <Metric title="内存" value={status.runtime.privateMemoryGiB === null ? '—' : `${status.runtime.privateMemoryGiB} GB`} sub="DSP 私有内存" color="cyan" kind="bars" points="2,38 14,37 27,36 39,36 52,35 65,35 78,34 91,34 104,33 118,33" />
         <Metric title="UPS" value={status.runtime.targetUps?.toString() ?? '—'} sub="目标模拟速率" color="green" points="2,26 14,21 27,30 39,17 52,25 65,18 78,23 91,16 104,24 118,20" />
         <Metric title="线程" value={status.runtime.threadCount?.toString() ?? '—'} sub="DSP 活跃线程" color="amber" points="2,34 14,28 27,32 39,22 52,30 65,25 78,31 91,23 104,29 118,26" />
         <Metric title="进程" value={status.runtime.processId ? `PID ${status.runtime.processId}` : '未运行'} sub={status.state === 'running' ? `${status.runtime.priority ?? '默认'} 优先级` : '等待启动'} color="blue" points="2,38 14,32 27,34 39,27 52,30 65,23 78,27 91,20 104,25 118,19" />
@@ -210,16 +210,31 @@ function StatusStrip({ status }: { status: ServerStatus }) {
     { label: 'Nebula 版本', value: status.versions.nebula ?? '待采集', sub: compatibilityLabel(status), icon: PlugZap, tone: status.versions.warnings.length ? 'warn' : undefined },
     { label: '在线玩家', value: `${status.runtime.onlinePlayers ?? '—'} / ${status.runtime.maxPlayers ?? '—'}`, sub: '连接槽位', icon: Users },
     { label: '运行时间', value: status.state === 'running' ? formatUptime(status.runtime.uptimeSeconds) : '—', sub: `采集于 ${new Date(status.collectedAt).toLocaleTimeString('zh-CN')}`, icon: History },
-    { label: '游戏链路', value: status.connections.find((item) => item.id === 'game-port')?.status === 'healthy' ? '可达' : '待检查', sub: status.connections.find((item) => item.id === 'game-port')?.detail ?? '—', icon: PlugZap, tone: status.connections.find((item) => item.id === 'game-port')?.status === 'healthy' ? 'good' : 'warn' },
+    { label: '游戏链路', value: status.connections.find((item) => item.id === 'game-port')?.status === 'healthy' ? '可达' : '待检查', sub: gamePortDetail(status), icon: PlugZap, tone: status.connections.find((item) => item.id === 'game-port')?.status === 'healthy' ? 'good' : 'warn' },
     { label: '存储状态', value: status.save.consistent ? '正常' : '不完整', sub: status.save.name ?? '未发现存档', icon: HardDrive, tone: status.save.consistent ? 'good' : 'warn' }
   ]
   return <section className="status-strip">{items.map(({ label, value, sub, icon: Icon, tone }) =>
     <div className="status-item" key={label}><Icon size={19} /><span>{label}<strong className={tone}>{value}</strong><small>{sub}</small></span></div>)}</section>
 }
 
-function Metric({ title, value, sub, color, points }: { title: string; value: string; sub: string; color: string; points: string }) {
+function Metric({ title, value, sub, color, points, kind = 'area' }: { title: string; value: string; sub: string; color: string; points: string; kind?: 'area' | 'bars' }) {
+  const fillId = `metric-fill-${useId().replace(/:/g, '')}`
+  const coordinates = points.split(' ').map((point) => point.split(',').map(Number))
+  const [lastX, lastY] = coordinates.at(-1) ?? [118, 24]
+  const chartColor = ({ cyan: '#11d7ff', green: '#45e47b', amber: '#f1b83a', blue: '#168de8' } as const)[color as 'cyan' | 'green' | 'amber' | 'blue'] ?? '#11d7ff'
   return <section className="metric"><div className="metric-head"><strong>{title}</strong><span>{value}</span></div>
-    <svg viewBox="0 0 120 48" preserveAspectRatio="none" aria-hidden="true"><polyline className={color} points={points} /></svg><small>{sub}</small></section>
+    <svg className="metric-chart" viewBox="0 0 120 48" preserveAspectRatio="none" aria-hidden="true" style={{ color: chartColor }}>
+      <defs><linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="currentColor" stopOpacity=".34" /><stop offset="1" stopColor="currentColor" stopOpacity=".035" /></linearGradient></defs>
+      <g className="metric-chart-grid"><path d="M0 12H120M0 24H120M0 36H120" /><path d="M30 0V48M60 0V48M90 0V48" /></g>
+      {kind === 'bars'
+        ? <g className="metric-bars">{coordinates.map(([x, y], index) => {
+          const height = Math.min(39, 15 + ((48 - y) * 1.4))
+          return <rect key={index} x={x - 3.5} y={48 - height} width="7" height={height} />
+        })}</g>
+        : <><polygon className="metric-area" points={`${points} 118,48 2,48`} fill={`url(#${fillId})`} />
+          <polyline className="metric-line" points={points} />
+          <circle className="metric-node" cx={lastX} cy={lastY} r="2.1" /></>}
+    </svg><small>{sub}</small></section>
 }
 
 const demoLogs = [
@@ -242,10 +257,16 @@ function ConsolePanel({ demo }: { demo: boolean }) {
 }
 
 function DeploymentPanel({ status, onRefresh }: { status: ServerStatus; onRefresh: () => void }) {
+  const versions = [
+    { label: '游戏版本', value: status.versions.dsp, tone: 'good' },
+    { label: 'BepInEx', value: status.versions.bepInEx, tone: 'good' },
+    { label: 'Nebula', value: status.versions.nebula, tone: status.versions.warnings.length ? 'warn' : 'good' },
+    { label: '运行兼容状态', value: compatibilityLabel(status), tone: status.versions.warnings.length ? 'warn' : 'good' }
+  ] as const
   return <section className="panel deployment-panel"><header><h2>部署与版本</h2></header>
     <div className="version-list">
-      {[['游戏版本', status.versions.dsp], ['BepInEx', status.versions.bepInEx], ['Nebula', status.versions.nebula], ['运行兼容状态', compatibilityLabel(status)]].map(([label, value]) =>
-        <div key={label}><span>{label}</span><strong>{value ?? '待采集'}</strong><Check size={15} /></div>)}
+      {versions.map(({ label, value, tone }) =>
+        <div key={label}><span>{label}</span><strong>{value ?? '待采集'}</strong><Check className={tone} size={15} /></div>)}
     </div>
     <div className="update-box"><div><strong>可用更新</strong><span>尚未执行在线检查</span></div><button onClick={onRefresh}><RefreshCw size={16} />刷新清单</button><p>更新只会进入预览；依赖、哈希、存档备份和回滚验证完成前无法激活。</p></div>
     <a className="panel-link">查看更新日志</a><a className="panel-link">版本锁定设置</a>
@@ -295,17 +316,19 @@ function featureBody(active: Exclude<NavKey, 'overview'>, status: ServerStatus, 
   if (active === 'console') return <ConsolePanel demo={provider === 'demo'} />
   if (active === 'tasks') return <TaskTable jobs={jobs} />
   if (active === 'players') return <div className="players-empty"><Users size={38} /><strong>{status.runtime.onlinePlayers ?? 0} 名玩家在线</strong><p>玩家身份接口尚未接入；当前不会显示或修改玩家数据。</p></div>
-  if (active === 'versions') return <DataRows rows={[["DSP", status.versions.dsp ?? '待采集'], ["Nebula", status.versions.nebula ?? '待采集'], ["BepInEx", status.versions.bepInEx ?? '待采集'], ["游戏加载", status.versions.gameLoaded === true ? '已完成' : status.versions.gameLoaded === false ? '未完成' : '待检查'], ["兼容性", compatibilityLabel(status)]]} />
+  if (active === 'versions') return <DataRows rows={[["DSP", status.versions.dsp ?? '待采集'], ["Nebula", status.versions.nebula ?? '待采集'], ["BepInEx", status.versions.bepInEx ?? '待采集'], ["游戏加载", status.versions.gameLoaded === true ? '已完成' : status.versions.gameLoaded === false ? '未完成' : '待检查', status.versions.gameLoaded ? 'good' : 'warn'], ["兼容性", compatibilityLabel(status), status.versions.warnings.length ? 'warn' : 'good']]} />
   if (active === 'mods') return <DataRows rows={[["模组锁状态", status.versions.compatible ? '依赖已锁定' : '待校验'], ["更新策略", '仅预览，不自动激活'], ["下载校验", 'SHA-256 + 清单'], ["客户端一致性", '等待 Profile 导出器']]} />
   if (active === 'saves') return <SavePanel status={status} />
-  if (active === 'server') return <DataRows rows={[["进程状态", stateLabel(status.state)], ["进程 ID", status.runtime.processId?.toString() ?? '—'], ["DSP 私有内存", status.runtime.privateMemoryGiB === null ? '—' : `${status.runtime.privateMemoryGiB} GiB`], ["客户机内存", status.host.memoryTotalGiB === null ? '—' : `${status.host.memoryFreeGiB ?? '—'} / ${status.host.memoryTotalGiB} GiB 可用`], ["逻辑处理器", status.host.logicalProcessors === null ? '—' : `${status.host.logicalProcessors} · ${status.host.processorGroups ?? '—'} 个处理器组`], ["线程与优先级", `${status.runtime.threadCount ?? '—'} · ${status.runtime.priority ?? '—'}`], ["开服任务", taskStateLabel(status.automation.serverTask.state)], ["停止任务上次结果", status.automation.stopTask.lastResult === null ? '未采集 · 写操作保持锁定' : `${status.automation.stopTask.lastResult} · 写操作保持锁定`], ["共享存储", storageStateLabel(status)], ["游戏端口", status.connections[0]?.detail ?? '待检查']]} />
+  if (active === 'server') return <DataRows rows={[["进程状态", stateLabel(status.state)], ["进程 ID", status.runtime.processId?.toString() ?? '—'], ["DSP 私有内存", status.runtime.privateMemoryGiB === null ? '—' : `${status.runtime.privateMemoryGiB} GiB`], ["客户机内存", status.host.memoryTotalGiB === null ? '—' : `${status.host.memoryFreeGiB ?? '—'} / ${status.host.memoryTotalGiB} GiB 可用`], ["逻辑处理器", status.host.logicalProcessors === null ? '—' : `${status.host.logicalProcessors} · ${status.host.processorGroups ?? '—'} 个处理器组`], ["线程与优先级", `${status.runtime.threadCount ?? '—'} · ${status.runtime.priority ?? '—'}`], ["开服任务", taskStateLabel(status.automation.serverTask.state)], ["停止任务上次结果", status.automation.stopTask.lastResult === null ? '未采集 · 写操作保持锁定' : `${status.automation.stopTask.lastResult} · 写操作保持锁定`, status.automation.stopTask.lastResult === 0 ? 'good' : 'warn'], ["共享存储", storageStateLabel(status), status.automation.projectRootAvailable && status.automation.globalMappingAvailable !== false ? 'good' : 'warn'], ["游戏端口", gamePortDetail(status), status.connections.find((item) => item.id === 'game-port')?.status === 'healthy' ? 'good' : 'warn']]} />
   if (active === 'game') return <DataRows rows={[["实例", status.serverName], ["运行状态", stateLabel(status.state)], ["运行时间", formatUptime(status.runtime.uptimeSeconds)], ["目标 UPS", status.runtime.targetUps?.toString() ?? '—'], ["加载状态", status.versions.gameLoaded ? '游戏存档已加载' : '待确认'], ["在线玩家", `${status.runtime.onlinePlayers ?? '—'} / ${status.runtime.maxPlayers ?? '—'}`], ["写操作", '等待安全适配器验证']]} />
   if (active === 'config') return <DataRows rows={[["游戏配置", '只读 Schema 草案'], ["Nebula 配置", '机密字段不回显'], ["性能配置", `目标 UPS ${status.runtime.targetUps ?? '—'}`], ["网络配置", '端点由部署层提供'], ["变更策略", '差异预览 + 回滚快照']]} />
   return <DataRows rows={[["Profile", '尚未生成'], ["服务端锁", '等待模组解析器'], ["游戏文件", '永不打包'], ["敏感信息", '永不导出'], ["交付格式", 'Thunderstore Profile + 安装说明']]} />
 }
 
-function DataRows({ rows }: { rows: string[][] }) {
-  return <div className="data-rows">{rows.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong><Check size={16} /></div>)}</div>
+type DataRow = [label: string, value: string, tone?: 'good' | 'warn' | 'muted']
+
+function DataRows({ rows }: { rows: DataRow[] }) {
+  return <div className="data-rows">{rows.map(([label, value, tone = 'good']) => <div key={label}><span>{label}</span><strong>{value}</strong><Check className={tone} size={16} /></div>)}</div>
 }
 
 function compatibilityLabel(status: ServerStatus): string {
@@ -327,10 +350,24 @@ function storageStateLabel(status: ServerStatus): string {
   return '项目根目录可用'
 }
 
+function gamePortDetail(status: ServerStatus): string {
+  const gamePort = status.connections.find((item) => item.id === 'game-port')
+  if (!gamePort || gamePort.status === 'unknown') return '尚未采集'
+  return gamePort.status === 'healthy' ? '本机 TCP 监听正常' : '未检测到本机 TCP 监听'
+}
+
 function stateLabel(state: ServerStatus['state']): string {
   return ({ running: '运行中', stopped: '已停止', starting: '启动中', stopping: '停止中', unknown: '未知' })[state]
 }
 
 function OrbitMark() {
-  return <svg className="orbit-mark" viewBox="0 0 42 42" aria-hidden="true"><circle cx="21" cy="21" r="5" /><ellipse cx="21" cy="21" rx="18" ry="8" transform="rotate(-25 21 21)" /><ellipse cx="21" cy="21" rx="18" ry="8" transform="rotate(60 21 21)" /><path d="M6 33c9-2 19-9 28-22" /></svg>
+  return <svg className="orbit-mark" viewBox="0 0 42 42" aria-hidden="true">
+    <path d="M21 2.8 36.8 12v18L21 39.2 5.2 30V12Z" opacity=".56" />
+    <circle className="orbit-core" cx="21" cy="21" r="5.2" />
+    <ellipse cx="21" cy="21" rx="17.5" ry="7.4" transform="rotate(-25 21 21)" />
+    <ellipse cx="21" cy="21" rx="17.5" ry="7.4" transform="rotate(60 21 21)" />
+    <path d="M6.5 32.7c8.8-2 18.7-8.8 28-22" />
+    <circle className="orbit-node" cx="35.2" cy="10.4" r="1.4" />
+    <circle className="orbit-node" cx="7.5" cy="31.9" r="1" />
+  </svg>
 }

@@ -13,7 +13,7 @@ client/server parity, and rollback-oriented operations.
 > inventory provider, tracked refresh jobs, and a deliberately disabled
 > mutation surface.
 
-![Dyson Control dashboard](design/dashboard-implementation-v1.png)
+![Dyson Control dashboard](design/dashboard-implementation-dsp-inspired-v2.png)
 
 ## Management scope
 
