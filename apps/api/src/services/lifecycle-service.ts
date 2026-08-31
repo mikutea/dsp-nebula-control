@@ -11,6 +11,11 @@ import {
   type LifecycleRunRecord
 } from '../domain.js'
 import { ControlDatabase } from '../storage/database.js'
+import {
+  LifecycleCoordinatorError,
+  type LifecycleLeaseDisposition,
+  type LifecycleMutationCoordinator
+} from '../host-mutation/lifecycle-coordinator.js'
 import { EventHub } from './event-hub.js'
 
 export interface LifecycleExecutionResult {
@@ -20,6 +25,14 @@ export interface LifecycleExecutionResult {
   reused: boolean
 }
 
+interface LifecycleTransactionOutcome {
+  state: 'succeeded' | 'failed'
+  failedPhase: LifecycleExecutionPhase | null
+  failureCode: string | null
+  recoveryRequired: boolean
+  disposition: LifecycleLeaseDisposition
+}
+
 export { LifecycleExecutionError } from '../domain.js'
 
 export class LifecycleService {
@@ -27,13 +40,15 @@ export class LifecycleService {
   readonly #adapter: LifecycleMutationAdapter
   readonly #events: EventHub
   readonly #phaseTimeoutMs: number
+  readonly #coordinator: LifecycleMutationCoordinator | undefined
   #queue: Promise<void> = Promise.resolve()
 
   constructor(
     database: ControlDatabase,
     adapter: LifecycleMutationAdapter,
     events: EventHub,
-    phaseTimeoutMs = 30_000
+    phaseTimeoutMs = 30_000,
+    coordinator?: LifecycleMutationCoordinator
   ) {
     if (!Number.isInteger(phaseTimeoutMs) || phaseTimeoutMs < 10 || phaseTimeoutMs > 300_000) {
       throw new Error('Lifecycle phase timeout must be between 10 and 300000 ms')
@@ -42,6 +57,7 @@ export class LifecycleService {
     this.#adapter = adapter
     this.#events = events
     this.#phaseTimeoutMs = phaseTimeoutMs
+    this.#coordinator = coordinator
   }
 
   initialize(): number {
@@ -122,11 +138,65 @@ export class LifecycleService {
       this.#events.publish({ type: 'job.updated', data: failed.job })
       return this.#snapshot(created.job.id, false)
     }
-    this.#database.finishLifecyclePhase(lockReceipt.id, 'succeeded', '已获取全局生命周期互斥锁', null, {})
+
+    if (!this.#coordinator) {
+      this.#database.finishLifecyclePhase(lockReceipt.id, 'succeeded', '已获取全局生命周期互斥锁', null, {})
+      return this.#completeTransaction(created, await this.#executeTransaction(created))
+    }
+
+    let coordinatorEntered = false
+    try {
+      const outcome = await this.#coordinator.runExclusive(
+        { requestId: created.run.requestId, action },
+        async (scope) => {
+          coordinatorEntered = true
+          this.#database.finishLifecyclePhase(
+            lockReceipt.id,
+            'succeeded',
+            '已获取全局生命周期互斥锁和主机变更租约',
+            null,
+            {}
+          )
+          const transaction = await this.#executeTransaction(created, scope.signal)
+          return { value: transaction, disposition: transaction.disposition }
+        }
+      )
+      return this.#completeTransaction(created, outcome)
+    } catch (error) {
+      const failureCode = coordinatorEntered
+        ? 'LIFECYCLE_HOST_LEASE_LOST'
+        : this.#coordinatorAcquireErrorCode(error)
+      if (!coordinatorEntered) {
+        this.#database.finishLifecyclePhase(
+          lockReceipt.id,
+          'failed',
+          '主机变更租约获取失败',
+          failureCode,
+          {}
+        )
+      }
+      const failed = this.#database.completeLifecycleRun(
+        created.job.id,
+        'failed',
+        `${this.#label(action)}生命周期事务失败（主机变更租约）`,
+        failureCode,
+        coordinatorEntered
+      )
+      this.#events.publish({ type: 'job.updated', data: failed.job })
+      return this.#snapshot(created.job.id, false)
+    }
+  }
+
+  async #executeTransaction(
+    created: ReturnType<ControlDatabase['createLifecycleJob']>,
+    leaseSignal?: AbortSignal
+  ): Promise<LifecycleTransactionOutcome> {
+    const action = created.run.action
 
     let protectionPointId: string | null = null
     let stopMayHaveOccurred = false
     let startMayHaveOccurred = false
+    let nativeMutationMayHaveOccurred = false
     let failedPhase: LifecycleExecutionPhase | null = null
     let failureCode = 'LIFECYCLE_PHASE_FAILED'
     let recoveryRequired = false
@@ -144,9 +214,10 @@ export class LifecycleService {
           summary: '生命周期执行预检通过',
           evidence: { blockerCount: preview.blockers.length, rollbackReady: preview.rollback.ready }
         }
-      })
+      }, leaseSignal)
 
       if (action !== 'start') {
+        nativeMutationMayHaveOccurred = true
         const protection = await this.#phase(
           created.run,
           'protection-point',
@@ -154,7 +225,8 @@ export class LifecycleService {
           async (context) => {
             const result = await this.#adapter.createProtectionPoint(context)
             return { ...result, protectionPointId: this.#validateProtectionPoint(result.protectionPointId) }
-          }
+          },
+          leaseSignal
         )
         protectionPointId = protection.protectionPointId!
         this.#database.setLifecycleProtectionPoint(created.job.id, protectionPointId)
@@ -163,117 +235,167 @@ export class LifecycleService {
           created.run,
           'save',
           protectionPointId,
-          (context) => this.#adapter.requestSave(context)
+          (context) => this.#adapter.requestSave(context),
+          leaseSignal
         )
       }
 
       if (action === 'graceful-stop' || action === 'restart') {
         stopMayHaveOccurred = true
+        nativeMutationMayHaveOccurred = true
         await this.#phase(
           created.run,
           'stop',
           protectionPointId,
-          (context) => this.#adapter.requestGracefulStop(context)
+          (context) => this.#adapter.requestGracefulStop(context),
+          leaseSignal
         )
         await this.#phase(
           created.run,
           'verify-stopped',
           protectionPointId,
-          (context) => this.#adapter.verifyStopped(context)
+          (context) => this.#adapter.verifyStopped(context),
+          leaseSignal
         )
       }
 
       if (action === 'start' || action === 'restart') {
         startMayHaveOccurred = true
+        nativeMutationMayHaveOccurred = true
         await this.#phase(
           created.run,
           'start',
           protectionPointId,
-          (context) => this.#adapter.requestStart(context)
+          (context) => this.#adapter.requestStart(context),
+          leaseSignal
         )
         await this.#phase(
           created.run,
           'verify-running',
           protectionPointId,
-          (context) => this.#adapter.verifyRunning(context)
+          (context) => this.#adapter.verifyRunning(context),
+          leaseSignal
         )
       }
 
-      const succeeded = this.#database.completeLifecycleRun(
-        created.job.id,
-        'succeeded',
-        `${this.#label(action)}生命周期事务已完成`,
-        null,
-        false
-      )
-      this.#events.publish({ type: 'job.updated', data: succeeded.job })
-      return this.#snapshot(created.job.id, false)
+      return {
+        state: 'succeeded',
+        failedPhase: null,
+        failureCode: null,
+        recoveryRequired: false,
+        disposition: 'release'
+      }
     } catch (error) {
       const run = this.#database.getLifecycleRun(created.job.id)
       failedPhase = run?.currentPhase ?? null
       failureCode = this.#errorCode(error)
       recoveryRequired = failureCode === 'LIFECYCLE_PHASE_TIMEOUT' || failedPhase === 'save' ||
         (action === 'start' && startMayHaveOccurred)
+      const leaseLost = leaseSignal?.aborted === true || failureCode === 'LIFECYCLE_HOST_LEASE_LOST'
+      if (leaseSignal && nativeMutationMayHaveOccurred) recoveryRequired = true
+      if (leaseLost) recoveryRequired = true
 
-      if (stopMayHaveOccurred) {
+      if (stopMayHaveOccurred && !leaseLost) {
         try {
           await this.#phase(
             created.run,
             'rollback-start',
             protectionPointId,
-            (context) => this.#adapter.requestRollbackStart(context)
+            (context) => this.#adapter.requestRollbackStart(context),
+            leaseSignal
           )
           await this.#phase(
             created.run,
             'verify-running',
             protectionPointId,
-            (context) => this.#adapter.verifyRunning(context)
+            (context) => this.#adapter.verifyRunning(context),
+            leaseSignal
           )
           recoveryRequired = false
-        } catch {
-          failureCode = 'LIFECYCLE_ROLLBACK_FAILED'
+        } catch (rollbackError) {
+          const rollbackCode = this.#errorCode(rollbackError)
+          failureCode = rollbackCode === 'LIFECYCLE_HOST_LEASE_LOST'
+            ? rollbackCode
+            : 'LIFECYCLE_ROLLBACK_FAILED'
           recoveryRequired = true
         }
       }
 
-      const failed = this.#database.completeLifecycleRun(
-        created.job.id,
-        'failed',
-        `${this.#label(action)}生命周期事务失败${failedPhase ? `（${failedPhase}）` : ''}`,
+      return {
+        state: 'failed',
+        failedPhase,
         failureCode,
-        recoveryRequired
-      )
-      this.#events.publish({ type: 'job.updated', data: failed.job })
-      return this.#snapshot(created.job.id, false)
+        recoveryRequired,
+        disposition: recoveryRequired ? 'abandon' : 'release'
+      }
     }
+  }
+
+  #completeTransaction(
+    created: ReturnType<ControlDatabase['createLifecycleJob']>,
+    outcome: LifecycleTransactionOutcome
+  ): LifecycleExecutionResult {
+    const action = created.run.action
+    const completed = this.#database.completeLifecycleRun(
+      created.job.id,
+      outcome.state,
+      outcome.state === 'succeeded'
+        ? `${this.#label(action)}生命周期事务已完成`
+        : `${this.#label(action)}生命周期事务失败${outcome.failedPhase ? `（${outcome.failedPhase}）` : ''}`,
+      outcome.failureCode,
+      outcome.recoveryRequired
+    )
+    this.#events.publish({ type: 'job.updated', data: completed.job })
+    return this.#snapshot(created.job.id, false)
   }
 
   async #phase(
     run: LifecycleRunRecord,
     phase: Exclude<LifecycleExecutionPhase, 'lock' | 'reconciliation'>,
     protectionPointId: string | null,
-    operation: (context: LifecycleOperationContext) => Promise<LifecyclePhaseResult>
+    operation: (context: LifecycleOperationContext) => Promise<LifecyclePhaseResult>,
+    leaseSignal?: AbortSignal
   ): Promise<LifecyclePhaseResult> {
     const receipt = this.#database.startLifecyclePhase(run.jobId, phase, `${this.#phaseLabel(phase)}开始`)
     const controller = new AbortController()
     let timer: NodeJS.Timeout | null = null
+    let removeLeaseAbortListener: (() => void) | null = null
     try {
+      if (leaseSignal?.aborted) {
+        throw new LifecycleExecutionError('LIFECYCLE_HOST_LEASE_LOST')
+      }
       const timeout = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
-          controller.abort()
           reject(new LifecycleExecutionError('LIFECYCLE_PHASE_TIMEOUT'))
+          controller.abort()
         }, this.#phaseTimeoutMs)
       })
-      const result = await Promise.race([
-        operation({
+      const contenders: Array<Promise<LifecyclePhaseResult> | Promise<never>> = [
+        Promise.resolve().then(() => operation({
           jobId: run.jobId,
           requestId: run.requestId,
           action: run.action,
           protectionPointId,
           signal: controller.signal
-        }),
+        })),
         timeout
-      ])
+      ]
+      if (leaseSignal) {
+        let rejectLeaseAbort!: (reason?: unknown) => void
+        const leaseAbort = new Promise<never>((_resolve, reject) => { rejectLeaseAbort = reject })
+        const onAbort = () => {
+          rejectLeaseAbort(new LifecycleExecutionError('LIFECYCLE_HOST_LEASE_LOST'))
+          controller.abort()
+        }
+        if (leaseSignal.aborted) {
+          onAbort()
+        } else {
+          leaseSignal.addEventListener('abort', onAbort, { once: true })
+          removeLeaseAbortListener = () => leaseSignal.removeEventListener('abort', onAbort)
+        }
+        contenders.push(leaseAbort)
+      }
+      const result = await Promise.race(contenders)
       const summary = this.#boundedSummary(result.summary)
       const evidence = this.#boundedEvidence(result.evidence ?? {})
       this.#database.finishLifecyclePhase(receipt.id, 'succeeded', summary, null, evidence)
@@ -290,6 +412,8 @@ export class LifecycleService {
       throw error instanceof LifecycleExecutionError ? error : new LifecycleExecutionError(code)
     } finally {
       if (timer) clearTimeout(timer)
+      removeLeaseAbortListener?.()
+      if (!controller.signal.aborted) controller.abort()
     }
   }
 
@@ -341,6 +465,11 @@ export class LifecycleService {
       return error.code
     }
     return 'LIFECYCLE_PHASE_FAILED'
+  }
+
+  #coordinatorAcquireErrorCode(error: unknown): string {
+    if (error instanceof LifecycleCoordinatorError) return error.code
+    return 'LIFECYCLE_HOST_LEASE_UNAVAILABLE'
   }
 
   #label(action: LifecycleAction): string {
