@@ -555,7 +555,8 @@ export async function buildApplication(
           return new GameConfigHistoryHttpController({
             service: new GameConfigHistoryService({
               configRoot: workspacePaths.configRoot,
-              validateStopProof: stopProof.validate
+              validateStopProof: stopProof.validate,
+              hostMutationCoordinator
             }),
             mutationGate: () => config.configHistoryMutationsEnabled,
             stopProofTokenProvider: stopProof.issue
@@ -568,7 +569,7 @@ export async function buildApplication(
       ? new SaveTransactionService({
           saveRoot: workspacePaths.saveRoot,
           backupRoot: workspacePaths.backupRoot,
-          verifyServiceStopped: async () => {
+          verifyServiceStopped: async (signal) => {
             const output = await windowsScriptRunner.run(
               'Test-DysonRuntimeState.ps1',
               [
@@ -576,7 +577,7 @@ export async function buildApplication(
                 '-Expected', 'stopped',
                 '-GamePort', String(config.gamePort)
               ],
-              new AbortController().signal
+              signal ?? new AbortController().signal
             )
             return JSON.parse(output) as unknown
           }
@@ -595,7 +596,7 @@ export async function buildApplication(
       : null
   )
   const saveJobs = saveTransactions
-    ? new SaveJobService(database, saveTransactions, events)
+    ? new SaveJobService(database, saveTransactions, events, { hostMutationCoordinator })
     : null
   if (saveJobs && config.saveMutationsEnabled) saveJobs.initialize()
   const saveTransfers = dependencies.savePairTransferService ?? (

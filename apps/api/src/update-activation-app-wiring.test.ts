@@ -12,6 +12,10 @@ import type {
   LifecyclePreviewContext,
   StatusProvider
 } from './domain.js'
+import {
+  type HostMutationOperationCoordinator,
+  type HostMutationOperationOutcome
+} from './host-mutation/operation-coordinator.js'
 import { initialComponentUpdateRevision } from './update-pipeline/index.js'
 
 const publicOrigin = 'http://127.0.0.1:13010'
@@ -27,7 +31,7 @@ afterEach(async () => {
 })
 
 describe('application component update activation default wiring', () => {
-  it('constructs the real Windows activation service while the mutation gate defaults closed', async () => {
+  it('constructs the default Windows coordinator and fails closed without its fixed broker script', async () => {
     const fixture = await createFixture(false)
     application = await buildApplication(fixture.config, {
       statusProvider: fixture.statusProvider,
@@ -61,10 +65,10 @@ describe('application component update activation default wiring', () => {
       ok: true,
       data: {
         schemaVersion: 1,
-        phase: 'ready',
-        mutationBlocked: false,
+        phase: 'unavailable',
+        mutationBlocked: true,
         recoveryRequired: false,
-        failureCode: null,
+        failureCode: 'UPDATE_HOST_LEASE_UNAVAILABLE',
         reconciledRequestId: null
       }
     })
@@ -85,10 +89,10 @@ describe('application component update activation default wiring', () => {
       cookies: { dyson_session: cookie },
       payload: activationExecuteRequest()
     })
-    expect(blocked.statusCode).toBe(423)
+    expect(blocked.statusCode).toBe(503)
     expect(blocked.json()).toEqual({
       ok: false,
-      error: { code: 'UPDATE_ACTIVATION_HTTP_MUTATION_DISABLED' }
+      error: { code: 'UPDATE_ACTIVATION_HTTP_RECOVERY_UNAVAILABLE' }
     })
 
     // Startup reconciliation creates only the bounded control-state directories;
@@ -103,7 +107,8 @@ describe('application component update activation default wiring', () => {
     const fixture = await createFixture(true)
     application = await buildApplication(fixture.config, {
       statusProvider: fixture.statusProvider,
-      lifecycleAdapter: fixture.lifecycleAdapter
+      lifecycleAdapter: fixture.lifecycleAdapter,
+      hostMutationCoordinator: fixture.hostMutationCoordinator
     })
     const cookie = await loginAdministrator()
 
@@ -146,6 +151,7 @@ interface Fixture {
     verifyRunning: ReturnType<typeof vi.fn>
     requestRollbackStart: ReturnType<typeof vi.fn>
   }
+  hostMutationCoordinator: HostMutationOperationCoordinator
 }
 
 async function createFixture(updateActivationEnabled: boolean): Promise<Fixture> {
@@ -208,6 +214,7 @@ async function createFixture(updateActivationEnabled: boolean): Promise<Fixture>
     stagedArtifactRoot,
     statusProvider,
     lifecycleAdapter,
+    hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
     config: loadConfig({
       NODE_ENV: 'test',
       DYSON_PROVIDER: 'windows',
@@ -225,6 +232,25 @@ async function createFixture(updateActivationEnabled: boolean): Promise<Fixture>
       DYSON_UPDATE_COMPATIBILITY_POLICY_FILE: compatibilityPolicyFile,
       DYSON_UPDATE_ACTIVATION_ENABLED: updateActivationEnabled ? 'true' : 'false'
     })
+  }
+}
+
+class PassThroughHostMutationCoordinator implements HostMutationOperationCoordinator {
+  async runExclusive<T>(
+    _request: Readonly<{ operation: string; requestId: string }>,
+    operation: (scope: {
+      signal: AbortSignal
+      assertActive(): void
+      toPowerShellBorrowArguments(): readonly string[]
+    }) => Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>
+  ): Promise<T> {
+    const outcome = await operation({
+      signal: new AbortController().signal,
+      assertActive: () => undefined,
+      toPowerShellBorrowArguments: () => []
+    })
+    if (outcome.kind === 'throw') throw outcome.error
+    return outcome.value
   }
 }
 

@@ -147,9 +147,10 @@ export class WindowsConfigHistoryStopProofAuthorizer {
     return pending
   }
 
-  readonly validate: GameConfigStopProofValidator = async (context) => {
+  readonly validate: GameConfigStopProofValidator = async (context, signal) => {
     const parsed = validationContextSchema.safeParse(context)
     if (!parsed.success) return false
+    if (signal?.aborted) return false
     let now: number
     try {
       now = this.#nowMs()
@@ -162,7 +163,8 @@ export class WindowsConfigHistoryStopProofAuthorizer {
     if (!grant || grant.expiresAt <= now || !grantMatches(grant, parsed.data)) return false
 
     try {
-      await this.#proveStopped()
+      await this.#proveStopped(signal)
+      if (signal?.aborted) return false
       const verifiedAt = this.#nowMs()
       const currentGrant = this.#grants.get(digest)
       if (!currentGrant || currentGrant !== grant || grant.expiresAt <= verifiedAt) {
@@ -219,7 +221,7 @@ export class WindowsConfigHistoryStopProofAuthorizer {
     )
   }
 
-  async #proveStopped(): Promise<void> {
+  async #proveStopped(signal: AbortSignal = new AbortController().signal): Promise<void> {
     try {
       const output = await this.#runner.run(
         'Test-DysonRuntimeState.ps1',
@@ -228,7 +230,7 @@ export class WindowsConfigHistoryStopProofAuthorizer {
           '-Expected', 'stopped',
           '-GamePort', String(this.#gamePort)
         ],
-        new AbortController().signal
+        signal
       )
       stoppedReceiptSchema.parse(JSON.parse(output) as unknown)
     } catch {

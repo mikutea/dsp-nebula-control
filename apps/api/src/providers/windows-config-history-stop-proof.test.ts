@@ -51,6 +51,25 @@ describe('Windows game configuration history stop-proof authorizer', () => {
     expect(runner.calls).toHaveLength(3)
   })
 
+  it('forwards the host mutation cancellation signal during validation', async () => {
+    const runner = new FixtureRunner()
+    const authorizer = createAuthorizer(runner)
+    const token = await authorizer.issue(restoreIssueContext)
+    const controller = new AbortController()
+
+    expect(await authorizer.validate(
+      validationContext(token, 'publish'), controller.signal
+    )).toBe(true)
+    expect(runner.signals.at(-1)).toBe(controller.signal)
+
+    const callCount = runner.calls.length
+    controller.abort('fixture-host-lease-lost')
+    expect(await authorizer.validate(
+      validationContext(token, 'publish'), controller.signal
+    )).toBe(false)
+    expect(runner.calls).toHaveLength(callCount)
+  })
+
   it('allows one reconcile grant to revalidate multiple bounded journal contexts', async () => {
     const runner = new FixtureRunner()
     const authorizer = createAuthorizer(runner)
@@ -254,6 +273,7 @@ function createAuthorizer(
 }
 
 class FixtureRunner implements LifecycleScriptRunner {
+  readonly signals: AbortSignal[] = []
   readonly calls: Array<{
     scriptName: LifecycleScriptName
     scriptArguments: string[]
@@ -270,6 +290,7 @@ class FixtureRunner implements LifecycleScriptRunner {
     scriptArguments: string[],
     signal: AbortSignal
   ): Promise<string> {
+    this.signals.push(signal)
     this.calls.push({ scriptName, scriptArguments: [...scriptArguments], aborted: signal.aborted })
     if (this.result instanceof Error) throw this.result
     return this.result

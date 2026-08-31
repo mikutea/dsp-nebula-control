@@ -5,6 +5,10 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { buildApplication, type BuiltApplication } from './app.js'
 import { loadConfig } from './config.js'
+import type {
+  HostMutationOperationCoordinator,
+  HostMutationOperationOutcome
+} from './host-mutation/operation-coordinator.js'
 import {
   SaveTransactionService,
   type BackupSavePairRequest,
@@ -27,6 +31,7 @@ describe('authenticated save transaction routes', () => {
     const fixture = await createFixture()
     const service = makeService(fixture)
     application = await buildApplication(config(false), {
+      hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
       saveTransactionService: service,
       workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
     })
@@ -53,6 +58,7 @@ describe('authenticated save transaction routes', () => {
     const fixture = await createFixture()
     const service = makeService(fixture)
     application = await buildApplication(config(true), {
+      hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
       saveTransactionService: service,
       workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
     })
@@ -148,6 +154,7 @@ describe('authenticated save transaction routes', () => {
       })
     })
     application = await buildApplication(config(true), {
+      hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
       saveTransactionService: running,
       workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
     })
@@ -164,6 +171,7 @@ describe('authenticated save transaction routes', () => {
     const fixture = await createFixture()
     const service = new ScriptedRouteSaveService()
     application = await buildApplication(config(true), {
+      hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
       saveTransactionService: service,
       workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
     })
@@ -218,6 +226,7 @@ describe('authenticated save transaction routes', () => {
   it('keeps the explicit reconcile route closed when save mutations are disabled', async () => {
     const fixture = await createFixture()
     application = await buildApplication(config(false), {
+      hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
       saveTransactionService: new ScriptedRouteSaveService(),
       workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
     })
@@ -259,6 +268,25 @@ class ScriptedRouteSaveService {
       input.protectionRequestId,
       this.restoreCalls.length === 1
     )
+  }
+}
+
+class PassThroughHostMutationCoordinator implements HostMutationOperationCoordinator {
+  async runExclusive<T>(
+    _request: Readonly<{ operation: string; requestId: string }>,
+    operation: (scope: {
+      signal: AbortSignal
+      assertActive(): void
+      toPowerShellBorrowArguments(): readonly string[]
+    }) => Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>
+  ): Promise<T> {
+    const outcome = await operation({
+      signal: new AbortController().signal,
+      assertActive: () => undefined,
+      toPowerShellBorrowArguments: () => []
+    })
+    if (outcome.kind === 'throw') throw outcome.error
+    return outcome.value
   }
 }
 
