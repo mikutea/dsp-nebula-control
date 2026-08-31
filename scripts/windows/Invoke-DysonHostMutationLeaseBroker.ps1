@@ -7,7 +7,8 @@ param(
     [Parameter(Mandatory)][ValidateRange(1, 2147483647)][int]$OwnerPid,
     [ValidateRange(0, 120000)][int]$TimeoutMilliseconds = 30000,
     [string]$RecoveryPriorInstanceId,
-    [string]$RecoveryPriorRecordDigest
+    [string]$RecoveryPriorRecordDigest,
+    [switch]$ProbeRecovery
 )
 
 Set-StrictMode -Version 2.0
@@ -21,7 +22,7 @@ function Write-DysonHostMutationBrokerMessage {
 
     $text = $Message | ConvertTo-Json -Depth 3 -Compress
     if ([System.Text.UTF8Encoding]::new($false).GetByteCount($text) -gt 2048) {
-        $text = '{"protocol":"DYSON_HOST_MUTATION_BROKER_V1","type":"error","code":"DYSON_HOST_MUTATION_LEASE_BROKER_PROTOCOL_FAILED","priorInstanceId":null,"priorRecordDigest":null,"priorState":null}'
+        $text = '{"protocol":"DYSON_HOST_MUTATION_BROKER_V1","type":"error","code":"DYSON_HOST_MUTATION_LEASE_BROKER_PROTOCOL_FAILED","priorInstanceId":null,"priorRecordDigest":null,"priorState":null,"priorOperation":null,"priorRequestId":null}'
     }
     [Console]::Out.WriteLine($text)
     [Console]::Out.Flush()
@@ -35,6 +36,8 @@ if (-not (Test-Path -LiteralPath $commonScript -PathType Leaf)) {
         priorInstanceId = $null
         priorRecordDigest = $null
         priorState = $null
+        priorOperation = $null
+        priorRequestId = $null
     })
     exit 20
 }
@@ -48,8 +51,88 @@ catch {
         priorInstanceId = $null
         priorRecordDigest = $null
         priorState = $null
+        priorOperation = $null
+        priorRequestId = $null
     })
     exit 20
+}
+
+function Write-DysonHostMutationBrokerException {
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
+    $code = 'DYSON_HOST_MUTATION_LEASE_ACQUIRE_FAILED'
+    $priorInstanceId = $null
+    $priorRecordDigest = $null
+    $priorState = $null
+    $priorOperation = $null
+    $priorRequestId = $null
+    if ($Exception.Data.Contains('Code') -and
+        ([string]$Exception.Data['Code'] -match '^DYSON_HOST_MUTATION_LEASE_[A-Z0-9_]+$')) {
+        $code = [string]$Exception.Data['Code']
+    }
+    if ($Exception.Data.Contains('PriorInstanceId')) {
+        $candidate = [string]$Exception.Data['PriorInstanceId']
+        if ($candidate -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+            $priorInstanceId = $candidate
+        }
+    }
+    if ($Exception.Data.Contains('PriorRecordDigest')) {
+        $candidate = [string]$Exception.Data['PriorRecordDigest']
+        if ($candidate -match '^[0-9a-f]{64}$') { $priorRecordDigest = $candidate }
+    }
+    if ($Exception.Data.Contains('PriorState')) {
+        $candidate = [string]$Exception.Data['PriorState']
+        if ($candidate -match '^(active|abandoned|recovery-required)$') { $priorState = $candidate }
+    }
+    if ($Exception.Data.Contains('PriorOperation')) {
+        $candidate = [string]$Exception.Data['PriorOperation']
+        if ($candidate -match '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$') { $priorOperation = $candidate }
+    }
+    if ($Exception.Data.Contains('PriorRequestId')) {
+        $candidate = [string]$Exception.Data['PriorRequestId']
+        if ($candidate -match '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$') { $priorRequestId = $candidate }
+    }
+    Write-DysonHostMutationBrokerMessage -Message ([pscustomobject][ordered]@{
+        protocol = 'DYSON_HOST_MUTATION_BROKER_V1'
+        type = 'error'
+        code = $code
+        priorInstanceId = $priorInstanceId
+        priorRecordDigest = $priorRecordDigest
+        priorState = $priorState
+        priorOperation = $priorOperation
+        priorRequestId = $priorRequestId
+    })
+}
+
+if ($ProbeRecovery) {
+    try {
+        if ($Owner -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' -or
+            $Operation -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' -or
+            $RequestId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$') {
+            Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_ARGUMENT_INVALID'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RecoveryPriorInstanceId) -or
+            -not [string]::IsNullOrWhiteSpace($RecoveryPriorRecordDigest)) {
+            Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_ARGUMENT_INVALID'
+        }
+        $candidate = Get-DysonHostMutationLeaseRecoveryCandidate -DataRoot $DataRoot `
+            -TimeoutMilliseconds $TimeoutMilliseconds
+        Write-DysonHostMutationBrokerMessage -Message ([pscustomobject][ordered]@{
+            protocol = 'DYSON_HOST_MUTATION_BROKER_V1'
+            type = 'recovery-candidate'
+            dataRootIdentity = $candidate.dataRootIdentity
+            priorInstanceId = $candidate.priorInstanceId
+            priorRecordDigest = $candidate.priorRecordDigest
+            priorState = $candidate.priorState
+            priorOperation = $candidate.priorOperation
+            priorRequestId = $candidate.priorRequestId
+        })
+        exit 0
+    }
+    catch {
+        Write-DysonHostMutationBrokerException -Exception $_.Exception
+        exit 20
+    }
 }
 
 $lease = $null
@@ -69,36 +152,7 @@ try {
     $lease = Enter-DysonHostMutationLease @enterArguments
 }
 catch {
-    $code = 'DYSON_HOST_MUTATION_LEASE_ACQUIRE_FAILED'
-    $priorInstanceId = $null
-    $priorRecordDigest = $null
-    $priorState = $null
-    if ($_.Exception.Data.Contains('Code') -and
-        ([string]$_.Exception.Data['Code'] -match '^DYSON_HOST_MUTATION_LEASE_[A-Z0-9_]+$')) {
-        $code = [string]$_.Exception.Data['Code']
-    }
-    if ($_.Exception.Data.Contains('PriorInstanceId')) {
-        $candidate = [string]$_.Exception.Data['PriorInstanceId']
-        if ($candidate -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
-            $priorInstanceId = $candidate
-        }
-    }
-    if ($_.Exception.Data.Contains('PriorRecordDigest')) {
-        $candidate = [string]$_.Exception.Data['PriorRecordDigest']
-        if ($candidate -match '^[0-9a-f]{64}$') { $priorRecordDigest = $candidate }
-    }
-    if ($_.Exception.Data.Contains('PriorState')) {
-        $candidate = [string]$_.Exception.Data['PriorState']
-        if ($candidate -match '^(active|abandoned|recovery-required)$') { $priorState = $candidate }
-    }
-    Write-DysonHostMutationBrokerMessage -Message ([pscustomobject][ordered]@{
-        protocol = 'DYSON_HOST_MUTATION_BROKER_V1'
-        type = 'error'
-        code = $code
-        priorInstanceId = $priorInstanceId
-        priorRecordDigest = $priorRecordDigest
-        priorState = $priorState
-    })
+    Write-DysonHostMutationBrokerException -Exception $_.Exception
     exit 20
 }
 

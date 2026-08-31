@@ -139,6 +139,64 @@ function Complete-LeaseSelfTestBroker {
     }
 }
 
+function Invoke-LeaseSelfTestRecoveryProbeBroker {
+    param([Parameter(Mandatory)][string]$DataRoot)
+
+    $arguments = @(
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $brokerScript,
+        '-DataRoot', $DataRoot,
+        '-Owner', 'selftest',
+        '-Operation', 'recovery-probe',
+        '-RequestId', 'recovery-probe',
+        '-OwnerPid', [string]$PID,
+        '-TimeoutMilliseconds', '1000',
+        '-ProbeRecovery'
+    )
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $powershellExecutable
+    $startInfo.Arguments = (($arguments | ForEach-Object {
+        ConvertTo-LeaseSelfTestNativeArgument -Value ([string]$_)
+    }) -join ' ')
+    $startInfo.WorkingDirectory = [System.IO.Path]::GetTempPath()
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw 'SELFTEST_FAILED: recovery probe broker did not start' }
+    $createdProcesses.Add($process)
+    $lineTask = $process.StandardOutput.ReadLineAsync()
+    if (-not $lineTask.Wait(10000)) {
+        try { $process.Kill() } catch {}
+        throw 'SELFTEST_FAILED: recovery probe broker timed out'
+    }
+    $line = [string]$lineTask.GetAwaiter().GetResult()
+    Assert-LeaseSelfTest -Condition ($line.Length -gt 0 -and $line.Length -le 2048) `
+        -Message 'recovery probe output was not bounded'
+    try { $message = $line | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'SELFTEST_FAILED: recovery probe output was invalid' }
+    if (-not $process.WaitForExit(10000)) {
+        try { $process.Kill() } catch {}
+        throw 'SELFTEST_FAILED: recovery probe broker did not exit'
+    }
+    $process.WaitForExit()
+    $remainingOutput = $process.StandardOutput.ReadToEnd()
+    $errorOutput = $process.StandardError.ReadToEnd()
+    Assert-LeaseSelfTest -Condition ($remainingOutput.Length -eq 0 -and $errorOutput.Length -eq 0) `
+        -Message 'recovery probe emitted additional or private output'
+    Assert-LeaseSelfTest -Condition ($message.protocol -ceq 'DYSON_HOST_MUTATION_BROKER_V1' -and
+        $message.type -in @('recovery-candidate', 'error')) `
+        -Message 'recovery probe returned an unexpected protocol envelope'
+    return [pscustomobject][ordered]@{
+        ExitCode = $process.ExitCode
+        Message = $message
+    }
+}
+
 function Assert-LeaseFailure {
     param(
         [Parameter(Mandatory)][scriptblock]$Action,
@@ -292,6 +350,13 @@ try {
             Enter-DysonHostMutationLease -DataRoot $corruptRoot -Owner selftest `
                 -Operation corrupt -RequestId corrupt-retry -OwnerPid $PID -TimeoutMilliseconds 0
         })
+    $corruptBeforeProbe = [System.IO.File]::ReadAllText($corruptPath)
+    $corruptProbe = Invoke-LeaseSelfTestRecoveryProbeBroker -DataRoot $corruptRoot
+    Assert-LeaseSelfTest -Condition ($corruptProbe.ExitCode -eq 20 -and
+        $corruptProbe.Message.type -ceq 'error' -and
+        $corruptProbe.Message.code -ceq 'DYSON_HOST_MUTATION_LEASE_RECORD_INVALID' -and
+        [System.IO.File]::ReadAllText($corruptPath) -ceq $corruptBeforeProbe) `
+        -Message 'a malformed recovery record was changed or exposed by the probe'
     $oversizedRoot = New-LeaseSelfTestDataRoot -Name 'oversized-record'
     $oversizedPath = Get-DysonHostMutationLeasePath -DataRoot $oversizedRoot
     [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($oversizedPath))
@@ -311,8 +376,19 @@ try {
     Complete-LeaseSelfTestBroker -Broker $normalBroker -ExpectedExitCode 0
     Assert-LeaseSelfTest -Condition ((Get-DysonHostMutationLeaseStatus -DataRoot $normalRoot).state -ceq 'released') `
         -Message 'normal broker release was not clean'
+    $normalProbe = Invoke-LeaseSelfTestRecoveryProbeBroker -DataRoot $normalRoot
+    Assert-LeaseSelfTest -Condition ($normalProbe.ExitCode -eq 20 -and
+        $normalProbe.Message.type -ceq 'error' -and
+        $normalProbe.Message.code -ceq 'DYSON_HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED' -and
+        $null -eq $normalProbe.Message.priorInstanceId -and
+        $null -eq $normalProbe.Message.priorRecordDigest -and
+        $null -eq $normalProbe.Message.priorOperation -and
+        $null -eq $normalProbe.Message.priorRequestId -and
+        (Get-DysonHostMutationLeaseStatus -DataRoot $normalRoot).state -ceq 'released') `
+        -Message 'a clean released root was advertised as recoverable'
 
-    # EOF is explicitly abandoned and needs an exact, digest-bound recovery lease.
+    # EOF is explicitly abandoned. A trusted probe returns the domain binding,
+    # and an abandoned recovery remains retryable under that same binding.
     $eofRoot = New-LeaseSelfTestDataRoot -Name 'eof-broker'
     $eofBroker = Start-LeaseSelfTestBroker -DataRoot $eofRoot -RequestId eof-request
     $eofBroker.Process.StandardInput.Close()
@@ -320,20 +396,68 @@ try {
     $eofStatus = Get-DysonHostMutationLeaseStatus -DataRoot $eofRoot
     Assert-LeaseSelfTest -Condition ($eofStatus.state -ceq 'abandoned') `
         -Message 'stdin EOF was not recorded as abandoned'
-    [void](Assert-LeaseFailure -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_REQUIRED' `
+    $eofFailure = Assert-LeaseFailure -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_REQUIRED' `
         -Message 'ordinary mutation crossed an abandoned record' -Action {
             Enter-DysonHostMutationLease -DataRoot $eofRoot -Owner selftest `
                 -Operation eof -RequestId eof-retry -OwnerPid $PID -TimeoutMilliseconds 0
+        }
+    Assert-LeaseSelfTest -Condition ($eofFailure.Data['PriorOperation'] -ceq 'lease-test' -and
+        $eofFailure.Data['PriorRequestId'] -ceq 'eof-request') `
+        -Message 'ordinary rejection omitted the trusted prior domain binding'
+    $eofProbeA = Invoke-LeaseSelfTestRecoveryProbeBroker -DataRoot $eofRoot
+    Assert-LeaseSelfTest -Condition ($eofProbeA.ExitCode -eq 0 -and
+        $eofProbeA.Message.type -ceq 'recovery-candidate' -and
+        $eofProbeA.Message.priorState -ceq 'abandoned' -and
+        $eofProbeA.Message.priorOperation -ceq 'lease-test' -and
+        $eofProbeA.Message.priorRequestId -ceq 'eof-request' -and
+        [string]$eofProbeA.Message.priorInstanceId -match '^[0-9a-f-]{36}$' -and
+        [string]$eofProbeA.Message.priorRecordDigest -match '^[0-9a-f]{64}$') `
+        -Message 'trusted abandoned-record recovery metadata was incomplete'
+    [void](Assert-LeaseFailure -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_BINDING_INVALID' `
+        -Message 'a caller changed the prior domain operation during recovery' -Action {
+            Enter-DysonHostMutationLease -DataRoot $eofRoot -Owner selftest `
+                -Operation wrong-domain -RequestId eof-request -OwnerPid $PID -TimeoutMilliseconds 0 `
+                -RecoveryPriorInstanceId $eofProbeA.Message.priorInstanceId `
+                -RecoveryPriorRecordDigest $eofProbeA.Message.priorRecordDigest
         })
-    $eofRecovery = Enter-DysonHostMutationLease -DataRoot $eofRoot -Owner selftest `
-        -Operation eof-recovery -RequestId eof-recovery -OwnerPid $PID -TimeoutMilliseconds 0 `
-        -RecoveryPriorInstanceId $eofStatus.instanceId -RecoveryPriorRecordDigest $eofStatus.recordDigest
-    Assert-LeaseSelfTest -Condition ($eofRecovery.Record.leaseKind -ceq 'recovery') `
+    Assert-LeaseSelfTest -Condition (
+        (Get-DysonHostMutationLeaseStatus -DataRoot $eofRoot).recordDigest -ceq
+        $eofProbeA.Message.priorRecordDigest
+    ) -Message 'a domain mismatch changed the original recovery evidence'
+    $eofRecoveryA = Enter-DysonHostMutationLease -DataRoot $eofRoot -Owner selftest `
+        -Operation lease-test -RequestId eof-request -OwnerPid $PID -TimeoutMilliseconds 0 `
+        -RecoveryPriorInstanceId $eofProbeA.Message.priorInstanceId `
+        -RecoveryPriorRecordDigest $eofProbeA.Message.priorRecordDigest
+    Assert-LeaseSelfTest -Condition ($eofRecoveryA.Record.leaseKind -ceq 'recovery') `
         -Message 'exact abandoned-record recovery was not identified'
-    [void](Exit-DysonHostMutationLease -Lease $eofRecovery)
+    [void](Exit-DysonHostMutationLease -Lease $eofRecoveryA -State abandoned)
+    $eofProbeB = Invoke-LeaseSelfTestRecoveryProbeBroker -DataRoot $eofRoot
+    Assert-LeaseSelfTest -Condition ($eofProbeB.ExitCode -eq 0 -and
+        $eofProbeB.Message.priorState -ceq 'abandoned' -and
+        $eofProbeB.Message.priorOperation -ceq 'lease-test' -and
+        $eofProbeB.Message.priorRequestId -ceq 'eof-request' -and
+        $eofProbeB.Message.priorInstanceId -cne $eofProbeA.Message.priorInstanceId -and
+        $eofProbeB.Message.priorRecordDigest -cne $eofProbeA.Message.priorRecordDigest) `
+        -Message 'abandoned recovery did not retain a retryable domain binding'
+    [void](Assert-LeaseFailure -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_BINDING_INVALID' `
+        -Message 'a probe binding was reused after another recovery changed the record' -Action {
+            Enter-DysonHostMutationLease -DataRoot $eofRoot -Owner selftest `
+                -Operation lease-test -RequestId eof-request -OwnerPid $PID -TimeoutMilliseconds 0 `
+                -RecoveryPriorInstanceId $eofProbeA.Message.priorInstanceId `
+                -RecoveryPriorRecordDigest $eofProbeA.Message.priorRecordDigest
+        })
+    Assert-LeaseSelfTest -Condition (
+        (Get-DysonHostMutationLeaseStatus -DataRoot $eofRoot).recordDigest -ceq
+        $eofProbeB.Message.priorRecordDigest
+    ) -Message 'a stale probe binding changed the replacement recovery evidence'
+    $eofRecoveryB = Enter-DysonHostMutationLease -DataRoot $eofRoot -Owner selftest `
+        -Operation lease-test -RequestId eof-request -OwnerPid $PID -TimeoutMilliseconds 0 `
+        -RecoveryPriorInstanceId $eofProbeB.Message.priorInstanceId `
+        -RecoveryPriorRecordDigest $eofProbeB.Message.priorRecordDigest
+    [void](Exit-DysonHostMutationLease -Lease $eofRecoveryB)
 
-    # A hard-killed broker leaves active evidence. The first ordinary attempt seals it
-    # as recovery-required; wrong binding fails and the exact current digest succeeds.
+    # A hard-killed broker leaves active evidence. Only the trusted probe, after
+    # obtaining the write handle, seals it recovery-required for exact recovery.
     $killRoot = New-LeaseSelfTestDataRoot -Name 'killed-broker'
     $killBroker = Start-LeaseSelfTestBroker -DataRoot $killRoot -RequestId kill-request
     $killBroker.Process.Kill()
@@ -341,14 +465,14 @@ try {
     $killedStatus = Get-DysonHostMutationLeaseStatus -DataRoot $killRoot
     Assert-LeaseSelfTest -Condition ($killedStatus.state -ceq 'active') `
         -Message 'hard-kill evidence was not retained'
-    $recoveryFailure = Assert-LeaseFailure -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_REQUIRED' `
-        -Message 'ordinary mutation crossed a hard-crash record' -Action {
-            Enter-DysonHostMutationLease -DataRoot $killRoot -Owner selftest `
-                -Operation kill -RequestId kill-retry -OwnerPid $PID -TimeoutMilliseconds 0
-        }
-    Assert-LeaseSelfTest -Condition ($recoveryFailure.Data['PriorInstanceId'] -ceq $killedStatus.instanceId -and
-        [string]$recoveryFailure.Data['PriorRecordDigest'] -match '^[0-9a-f]{64}$') `
-        -Message 'recovery-required error omitted its safe binding identity'
+    $killProbe = Invoke-LeaseSelfTestRecoveryProbeBroker -DataRoot $killRoot
+    Assert-LeaseSelfTest -Condition ($killProbe.ExitCode -eq 0 -and
+        $killProbe.Message.type -ceq 'recovery-candidate' -and
+        $killProbe.Message.priorState -ceq 'recovery-required' -and
+        $killProbe.Message.priorInstanceId -ceq $killedStatus.instanceId -and
+        $killProbe.Message.priorOperation -ceq 'lease-test' -and
+        $killProbe.Message.priorRequestId -ceq 'kill-request') `
+        -Message 'hard-crash probe did not return the trusted original domain binding'
     $recoveryStatus = Get-DysonHostMutationLeaseStatus -DataRoot $killRoot
     Assert-LeaseSelfTest -Condition ($recoveryStatus.state -ceq 'recovery-required') `
         -Message 'hard-crash record was not sealed recovery-required'
@@ -357,12 +481,12 @@ try {
     [void](Assert-LeaseFailure -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_BINDING_INVALID' `
         -Message 'a wrong recovery digest was accepted' -Action {
             Enter-DysonHostMutationLease -DataRoot $killRoot -Owner selftest `
-                -Operation kill-recovery -RequestId kill-wrong -OwnerPid $PID -TimeoutMilliseconds 0 `
+                -Operation lease-test -RequestId kill-request -OwnerPid $PID -TimeoutMilliseconds 0 `
                 -RecoveryPriorInstanceId $recoveryStatus.instanceId `
                 -RecoveryPriorRecordDigest $wrongRecoveryDigest
         })
     $killRecovery = Enter-DysonHostMutationLease -DataRoot $killRoot -Owner selftest `
-        -Operation kill-recovery -RequestId kill-recovery -OwnerPid $PID -TimeoutMilliseconds 0 `
+        -Operation lease-test -RequestId kill-request -OwnerPid $PID -TimeoutMilliseconds 0 `
         -RecoveryPriorInstanceId $recoveryStatus.instanceId `
         -RecoveryPriorRecordDigest $recoveryStatus.recordDigest
     Assert-LeaseSelfTest -Condition ($killRecovery.Record.recoveryOfInstanceId -ceq $recoveryStatus.instanceId -and
@@ -374,7 +498,7 @@ try {
         protocol = 'DYSON_HOST_MUTATION_LEASE_SELFTEST_V1'
         state = 'passed'
         windowsPowerShell = '5.1'
-        cases = 21
+        cases = 30
     } | ConvertTo-Json -Compress
 }
 finally {

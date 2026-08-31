@@ -30,7 +30,9 @@ function New-DysonHostMutationLeaseException {
         [Parameter(Mandatory)][string]$Code,
         [string]$PriorInstanceId,
         [string]$PriorRecordDigest,
-        [string]$PriorState
+        [string]$PriorState,
+        [string]$PriorOperation,
+        [string]$PriorRequestId
     )
 
     $exception = [System.InvalidOperationException]::new($Code)
@@ -43,6 +45,12 @@ function New-DysonHostMutationLeaseException {
     }
     if (-not [string]::IsNullOrWhiteSpace($PriorState)) {
         $exception.Data['PriorState'] = $PriorState
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PriorOperation)) {
+        $exception.Data['PriorOperation'] = $PriorOperation
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PriorRequestId)) {
+        $exception.Data['PriorRequestId'] = $PriorRequestId
     }
     return $exception
 }
@@ -59,11 +67,14 @@ function Throw-DysonHostMutationLeaseError {
         [Parameter(Mandatory)][string]$Code,
         [string]$PriorInstanceId,
         [string]$PriorRecordDigest,
-        [string]$PriorState
+        [string]$PriorState,
+        [string]$PriorOperation,
+        [string]$PriorRequestId
     )
 
     throw (New-DysonHostMutationLeaseException -Code $Code -PriorInstanceId $PriorInstanceId `
-        -PriorRecordDigest $PriorRecordDigest -PriorState $PriorState)
+        -PriorRecordDigest $PriorRecordDigest -PriorState $PriorState `
+        -PriorOperation $PriorOperation -PriorRequestId $PriorRequestId)
 }
 
 function Initialize-DysonHostMutationLeaseNativeMethods {
@@ -789,11 +800,19 @@ function Enter-DysonHostMutationLease {
                     Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_REQUIRED' `
                         -PriorInstanceId ([string]$prior.Record.instanceId) `
                         -PriorRecordDigest ([string]$prior.Digest) `
-                        -PriorState ([string]$prior.Record.state)
+                        -PriorState ([string]$prior.Record.state) `
+                        -PriorOperation ([string]$prior.Record.operation) `
+                        -PriorRequestId ([string]$prior.Record.requestId)
                 }
                 if (-not (Test-DysonHostMutationLeaseRecoveryBinding -Envelope $prior `
                     -RecoveryPriorInstanceId $RecoveryPriorInstanceId `
                     -RecoveryPriorRecordDigest $RecoveryPriorRecordDigest)) {
+                    Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_BINDING_INVALID'
+                }
+                if (-not (Test-DysonHostMutationLeaseFixedText `
+                    -Left ([string]$prior.Record.operation) -Right $Operation) -or
+                    -not (Test-DysonHostMutationLeaseFixedText `
+                    -Left ([string]$prior.Record.requestId) -Right $RequestId)) {
                     Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_BINDING_INVALID'
                 }
             }
@@ -877,6 +896,85 @@ function Exit-DysonHostMutationLease {
         if (Test-DysonHostMutationLeaseException -Exception $_.Exception) { throw $_.Exception }
         Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_RELEASE_FAILED'
     }
+}
+
+function Get-DysonHostMutationLeaseRecoveryCandidate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DataRoot,
+        [ValidateRange(0, 120000)][int]$TimeoutMilliseconds = 30000
+    )
+
+    $stream = $null
+    try {
+        $pathInfo = Get-DysonHostMutationLeasePathInfo -DataRoot $DataRoot
+        if (-not (Test-Path -LiteralPath $pathInfo.LockPath -PathType Leaf)) {
+            Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED'
+        }
+        Assert-DysonHostMutationLeasePlainLockFile -Path $pathInfo.LockPath
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($null -eq $stream) {
+            try {
+                $stream = [System.IO.FileStream]::new(
+                    $pathInfo.LockPath,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::ReadWrite,
+                    [System.IO.FileShare]::Read
+                )
+                Assert-DysonHostMutationLeaseStreamPath -Stream $stream -ExpectedPath $pathInfo.LockPath
+            }
+            catch [System.IO.IOException] {
+                if (-not (Test-DysonHostMutationLeaseSharingViolation -Exception $_.Exception)) {
+                    Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_STORAGE_UNAVAILABLE'
+                }
+                if ($stopwatch.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+                    Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_BUSY'
+                }
+                Start-Sleep -Milliseconds 25
+            }
+        }
+        $stopwatch.Stop()
+
+        $candidate = Read-DysonHostMutationLeaseRecordFromStream -Stream $stream
+        if (-not [string]::Equals(
+            [string]$candidate.Record.dataRootIdentity,
+            [string]$pathInfo.DataRootIdentity,
+            [System.StringComparison]::Ordinal
+        )) {
+            Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_RECORD_INVALID'
+        }
+        if ($candidate.Record.state -eq 'released') {
+            Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED'
+        }
+        if ($candidate.Record.state -eq 'active') {
+            $sealedRecord = Copy-DysonHostMutationLeaseRecordWithState `
+                -Record $candidate.Record -State 'recovery-required'
+            $candidate = Write-DysonHostMutationLeaseRecordToStream -Stream $stream -Record $sealedRecord
+        }
+        elseif ($candidate.Record.state -notin @('abandoned', 'recovery-required')) {
+            Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_RECORD_INVALID'
+        }
+
+        return [pscustomobject][ordered]@{
+            dataRootIdentity = $candidate.Record.dataRootIdentity
+            priorInstanceId = $candidate.Record.instanceId
+            priorRecordDigest = $candidate.Digest
+            priorState = $candidate.Record.state
+            priorOperation = $candidate.Record.operation
+            priorRequestId = $candidate.Record.requestId
+        }
+    }
+    catch [System.IO.IOException] {
+        if (Test-DysonHostMutationLeaseSharingViolation -Exception $_.Exception) {
+            Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_BUSY'
+        }
+        Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_STORAGE_UNAVAILABLE'
+    }
+    catch {
+        if (Test-DysonHostMutationLeaseException -Exception $_.Exception) { throw $_.Exception }
+        Throw-DysonHostMutationLeaseError -Code 'DYSON_HOST_MUTATION_LEASE_STATUS_FAILED'
+    }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
 }
 
 function Get-DysonHostMutationLeaseStatus {

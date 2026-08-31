@@ -14,7 +14,8 @@ import { HostMutationLifecycleCoordinator } from './lifecycle-coordinator.js'
 import {
   HostMutationCoordinator,
   hostMutationReturn,
-  hostMutationThrow
+  hostMutationThrow,
+  type HostMutationRecoveryOperationRequest
 } from './operation-coordinator.js'
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..', '..', '..')
@@ -115,6 +116,163 @@ describe('generic host mutation operation coordinator', () => {
       { operation: 'mod-deployment', requestId: '00000000-0000-4000-8000-000000000007' },
       async () => hostMutationReturn('never-observed')
     )).rejects.toMatchObject({ code: 'HOST_MUTATION_LEASE_LOST' })
+  })
+})
+
+describe('explicit host mutation recovery coordinator', () => {
+  it('fails closed when the trusted broker reports that no recovery is required', async () => {
+    const harness = createRecoveryLeaseHarness('not-required', [{
+      kind: 'error',
+      code: 'DYSON_HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED'
+    }])
+    let entered = false
+
+    await expect(harness.coordinator.runRecoveryExclusive(
+      recoveryRequest(),
+      async () => {
+        entered = true
+        return hostMutationReturn('unexpected')
+      }
+    )).rejects.toMatchObject({ code: 'HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED' })
+
+    expect(entered).toBe(false)
+    expect(harness.calls).toHaveLength(1)
+    expect(harness.calls[0]).toContain('-ProbeRecovery')
+    expect(harness.commands).toEqual([])
+  })
+
+  it.each([
+    ['operation', { expectedOperation: 'update-activation', expectedRequestId: recoveryRequestId }],
+    ['request', { expectedOperation: recoveryOperation, expectedRequestId: 'different-request' }]
+  ] as const)('does not consume recovery evidence for a wrong expected %s', async (_field, request) => {
+    const harness = createRecoveryLeaseHarness(`mismatch-${_field}`, [
+      { kind: 'candidate', message: recoveryCandidate() }
+    ])
+
+    await expect(harness.coordinator.runRecoveryExclusive(
+      request,
+      async () => hostMutationReturn('unexpected')
+    )).rejects.toMatchObject({ code: 'HOST_MUTATION_LEASE_RECOVERY_MISMATCH' })
+
+    expect(harness.calls).toHaveLength(1)
+    expect(harness.commands).toEqual([])
+  })
+
+  it('rejects caller-supplied binding fields before probing the broker', async () => {
+    const harness = createRecoveryLeaseHarness('forged-binding', [])
+    const forged = {
+      ...recoveryRequest(),
+      priorInstanceId: recoveryInstanceA,
+      priorRecordDigest: recoveryDigestA
+    } as unknown as HostMutationRecoveryOperationRequest
+
+    await expect(harness.coordinator.runRecoveryExclusive(
+      forged,
+      async () => hostMutationReturn('unexpected')
+    )).rejects.toMatchObject({ code: 'HOST_MUTATION_LEASE_RECOVERY_MISMATCH' })
+
+    expect(harness.calls).toEqual([])
+  })
+
+  it('closes a probe-to-acquire race with the exact instance and digest binding', async () => {
+    const harness = createRecoveryLeaseHarness('binding-race', [
+      { kind: 'candidate', message: recoveryCandidate() },
+      { kind: 'error', code: 'DYSON_HOST_MUTATION_LEASE_RECOVERY_BINDING_INVALID' }
+    ])
+    let entered = false
+
+    await expect(harness.coordinator.runRecoveryExclusive(
+      recoveryRequest(),
+      async () => {
+        entered = true
+        return hostMutationReturn('unexpected')
+      }
+    )).rejects.toMatchObject({ code: 'HOST_MUTATION_LEASE_RECOVERY_MISMATCH' })
+
+    expect(entered).toBe(false)
+    expect(harness.calls).toHaveLength(2)
+    expect(harness.calls[1]).toEqual(expect.arrayContaining([
+      '-RecoveryPriorInstanceId', recoveryInstanceA,
+      '-RecoveryPriorRecordDigest', recoveryDigestA
+    ]))
+    expect(harness.commands).toEqual([])
+  })
+
+  it('consumes one trusted binding while preserving the original domain identity', async () => {
+    const harness = createRecoveryLeaseHarness('single-success', [
+      { kind: 'candidate', message: recoveryCandidate() },
+      { kind: 'ready' }
+    ])
+
+    await expect(harness.coordinator.runRecoveryExclusive(
+      recoveryRequest(),
+      async (scope) => {
+        expect(scope.signal.aborted).toBe(false)
+        expect(() => scope.assertActive()).not.toThrow()
+        return hostMutationReturn('recovered')
+      }
+    )).resolves.toBe('recovered')
+
+    expect(harness.calls).toHaveLength(2)
+    expect(harness.calls[1]).toEqual(expect.arrayContaining([
+      '-Operation', recoveryOperation,
+      '-RequestId', recoveryRequestId,
+      '-RecoveryPriorInstanceId', recoveryInstanceA,
+      '-RecoveryPriorRecordDigest', recoveryDigestA
+    ]))
+    expect(harness.commands).toEqual(['RELEASE'])
+  })
+
+  it('keeps the original domain binding retryable after a recovery callback abandons', async () => {
+    const harness = createRecoveryLeaseHarness('repeat-after-abandon', [
+      { kind: 'candidate', message: recoveryCandidate() },
+      { kind: 'ready', instanceId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1' },
+      {
+        kind: 'candidate',
+        message: recoveryCandidate({
+          priorInstanceId: recoveryInstanceB,
+          priorRecordDigest: recoveryDigestB,
+          priorState: 'abandoned'
+        })
+      },
+      { kind: 'ready', instanceId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2' }
+    ])
+
+    await expect(harness.coordinator.runRecoveryExclusive(
+      recoveryRequest(),
+      async () => hostMutationReturn('still-needs-recovery', 'abandon')
+    )).resolves.toBe('still-needs-recovery')
+    await expect(harness.coordinator.runRecoveryExclusive(
+      recoveryRequest(),
+      async () => hostMutationReturn('recovered')
+    )).resolves.toBe('recovered')
+
+    expect(harness.commands).toEqual(['ABANDON', 'RELEASE'])
+    for (const call of [harness.calls[1], harness.calls[3]]) {
+      expect(call).toEqual(expect.arrayContaining([
+        '-Operation', recoveryOperation,
+        '-RequestId', recoveryRequestId
+      ]))
+    }
+    expect(harness.calls[3]).toEqual(expect.arrayContaining([
+      '-RecoveryPriorInstanceId', recoveryInstanceB,
+      '-RecoveryPriorRecordDigest', recoveryDigestB
+    ]))
+  })
+
+  it('rejects malformed recovery metadata without attempting acquisition', async () => {
+    const harness = createRecoveryLeaseHarness('malformed-metadata', [{
+      kind: 'candidate',
+      message: { ...recoveryCandidate(), priorRequestId: 'contains whitespace' }
+    }])
+
+    await expect(harness.coordinator.runRecoveryExclusive(
+      recoveryRequest(),
+      async () => hostMutationReturn('unexpected')
+    )).rejects.toMatchObject({ code: 'HOST_MUTATION_LEASE_UNAVAILABLE' })
+
+    expect(harness.calls).toHaveLength(1)
+    expect(harness.commands).toEqual([])
   })
 })
 
@@ -344,6 +502,126 @@ class RecordingBrokerProcess extends EventEmitter implements HostMutationBrokerP
         instanceId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
         token: 'A'.repeat(43)
       }) + '\n')
+    })
+  }
+
+  kill(): boolean {
+    this.#exit(null, 'SIGTERM')
+    return true
+  }
+
+  #exit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.#exited) return
+    this.#exited = true
+    this.stdin.destroy()
+    this.stdout.end()
+    this.stderr.end()
+    queueMicrotask(() => this.emit('exit', code, signal))
+  }
+}
+
+const recoveryOperation = 'save-restore'
+const recoveryRequestId = 'restore-request-0001'
+const recoveryInstanceA = '11111111-2222-4333-8444-555555555555'
+const recoveryInstanceB = '66666666-7777-4888-8999-aaaaaaaaaaaa'
+const recoveryDigestA = 'a'.repeat(64)
+const recoveryDigestB = 'b'.repeat(64)
+
+function recoveryRequest(): HostMutationRecoveryOperationRequest {
+  return {
+    expectedOperation: recoveryOperation,
+    expectedRequestId: recoveryRequestId
+  }
+}
+
+function recoveryCandidate(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    protocol: 'DYSON_HOST_MUTATION_BROKER_V1',
+    type: 'recovery-candidate',
+    dataRootIdentity: `sha256:${'c'.repeat(64)}`,
+    priorInstanceId: recoveryInstanceA,
+    priorRecordDigest: recoveryDigestA,
+    priorState: 'recovery-required',
+    priorOperation: recoveryOperation,
+    priorRequestId: recoveryRequestId,
+    ...overrides
+  }
+}
+
+type RecoveryBrokerStep =
+  | Readonly<{ kind: 'candidate'; message: Record<string, unknown> }>
+  | Readonly<{ kind: 'error'; code: string }>
+  | Readonly<{ kind: 'ready'; instanceId?: string }>
+
+function createRecoveryLeaseHarness(
+  label: string,
+  steps: readonly RecoveryBrokerStep[]
+): {
+  coordinator: HostMutationCoordinator
+  calls: string[][]
+  commands: Array<'RELEASE' | 'ABANDON'>
+} {
+  const calls: string[][] = []
+  const commands: Array<'RELEASE' | 'ABANDON'> = []
+  let stepIndex = 0
+  const spawnBroker: HostMutationBrokerSpawner = (_executable, arguments_) => {
+    calls.push([...arguments_])
+    const step = steps[stepIndex++]
+    if (!step) throw new Error('UNEXPECTED_BROKER_SPAWN')
+    return new ScriptedRecoveryBrokerProcess(step, (command) => commands.push(command))
+  }
+  const manager = new HostMutationLeaseManager({ scriptRoot, spawnBroker })
+  return {
+    coordinator: new HostMutationCoordinator(manager, {
+      dataRoot: path.join(repositoryRoot, 'fictional-host-mutation-recovery', label)
+    }),
+    calls,
+    commands
+  }
+}
+
+class ScriptedRecoveryBrokerProcess extends EventEmitter implements HostMutationBrokerProcess {
+  readonly stdin = new PassThrough()
+  readonly stdout = new PassThrough()
+  readonly stderr = new PassThrough()
+  #exited = false
+
+  constructor(
+    step: RecoveryBrokerStep,
+    onCommand: (command: 'RELEASE' | 'ABANDON') => void
+  ) {
+    super()
+    this.stdin.on('data', (chunk: Buffer | string) => {
+      const command = String(chunk).trim()
+      if (command !== 'RELEASE' && command !== 'ABANDON') return
+      onCommand(command)
+      queueMicrotask(() => this.#exit(command === 'RELEASE' ? 0 : 22, null))
+    })
+    queueMicrotask(() => {
+      if (step.kind === 'ready') {
+        this.stdout.write(JSON.stringify({
+          protocol: 'DYSON_HOST_MUTATION_BROKER_V1',
+          type: 'ready',
+          dataRootIdentity: `sha256:${'d'.repeat(64)}`,
+          instanceId: step.instanceId ?? 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+          token: 'A'.repeat(43)
+        }) + '\n')
+        return
+      }
+      const message = step.kind === 'candidate'
+        ? step.message
+        : {
+            protocol: 'DYSON_HOST_MUTATION_BROKER_V1',
+            type: 'error',
+            code: step.code,
+            priorInstanceId: null,
+            priorRecordDigest: null,
+            priorState: null,
+            priorOperation: null,
+            priorRequestId: null
+          }
+      this.stdout.write(JSON.stringify(message) + '\n')
+      queueMicrotask(() => this.#exit(step.kind === 'candidate' ? 0 : 20, null))
     })
   }
 

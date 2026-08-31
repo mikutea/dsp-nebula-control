@@ -16,6 +16,7 @@ const brokerErrorCodes = new Set([
   'DYSON_HOST_MUTATION_LEASE_HOST_IDENTITY_UNAVAILABLE',
   'DYSON_HOST_MUTATION_LEASE_RECORD_INVALID',
   'DYSON_HOST_MUTATION_LEASE_RECORD_WRITE_FAILED',
+  'DYSON_HOST_MUTATION_LEASE_STATUS_FAILED',
   'DYSON_HOST_MUTATION_LEASE_BUSY',
   'DYSON_HOST_MUTATION_LEASE_RECOVERY_REQUIRED',
   'DYSON_HOST_MUTATION_LEASE_RECOVERY_BINDING_INVALID',
@@ -37,6 +38,21 @@ export interface HostMutationLeaseRequest {
   requestId: string
   acquireTimeoutMs?: number
   recovery?: HostMutationLeaseRecoveryBinding
+}
+
+export interface HostMutationLeaseRecoveryProbeRequest {
+  dataRoot: string
+  owner: string
+  acquireTimeoutMs?: number
+}
+
+export interface HostMutationLeaseRecoveryCandidate {
+  dataRootIdentity: string
+  priorInstanceId: string
+  priorRecordDigest: string
+  priorState: 'abandoned' | 'recovery-required'
+  priorOperation: string
+  priorRequestId: string
 }
 
 export interface HostMutationBrokerProcess {
@@ -74,11 +90,14 @@ export class HostMutationLeaseError extends Error {
   readonly priorInstanceId?: string
   readonly priorRecordDigest?: string
   readonly priorState?: 'active' | 'abandoned' | 'recovery-required'
+  readonly priorOperation?: string
+  readonly priorRequestId?: string
 
   constructor(
     code: string,
     recovery: Partial<Pick<HostMutationLeaseError,
-      'priorInstanceId' | 'priorRecordDigest' | 'priorState'>> = {}
+      'priorInstanceId' | 'priorRecordDigest' | 'priorState' |
+      'priorOperation' | 'priorRequestId'>> = {}
   ) {
     super(code)
     this.name = 'HostMutationLeaseError'
@@ -86,6 +105,8 @@ export class HostMutationLeaseError extends Error {
     this.priorInstanceId = recovery.priorInstanceId
     this.priorRecordDigest = recovery.priorRecordDigest
     this.priorState = recovery.priorState
+    this.priorOperation = recovery.priorOperation
+    this.priorRequestId = recovery.priorRequestId
   }
 }
 
@@ -104,7 +125,22 @@ interface BrokerErrorMessage {
   priorInstanceId: string | null
   priorRecordDigest: string | null
   priorState: 'active' | 'abandoned' | 'recovery-required' | null
+  priorOperation: string | null
+  priorRequestId: string | null
 }
+
+interface BrokerRecoveryCandidateMessage {
+  protocol: typeof brokerProtocol
+  type: 'recovery-candidate'
+  dataRootIdentity: string
+  priorInstanceId: string
+  priorRecordDigest: string
+  priorState: 'abandoned' | 'recovery-required'
+  priorOperation: string
+  priorRequestId: string
+}
+
+type BrokerStartMessage = BrokerReadyMessage | BrokerRecoveryCandidateMessage
 
 interface BrokerExit {
   code: number | null
@@ -193,8 +229,8 @@ class RunningBroker {
   readonly #maximumOutputBytes: number
   readonly #exitPromise: Promise<BrokerExit>
   #resolveExit!: (exit: BrokerExit) => void
-  #readyPromise: Promise<BrokerReadyMessage>
-  #resolveReady!: (ready: BrokerReadyMessage) => void
+  #readyPromise: Promise<BrokerStartMessage>
+  #resolveReady!: (ready: BrokerStartMessage) => void
   #rejectReady!: (error: HostMutationLeaseError) => void
   #readySettled = false
   #ready = false
@@ -208,7 +244,7 @@ class RunningBroker {
   constructor(process_: HostMutationBrokerProcess, maximumOutputBytes: number) {
     this.#process = process_
     this.#maximumOutputBytes = maximumOutputBytes
-    this.#readyPromise = new Promise<BrokerReadyMessage>((resolve, reject) => {
+    this.#readyPromise = new Promise<BrokerStartMessage>((resolve, reject) => {
       this.#resolveReady = resolve
       this.#rejectReady = reject
     })
@@ -229,7 +265,7 @@ class RunningBroker {
     process_.once('exit', (code, signal) => this.#markExited({ code, signal }))
   }
 
-  async start(timeoutMs: number): Promise<BrokerReadyMessage> {
+  async start(timeoutMs: number): Promise<BrokerStartMessage> {
     let timer: NodeJS.Timeout | undefined
     try {
       return await Promise.race([
@@ -286,6 +322,27 @@ class RunningBroker {
     }
   }
 
+  async finishProbe(timeoutMs: number): Promise<void> {
+    let timer: NodeJS.Timeout | undefined
+    const exit = await Promise.race([
+      this.#exitPromise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const error = new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_BROKER_TIMEOUT')
+          this.#setFailure(error)
+          this.abort()
+          reject(error)
+        }, timeoutMs)
+      })
+    ]).finally(() => {
+      if (timer) clearTimeout(timer)
+    })
+    if (this.#failure) throw this.#failure
+    if (exit.code !== 0 || exit.signal !== null) {
+      throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_BROKER_PROTOCOL_INVALID')
+    }
+  }
+
   abort(): void {
     if (this.#exited) return
     try { this.#process.kill() } catch { /* best-effort containment */ }
@@ -319,7 +376,7 @@ class RunningBroker {
     const line = lineBytes.at(-1) === 0x0d
       ? lineBytes.subarray(0, lineBytes.length - 1).toString('utf8')
       : lineBytes.toString('utf8')
-    let message: BrokerReadyMessage | BrokerErrorMessage
+    let message: BrokerStartMessage | BrokerErrorMessage
     try { message = parseBrokerMessage(line) }
     catch {
       this.#setFailure(new HostMutationLeaseError(
@@ -332,7 +389,9 @@ class RunningBroker {
       const error = new HostMutationLeaseError(message.code, {
         ...(message.priorInstanceId ? { priorInstanceId: message.priorInstanceId } : {}),
         ...(message.priorRecordDigest ? { priorRecordDigest: message.priorRecordDigest } : {}),
-        ...(message.priorState ? { priorState: message.priorState } : {})
+        ...(message.priorState ? { priorState: message.priorState } : {}),
+        ...(message.priorOperation ? { priorOperation: message.priorOperation } : {}),
+        ...(message.priorRequestId ? { priorRequestId: message.priorRequestId } : {})
       })
       this.#setFailure(error)
       this.abort()
@@ -360,7 +419,7 @@ class RunningBroker {
     }
   }
 
-  #settleReady(message: BrokerReadyMessage): void {
+  #settleReady(message: BrokerStartMessage): void {
     if (this.#readySettled) return
     this.#readySettled = true
     this.#resolveReady(message)
@@ -431,6 +490,56 @@ export class HostMutationLeaseManager {
     return new HostMutationLease(scope, true)
   }
 
+  async probeRecovery(
+    request: HostMutationLeaseRecoveryProbeRequest
+  ): Promise<HostMutationLeaseRecoveryCandidate> {
+    const validated = validateRecoveryProbeRequest(request)
+    if (this.#storage.getStore()) {
+      throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_NESTED_RECOVERY_INVALID')
+    }
+    if (activeDataRoots.has(validated.dataRootKey)) {
+      throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_BUSY')
+    }
+    activeDataRoots.add(validated.dataRootKey)
+
+    let broker: RunningBroker | null = null
+    try {
+      await fs.access(this.#brokerScript).catch(() => {
+        throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_BROKER_UNAVAILABLE')
+      })
+      const arguments_ = buildRecoveryProbeArguments(this.#brokerScript, validated)
+      let process_: HostMutationBrokerProcess
+      try {
+        process_ = this.#spawnBroker(this.#powershellExecutable, arguments_, {
+          windowsHide: true,
+          stdio: ['pipe', 'pipe', 'pipe']
+        })
+      } catch {
+        throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_BROKER_START_FAILED')
+      }
+      broker = new RunningBroker(process_, this.#maximumOutputBytes)
+      const candidate = await broker.start(this.#startupTimeoutMs)
+      if (candidate.type !== 'recovery-candidate') {
+        throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_BROKER_PROTOCOL_INVALID')
+      }
+      await broker.finishProbe(this.#releaseTimeoutMs)
+      return {
+        dataRootIdentity: candidate.dataRootIdentity,
+        priorInstanceId: candidate.priorInstanceId,
+        priorRecordDigest: candidate.priorRecordDigest,
+        priorState: candidate.priorState,
+        priorOperation: candidate.priorOperation,
+        priorRequestId: candidate.priorRequestId
+      }
+    } catch (error) {
+      broker?.abort()
+      if (error instanceof HostMutationLeaseError) throw error
+      throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_FAILED')
+    } finally {
+      activeDataRoots.delete(validated.dataRootKey)
+    }
+  }
+
   async runExclusive<T>(
     request: HostMutationLeaseRequest,
     action: (lease: HostMutationLease) => Promise<T> | T
@@ -485,6 +594,9 @@ export class HostMutationLeaseManager {
       }
       broker = new RunningBroker(process_, this.#maximumOutputBytes)
       const ready = await broker.start(this.#startupTimeoutMs)
+      if (ready.type !== 'ready') {
+        throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_BROKER_PROTOCOL_INVALID')
+      }
       scope = {
         active: true,
         abandonRequired: false,
@@ -552,6 +664,13 @@ interface ValidatedRequest {
   recovery?: HostMutationLeaseRecoveryBinding
 }
 
+interface ValidatedRecoveryProbeRequest {
+  dataRoot: string
+  dataRootKey: string
+  owner: string
+  acquireTimeoutMs: number
+}
+
 function validateRequest(request: HostMutationLeaseRequest): ValidatedRequest {
   if (!request || typeof request !== 'object') {
     throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_ARGUMENT_INVALID')
@@ -585,6 +704,27 @@ function validateRequest(request: HostMutationLeaseRequest): ValidatedRequest {
     requestId: request.requestId,
     acquireTimeoutMs,
     ...(recovery ? { recovery } : {})
+  }
+}
+
+function validateRecoveryProbeRequest(
+  request: HostMutationLeaseRecoveryProbeRequest
+): ValidatedRecoveryProbeRequest {
+  if (!request || typeof request !== 'object') {
+    throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_ARGUMENT_INVALID')
+  }
+  const root = normalizeDataRoot(request.dataRoot)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(request.owner)) {
+    throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_ARGUMENT_INVALID')
+  }
+  return {
+    dataRoot: root.full,
+    dataRootKey: root.key,
+    owner: request.owner,
+    acquireTimeoutMs: boundedInteger(
+      request.acquireTimeoutMs ?? 30_000, 0, 120_000,
+      'DYSON_HOST_MUTATION_LEASE_ARGUMENT_INVALID'
+    )
   }
 }
 
@@ -641,7 +781,24 @@ function buildBrokerArguments(script: string, request: ValidatedRequest): readon
   return arguments_
 }
 
-function parseBrokerMessage(line: string): BrokerReadyMessage | BrokerErrorMessage {
+function buildRecoveryProbeArguments(
+  script: string,
+  request: ValidatedRecoveryProbeRequest
+): readonly string[] {
+  return [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', script,
+    '-DataRoot', request.dataRoot,
+    '-Owner', request.owner,
+    '-Operation', 'recovery-probe',
+    '-RequestId', 'recovery-probe',
+    '-OwnerPid', String(process.pid),
+    '-TimeoutMilliseconds', String(request.acquireTimeoutMs),
+    '-ProbeRecovery'
+  ]
+}
+
+function parseBrokerMessage(line: string): BrokerStartMessage | BrokerErrorMessage {
   if (Buffer.byteLength(line, 'utf8') > 2_048 || line.length < 2) {
     throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_BROKER_PROTOCOL_INVALID')
   }
@@ -662,16 +819,41 @@ function parseBrokerMessage(line: string): BrokerReadyMessage | BrokerErrorMessa
     }
     return value as unknown as BrokerReadyMessage
   }
+  if (value.type === 'recovery-candidate') {
+    assertExactKeys(value, [
+      'protocol', 'type', 'dataRootIdentity', 'priorInstanceId', 'priorRecordDigest',
+      'priorState', 'priorOperation', 'priorRequestId'
+    ])
+    if (typeof value.dataRootIdentity !== 'string' ||
+        !/^sha256:[0-9a-f]{64}$/.test(value.dataRootIdentity) ||
+        typeof value.priorInstanceId !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+          value.priorInstanceId
+        ) ||
+        typeof value.priorRecordDigest !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(value.priorRecordDigest) ||
+        (value.priorState !== 'abandoned' && value.priorState !== 'recovery-required') ||
+        typeof value.priorOperation !== 'string' ||
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(value.priorOperation) ||
+        typeof value.priorRequestId !== 'string' ||
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value.priorRequestId)) {
+      throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_BROKER_PROTOCOL_INVALID')
+    }
+    return value as unknown as BrokerRecoveryCandidateMessage
+  }
   if (value.type === 'error') {
     assertExactKeys(value, [
-      'protocol', 'type', 'code', 'priorInstanceId', 'priorRecordDigest', 'priorState'
+      'protocol', 'type', 'code', 'priorInstanceId', 'priorRecordDigest', 'priorState',
+      'priorOperation', 'priorRequestId'
     ])
     if (typeof value.code !== 'string' || !brokerErrorCodes.has(value.code) ||
         !isNullableMatch(value.priorInstanceId,
           /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/) ||
         !isNullableMatch(value.priorRecordDigest, /^[0-9a-f]{64}$/) ||
         (value.priorState !== null && value.priorState !== 'active' &&
-          value.priorState !== 'abandoned' && value.priorState !== 'recovery-required')) {
+          value.priorState !== 'abandoned' && value.priorState !== 'recovery-required') ||
+        !isNullableMatch(value.priorOperation, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/) ||
+        !isNullableMatch(value.priorRequestId, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)) {
       throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_BROKER_PROTOCOL_INVALID')
     }
     return value as unknown as BrokerErrorMessage
