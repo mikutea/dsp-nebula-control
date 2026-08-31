@@ -54,28 +54,129 @@ function New-FixtureSnapshot {
     return $result
 }
 
-# These read-only fixture functions shadow Task Scheduler only inside this self-test.
+# These fixture functions shadow Task Scheduler only inside this self-test.
 # They guarantee that no real task is inspected or changed.
-$global:DysonGsMigrationSelfTestTaskPresent = $false
-$global:DysonGsMigrationSelfTestSensitiveMarker = $sensitiveMarker
+$global:DysonGsMigrationSelfTestTasks = New-Object 'System.Collections.Generic.List[object]'
+$global:DysonGsMigrationSelfTestQueryFailure = $false
+$global:DysonGsMigrationSelfTestRegisterCount = 0
+$global:DysonGsMigrationSelfTestUnregisterCount = 0
+$global:DysonGsMigrationSelfTestStopCount = 0
+$global:DysonGsMigrationSelfTestFailNextEnable = $false
+$global:DysonGsMigrationSelfTestFailNextDisable = $false
+$global:DysonGsMigrationSelfTestRunAfterRegister = $false
+
+function New-MigrationTaskFixture {
+    param(
+        [string]$Name = $taskName,
+        [string]$Path = '\',
+        [string]$Xml = '<Task><Description>fictional safe task</Description></Task>',
+        [bool]$Enabled = $true,
+        [string]$State = 'Ready'
+    )
+    return [pscustomobject][ordered]@{
+        TaskName = $Name
+        TaskPath = $Path
+        State = $State
+        Settings = [pscustomobject][ordered]@{ Enabled = $Enabled }
+        Xml = $Xml
+    }
+}
+
+function Reset-MigrationTaskFixture {
+    $global:DysonGsMigrationSelfTestTasks.Clear()
+    $global:DysonGsMigrationSelfTestQueryFailure = $false
+    $global:DysonGsMigrationSelfTestFailNextEnable = $false
+    $global:DysonGsMigrationSelfTestFailNextDisable = $false
+    $global:DysonGsMigrationSelfTestRunAfterRegister = $false
+}
+
+function Get-MigrationTaskFixtureMatches {
+    param([string]$TaskName, [string]$TaskPath, [bool]$UseTaskName, [bool]$UseTaskPath)
+    return @($global:DysonGsMigrationSelfTestTasks | Where-Object {
+        (-not $UseTaskName -or [string]::Equals([string]$_.TaskName, $TaskName, [System.StringComparison]::OrdinalIgnoreCase)) -and
+        (-not $UseTaskPath -or [string]::Equals([string]$_.TaskPath, $TaskPath, [System.StringComparison]::Ordinal))
+    })
+}
+
 function Get-ScheduledTask {
     [CmdletBinding()]
-    param([string]$TaskName)
-    if ($global:DysonGsMigrationSelfTestTaskPresent) {
-        return [pscustomobject][ordered]@{
-            State = 'Ready'
-            Settings = [pscustomobject][ordered]@{ Enabled = $true }
-        }
-    }
-    throw (New-Object System.Management.Automation.ItemNotFoundException('fictional task is absent'))
+    param([string]$TaskName, [string]$TaskPath)
+    if ($global:DysonGsMigrationSelfTestQueryFailure) { throw 'fictional Task Scheduler provider query failure' }
+    return @(Get-MigrationTaskFixtureMatches -TaskName $TaskName -TaskPath $TaskPath `
+        -UseTaskName $PSBoundParameters.ContainsKey('TaskName') -UseTaskPath $PSBoundParameters.ContainsKey('TaskPath'))
 }
+
 function Export-ScheduledTask {
     [CmdletBinding()]
-    param([string]$TaskName)
-    if ($global:DysonGsMigrationSelfTestTaskPresent) {
-        return '<Task><Description>' + $global:DysonGsMigrationSelfTestSensitiveMarker + '</Description></Task>'
+    param([Parameter(Mandatory)][string]$TaskName, [Parameter(Mandatory)][string]$TaskPath)
+    $matches = @(Get-MigrationTaskFixtureMatches -TaskName $TaskName -TaskPath $TaskPath -UseTaskName $true -UseTaskPath $true)
+    if ($matches.Count -ne 1) { throw 'fictional task export identity is not unique' }
+    return [string]$matches[0].Xml
+}
+
+function Register-ScheduledTask {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$TaskName,
+        [Parameter(Mandatory)][string]$TaskPath,
+        [Parameter(Mandatory)][string]$Xml,
+        [switch]$Force
+    )
+    $global:DysonGsMigrationSelfTestRegisterCount++
+    for ($index = $global:DysonGsMigrationSelfTestTasks.Count - 1; $index -ge 0; $index--) {
+        $candidate = $global:DysonGsMigrationSelfTestTasks[$index]
+        if ([string]::Equals([string]$candidate.TaskName, $TaskName, [System.StringComparison]::OrdinalIgnoreCase) -and
+            [string]::Equals([string]$candidate.TaskPath, $TaskPath, [System.StringComparison]::Ordinal)) {
+            $global:DysonGsMigrationSelfTestTasks.RemoveAt($index)
+        }
     }
-    throw 'fixture export should not be called for an absent task'
+    $state = if ($global:DysonGsMigrationSelfTestRunAfterRegister) { 'Running' } else { 'Ready' }
+    $global:DysonGsMigrationSelfTestRunAfterRegister = $false
+    $global:DysonGsMigrationSelfTestTasks.Add((New-MigrationTaskFixture -Name $TaskName -Path $TaskPath -Xml $Xml -State $state))
+}
+
+function Unregister-ScheduledTask {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$TaskName, [Parameter(Mandatory)][string]$TaskPath, [switch]$Confirm)
+    $global:DysonGsMigrationSelfTestUnregisterCount++
+    $matches = @(Get-MigrationTaskFixtureMatches -TaskName $TaskName -TaskPath $TaskPath -UseTaskName $true -UseTaskPath $true)
+    if ($matches.Count -ne 1) { throw 'fictional task unregister identity is not unique' }
+    [void]$global:DysonGsMigrationSelfTestTasks.Remove($matches[0])
+}
+
+function Enable-ScheduledTask {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$TaskName, [Parameter(Mandatory)][string]$TaskPath)
+    $matches = @(Get-MigrationTaskFixtureMatches -TaskName $TaskName -TaskPath $TaskPath -UseTaskName $true -UseTaskPath $true)
+    if ($matches.Count -ne 1) { throw 'fictional task enable identity is not unique' }
+    $matches[0].Settings.Enabled = $true
+    if ([string]$matches[0].State -ne 'Running') { $matches[0].State = 'Ready' }
+    if ($global:DysonGsMigrationSelfTestFailNextEnable) {
+        $global:DysonGsMigrationSelfTestFailNextEnable = $false
+        throw 'fictional partial enable failure'
+    }
+}
+
+function Disable-ScheduledTask {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$TaskName, [Parameter(Mandatory)][string]$TaskPath)
+    $matches = @(Get-MigrationTaskFixtureMatches -TaskName $TaskName -TaskPath $TaskPath -UseTaskName $true -UseTaskPath $true)
+    if ($matches.Count -ne 1) { throw 'fictional task disable identity is not unique' }
+    $matches[0].Settings.Enabled = $false
+    if ([string]$matches[0].State -ne 'Running') { $matches[0].State = 'Disabled' }
+    if ($global:DysonGsMigrationSelfTestFailNextDisable) {
+        $global:DysonGsMigrationSelfTestFailNextDisable = $false
+        throw 'fictional partial disable failure'
+    }
+}
+
+function Stop-ScheduledTask {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$TaskName, [Parameter(Mandatory)][string]$TaskPath)
+    $matches = @(Get-MigrationTaskFixtureMatches -TaskName $TaskName -TaskPath $TaskPath -UseTaskName $true -UseTaskPath $true)
+    if ($matches.Count -ne 1) { throw 'fictional task stop identity is not unique' }
+    $global:DysonGsMigrationSelfTestStopCount++
+    $matches[0].State = if ([bool]$matches[0].Settings.Enabled) { 'Ready' } else { 'Disabled' }
 }
 
 try {
@@ -205,7 +306,8 @@ try {
     [System.IO.Directory]::Delete($snapshotJunction, $false)
     [void]$junctions.Remove($snapshotJunction)
 
-    $global:DysonGsMigrationSelfTestTaskPresent = $true
+    $sensitiveTaskXml = '<Task><Description>' + $sensitiveMarker + '</Description></Task>'
+    $global:DysonGsMigrationSelfTestTasks.Add((New-MigrationTaskFixture -Xml $sensitiveTaskXml))
     $sensitiveTaskRaw = & $snapshotScript -ProjectRoot $projectRoot -GsManagerRoot $gsManagerRoot -DataRoot $dataRoot `
         -TaskName $taskName -PairedSaveProtectionPointId $protectionPointId `
         -PairedSaveProtectionManifestSha256 $script:ProtectionDigest -Confirm:$false
@@ -214,10 +316,123 @@ try {
     $sensitiveTaskVerified = Test-DysonGsSnapshotCore -SnapshotRoot $sensitiveTaskRoot `
         -ExpectedSnapshotId $sensitiveTaskSnapshot.snapshotId -ExpectedManifestSha256 $sensitiveTaskSnapshot.snapshotManifestSha256
     Assert-MigrationSelfTest -Condition ([bool]$sensitiveTaskVerified.taskCapture.present -and
+        [string]$sensitiveTaskVerified.taskCapture.taskPath -ceq '\' -and
+        [string]$sensitiveTaskVerified.taskCapture.xmlSha256 -ceq (Get-DysonGsTextSha256 -Value $sensitiveTaskXml) -and
         ([string]$sensitiveTaskVerified.taskCapture.xml).Contains($sensitiveMarker) -and
         -not (($sensitiveTaskRaw | Out-String).Contains($sensitiveMarker))) `
         -Message 'private scheduled-task XML was not captured or leaked into output'
-    $global:DysonGsMigrationSelfTestTaskPresent = $false
+    Reset-MigrationTaskFixture
+
+    $queryFailureMessage = $null
+    $global:DysonGsMigrationSelfTestQueryFailure = $true
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$queryFailureMessage) -Command {
+        Get-DysonGsTaskCapture -TaskName $taskName | Out-Null
+    }) -Message 'a Task Scheduler query failure was accepted as task absence'
+    Assert-MigrationSelfTest -Condition ($queryFailureMessage -eq 'The Task Scheduler state could not be queried.') `
+        -Message 'a Task Scheduler query failure did not return the fixed fail-closed error'
+    Reset-MigrationTaskFixture
+
+    $global:DysonGsMigrationSelfTestTasks.Add((New-MigrationTaskFixture -Path '\FictionalFolder\'))
+    $nonRootMessage = $null
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$nonRootMessage) -Command {
+        Get-DysonGsTaskCapture -TaskName $taskName | Out-Null
+    }) -Message 'a non-root scheduled task was accepted'
+    Assert-MigrationSelfTest -Condition ($nonRootMessage -eq 'The scheduled task must use the fixed root Task Scheduler path.') `
+        -Message 'the non-root scheduled task did not fail at the fixed task-path gate'
+    Reset-MigrationTaskFixture
+
+    $global:DysonGsMigrationSelfTestTasks.Add((New-MigrationTaskFixture -Path '\'))
+    $global:DysonGsMigrationSelfTestTasks.Add((New-MigrationTaskFixture -Path '\FictionalFolder\'))
+    $ambiguousTaskMessage = $null
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$ambiguousTaskMessage) -Command {
+        Get-DysonGsTaskCapture -TaskName $taskName | Out-Null
+    }) -Message 'same-name tasks across Task Scheduler paths were accepted'
+    Assert-MigrationSelfTest -Condition ($ambiguousTaskMessage -eq 'The scheduled task identity is ambiguous across Task Scheduler paths.') `
+        -Message 'same-name cross-path tasks did not fail at the global identity gate'
+    Reset-MigrationTaskFixture
+
+    foreach ($unsupported in @(
+        [pscustomobject]@{
+            xml = '<Task><Triggers><RegistrationTrigger /></Triggers></Task>'
+            expected = 'Scheduled tasks with registration triggers cannot be restored safely.'
+        },
+        [pscustomobject]@{
+            xml = '<Task><Principals><Principal><LogonType>Password</LogonType></Principal></Principals></Task>'
+            expected = 'Scheduled tasks that require a password cannot be restored without an external secret.'
+        },
+        [pscustomobject]@{
+            xml = '<Task><Principals><Principal><LogonType>InteractiveTokenOrPassword</LogonType></Principal></Principals></Task>'
+            expected = 'Scheduled tasks that require a password cannot be restored without an external secret.'
+        }
+    )) {
+        $global:DysonGsMigrationSelfTestTasks.Add((New-MigrationTaskFixture -Xml ([string]$unsupported.xml)))
+        $unsupportedMessage = $null
+        Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$unsupportedMessage) -Command {
+            Get-DysonGsTaskCapture -TaskName $taskName -IncludeXml | Out-Null
+        }) -Message 'an unsupported scheduled-task XML definition was accepted'
+        Assert-MigrationSelfTest -Condition ($unsupportedMessage -eq [string]$unsupported.expected) `
+            -Message 'unsupported scheduled-task XML failed outside its exact gate'
+        Reset-MigrationTaskFixture
+    }
+
+    $noOpXml = '<Task><Description>fictional exact no-op task</Description></Task>'
+    $global:DysonGsMigrationSelfTestTasks.Add((New-MigrationTaskFixture -Xml $noOpXml))
+    $noOpCapture = Get-DysonGsTaskCapture -TaskName $taskName -IncludeXml
+    $registerBeforeNoOp = $global:DysonGsMigrationSelfTestRegisterCount
+    $noOpResult = Set-DysonGsTaskCapture -Capture $noOpCapture -TaskName $taskName
+    Assert-MigrationSelfTest -Condition ([bool]$noOpResult.taskNoOp -and -not [bool]$noOpResult.taskChanged -and
+        $global:DysonGsMigrationSelfTestRegisterCount -eq $registerBeforeNoOp) `
+        -Message 'an already exact scheduled task was registered again instead of remaining a true no-op'
+
+    $partialXml = '<Task><Description>fictional partial task replacement</Description></Task>'
+    $partialCapture = [pscustomobject][ordered]@{
+        taskName = $taskName
+        taskPath = '\'
+        present = $true
+        enabled = $false
+        state = 'Disabled'
+        xmlSha256 = Get-DysonGsTextSha256 -Value $partialXml
+        xml = $partialXml
+    }
+    $registerBeforePartial = $global:DysonGsMigrationSelfTestRegisterCount
+    $global:DysonGsMigrationSelfTestFailNextDisable = $true
+    $partialMessage = $null
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$partialMessage) -Command {
+        Set-DysonGsTaskCapture -Capture $partialCapture -TaskName $taskName | Out-Null
+    }) -Message 'an injected partial scheduled-task application unexpectedly succeeded'
+    Assert-MigrationSelfTest -Condition ($partialMessage -eq 'The scheduled task could not be restored and verified from its private snapshot.') `
+        -Message 'partial scheduled-task application did not return the fixed failure'
+    [void](Set-DysonGsTaskCapture -Capture $noOpCapture -TaskName $taskName)
+    $afterPartialCompensation = Get-DysonGsTaskCapture -TaskName $taskName -IncludeXml
+    Assert-MigrationSelfTest -Condition ((Test-DysonGsTaskDefinitionsEqual -Left $noOpCapture -Right $afterPartialCompensation) -and
+        -not (Test-DysonGsTaskIsRunning -Capture $afterPartialCompensation) -and
+        $global:DysonGsMigrationSelfTestRegisterCount -eq ($registerBeforePartial + 2)) `
+        -Message 'partial scheduled-task application was not restored to its exact preimage'
+
+    $unexpectedRunXml = '<Task><Description>fictional unexpected running replacement</Description></Task>'
+    $unexpectedRunCapture = [pscustomobject][ordered]@{
+        taskName = $taskName
+        taskPath = '\'
+        present = $true
+        enabled = $true
+        state = 'Ready'
+        xmlSha256 = Get-DysonGsTextSha256 -Value $unexpectedRunXml
+        xml = $unexpectedRunXml
+    }
+    $stopBeforeUnexpectedRun = $global:DysonGsMigrationSelfTestStopCount
+    $global:DysonGsMigrationSelfTestRunAfterRegister = $true
+    $unexpectedRunMessage = $null
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$unexpectedRunMessage) -Command {
+        Set-DysonGsTaskCapture -Capture $unexpectedRunCapture -TaskName $taskName | Out-Null
+    }) -Message 'a scheduled task that started during registration was accepted'
+    [void](Set-DysonGsTaskCapture -Capture $noOpCapture -TaskName $taskName)
+    $afterUnexpectedRun = Get-DysonGsTaskCapture -TaskName $taskName -IncludeXml
+    Assert-MigrationSelfTest -Condition ($unexpectedRunMessage -eq 'The scheduled task could not be restored and verified from its private snapshot.' -and
+        $global:DysonGsMigrationSelfTestStopCount -gt $stopBeforeUnexpectedRun -and
+        (Test-DysonGsTaskDefinitionsEqual -Left $noOpCapture -Right $afterUnexpectedRun) -and
+        -not (Test-DysonGsTaskIsRunning -Capture $afterUnexpectedRun)) `
+        -Message 'an unexpectedly running registered task was not stopped and compensated'
+    Reset-MigrationTaskFixture
 
     $restoreSnapshot = New-FixtureSnapshot
     $verifiedPublicRaw = & $verifyScript -DataRoot $dataRoot -SnapshotId $restoreSnapshot.snapshotId `
@@ -247,12 +462,15 @@ try {
     $snapshotVerification = Test-DysonGsSnapshotCore -SnapshotRoot (Get-DysonGsSnapshotRoot -DataRoot $dataRoot `
         -SnapshotId $restoreSnapshot.snapshotId) -ExpectedSnapshotId $restoreSnapshot.snapshotId `
         -ExpectedManifestSha256 $restoreSnapshot.snapshotManifestSha256
+    $currentTaskXml = '<Task><Description>' + $sensitiveMarker + '</Description></Task>'
     $currentTaskCapture = [pscustomobject][ordered]@{
         taskName = $taskName
+        taskPath = '\'
         present = $true
         enabled = $true
         state = 'Ready'
-        xml = '<Task><Description>' + $sensitiveMarker + '</Description></Task>'
+        xmlSha256 = Get-DysonGsTextSha256 -Value $currentTaskXml
+        xml = $currentTaskXml
     }
     $script:TaskApplyEvents = New-Object 'System.Collections.Generic.List[string]'
     $taskApply = {
@@ -323,6 +541,13 @@ try {
         tamperExtraAndReparseRejected = $true
         fileCountTotalAndSingleFileLimitsEnforced = $true
         sensitiveOutputRedacted = $true
+        schedulerQueryFailureRejected = $true
+        nonRootTaskRejected = $true
+        crossPathTaskAmbiguityRejected = $true
+        unsupportedTaskXmlRejected = $true
+        exactTaskNoOp = $true
+        partialTaskApplicationCompensated = $true
+        unexpectedRunningTaskStopped = $true
         restoreGuardVerified = $true
         restoreConflictRejected = $true
         restoreFailureCompensated = $true
@@ -332,8 +557,18 @@ try {
     } | ConvertTo-Json -Depth 5 -Compress
 }
 finally {
-    Remove-Variable -Name 'DysonGsMigrationSelfTestTaskPresent' -Scope Global -ErrorAction SilentlyContinue
-    Remove-Variable -Name 'DysonGsMigrationSelfTestSensitiveMarker' -Scope Global -ErrorAction SilentlyContinue
+    foreach ($fixtureVariable in @(
+        'DysonGsMigrationSelfTestTasks',
+        'DysonGsMigrationSelfTestQueryFailure',
+        'DysonGsMigrationSelfTestRegisterCount',
+        'DysonGsMigrationSelfTestUnregisterCount',
+        'DysonGsMigrationSelfTestStopCount',
+        'DysonGsMigrationSelfTestFailNextEnable',
+        'DysonGsMigrationSelfTestFailNextDisable',
+        'DysonGsMigrationSelfTestRunAfterRegister'
+    )) {
+        Remove-Variable -Name $fixtureVariable -Scope Global -ErrorAction SilentlyContinue
+    }
     foreach ($junction in @($junctions)) {
         if (Test-Path -LiteralPath $junction) {
             $item = Get-Item -LiteralPath $junction -Force -ErrorAction SilentlyContinue

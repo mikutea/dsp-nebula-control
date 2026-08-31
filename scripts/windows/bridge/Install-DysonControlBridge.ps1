@@ -71,7 +71,9 @@ try {
     foreach ($existing in @($pluginPath, $configPath, $statePath, $secretPath)) {
         if (Test-Path -LiteralPath $existing) { [void](Assert-DysonBridgePlainFile -Path $existing -MaximumBytes 64MB) }
     }
-    if ($secretExisted) { $originalSecretSddl = (Get-Acl -LiteralPath $secretPath -ErrorAction Stop).Sddl }
+    if ($secretExisted) {
+        $originalSecretSddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $secretPath -ErrorAction Stop).Sddl
+    }
     [System.IO.Directory]::CreateDirectory($pluginRoot) | Out-Null
     [void](Assert-DysonBridgePlainDirectory -Path $pluginRoot)
     [System.IO.Directory]::CreateDirectory($snapshotParent) | Out-Null
@@ -154,9 +156,9 @@ catch {
         }
         if (-not $secretExisted -and (Test-Path -LiteralPath $secretPath -PathType Leaf)) { Remove-Item -LiteralPath $secretPath -Force }
         elseif ($secretExisted -and $originalSecretSddl -and (Test-Path -LiteralPath $secretPath -PathType Leaf)) {
-            $secretAcl = Get-Acl -LiteralPath $secretPath -ErrorAction Stop
+            $secretAcl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $secretPath -ErrorAction Stop
             $secretAcl.SetSecurityDescriptorSddlForm($originalSecretSddl)
-            Set-Acl -LiteralPath $secretPath -AclObject $secretAcl -ErrorAction Stop
+            Microsoft.PowerShell.Security\Set-Acl -LiteralPath $secretPath -AclObject $secretAcl -ErrorAction Stop
         }
     }
     throw $installError

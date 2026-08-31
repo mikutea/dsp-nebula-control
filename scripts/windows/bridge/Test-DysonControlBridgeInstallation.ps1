@@ -34,7 +34,7 @@ $secretItem = Assert-DysonBridgePlainFile -Path $secretPath -MaximumBytes 4096
 try { $secretBytes = [Convert]::FromBase64String([System.IO.File]::ReadAllText($secretItem.FullName, [System.Text.Encoding]::UTF8).Trim()) }
 catch { throw 'The installed Bridge secret is invalid.' }
 if ($secretBytes.Length -lt 32) { throw 'The installed Bridge secret is too short.' }
-$acl = Get-Acl -LiteralPath $secretItem.FullName -ErrorAction Stop
+$acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $secretItem.FullName -ErrorAction Stop
 if (-not $acl.AreAccessRulesProtected) { throw 'The installed Bridge secret ACL is not protected.' }
 foreach ($rule in @($acl.Access)) {
     $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value

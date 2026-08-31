@@ -48,6 +48,16 @@ function Assert-BridgeRejected {
     Assert-BridgeSelfTest -Condition $rejected -Message $Message
 }
 
+$global:DysonBridgeSelfTestAclShadowCalls = 0
+function Get-Acl {
+    $global:DysonBridgeSelfTestAclShadowCalls++
+    throw 'The untrusted self-test Get-Acl shadow must never be invoked.'
+}
+function Set-Acl {
+    $global:DysonBridgeSelfTestAclShadowCalls++
+    throw 'The untrusted self-test Set-Acl shadow must never be invoked.'
+}
+
 try {
     [System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
     [System.IO.Directory]::CreateDirectory((Join-Path $serverRoot 'BepInEx\core')) | Out-Null
@@ -211,6 +221,8 @@ namespace DysonControl.Bridge {
     Assert-BridgeSelfTest -Condition ([bool]$installation.ready -and $installation.enabled -eq $false -and
         [bool]$installation.secretBytesAtLeast32 -and [bool]$installation.secretAclProtected) `
         -Message 'the installed Bridge did not verify'
+    Assert-BridgeSelfTest -Condition ($global:DysonBridgeSelfTestAclShadowCalls -eq 0) `
+        -Message 'a Bridge ACL operation resolved through an untrusted command shadow'
 
     $beforeRollbackDll = Get-DysonBridgeSha256 -Path $pluginPath
     $beforeRollbackConfig = Get-DysonBridgeSha256 -Path $configPath
@@ -260,6 +272,7 @@ namespace DysonControl.Bridge {
         candidateTamperExtraAndReparseRejected = $true
         installWhatIfWasNonMutating = $true
         installDefaultedDisabled = $true
+        platformSecurityModuleBound = $true
         secretWasRandomProtectedAndUndisclosed = $true
         failedInstallRolledBack = $true
         uninstallWasRecoverable = $true
@@ -269,6 +282,7 @@ namespace DysonControl.Bridge {
 }
 finally {
     Remove-Item Env:DYSON_BRIDGE_ALLOW_SELFTEST_FAILURE -ErrorAction SilentlyContinue
+    Remove-Variable -Name DysonBridgeSelfTestAclShadowCalls -Scope Global -ErrorAction SilentlyContinue
     if ($redirectCreated -and (Test-Path -LiteralPath $candidateRedirect)) {
         $item = Get-Item -LiteralPath $candidateRedirect -Force -ErrorAction SilentlyContinue
         if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {

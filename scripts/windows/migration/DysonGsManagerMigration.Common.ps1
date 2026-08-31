@@ -1,9 +1,28 @@
 Set-StrictMode -Version 2.0
 
+$script:DysonGsPlatformSecurityModulePath = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+if (-not (Test-Path -LiteralPath $script:DysonGsPlatformSecurityModulePath -PathType Leaf)) {
+    throw 'The platform security module required by GSManager migration is unavailable.'
+}
+$script:DysonGsPlatformSecurityModules = @(
+    Import-Module -Name $script:DysonGsPlatformSecurityModulePath -PassThru -ErrorAction Stop
+)
+if ($script:DysonGsPlatformSecurityModules.Count -ne 1 -or
+    -not [string]::Equals(
+        [System.IO.Path]::GetFullPath([string]$script:DysonGsPlatformSecurityModules[0].Path),
+        [System.IO.Path]::GetFullPath($script:DysonGsPlatformSecurityModulePath),
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not $script:DysonGsPlatformSecurityModules[0].ExportedCommands.ContainsKey('Get-Acl') -or
+    -not $script:DysonGsPlatformSecurityModules[0].ExportedCommands.ContainsKey('Set-Acl')) {
+    throw 'The platform security module required by GSManager migration has an invalid identity.'
+}
+
 $script:DysonGsMigrationProtocol = 'DYSON_GSMANAGER_MIGRATION_V1'
 $script:DysonGsSnapshotProtocol = 'DYSON_GSMANAGER_SNAPSHOT_V1'
 $script:DysonGsGuardProtocol = 'DYSON_GSMANAGER_RESTORE_GUARD_V1'
 $script:DysonGsSchemaVersion = 1
+$script:DysonGsTaskPath = '\'
 $script:DysonGsHardMaximumFiles = 50000
 $script:DysonGsHardMaximumTotalBytes = [int64](8GB)
 $script:DysonGsHardMaximumSingleFileBytes = [int64](2GB)
@@ -142,8 +161,8 @@ function Protect-DysonGsPrivateDirectory {
             )
             [void]$security.AddAccessRule($rule)
         }
-        Set-Acl -LiteralPath $directory -AclObject $security -ErrorAction Stop
-        $verified = Get-Acl -LiteralPath $directory -ErrorAction Stop
+        Microsoft.PowerShell.Security\Set-Acl -LiteralPath $directory -AclObject $security -ErrorAction Stop
+        $verified = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $directory -ErrorAction Stop
         if (-not $verified.AreAccessRulesProtected) { throw 'private ACL inheritance remained enabled' }
         $allowedSids = @($sidMap.Keys)
         $rules = @($verified.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
@@ -536,12 +555,58 @@ function Test-DysonGsProtectionPointBinding {
     return [pscustomobject][ordered]@{ protectionPointId = $normalizedId; manifestSha256 = $digest }
 }
 
-function Test-DysonGsTaskNotFoundError {
-    param([Parameter(Mandatory)]$ErrorRecord)
+function Assert-DysonGsTaskXmlRestorable {
+    param([Parameter(Mandatory)][string]$Xml)
 
-    return $ErrorRecord.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound -or
-        $ErrorRecord.Exception -is [System.Management.Automation.ItemNotFoundException] -or
-        [string]$ErrorRecord.FullyQualifiedErrorId -match 'NoMatchingMSFT_ScheduledTask|HRESULT 0x80070002'
+    if ([string]::IsNullOrWhiteSpace($Xml) -or $Xml.Length -gt 4MB) {
+        throw 'The scheduled task XML is empty or exceeds its bound.'
+    }
+    try {
+        $document = New-Object System.Xml.XmlDocument
+        $document.PreserveWhitespace = $true
+        $document.LoadXml($Xml)
+    }
+    catch { throw 'The scheduled task XML is malformed.' }
+    if (@($document.SelectNodes("//*[local-name()='RegistrationTrigger']")).Count -ne 0) {
+        throw 'Scheduled tasks with registration triggers cannot be restored safely.'
+    }
+    foreach ($node in @($document.SelectNodes("//*[local-name()='LogonType']"))) {
+        $logonType = ([string]$node.InnerText).Trim()
+        if ($logonType -in @('Password', 'InteractiveTokenOrPassword')) {
+            throw 'Scheduled tasks that require a password cannot be restored without an external secret.'
+        }
+    }
+    return Get-DysonGsTextSha256 -Value $Xml
+}
+
+function Get-DysonGsScheduledTasksByExactName {
+    param([Parameter(Mandatory)][string]$TaskName)
+
+    Assert-DysonGsTaskName -TaskName $TaskName
+    if (-not (Get-Command -Name 'Get-ScheduledTask' -ErrorAction SilentlyContinue)) {
+        throw 'Task Scheduler inspection is unavailable.'
+    }
+    try { $allTasks = @(Get-ScheduledTask -ErrorAction Stop) }
+    catch { throw 'The Task Scheduler state could not be queried.' }
+    $matches = @(
+        foreach ($task in $allTasks) {
+            if ($null -eq $task -or $task.PSObject.Properties.Name -notcontains 'TaskName') {
+                throw 'The Task Scheduler returned an invalid task record.'
+            }
+            if ([string]::Equals([string]$task.TaskName, $TaskName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                if ($task.PSObject.Properties.Name -notcontains 'TaskPath') {
+                    throw 'The scheduled task identity is missing its task path.'
+                }
+                $task
+            }
+        }
+    )
+    if ($matches.Count -gt 1) { throw 'The scheduled task identity is ambiguous across Task Scheduler paths.' }
+    if ($matches.Count -eq 1 -and
+        -not [string]::Equals([string]$matches[0].TaskPath, $script:DysonGsTaskPath, [System.StringComparison]::Ordinal)) {
+        throw 'The scheduled task must use the fixed root Task Scheduler path.'
+    }
+    return @($matches)
 }
 
 function Get-DysonGsTaskCapture {
@@ -551,35 +616,85 @@ function Get-DysonGsTaskCapture {
     )
 
     Assert-DysonGsTaskName -TaskName $TaskName
-    $requiredCommands = @('Get-ScheduledTask')
-    if ($IncludeXml) { $requiredCommands += 'Export-ScheduledTask' }
-    foreach ($commandName in $requiredCommands) {
-        if (-not (Get-Command -Name $commandName -ErrorAction SilentlyContinue)) {
-            throw 'Task Scheduler inspection is unavailable.'
+    if (-not (Get-Command -Name 'Export-ScheduledTask' -ErrorAction SilentlyContinue)) {
+        throw 'Task Scheduler inspection is unavailable.'
+    }
+    $matches = @(Get-DysonGsScheduledTasksByExactName -TaskName $TaskName)
+    if ($matches.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            taskName = $TaskName
+            taskPath = $script:DysonGsTaskPath
+            present = $false
+            enabled = $false
+            state = 'Absent'
+            xmlSha256 = $null
+            xml = $null
         }
     }
-    try { $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
-    catch {
-        if (Test-DysonGsTaskNotFoundError -ErrorRecord $_) {
-            return [pscustomobject][ordered]@{ taskName = $TaskName; present = $false; enabled = $false; state = 'Absent'; xml = $null }
+    $task = $matches[0]
+    try {
+        $xml = [string](Export-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonGsTaskPath -ErrorAction Stop)
+    }
+    catch { throw 'The scheduled task XML could not be captured.' }
+    $xmlSha256 = Assert-DysonGsTaskXmlRestorable -Xml $xml
+    try {
+        if ($task.PSObject.Properties.Name -notcontains 'Settings' -or $null -eq $task.Settings -or
+            $task.Settings.PSObject.Properties.Name -notcontains 'Enabled') {
+            throw 'missing enabled state'
         }
-        throw 'The scheduled task could not be inspected.'
+        $enabled = [bool]$task.Settings.Enabled
     }
-    if ($null -eq $task -or @($task).Count -ne 1) { throw 'The scheduled task identity is ambiguous.' }
-    $xml = $null
-    if ($IncludeXml) {
-        try { $xml = [string](Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop) }
-        catch { throw 'The scheduled task XML could not be captured.' }
-        if ([string]::IsNullOrWhiteSpace($xml) -or $xml.Length -gt 4MB) { throw 'The scheduled task XML is empty or exceeds its bound.' }
-    }
-    $enabled = $true
-    try { if ($null -ne $task.Settings -and $null -ne $task.Settings.Enabled) { $enabled = [bool]$task.Settings.Enabled } }
     catch { throw 'The scheduled task enabled state could not be inspected.' }
+    if ($task.PSObject.Properties.Name -notcontains 'State') { throw 'The scheduled task state is invalid.' }
     $state = [string]$task.State
     if ([string]::IsNullOrWhiteSpace($state) -or $state.Length -gt 32 -or $state -match '[\r\n]') {
         throw 'The scheduled task state is invalid.'
     }
-    return [pscustomobject][ordered]@{ taskName = $TaskName; present = $true; enabled = $enabled; state = $state; xml = $xml }
+    return [pscustomobject][ordered]@{
+        taskName = $TaskName
+        taskPath = $script:DysonGsTaskPath
+        present = $true
+        enabled = $enabled
+        state = $state
+        xmlSha256 = $xmlSha256
+        xml = if ($IncludeXml) { $xml } else { $null }
+    }
+}
+
+function Assert-DysonGsTaskCapture {
+    param(
+        [Parameter(Mandatory)]$Capture,
+        [switch]$RequireXml
+    )
+
+    Assert-DysonGsExactProperties -Value $Capture -Expected @(
+        'taskName', 'taskPath', 'present', 'enabled', 'state', 'xmlSha256', 'xml'
+    ) -Name 'Scheduled task capture'
+    Assert-DysonGsTaskName -TaskName ([string]$Capture.taskName)
+    if (-not ($Capture.taskName -is [string]) -or -not ($Capture.taskPath -is [string]) -or
+        [string]$Capture.taskPath -cne $script:DysonGsTaskPath -or $Capture.present -isnot [bool] -or
+        $Capture.enabled -isnot [bool] -or -not ($Capture.state -is [string]) -or
+        [string]::IsNullOrWhiteSpace([string]$Capture.state) -or ([string]$Capture.state).Length -gt 32 -or
+        [string]$Capture.state -match '[\r\n]') {
+        throw 'The scheduled task capture is invalid.'
+    }
+    if (-not [bool]$Capture.present) {
+        if ([bool]$Capture.enabled -or [string]$Capture.state -cne 'Absent' -or
+            $null -ne $Capture.xmlSha256 -or $null -ne $Capture.xml) {
+            throw 'The absent scheduled task capture is invalid.'
+        }
+        return
+    }
+    if (-not ($Capture.xmlSha256 -is [string]) -or [string]$Capture.xmlSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw 'The scheduled task capture XML digest is invalid.'
+    }
+    if ($null -eq $Capture.xml) {
+        if ($RequireXml) { throw 'The scheduled task capture is missing its XML.' }
+        return
+    }
+    if (-not ($Capture.xml -is [string])) { throw 'The scheduled task capture XML is invalid.' }
+    $actualDigest = Assert-DysonGsTaskXmlRestorable -Xml ([string]$Capture.xml)
+    if ($actualDigest -cne [string]$Capture.xmlSha256) { throw 'The scheduled task capture XML digest does not match.' }
 }
 
 function Write-DysonGsTaskCapture {
@@ -588,12 +703,15 @@ function Write-DysonGsTaskCapture {
         [Parameter(Mandatory)][string]$Directory
     )
 
+    Assert-DysonGsTaskCapture -Capture $Capture -RequireXml
     $taskRoot = New-DysonGsPlainDirectory -Path $Directory
     Write-DysonGsUtf8Json -Path (Join-Path $taskRoot 'state.json') -Value ([ordered]@{
         taskName = [string]$Capture.taskName
+        taskPath = [string]$Capture.taskPath
         present = [bool]$Capture.present
         enabled = [bool]$Capture.enabled
         state = [string]$Capture.state
+        xmlSha256 = if ([bool]$Capture.present) { [string]$Capture.xmlSha256 } else { $null }
     })
     if ([bool]$Capture.present) {
         [System.IO.File]::WriteAllText((Join-Path $taskRoot 'task.xml'), [string]$Capture.xml, [System.Text.Encoding]::Unicode)
@@ -605,30 +723,104 @@ function Read-DysonGsTaskCapture {
 
     $taskRoot = Assert-DysonGsPlainDirectory -Path $Directory
     $state = Read-DysonGsJsonBounded -Path (Join-Path $taskRoot 'state.json') -MaximumBytes 8192
-    Assert-DysonGsExactProperties -Value $state -Expected @('taskName', 'present', 'enabled', 'state') -Name 'Task snapshot state'
+    Assert-DysonGsExactProperties -Value $state -Expected @(
+        'taskName', 'taskPath', 'present', 'enabled', 'state', 'xmlSha256'
+    ) -Name 'Task snapshot state'
     Assert-DysonGsTaskName -TaskName ([string]$state.taskName)
     Assert-DysonGsJsonString -Value $state.taskName -Name 'Task snapshot name'
+    Assert-DysonGsJsonString -Value $state.taskPath -Name 'Task snapshot path'
     Assert-DysonGsJsonBoolean -Value $state.present -Name 'Task snapshot presence'
     Assert-DysonGsJsonBoolean -Value $state.enabled -Name 'Task snapshot enabled state'
     Assert-DysonGsJsonString -Value $state.state -Name 'Task snapshot runtime state'
-    if ([string]::IsNullOrWhiteSpace([string]$state.state) -or ([string]$state.state).Length -gt 32 -or [string]$state.state -match '[\r\n]') {
+    if ([string]$state.taskPath -cne $script:DysonGsTaskPath -or
+        [string]::IsNullOrWhiteSpace([string]$state.state) -or ([string]$state.state).Length -gt 32 -or
+        [string]$state.state -match '[\r\n]') {
         throw 'Task snapshot state is invalid.'
     }
     $xmlPath = Join-Path $taskRoot 'task.xml'
     $xml = $null
     if ([bool]$state.present) {
+        Assert-DysonGsJsonString -Value $state.xmlSha256 -Name 'Task snapshot XML digest'
+        $xmlDigest = Normalize-DysonGsDigest -Digest ([string]$state.xmlSha256) -Name 'Task snapshot XML digest'
         $xmlItem = Assert-DysonGsPlainFile -Path $xmlPath -MaximumBytes (4MB)
         $xml = [System.IO.File]::ReadAllText($xmlItem.FullName)
-        if ([string]::IsNullOrWhiteSpace($xml)) { throw 'Task snapshot XML is empty.' }
+        $actualDigest = Assert-DysonGsTaskXmlRestorable -Xml $xml
+        if ($actualDigest -cne $xmlDigest) { throw 'Task snapshot XML digest does not match.' }
     }
-    elseif (Test-Path -LiteralPath $xmlPath) { throw 'An absent task snapshot unexpectedly contains task XML.' }
-    return [pscustomobject][ordered]@{
+    else {
+        if ($null -ne $state.xmlSha256 -or [bool]$state.enabled -or [string]$state.state -cne 'Absent') {
+            throw 'An absent task snapshot has invalid state.'
+        }
+        if (Test-Path -LiteralPath $xmlPath) { throw 'An absent task snapshot unexpectedly contains task XML.' }
+    }
+    $capture = [pscustomobject][ordered]@{
         taskName = [string]$state.taskName
+        taskPath = [string]$state.taskPath
         present = [bool]$state.present
         enabled = [bool]$state.enabled
         state = [string]$state.state
+        xmlSha256 = if ([bool]$state.present) { [string]$state.xmlSha256 } else { $null }
         xml = $xml
     }
+    Assert-DysonGsTaskCapture -Capture $capture -RequireXml
+    return $capture
+}
+
+function Test-DysonGsTaskIsRunning {
+    param([Parameter(Mandatory)]$Capture)
+
+    return [bool]$Capture.present -and
+        [string]::Equals([string]$Capture.state, 'Running', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-DysonGsTaskDefinitionsEqual {
+    param(
+        [Parameter(Mandatory)]$Left,
+        [Parameter(Mandatory)]$Right
+    )
+
+    if (-not [string]::Equals([string]$Left.taskName, [string]$Right.taskName, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals([string]$Left.taskPath, [string]$Right.taskPath, [System.StringComparison]::Ordinal) -or
+        [bool]$Left.present -ne [bool]$Right.present -or [bool]$Left.enabled -ne [bool]$Right.enabled) {
+        return $false
+    }
+    if (-not [bool]$Left.present) { return $true }
+    return [string]::Equals([string]$Left.xmlSha256, [string]$Right.xmlSha256, [System.StringComparison]::Ordinal)
+}
+
+function Assert-DysonGsTaskRestorePostcondition {
+    param(
+        [Parameter(Mandatory)]$Expected,
+        [Parameter(Mandatory)]$Actual
+    )
+
+    if (Test-DysonGsTaskIsRunning -Capture $Actual) {
+        throw 'The restored scheduled task unexpectedly entered the Running state.'
+    }
+    if (-not (Test-DysonGsTaskDefinitionsEqual -Left $Expected -Right $Actual)) {
+        throw 'The restored scheduled task does not match its private snapshot.'
+    }
+}
+
+function Stop-DysonGsTaskForRestore {
+    param(
+        [Parameter(Mandatory)][string]$TaskName,
+        [ValidateRange(1, 60)][int]$TimeoutSeconds = 20
+    )
+
+    if (-not (Get-Command -Name 'Stop-ScheduledTask' -ErrorAction SilentlyContinue)) {
+        throw 'Task Scheduler restore is unavailable.'
+    }
+    $capture = Get-DysonGsTaskCapture -TaskName $TaskName -IncludeXml
+    if (-not (Test-DysonGsTaskIsRunning -Capture $capture)) { return $false }
+    Stop-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonGsTaskPath -ErrorAction Stop | Out-Null
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        Start-Sleep -Milliseconds 250
+        $capture = Get-DysonGsTaskCapture -TaskName $TaskName -IncludeXml
+        if (-not (Test-DysonGsTaskIsRunning -Capture $capture)) { return $true }
+    } while ((Get-Date) -lt $deadline)
+    throw 'The scheduled task could not be stopped after an unexpected start.'
 }
 
 function Set-DysonGsTaskCapture {
@@ -638,23 +830,73 @@ function Set-DysonGsTaskCapture {
     )
 
     Assert-DysonGsTaskName -TaskName $TaskName
-    if (-not [string]::Equals([string]$Capture.taskName, $TaskName, [System.StringComparison]::Ordinal)) {
-        throw 'The task snapshot is bound to a different task name.'
+    Assert-DysonGsTaskCapture -Capture $Capture -RequireXml
+    if (-not [string]::Equals([string]$Capture.taskName, $TaskName, [System.StringComparison]::Ordinal) -or
+        [string]$Capture.taskPath -cne $script:DysonGsTaskPath) {
+        throw 'The task snapshot is bound to a different task identity.'
     }
-    foreach ($commandName in @('Register-ScheduledTask', 'Unregister-ScheduledTask', 'Enable-ScheduledTask', 'Disable-ScheduledTask')) {
-        if (-not (Get-Command -Name $commandName -ErrorAction SilentlyContinue)) { throw 'Task Scheduler restore is unavailable.' }
+    foreach ($commandName in @(
+        'Register-ScheduledTask', 'Unregister-ScheduledTask', 'Enable-ScheduledTask',
+        'Disable-ScheduledTask', 'Stop-ScheduledTask'
+    )) {
+        if (-not (Get-Command -Name $commandName -ErrorAction SilentlyContinue)) {
+            throw 'Task Scheduler restore is unavailable.'
+        }
     }
-    if (-not [bool]$Capture.present) {
-        try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop | Out-Null }
-        catch { if (-not (Test-DysonGsTaskNotFoundError -ErrorRecord $_)) { throw 'The scheduled task could not be restored to absent.' } }
-        return
+    $current = Get-DysonGsTaskCapture -TaskName $TaskName -IncludeXml
+    $stoppedUnexpectedTask = $false
+    if (Test-DysonGsTaskIsRunning -Capture $current) {
+        $stoppedUnexpectedTask = Stop-DysonGsTaskForRestore -TaskName $TaskName
+        $current = Get-DysonGsTaskCapture -TaskName $TaskName -IncludeXml
     }
+    if (Test-DysonGsTaskDefinitionsEqual -Left $Capture -Right $current) {
+        Assert-DysonGsTaskRestorePostcondition -Expected $Capture -Actual $current
+        return [pscustomobject][ordered]@{
+            taskChanged = [bool]$stoppedUnexpectedTask
+            taskNoOp = -not [bool]$stoppedUnexpectedTask
+            unexpectedRunningStopped = [bool]$stoppedUnexpectedTask
+        }
+    }
+
     try {
-        Register-ScheduledTask -TaskName $TaskName -Xml ([string]$Capture.xml) -Force -ErrorAction Stop | Out-Null
-        if ([bool]$Capture.enabled) { Enable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null }
-        else { Disable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null }
+        if (-not [bool]$Capture.present) {
+            if ([bool]$current.present) {
+                Unregister-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonGsTaskPath `
+                    -Confirm:$false -ErrorAction Stop | Out-Null
+            }
+        }
+        else {
+            Register-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonGsTaskPath `
+                -Xml ([string]$Capture.xml) -Force -ErrorAction Stop | Out-Null
+            if ([bool]$Capture.enabled) {
+                Enable-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonGsTaskPath -ErrorAction Stop | Out-Null
+            }
+            else {
+                Disable-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonGsTaskPath -ErrorAction Stop | Out-Null
+            }
+        }
+        $actual = Get-DysonGsTaskCapture -TaskName $TaskName -IncludeXml
+        if (Test-DysonGsTaskIsRunning -Capture $actual) {
+            [void](Stop-DysonGsTaskForRestore -TaskName $TaskName)
+            throw 'unexpected running task'
+        }
+        Assert-DysonGsTaskRestorePostcondition -Expected $Capture -Actual $actual
+        return [pscustomobject][ordered]@{
+            taskChanged = $true
+            taskNoOp = $false
+            unexpectedRunningStopped = [bool]$stoppedUnexpectedTask
+        }
     }
-    catch { throw 'The scheduled task could not be restored from its private snapshot.' }
+    catch {
+        try {
+            $latest = Get-DysonGsTaskCapture -TaskName $TaskName -IncludeXml
+            if (Test-DysonGsTaskIsRunning -Capture $latest) {
+                [void](Stop-DysonGsTaskForRestore -TaskName $TaskName)
+            }
+        }
+        catch { }
+        throw 'The scheduled task could not be restored and verified from its private snapshot.'
+    }
 }
 
 function Test-DysonGsTaskCapturesEqual {
@@ -663,14 +905,8 @@ function Test-DysonGsTaskCapturesEqual {
         [Parameter(Mandatory)]$Right
     )
 
-    if (-not [string]::Equals([string]$Left.taskName, [string]$Right.taskName, [System.StringComparison]::Ordinal) -or
-        [bool]$Left.present -ne [bool]$Right.present -or [bool]$Left.enabled -ne [bool]$Right.enabled -or
-        -not [string]::Equals([string]$Left.state, [string]$Right.state, [System.StringComparison]::Ordinal)) {
-        return $false
-    }
-    if (-not [bool]$Left.present) { return $true }
-    return (Get-DysonGsTextSha256 -Value ([string]$Left.xml)) -ceq
-        (Get-DysonGsTextSha256 -Value ([string]$Right.xml))
+    if (-not (Test-DysonGsTaskDefinitionsEqual -Left $Left -Right $Right)) { return $false }
+    return [string]::Equals([string]$Left.state, [string]$Right.state, [System.StringComparison]::Ordinal)
 }
 
 function Get-DysonGsSnapshotRoot {
@@ -722,7 +958,9 @@ function Test-DysonGsSnapshotCore {
     Assert-DysonGsExactProperties -Value $manifest.pairedSaveProtection -Expected @('id', 'manifestSha256') -Name 'Protection binding'
     Assert-DysonGsExactProperties -Value $manifest.limits -Expected @('maximumFiles', 'maximumTotalBytes', 'maximumSingleFileBytes') -Name 'Snapshot limits'
     Assert-DysonGsExactProperties -Value $manifest.gsManager -Expected @('fileCount', 'totalBytes', 'treeSha256') -Name 'GSManager tree summary'
-    Assert-DysonGsExactProperties -Value $manifest.task -Expected @('present', 'enabled', 'state') -Name 'Task summary'
+    Assert-DysonGsExactProperties -Value $manifest.task -Expected @(
+        'taskPath', 'present', 'enabled', 'state', 'xmlSha256'
+    ) -Name 'Task summary'
     Assert-DysonGsJsonString -Value $manifest.protocol -Name 'Snapshot protocol'
     Assert-DysonGsJsonInteger -Value $manifest.schemaVersion -Name 'Snapshot schema version' -Minimum 1 -Maximum 1
     foreach ($stringField in @('snapshotId', 'createdAt', 'projectBindingSha256', 'gsManagerRelativeRoot', 'taskName', 'payloadSha256')) {
@@ -736,9 +974,13 @@ function Test-DysonGsSnapshotCore {
     Assert-DysonGsJsonInteger -Value $manifest.gsManager.fileCount -Name 'Snapshot GSManager file count' -Minimum 0 -Maximum $script:DysonGsHardMaximumFiles
     Assert-DysonGsJsonInteger -Value $manifest.gsManager.totalBytes -Name 'Snapshot GSManager total bytes' -Minimum 0 -Maximum $script:DysonGsHardMaximumTotalBytes
     Assert-DysonGsJsonString -Value $manifest.gsManager.treeSha256 -Name 'Snapshot GSManager tree digest'
+    Assert-DysonGsJsonString -Value $manifest.task.taskPath -Name 'Snapshot task path'
     Assert-DysonGsJsonBoolean -Value $manifest.task.present -Name 'Snapshot task presence'
     Assert-DysonGsJsonBoolean -Value $manifest.task.enabled -Name 'Snapshot task enabled state'
     Assert-DysonGsJsonString -Value $manifest.task.state -Name 'Snapshot task runtime state'
+    if ([bool]$manifest.task.present) {
+        Assert-DysonGsJsonString -Value $manifest.task.xmlSha256 -Name 'Snapshot task XML digest'
+    }
     Assert-DysonGsJsonInteger -Value $manifest.fileCount -Name 'Snapshot payload file count' -Minimum 1 -Maximum $script:DysonGsHardMaximumFiles
     Assert-DysonGsJsonInteger -Value $manifest.totalBytes -Name 'Snapshot payload total bytes' -Minimum 1 -Maximum $script:DysonGsHardMaximumTotalBytes
     if ([string]$manifest.protocol -cne $script:DysonGsSnapshotProtocol -or [int]$manifest.schemaVersion -ne $script:DysonGsSchemaVersion -or
@@ -756,6 +998,10 @@ function Test-DysonGsSnapshotCore {
         [int64]$manifest.totalBytes -lt 1 -or [int64]$manifest.totalBytes -gt $maximumTotalBytes -or
         [string]$manifest.payloadSha256 -notmatch '^[0-9a-f]{64}$' -or
         [string]$manifest.gsManager.treeSha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$manifest.task.taskPath -cne $script:DysonGsTaskPath -or
+        ([bool]$manifest.task.present -and [string]$manifest.task.xmlSha256 -notmatch '^[0-9a-f]{64}$') -or
+        (-not [bool]$manifest.task.present -and ($null -ne $manifest.task.xmlSha256 -or
+            [bool]$manifest.task.enabled -or [string]$manifest.task.state -cne 'Absent')) -or
         [string]$manifest.pairedSaveProtection.id -notmatch '^save:[0-9a-f-]{36}$' -or
         [string]$manifest.pairedSaveProtection.manifestSha256 -notmatch '^[0-9a-f]{64}$') {
         throw 'The GSManager migration snapshot summary is invalid.'
@@ -796,8 +1042,10 @@ function Test-DysonGsSnapshotCore {
     }
     $taskCapture = Read-DysonGsTaskCapture -Directory (Join-Path $snapshot 'task')
     if (-not [string]::Equals([string]$taskCapture.taskName, [string]$manifest.taskName, [System.StringComparison]::Ordinal) -or
+        [string]$taskCapture.taskPath -cne [string]$manifest.task.taskPath -or
         [bool]$taskCapture.present -ne [bool]$manifest.task.present -or
         [bool]$taskCapture.enabled -ne [bool]$manifest.task.enabled -or
+        -not [string]::Equals([string]$taskCapture.xmlSha256, [string]$manifest.task.xmlSha256, [System.StringComparison]::Ordinal) -or
         -not [string]::Equals([string]$taskCapture.state, [string]$manifest.task.state, [System.StringComparison]::Ordinal)) {
         throw 'The scheduled task snapshot does not match its manifest summary.'
     }
@@ -914,7 +1162,14 @@ function Write-DysonGsGuardManifest {
         guardId = $GuardId
         createdAt = (Get-Date).ToUniversalTime().ToString('o')
         root = [ordered]@{ existed = $RootExisted; fileCount = [int]$RootInventory.fileCount; totalBytes = [int64]$RootInventory.totalBytes; treeSha256 = [string]$RootInventory.treeSha256 }
-        task = [ordered]@{ taskName = [string]$TaskCapture.taskName; present = [bool]$TaskCapture.present; enabled = [bool]$TaskCapture.enabled; state = [string]$TaskCapture.state }
+        task = [ordered]@{
+            taskName = [string]$TaskCapture.taskName
+            taskPath = [string]$TaskCapture.taskPath
+            present = [bool]$TaskCapture.present
+            enabled = [bool]$TaskCapture.enabled
+            state = [string]$TaskCapture.state
+            xmlSha256 = if ([bool]$TaskCapture.present) { [string]$TaskCapture.xmlSha256 } else { $null }
+        }
         payloadSha256 = $payload.treeSha256
         fileCount = $payload.fileCount
         totalBytes = $payload.totalBytes
@@ -935,10 +1190,26 @@ function Test-DysonGsGuardCore {
     $manifest = Read-DysonGsJsonBounded -Path (Join-Path $root 'guard.json') -MaximumBytes (16MB)
     Assert-DysonGsExactProperties -Value $manifest -Expected @('protocol', 'schemaVersion', 'guardId', 'createdAt', 'root', 'task', 'payloadSha256', 'fileCount', 'totalBytes', 'files') -Name 'Restore guard manifest'
     Assert-DysonGsExactProperties -Value $manifest.root -Expected @('existed', 'fileCount', 'totalBytes', 'treeSha256') -Name 'Restore guard root summary'
-    Assert-DysonGsExactProperties -Value $manifest.task -Expected @('taskName', 'present', 'enabled', 'state') -Name 'Restore guard task summary'
+    Assert-DysonGsExactProperties -Value $manifest.task -Expected @(
+        'taskName', 'taskPath', 'present', 'enabled', 'state', 'xmlSha256'
+    ) -Name 'Restore guard task summary'
     if ([string]$manifest.protocol -cne $script:DysonGsGuardProtocol -or [int]$manifest.schemaVersion -ne $script:DysonGsSchemaVersion -or
         [string]$manifest.guardId -cne $GuardId -or [string]$manifest.payloadSha256 -notmatch '^[0-9a-f]{64}$' -or
-        [string]$manifest.root.treeSha256 -notmatch '^[0-9a-f]{64}$') { throw 'The restore guard identity is invalid.' }
+        [string]$manifest.root.treeSha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$manifest.task.taskPath -cne $script:DysonGsTaskPath -or
+        ([bool]$manifest.task.present -and [string]$manifest.task.xmlSha256 -notmatch '^[0-9a-f]{64}$') -or
+        (-not [bool]$manifest.task.present -and ($null -ne $manifest.task.xmlSha256 -or
+            [bool]$manifest.task.enabled -or [string]$manifest.task.state -cne 'Absent'))) {
+        throw 'The restore guard identity is invalid.'
+    }
+    Assert-DysonGsJsonString -Value $manifest.task.taskName -Name 'Restore guard task name'
+    Assert-DysonGsJsonString -Value $manifest.task.taskPath -Name 'Restore guard task path'
+    Assert-DysonGsJsonBoolean -Value $manifest.task.present -Name 'Restore guard task presence'
+    Assert-DysonGsJsonBoolean -Value $manifest.task.enabled -Name 'Restore guard task enabled state'
+    Assert-DysonGsJsonString -Value $manifest.task.state -Name 'Restore guard task runtime state'
+    if ([bool]$manifest.task.present) {
+        Assert-DysonGsJsonString -Value $manifest.task.xmlSha256 -Name 'Restore guard task XML digest'
+    }
     Assert-DysonGsTaskName -TaskName ([string]$manifest.task.taskName)
     if ([int]$manifest.fileCount -lt 1 -or [int]$manifest.fileCount -gt [int]$Limits.maximumFiles -or
         [int64]$manifest.totalBytes -lt 1 -or [int64]$manifest.totalBytes -gt [int64]$Limits.maximumTotalBytes -or
@@ -981,7 +1252,9 @@ function Test-DysonGsGuardCore {
     }
     $task = Read-DysonGsTaskCapture -Directory (Join-Path $root 'task')
     if (-not [string]::Equals([string]$task.taskName, [string]$manifest.task.taskName, [System.StringComparison]::Ordinal) -or
+        [string]$task.taskPath -cne [string]$manifest.task.taskPath -or
         [bool]$task.present -ne [bool]$manifest.task.present -or [bool]$task.enabled -ne [bool]$manifest.task.enabled -or
+        -not [string]::Equals([string]$task.xmlSha256, [string]$manifest.task.xmlSha256, [System.StringComparison]::Ordinal) -or
         -not [string]::Equals([string]$task.state, [string]$manifest.task.state, [System.StringComparison]::Ordinal)) {
         throw 'The restore guard task does not match its manifest summary.'
     }

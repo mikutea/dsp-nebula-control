@@ -1,5 +1,23 @@
 Set-StrictMode -Version 2.0
 
+$script:DysonBridgePlatformSecurityModulePath = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+if (-not (Test-Path -LiteralPath $script:DysonBridgePlatformSecurityModulePath -PathType Leaf)) {
+    throw 'The platform security module required by Dyson Control Bridge is unavailable.'
+}
+$script:DysonBridgePlatformSecurityModules = @(
+    Import-Module -Name $script:DysonBridgePlatformSecurityModulePath -PassThru -ErrorAction Stop
+)
+if ($script:DysonBridgePlatformSecurityModules.Count -ne 1 -or
+    -not [string]::Equals(
+        [System.IO.Path]::GetFullPath([string]$script:DysonBridgePlatformSecurityModules[0].Path),
+        [System.IO.Path]::GetFullPath($script:DysonBridgePlatformSecurityModulePath),
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not $script:DysonBridgePlatformSecurityModules[0].ExportedCommands.ContainsKey('Get-Acl') -or
+    -not $script:DysonBridgePlatformSecurityModules[0].ExportedCommands.ContainsKey('Set-Acl')) {
+    throw 'The platform security module required by Dyson Control Bridge has an invalid identity.'
+}
+
 $script:DysonBridgeCandidateProtocol = 'DYSON_CONTROL_BRIDGE_CANDIDATE_V1'
 $script:DysonBridgeInstallProtocol = 'DYSON_CONTROL_BRIDGE_INSTALL_V1'
 $script:DysonBridgeGuid = 'io.github.mikutea.dyson-control-bridge'
@@ -575,8 +593,8 @@ function Protect-DysonBridgeSecretAcl {
         )
         $acl.AddAccessRule($rule) | Out-Null
     }
-    Set-Acl -LiteralPath $item.FullName -AclObject $acl -ErrorAction Stop
-    $verified = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $item.FullName -AclObject $acl -ErrorAction Stop
+    $verified = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
     if (-not $verified.AreAccessRulesProtected) { throw 'The Bridge secret ACL could not be restricted.' }
     foreach ($rule in @($verified.Access)) {
         $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value

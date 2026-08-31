@@ -85,7 +85,13 @@ try {
         pairedSaveProtection = [ordered]@{ id = $protection.protectionPointId; manifestSha256 = $protection.manifestSha256 }
         limits = [ordered]@{ maximumFiles = $MaximumFiles; maximumTotalBytes = $MaximumTotalBytes; maximumSingleFileBytes = $MaximumSingleFileBytes }
         gsManager = [ordered]@{ fileCount = $copied.fileCount; totalBytes = $copied.totalBytes; treeSha256 = $copied.treeSha256 }
-        task = [ordered]@{ present = [bool]$task.present; enabled = [bool]$task.enabled; state = [string]$task.state }
+        task = [ordered]@{
+            taskPath = [string]$task.taskPath
+            present = [bool]$task.present
+            enabled = [bool]$task.enabled
+            state = [string]$task.state
+            xmlSha256 = if ([bool]$task.present) { [string]$task.xmlSha256 } else { $null }
+        }
         payloadSha256 = $payload.treeSha256
         fileCount = $payload.fileCount
         totalBytes = $payload.totalBytes

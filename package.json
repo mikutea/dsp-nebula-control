@@ -16,6 +16,8 @@
     "acceptance:summary": "node scripts/validate-acceptance.mjs --summary",
     "acceptance:gate": "node scripts/validate-acceptance.mjs --require-release-ready",
     "bridge:protocol-check": "dotnet run --project integrations/dyson-control-bridge/protocol-tests/DysonControlBridge.ProtocolTests.csproj --configuration Release",
+    "bridge:selftest": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows/bridge/SelfTest-DysonControlBridge.ps1",
+    "migration:selftest": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows/migration/SelfTest-DysonGsManagerMigration.ps1",
     "bridge:build": "dotnet build integrations/dyson-control-bridge/DysonControlBridge.csproj --configuration Release",
     "powershell:check": "node scripts/validate-powershell.mjs",
     "evidence:selftest": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows/evidence/SelfTest-DysonPrivateEvidenceBundle.ps1",
@@ -30,7 +32,7 @@
     "release:workflow-selftest": "node --test scripts/windows/release/release-workflow.test.mjs",
     "public-release:check": "node scripts/public-release/check.mjs --history",
     "public-release:selftest": "node --test scripts/public-release/scanner.test.mjs",
-    "check": "npm run version:check && npm run version:selftest && npm run acceptance:check && npm run acceptance:selftest && npm run public-release:selftest && npm run bridge:protocol-check && npm run powershell:check && npm run evidence:selftest && npm run deployment:selftest && npm run session:selftest && npm run release:selftest && npm run release:package-selftest && npm run release:workflow-selftest && npm run typecheck && npm test && npm run build",
+    "check": "npm run version:check && npm run version:selftest && npm run acceptance:check && npm run acceptance:selftest && npm run public-release:selftest && npm run bridge:protocol-check && npm run powershell:check && npm run bridge:selftest && npm run migration:selftest && npm run evidence:selftest && npm run deployment:selftest && npm run session:selftest && npm run release:selftest && npm run release:package-selftest && npm run release:workflow-selftest && npm run typecheck && npm test && npm run build",
     "hash-password": "npm --prefix apps/api run hash-password --"
   },
   "engines": {
