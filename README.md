@@ -249,12 +249,11 @@ Run the repository-safe checks before using a package:
 
 ```powershell
 npm run powershell:check
+npm run host-mutation:selftest
+npm run bridge:selftest
+npm run migration:selftest
 npm run deployment:selftest
 npm run evidence:selftest
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-  -File scripts/windows/bridge/SelfTest-DysonControlBridge.ps1
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-  -File scripts/windows/migration/SelfTest-DysonGsManagerMigration.ps1
 ```
 
 Then follow [the Windows deployment guide](docs/WINDOWS-DEPLOYMENT-DRAFT.md),
@@ -306,8 +305,10 @@ design         Accepted UI concept used as an implementation specification
 
 ## Roadmap
 
-1. Finish the remaining repository-level configuration snapshot/restore and
-   component live-publication surfaces, then pass the complete local gate.
+1. Close the remaining repository-level transaction gaps: one host-mutation
+   lease across lifecycle/save/update/migration operations, crash-recoverable
+   save and GSManager journals, digest-bound paired-save compensation, and
+   fully verified task/root rollback; then pass the complete local gate.
 2. Run desktop/mobile browser acceptance against fictional local data and
    verify the release artifact with the public hygiene/provenance gate.
 3. Run the reusable Windows package through clean-host, reboot, ACL, upgrade,

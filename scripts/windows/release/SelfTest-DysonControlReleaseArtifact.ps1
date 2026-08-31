@@ -3,6 +3,7 @@ param([switch]$IncludeCurrentWorkspace)
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+. (Join-Path $PSScriptRoot 'DysonReleasePackaging.Common.ps1')
 
 $newArtifactScript = Join-Path $PSScriptRoot 'New-DysonControlReleaseArtifact.ps1'
 $testArtifactScript = Join-Path $PSScriptRoot 'Test-DysonControlReleaseArtifact.ps1'
@@ -90,6 +91,10 @@ try {
         'New-DysonPrivateEvidenceBundle.ps1', 'SelfTest-DysonPrivateEvidenceBundle.ps1',
         'Test-DysonPrivateEvidenceBundle.ps1'
     )
+    $hostMutationScriptPaths = @($script:DysonArtifactRequiredHostMutationScripts)
+    $hostMutationScripts = @($hostMutationScriptPaths | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+    Assert-ReleaseSelfTest -Condition ($hostMutationScripts.Count -eq 3) `
+        -Message 'the exact required host-mutation lease script allowlist did not contain three entries'
     $migrationDocs = @('docs/GSM-EVALUATION.md', 'docs/WINDOWS-DEPLOYMENT-DRAFT.md')
     $bridgeScripts = @(
         'Build-DysonControlBridgeCandidate.ps1', 'DysonBridge.Common.ps1',
@@ -105,6 +110,11 @@ try {
     foreach ($name in $topLevelScripts) {
         Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\$name") `
             -Destination (Join-Path $fixtureRoot "scripts\windows\$name")
+    }
+    foreach ($relative in $hostMutationScriptPaths) {
+        $name = [System.IO.Path]::GetFileName($relative)
+        Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\$name") `
+            -Destination (Join-Path $fixtureRoot $relative.Replace('/', '\'))
     }
     foreach ($name in $releaseVerifierScripts) {
         Copy-FixtureScript -Source (Join-Path $PSScriptRoot $name) `
@@ -161,6 +171,8 @@ try {
         -Message 'artifact verification did not attest the GSManager parallel-migration tools and documentation'
     Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.privateAcceptanceEvidenceToolingPackaged) `
         -Message 'artifact verification did not attest the private acceptance evidence tooling'
+    Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.hostMutationLeaseToolingPackaged) `
+        -Message 'artifact verification did not attest the host-mutation lease tooling'
     Assert-ReleaseSelfTest -Condition ($verifiedA.payloadSha256 -eq $verifiedB.payloadSha256) -Message 'identical inputs produced different payload hashes'
     $manifestA = [System.IO.File]::ReadAllText((Join-Path $artifactA 'artifact-manifest.json'), [System.Text.Encoding]::UTF8)
     $manifestB = [System.IO.File]::ReadAllText((Join-Path $artifactB 'artifact-manifest.json'), [System.Text.Encoding]::UTF8)
@@ -202,6 +214,10 @@ try {
     foreach ($name in $evidenceScripts) {
         Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA "scripts\windows\evidence\$name") -PathType Leaf) `
             -Message "a private acceptance evidence tool was omitted from the public artifact: $name"
+    }
+    foreach ($relative in $hostMutationScriptPaths) {
+        Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA $relative.Replace('/', '\')) -PathType Leaf) `
+            -Message "a required host-mutation lease script was omitted from the artifact: $relative"
     }
     $packagedEvidenceSelfTest = Convert-LastJsonResult -Output (& (Join-Path $artifactA `
         'scripts\windows\evidence\SelfTest-DysonPrivateEvidenceBundle.ps1'))
@@ -274,6 +290,39 @@ try {
     catch { $evidenceExtraRejected = $true }
     Assert-ReleaseSelfTest -Condition $evidenceExtraRejected -Message 'an extra private acceptance evidence script was accepted'
     Remove-Item -LiteralPath (Join-Path $artifactB 'scripts\windows\evidence\Unexpected-Evidence.ps1') -Force
+
+    $hostMutationMissingFileCases = 0
+    for ($hostMutationIndex = 0; $hostMutationIndex -lt $hostMutationScriptPaths.Count; $hostMutationIndex++) {
+        $requiredHostMutationPath = Join-Path $artifactB $hostMutationScriptPaths[$hostMutationIndex].Replace('/', '\')
+        $requiredHostMutationBackup = Join-Path $testRoot ("required-host-mutation-$hostMutationIndex.backup")
+        [System.IO.File]::Move($requiredHostMutationPath, $requiredHostMutationBackup)
+        $hostMutationMissingMessage = $null
+        try {
+            & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null
+        }
+        catch {
+            $hostMutationMissingMessage = $_.Exception.Message
+        }
+        finally {
+            if (Test-Path -LiteralPath $requiredHostMutationBackup -PathType Leaf) {
+                [System.IO.File]::Move($requiredHostMutationBackup, $requiredHostMutationPath)
+            }
+        }
+        Assert-ReleaseSelfTest -Condition ($hostMutationMissingMessage -eq 'The host-mutation lease delivery package is incomplete.') `
+            -Message "removing required host-mutation lease script index $hostMutationIndex did not fail through the exact required-file gate"
+        $hostMutationMissingFileCases++
+    }
+    Assert-ReleaseSelfTest -Condition ($hostMutationMissingFileCases -eq $hostMutationScriptPaths.Count) `
+        -Message 'not every required host-mutation lease script was covered by a removal test'
+
+    $unexpectedHostMutationPath = Join-Path $artifactB 'scripts\windows\Unexpected-DysonHostMutationLease.ps1'
+    Write-FixtureText -Path $unexpectedHostMutationPath -Value "throw 'unexpected host-mutation lease tool'`n"
+    $hostMutationExtraRejected = $false
+    try { & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null }
+    catch { $hostMutationExtraRejected = $true }
+    Assert-ReleaseSelfTest -Condition $hostMutationExtraRejected `
+        -Message 'an extra host-mutation lease script outside the exact allowlist was accepted'
+    Remove-Item -LiteralPath $unexpectedHostMutationPath -Force
 
     $installRoot = Join-Path $testRoot 'deployment-install'
     $dataRoot = Join-Path $testRoot 'deployment-data'
@@ -388,6 +437,10 @@ try {
         gsManagerParallelMigrationPackaged = $true
         migrationDocumentationPackaged = $true
         privateAcceptanceEvidenceToolingPackaged = $true
+        hostMutationLeaseToolingPackaged = $true
+        hostMutationMissingFilesRejected = $true
+        hostMutationMissingFileCases = $hostMutationMissingFileCases
+        hostMutationExtraFileRejected = $true
         packagedEvidenceSelfTestPassed = $true
         evidenceMissingFileRejected = $true
         evidenceExtraFileRejected = $true

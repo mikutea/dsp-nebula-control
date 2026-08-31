@@ -182,6 +182,7 @@ $runtimeSessionScripts = @(
 )
 $runtimeMigrationScripts = @($script:DysonArtifactRequiredMigrationScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
 $runtimeEvidenceScripts = @($script:DysonArtifactRequiredEvidenceScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+$runtimeHostMutationScripts = @($script:DysonArtifactRequiredHostMutationScripts)
 $runtimeBridgeScripts = @($script:DysonArtifactRequiredBridgeScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
 $bridgeSourceFiles = @($script:DysonArtifactRequiredBridgeSources | ForEach-Object { [System.IO.Path]::GetFileName($_) })
 $scriptFiles = @()
@@ -189,6 +190,12 @@ foreach ($name in $runtimeTopLevelScripts) {
     $source = Join-Path $windowsScripts $name
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required Windows runtime script is missing: $name" }
     $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/$name" }
+}
+foreach ($relative in $runtimeHostMutationScripts) {
+    $name = [System.IO.Path]::GetFileName($relative)
+    $source = Join-Path $repository $relative.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required host-mutation lease script is missing: $name" }
+    $scriptFiles += [ordered]@{ source = $source; relative = $relative }
 }
 foreach ($name in $runtimeReleaseScripts) {
     $source = Join-Path (Join-Path $windowsScripts 'release') $name
@@ -296,6 +303,7 @@ $preview = [ordered]@{
     builtApiFiles = $apiFiles.Count
     builtWebFiles = $webFiles.Count
     runtimeWindowsScripts = $scriptFiles.Count
+    hostMutationLeaseScripts = $runtimeHostMutationScripts.Count
     gsManagerMigrationScripts = $runtimeMigrationScripts.Count
     privateAcceptanceEvidenceScripts = $runtimeEvidenceScripts.Count
     migrationDocuments = $migrationDocFiles.Count
@@ -352,6 +360,7 @@ try {
         gsManagerParallelMigrationPackaged = $true
         migrationDocumentationPackaged = $true
         privateAcceptanceEvidenceToolingPackaged = $true
+        hostMutationLeaseToolingPackaged = $true
         productionChanged = $false
     } | ConvertTo-DysonArtifactJsonLine
 }

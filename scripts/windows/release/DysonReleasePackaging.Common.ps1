@@ -38,6 +38,11 @@ $script:DysonArtifactRequiredEvidenceScripts = @(
     'scripts/windows/evidence/SelfTest-DysonPrivateEvidenceBundle.ps1',
     'scripts/windows/evidence/Test-DysonPrivateEvidenceBundle.ps1'
 )
+$script:DysonArtifactRequiredHostMutationScripts = @(
+    'scripts/windows/DysonHostMutationLease.Common.ps1',
+    'scripts/windows/Invoke-DysonHostMutationLeaseBroker.ps1',
+    'scripts/windows/SelfTest-DysonHostMutationLease.ps1'
+)
 $script:DysonArtifactRequiredMigrationDocs = @(
     'docs/GSM-EVALUATION.md',
     'docs/WINDOWS-DEPLOYMENT-DRAFT.md'
@@ -216,6 +221,7 @@ function Assert-DysonArtifactAllowedFile {
     $allowedBridgeScripts = @($script:DysonArtifactRequiredBridgeScripts | ForEach-Object { $_.ToLowerInvariant() })
     $allowedMigrationScripts = @($script:DysonArtifactRequiredMigrationScripts | ForEach-Object { $_.ToLowerInvariant() })
     $allowedEvidenceScripts = @($script:DysonArtifactRequiredEvidenceScripts | ForEach-Object { $_.ToLowerInvariant() })
+    $allowedHostMutationScripts = @($script:DysonArtifactRequiredHostMutationScripts | ForEach-Object { $_.ToLowerInvariant() })
     $allowedMigrationDocs = @($script:DysonArtifactRequiredMigrationDocs | ForEach-Object { $_.ToLowerInvariant() })
     if ($lower.StartsWith('integrations/dyson-control-bridge/') -and $lower -notin $allowedBridgeSources) {
         throw "The public Bridge source package contains a path outside its exact allowlist: $RelativePath"
@@ -228,6 +234,10 @@ function Assert-DysonArtifactAllowedFile {
     }
     if ($lower.StartsWith('scripts/windows/evidence/') -and $lower -notin $allowedEvidenceScripts) {
         throw "The private acceptance evidence tools contain a path outside their exact allowlist: $RelativePath"
+    }
+    if ($segments.Count -eq 3 -and $segments[0] -eq 'scripts' -and $segments[1] -eq 'windows' -and
+        $name.Contains('dysonhostmutationlease') -and $lower -notin $allowedHostMutationScripts) {
+        throw "The host-mutation lease tools contain a path outside their exact allowlist: $RelativePath"
     }
     if ($lower.StartsWith('docs/') -and $lower -notin $allowedMigrationDocs) {
         throw "The release documentation contains a path outside its exact allowlist: $RelativePath"
@@ -408,6 +418,13 @@ function Test-DysonControlReleaseArtifactCore {
             throw 'The private acceptance evidence delivery package is incomplete.'
         }
     }
+    foreach ($requiredHostMutationPath in $script:DysonArtifactRequiredHostMutationScripts) {
+        $requiredHostMutationFile = Get-DysonArtifactFullPath -Path (Join-Path $root $requiredHostMutationPath.Replace('/', '\'))
+        if (-not (Test-DysonArtifactPathWithin -Candidate $requiredHostMutationFile -Parent $root) -or
+            -not (Test-Path -LiteralPath $requiredHostMutationFile -PathType Leaf)) {
+            throw 'The host-mutation lease delivery package is incomplete.'
+        }
+    }
     $inventory = Get-DysonArtifactInventory -Root $root
     if ($inventory.payloadSha256 -ne [string]$manifest.payloadSha256 -or
         $inventory.fileCount -ne [int]$manifest.fileCount -or
@@ -457,5 +474,6 @@ function Test-DysonControlReleaseArtifactCore {
         gsManagerParallelMigrationPackaged = $true
         migrationDocumentationPackaged = $true
         privateAcceptanceEvidenceToolingPackaged = $true
+        hostMutationLeaseToolingPackaged = $true
     }
 }
