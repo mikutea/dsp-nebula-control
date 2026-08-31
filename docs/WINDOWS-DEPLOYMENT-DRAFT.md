@@ -810,6 +810,70 @@ The offline transaction/rollback fixture runs as `npm run session:selftest` and
 is included in the root `npm run check` gate; it deliberately reports that
 native LSA runtime and real boot validation are still required.
 
+## Reboot-resume acceptance checkpoint
+
+The deployment directory includes a bounded two-command protocol for an
+operator-approved reboot drill. It does not initiate a reboot, register or run
+a task, log on, or change the game/control processes. The first command proves a
+healthy pre-reboot baseline and, unless run with `-WhatIf`, creates one immutable
+checkpoint beneath `DataRoot\acceptance\reboot-checkpoints`. The checkpoint is
+restricted with the deployment backup ACL and binds the current host/boot,
+active release and payload, exact control task, game project/account identities,
+port, both tasks' baseline last-run times, creation time, and expiry. Its
+SHA-256 field detects accidental or local content corruption; it is not a
+signature and does not replace a private acceptance evidence bundle.
+
+Preview first, then create the checkpoint only on the intended validation host:
+
+```powershell
+& .\scripts\windows\deployment\New-DysonRebootAcceptanceCheckpoint.ps1 `
+  -InstallRoot 'C:\Program Files\FictionalDysonControl' `
+  -DataRoot 'C:\ProgramData\FictionalDysonControl' `
+  -ReadinessUri 'http://127.0.0.1:13010/readyz' `
+  -WhatIf
+
+$checkpointJson = & .\scripts\windows\deployment\New-DysonRebootAcceptanceCheckpoint.ps1 `
+  -InstallRoot 'C:\Program Files\FictionalDysonControl' `
+  -DataRoot 'C:\ProgramData\FictionalDysonControl' `
+  -ReadinessUri 'http://127.0.0.1:13010/readyz'
+$checkpoint = $checkpointJson | ConvertFrom-Json
+```
+
+After a separately authorized real guest reboot, resume with the exact returned
+ID and the same roots:
+
+```powershell
+& .\scripts\windows\deployment\Test-DysonRebootAcceptanceResume.ps1 `
+  -InstallRoot 'C:\Program Files\FictionalDysonControl' `
+  -DataRoot 'C:\ProgramData\FictionalDysonControl' `
+  -CheckpointId $checkpoint.checkpointId `
+  -ReadinessUri 'http://127.0.0.1:13010/readyz'
+```
+
+Resume is read-only and fails closed when the checkpoint is missing, redirected,
+noncanonical, ACL-invalid, tampered, expired, resumed on a different host, or
+still on the original boot. It also rejects a boot timestamp outside the
+checkpoint window, control release/task drift, game project/account drift, a
+missing non-Session-0 dedicated session, an unhealthy loopback API, or a game
+runtime/process/listener mismatch. The control and game scheduled tasks must
+both be in `Running` state, and each current `LastRunTime` must be newer than
+the checkpoint baseline and fall within the new boot window. This proves that
+both task instances executed after the reboot; Task Scheduler's `LastRunTime`
+does not by itself prove that the boot/logon trigger, rather than a later manual
+`Start-ScheduledTask`, caused the run. The native receipt therefore fixes
+`automaticTaskTriggerProven`, `unattendedStartupValidated`, and
+`qualifyingProductionEvidence` to `false`, and fixes
+`requiresPrivateEvidenceBundle` to `true`. The operator must place the receipt,
+Task Scheduler Operational trigger/instance evidence, and independently
+captured no-manual-login evidence in the private acceptance workflow.
+
+`npm run deployment:reboot-selftest` exercises this state machine using only a
+unique fictional temporary root and injected fixture observations. Its receipt
+always reports `realRebootObserved: false`,
+`nativeTaskSchedulerValidated: false`, and `productionChanged: false`. It proves
+the repository contract and rejection behavior, not a real reboot, native Task
+Scheduler/LSA behavior, or target-host recovery.
+
 ## Non-administrator self-test
 
 The Pester-free self-test creates fictional payloads beneath a unique temporary
@@ -852,9 +916,10 @@ It verifies:
 - restoration of the exact task XML and prior Running state when unregister fails
   after Stop, and when a later uninstall filesystem step fails.
 
-The self-test validates PowerShell 5.1 behavior but cannot prove Task Scheduler,
-service-account ACL inheritance, boot startup, process termination, or real HTTP
-health on the target Windows host. Those remain target-host gates.
+The deployment self-tests validate PowerShell 5.1 behavior but cannot prove
+Task Scheduler, service-account ACL inheritance, boot startup, process
+termination, or real HTTP health on the target Windows host. Those remain
+target-host gates.
 
 `npm run powershell:check` recursively parses every `.ps1` file beneath
 `scripts/windows`, including this deployment directory. Parser success and the
@@ -867,11 +932,15 @@ non-production Windows Server Core VM and then on the target during an approved
 maintenance window:
 
 1. Parse every script in `scripts/windows/deployment` with the Windows PowerShell
-   parser and run the Pester-free self-test.
+   parser and run both Pester-free deployment self-tests.
 2. Install with a complete local production configuration and the exact supported
    Node 24 executable.
-3. Confirm the startup task runs without any RDP/interactive user session and
-   survives a guest reboot.
+3. Create a reboot-acceptance checkpoint, perform a separately approved guest
+   reboot, and resume the exact checkpoint ID. Preserve the private receipt and
+   independently prove the AtStartup and dedicated-account AtLogOn triggers
+   caused the recorded task instances without an RDP/manual recovery action,
+   the dedicated game session/task became healthy, and neither runtime
+   duplicated.
 4. Confirm `Get-NetTCPConnection` shows the Node listener only on loopback.
 5. Confirm the service identity can access ProgramData and the configured project
    root, while no credentials are copied into a release.
@@ -904,7 +973,8 @@ operator must still provide or decide:
 - the artifact retention policy for inactive releases and deployment snapshots.
 
 Release automation must continue to preserve the recursive PowerShell parser,
-deployment self-test, exact artifact/package verifiers, and public-release scan.
+both deployment self-tests, exact artifact/package verifiers, and public-release
+scan.
 The real clean-host and target-host commands above have not yet been executed as
 production evidence. Until those runs exist, `OSS-001` and `SRV-002` are
 `implemented`, not `verified`, and this mechanism is not authorization to replace

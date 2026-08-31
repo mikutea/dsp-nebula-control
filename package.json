@@ -23,6 +23,7 @@
     "host-mutation:selftest": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows/SelfTest-DysonHostMutationLease.ps1",
     "evidence:selftest": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows/evidence/SelfTest-DysonPrivateEvidenceBundle.ps1",
     "deployment:selftest": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1",
+    "deployment:reboot-selftest": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows/deployment/SelfTest-DysonRebootAcceptance.ps1",
     "session:selftest": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows/session/SelfTest-DysonInteractiveSession.ps1",
     "release:artifact": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows/release/New-DysonControlReleaseArtifact.ps1",
     "release:artifact-check": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows/release/Test-DysonControlReleaseArtifact.ps1",
@@ -33,7 +34,7 @@
     "release:workflow-selftest": "node --test scripts/windows/release/release-workflow.test.mjs",
     "public-release:check": "node scripts/public-release/check.mjs --history",
     "public-release:selftest": "node --test scripts/public-release/scanner.test.mjs",
-    "check": "npm run version:check && npm run version:selftest && npm run acceptance:check && npm run acceptance:selftest && npm run public-release:selftest && npm run bridge:protocol-check && npm run powershell:check && npm run host-mutation:selftest && npm run bridge:selftest && npm run migration:selftest && npm run evidence:selftest && npm run deployment:selftest && npm run session:selftest && npm run release:selftest && npm run release:package-selftest && npm run release:workflow-selftest && npm run typecheck && npm test && npm run build",
+    "check": "npm run version:check && npm run version:selftest && npm run acceptance:check && npm run acceptance:selftest && npm run public-release:selftest && npm run bridge:protocol-check && npm run powershell:check && npm run host-mutation:selftest && npm run bridge:selftest && npm run migration:selftest && npm run evidence:selftest && npm run deployment:selftest && npm run deployment:reboot-selftest && npm run session:selftest && npm run release:selftest && npm run release:package-selftest && npm run release:workflow-selftest && npm run typecheck && npm test && npm run build",
     "hash-password": "npm --prefix apps/api run hash-password --"
   },
   "engines": {

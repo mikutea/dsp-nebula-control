@@ -73,9 +73,11 @@ try {
         'DysonReleasePackaging.Common.ps1', 'Test-DysonControlReleaseArtifact.ps1'
     )
     $deploymentScripts = @(
-        'DysonDeployment.Common.ps1', 'Install-DysonControl.ps1', 'Install-DysonControlTask.ps1',
-        'Invoke-DysonControlDeployment.ps1', 'Start-DysonControl.ps1',
-        'Test-DysonControlDeployment.ps1', 'Uninstall-DysonControl.ps1'
+        'DysonDeployment.Common.ps1', 'DysonRebootAcceptance.Common.ps1',
+        'Install-DysonControl.ps1', 'Install-DysonControlTask.ps1',
+        'Invoke-DysonControlDeployment.ps1', 'New-DysonRebootAcceptanceCheckpoint.ps1',
+        'Start-DysonControl.ps1', 'Test-DysonControlDeployment.ps1',
+        'Test-DysonRebootAcceptanceResume.ps1', 'Uninstall-DysonControl.ps1'
     )
     $sessionScripts = @(
         'Configure-DysonInteractiveSession.ps1', 'Disable-DysonInteractiveSession.ps1',

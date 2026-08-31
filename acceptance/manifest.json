@@ -588,8 +588,12 @@
         { "kind": "implementation", "ref": "scripts/windows/Install-DysonRuntimeTasks.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/session/Configure-DysonInteractiveSession.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/session/Disable-DysonInteractiveSession.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/deployment/DysonRebootAcceptance.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/deployment/New-DysonRebootAcceptanceCheckpoint.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/deployment/Test-DysonRebootAcceptanceResume.ps1" },
         { "kind": "self-test", "ref": "scripts/windows/session/SelfTest-DysonInteractiveSession.ps1" },
         { "kind": "self-test", "ref": "scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/deployment/SelfTest-DysonRebootAcceptance.ps1" },
         { "kind": "contract", "ref": "docs/WINDOWS-DEPLOYMENT-DRAFT.md" }
       ]
     },
