@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { HostMutationLeaseError } from '../host-mutation/lease.js'
+import type { HostMutationOperationScope } from '../host-mutation/operation-coordinator.js'
 import {
   ComponentUpdateActivationError,
   FixedLiveComponentDeployment,
@@ -18,6 +21,11 @@ const limits = {
   maximumExpandedBytes: 64 * 1_024 * 1_024,
   maximumFiles: 64
 }
+const activeHostMutation: HostMutationOperationScope = {
+  signal: new AbortController().signal,
+  assertActive: () => undefined,
+  toPowerShellBorrowArguments: () => []
+}
 
 afterEach(async () => {
   await Promise.all(temporaryRoots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })))
@@ -32,12 +40,14 @@ describe('fixed live component deployment', () => {
     ])
     const service = createService(fixture)
 
-    expect(await service.publishCandidate(request)).toMatchObject({ status: 'published', reused: false, fileCount: 2 })
+    expect(await service.publishCandidate(request, activeHostMutation)).toMatchObject({ status: 'published', reused: false, fileCount: 2 })
     expect(await readFile(path.join(fixture.liveRoot, 'plugins', 'nebula-NebulaMultiplayerMod', 'Nebula.dll'), 'utf8')).toBe('candidate-nebula')
-    expect(await service.commitCandidate(request)).toMatchObject({ status: 'committed', reused: false })
-    expect(await service.commitCandidate(request)).toMatchObject({ status: 'committed', reused: true })
+    expect(await service.commitCandidate(request, activeHostMutation)).toMatchObject({ status: 'committed', reused: false })
+    expect(await service.commitCandidate(request, activeHostMutation)).toMatchObject({ status: 'committed', reused: true })
 
-    await expect(service.publishCandidate({ ...request, artifactId: 'nebula-artifact-conflict' }))
+    await expect(service.publishCandidate(
+      { ...request, artifactId: 'nebula-artifact-conflict' }, activeHostMutation
+    ))
       .rejects.toMatchObject({ code: 'UPDATE_LIVE_IDEMPOTENCY_CONFLICT' })
     const persisted = await readFile(
       path.join(fixture.controlRoot, 'receipts', `${request.requestId}.json`),
@@ -57,11 +67,11 @@ describe('fixed live component deployment', () => {
     ])
     const service = createService(fixture)
 
-    await service.publishCandidate(request)
+    await service.publishCandidate(request, activeHostMutation)
     expect(await readFile(liveFile, 'utf8')).toBe('candidate-nebula')
-    expect(await service.rollbackCandidate(request)).toMatchObject({ status: 'rolled-back', reused: false })
+    expect(await service.rollbackCandidate(request, activeHostMutation)).toMatchObject({ status: 'rolled-back', reused: false })
     expect(await readFile(liveFile, 'utf8')).toBe('previous-nebula')
-    expect(await service.rollbackCandidate(request)).toMatchObject({ status: 'rolled-back', reused: true })
+    expect(await service.rollbackCandidate(request, activeHostMutation)).toMatchObject({ status: 'rolled-back', reused: true })
   })
 
   it('recovers a published-but-uncommitted transaction after a fresh service instance', async () => {
@@ -73,11 +83,11 @@ describe('fixed live component deployment', () => {
       ['plugins/nebula-NebulaMultiplayerMod/Nebula.dll', Buffer.from('candidate-nebula')]
     ])
 
-    await createService(fixture).publishCandidate(request)
+    await createService(fixture).publishCandidate(request, activeHostMutation)
     const restarted = createService(fixture)
-    await expect(restarted.reconcileCandidate(request, 'previous')).resolves.toBe('previous')
+    await expect(restarted.reconcileCandidate(request, 'previous', activeHostMutation)).resolves.toBe('previous')
     expect(await readFile(liveFile, 'utf8')).toBe('previous-nebula')
-    await expect(restarted.reconcileCandidate(request, 'previous')).resolves.toBe('previous')
+    await expect(restarted.reconcileCandidate(request, 'previous', activeHostMutation)).resolves.toBe('previous')
   })
 
   it('compensates every changed file when a later candidate copy fails', async () => {
@@ -100,7 +110,7 @@ describe('fixed live component deployment', () => {
       }
     })
 
-    await expect(service.publishCandidate(request)).rejects.toBeInstanceOf(ComponentUpdateActivationError)
+    await expect(service.publishCandidate(request, activeHostMutation)).rejects.toBeInstanceOf(ComponentUpdateActivationError)
     expect(await readFile(first, 'utf8')).toBe('old-a')
     expect(await readFile(second, 'utf8')).toBe('old-b')
     const receipt = JSON.parse(await readFile(
@@ -108,6 +118,135 @@ describe('fixed live component deployment', () => {
       'utf8'
     )) as { status: string }
     expect(receipt.status).toBe('rolled-back')
+  })
+
+  it.each(['first-target-moved', 'first-candidate-installed'] as const)(
+    'preserves the live journal without rollback when the lease is lost after %s',
+    async (boundary) => {
+      const fixture = await createFixture()
+      const first = path.join(fixture.liveRoot, 'plugins', 'nebula-NebulaMultiplayerMod', 'A.dll')
+      const second = path.join(fixture.liveRoot, 'plugins', 'nebula-NebulaMultiplayerMod', 'B.dll')
+      await mkdir(path.dirname(first), { recursive: true })
+      await Promise.all([writeFile(first, 'old-a'), writeFile(second, 'old-b')])
+      const request = await createImmutableRelease(
+        fixture, 'nebula', '0.9.1', `nebula-artifact-lost-${boundary}`,
+        [
+          ['plugins/nebula-NebulaMultiplayerMod/A.dll', Buffer.from('new-a')],
+          ['plugins/nebula-NebulaMultiplayerMod/B.dll', Buffer.from('new-b')]
+        ]
+      )
+      const siblings = liveSiblingPathsForTest(first, request.requestId, 0)
+      const lost = new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+      const scope = faultingHostMutation(() => {
+        const firstMoved = !existsSync(first) && existsSync(siblings.previous) && existsSync(siblings.candidate)
+        const candidateInstalled = existsSync(first) && existsSync(siblings.previous) &&
+          readFileSync(first, 'utf8') === 'new-a'
+        if ((boundary === 'first-target-moved' && firstMoved) ||
+            (boundary === 'first-candidate-installed' && candidateInstalled)) {
+          throw lost
+        }
+      })
+
+      await expect(createService(fixture).publishCandidate(request, scope)).rejects.toBe(lost)
+
+      expect(await readFile(second, 'utf8')).toBe('old-b')
+      expect(existsSync(path.join(fixture.controlRoot, 'journals', `${request.requestId}.json`))).toBe(true)
+      expect(existsSync(path.join(fixture.controlRoot, 'receipts', `${request.requestId}.json`))).toBe(false)
+      if (boundary === 'first-target-moved') {
+        expect(existsSync(first)).toBe(false)
+        expect(existsSync(siblings.previous)).toBe(true)
+        expect(existsSync(siblings.candidate)).toBe(true)
+      } else {
+        expect(await readFile(first, 'utf8')).toBe('new-a')
+        expect(existsSync(siblings.previous)).toBe(true)
+      }
+    }
+  )
+
+  it('rethrows lease loss from the second internal stopped proof without cleanup', async () => {
+    const fixture = await createFixture()
+    const liveFile = path.join(fixture.liveRoot, 'plugins', 'nebula-NebulaMultiplayerMod', 'Nebula.dll')
+    await mkdir(path.dirname(liveFile), { recursive: true })
+    await writeFile(liveFile, 'old-nebula')
+    const request = await createImmutableRelease(
+      fixture, 'nebula', '0.9.1', 'nebula-artifact-lost-stop-proof',
+      [['plugins/nebula-NebulaMultiplayerMod/Nebula.dll', Buffer.from('new-nebula')]]
+    )
+    const lost = new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+    let proofs = 0
+    const service = createService(fixture, {
+      verifyStoppedState: async (_request, receivedScope) => {
+        expect(receivedScope).toBe(activeHostMutation)
+        expect(receivedScope.signal).toBe(activeHostMutation.signal)
+        proofs += 1
+        if (proofs === 2) throw lost
+        return { processStopped: true, portClosed: true }
+      }
+    })
+
+    await expect(service.publishCandidate(request, activeHostMutation)).rejects.toBe(lost)
+
+    expect(proofs).toBe(2)
+    expect(await readFile(liveFile, 'utf8')).toBe('old-nebula')
+    expect(existsSync(path.join(fixture.controlRoot, 'journals', `${request.requestId}.json`))).toBe(true)
+    expect(existsSync(path.join(fixture.controlRoot, 'transactions', request.requestId))).toBe(true)
+    expect(existsSync(path.join(fixture.controlRoot, 'receipts', `${request.requestId}.json`))).toBe(false)
+  })
+
+  it('stops rollback at the first live discard rename when the lease is lost', async () => {
+    const fixture = await createFixture()
+    const liveFile = path.join(fixture.liveRoot, 'plugins', 'nebula-NebulaMultiplayerMod', 'Nebula.dll')
+    await mkdir(path.dirname(liveFile), { recursive: true })
+    await writeFile(liveFile, 'old-nebula')
+    const request = await createImmutableRelease(
+      fixture, 'nebula', '0.9.1', 'nebula-artifact-lost-rollback',
+      [['plugins/nebula-NebulaMultiplayerMod/Nebula.dll', Buffer.from('new-nebula')]]
+    )
+    const service = createService(fixture)
+    await service.publishCandidate(request, activeHostMutation)
+    const siblings = liveSiblingPathsForTest(liveFile, request.requestId, 0)
+    const lost = new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+    const scope = faultingHostMutation(() => {
+      if (!existsSync(liveFile) && existsSync(siblings.discard) && existsSync(siblings.candidate)) {
+        throw lost
+      }
+    })
+
+    await expect(service.rollbackCandidate(request, scope)).rejects.toBe(lost)
+
+    expect(existsSync(liveFile)).toBe(false)
+    expect(existsSync(siblings.discard)).toBe(true)
+    expect(existsSync(siblings.candidate)).toBe(true)
+    expect(existsSync(path.join(fixture.controlRoot, 'journals', `${request.requestId}.json`))).toBe(true)
+    expect(existsSync(path.join(fixture.controlRoot, 'receipts', `${request.requestId}.json`))).toBe(false)
+  })
+
+  it('stops restart reconciliation at the first live restore boundary when the lease is lost', async () => {
+    const fixture = await createFixture()
+    const liveFile = path.join(fixture.liveRoot, 'plugins', 'nebula-NebulaMultiplayerMod', 'Nebula.dll')
+    await mkdir(path.dirname(liveFile), { recursive: true })
+    await writeFile(liveFile, 'old-nebula')
+    const request = await createImmutableRelease(
+      fixture, 'nebula', '0.9.1', 'nebula-artifact-lost-reconcile',
+      [['plugins/nebula-NebulaMultiplayerMod/Nebula.dll', Buffer.from('new-nebula')]]
+    )
+    await createService(fixture).publishCandidate(request, activeHostMutation)
+    const restarted = createService(fixture)
+    const siblings = liveSiblingPathsForTest(liveFile, request.requestId, 0)
+    const lost = new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+    const scope = faultingHostMutation(() => {
+      if (!existsSync(liveFile) && existsSync(siblings.discard) && existsSync(siblings.candidate)) {
+        throw lost
+      }
+    })
+
+    await expect(restarted.reconcileCandidate(request, 'previous', scope)).rejects.toBe(lost)
+
+    expect(existsSync(liveFile)).toBe(false)
+    expect(existsSync(siblings.discard)).toBe(true)
+    expect(existsSync(siblings.candidate)).toBe(true)
+    expect(existsSync(path.join(fixture.controlRoot, 'journals', `${request.requestId}.json`))).toBe(true)
+    expect(existsSync(path.join(fixture.controlRoot, 'receipts', `${request.requestId}.json`))).toBe(false)
   })
 
   it('rejects unsupported plugin layout, an unproven stop, and immutable payload tampering without live mutation', async () => {
@@ -136,11 +275,11 @@ describe('fixed live component deployment', () => {
     ), 'tampered')
 
     const service = createService(fixture)
-    await expect(service.publishCandidate(unsupportedLayout)).rejects.toMatchObject({ code: 'UPDATE_RELEASE_FILE_TYPE_FORBIDDEN' })
+    await expect(service.publishCandidate(unsupportedLayout, activeHostMutation)).rejects.toMatchObject({ code: 'UPDATE_RELEASE_FILE_TYPE_FORBIDDEN' })
     await expect(createService(fixture, {
       verifyStoppedState: async () => ({ processStopped: false, portClosed: true })
-    }).publishCandidate(stoppedRequest)).rejects.toMatchObject({ code: 'UPDATE_SERVICE_STILL_RUNNING' })
-    await expect(service.publishCandidate(tampered)).rejects.toMatchObject({ code: 'UPDATE_RELEASE_CONTENT_MISMATCH' })
+    }).publishCandidate(stoppedRequest, activeHostMutation)).rejects.toMatchObject({ code: 'UPDATE_SERVICE_STILL_RUNNING' })
+    await expect(service.publishCandidate(tampered, activeHostMutation)).rejects.toMatchObject({ code: 'UPDATE_RELEASE_CONTENT_MISMATCH' })
     expect(await readFile(liveFile, 'utf8')).toBe('unchanged')
   })
 
@@ -150,28 +289,28 @@ describe('fixed live component deployment', () => {
       ['plugins/nebula-NebulaMultiplayerMod/Shared.dll', Buffer.from('nebula-owner')]
     ])
     const service = createService(fixture)
-    await service.publishCandidate(shared)
+    await service.publishCandidate(shared, activeHostMutation)
     await writeFile(path.join(fixture.liveRoot, 'plugins', 'nebula-NebulaMultiplayerMod', 'Shared.dll'), 'tampered-live')
-    await expect(service.commitCandidate(shared)).rejects.toMatchObject({ code: 'UPDATE_LIVE_CANDIDATE_VERIFICATION_FAILED' })
+    await expect(service.commitCandidate(shared, activeHostMutation)).rejects.toMatchObject({ code: 'UPDATE_LIVE_CANDIDATE_VERIFICATION_FAILED' })
     await writeFile(path.join(fixture.liveRoot, 'plugins', 'nebula-NebulaMultiplayerMod', 'Shared.dll'), 'nebula-owner')
-    await service.rollbackCandidate(shared)
+    await service.rollbackCandidate(shared, activeHostMutation)
 
     const owner = await createImmutableRelease(fixture, 'nebula', '0.9.2', 'nebula-artifact-0008', [
       ['plugins/nebula-NebulaMultiplayerMod/Shared.dll', Buffer.from('nebula-owner-v2')]
     ])
-    await service.publishCandidate(owner)
-    await service.commitCandidate(owner)
+    await service.publishCandidate(owner, activeHostMutation)
+    await service.commitCandidate(owner, activeHostMutation)
     const collision = await createImmutableRelease(fixture, 'bridge', '0.2.0', 'bridge-artifact-0002', [
       ['plugins/nebula-NebulaMultiplayerMod/Shared.dll', Buffer.from('bridge-collision')]
     ])
-    await expect(service.publishCandidate(collision)).rejects.toMatchObject({ code: 'UPDATE_RELEASE_FILE_TYPE_FORBIDDEN' })
+    await expect(service.publishCandidate(collision, activeHostMutation)).rejects.toMatchObject({ code: 'UPDATE_RELEASE_FILE_TYPE_FORBIDDEN' })
 
     const next = await createImmutableRelease(fixture, 'nebula', '0.9.3', 'nebula-artifact-0009', [
       ['plugins/nebula-NebulaMultiplayerMod/Nebula.dll', Buffer.from('next')]
     ])
     const lockRoot = path.join(fixture.controlRoot, 'locks')
     await writeFile(path.join(lockRoot, 'live.lock'), JSON.stringify({ host: 'another-host', bootId: 'unknown', pid: process.pid }))
-    await expect(createService(fixture).publishCandidate(next)).rejects.toMatchObject({ code: 'UPDATE_LIVE_LOCK_BUSY' })
+    await expect(createService(fixture).publishCandidate(next, activeHostMutation)).rejects.toMatchObject({ code: 'UPDATE_LIVE_LOCK_BUSY' })
   })
 
   it('never follows a linked or reparse live root', async () => {
@@ -189,7 +328,7 @@ describe('fixed live component deployment', () => {
       verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
     })
 
-    await expect(service.publishCandidate(request)).rejects.toMatchObject({ code: 'UPDATE_LIVE_DIRECTORY_INVALID' })
+    await expect(service.publishCandidate(request, activeHostMutation)).rejects.toMatchObject({ code: 'UPDATE_LIVE_DIRECTORY_INVALID' })
   })
 })
 
@@ -226,6 +365,27 @@ function createService(
     verifyStoppedState: async () => ({ processStopped: true, portClosed: true }),
     ...overrides
   })
+}
+
+function faultingHostMutation(assertActive: () => void): HostMutationOperationScope {
+  return {
+    signal: new AbortController().signal,
+    assertActive,
+    toPowerShellBorrowArguments: () => []
+  }
+}
+
+function liveSiblingPathsForTest(target: string, requestId: string, index: number): {
+  candidate: string
+  previous: string
+  discard: string
+} {
+  const prefix = `.dyson-${requestId}-${index}`
+  return {
+    candidate: path.join(path.dirname(target), `${prefix}.candidate.tmp`),
+    previous: path.join(path.dirname(target), `${prefix}.previous.tmp`),
+    discard: path.join(path.dirname(target), `${prefix}.discard.tmp`)
+  }
 }
 
 async function createImmutableRelease(

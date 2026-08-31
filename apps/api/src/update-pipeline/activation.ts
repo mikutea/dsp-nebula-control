@@ -367,12 +367,10 @@ export class ComponentUpdateActivationService {
       immutableReleaseRoot: path.join(this.#controlRoot, 'releases'),
       controlRoot: path.join(this.#controlRoot, 'live-deployment'),
       componentRoots: options.liveComponentRoots,
-      verifyStoppedState: async (request) => {
-        const context = this.#activeHostMutationContext
-        if (context === null) throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE')
-        context.scope.assertActive()
-        const proof = await this.#verifyStoppedState(request, context.scope)
-        context.scope.assertActive()
+      verifyStoppedState: async (request, hostMutation) => {
+        hostMutation.assertActive()
+        const proof = await this.#verifyStoppedState(request, hostMutation)
+        hostMutation.assertActive()
         return proof
       },
       limits: this.#limits,
@@ -483,7 +481,10 @@ export class ComponentUpdateActivationService {
               await this.#persistJournal(transaction)
               journalPersisted = true
               context.scope.assertActive()
-              await this.#liveDeployment.publishCandidate(transactionToLiveRequest(transaction))
+              await this.#liveDeployment.publishCandidate(
+                transactionToLiveRequest(transaction),
+                context.scope
+              )
               context.scope.assertActive()
               const candidateState = buildCandidateState(state, request, releaseId, transaction)
               await this.#writeActiveState(candidateState, context)
@@ -637,7 +638,10 @@ export class ComponentUpdateActivationService {
     if (healthy) {
       context.scope.assertActive()
       context.markPossibleWrite()
-      await this.#liveDeployment.commitCandidate(transactionToLiveRequest(transaction))
+      await this.#liveDeployment.commitCandidate(
+        transactionToLiveRequest(transaction),
+        context.scope
+      )
       context.scope.assertActive()
       const receipt = createReceipt({
         request,
@@ -693,7 +697,10 @@ export class ComponentUpdateActivationService {
     try {
       context.scope.assertActive()
       context.markPossibleWrite()
-      await this.#liveDeployment.rollbackCandidate(transactionToLiveRequest(transaction))
+      await this.#liveDeployment.rollbackCandidate(
+        transactionToLiveRequest(transaction),
+        context.scope
+      )
       context.scope.assertActive()
       await this.#writeActiveState(previousState, context)
     } catch (error) {
@@ -804,7 +811,8 @@ export class ComponentUpdateActivationService {
         context.scope.assertActive()
         liveResult = await this.#liveDeployment.reconcileCandidate(
           transactionToLiveRequest(journal.transaction),
-          'candidate'
+          'candidate',
+          context.scope
         )
         context.scope.assertActive()
       } catch (error) {
@@ -828,7 +836,8 @@ export class ComponentUpdateActivationService {
         context.scope.assertActive()
         await this.#liveDeployment.reconcileCandidate(
           transactionToLiveRequest(journal.transaction),
-          'previous'
+          'previous',
+          context.scope
         )
         context.scope.assertActive()
       } catch (error) {

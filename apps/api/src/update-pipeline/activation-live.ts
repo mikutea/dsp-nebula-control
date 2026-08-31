@@ -16,6 +16,8 @@ import type { FileHandle } from 'node:fs/promises'
 import { hostname, uptime } from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
+import { HostMutationLeaseError } from '../host-mutation/lease.js'
+import type { HostMutationOperationScope } from '../host-mutation/operation-coordinator.js'
 import {
   componentReleaseManifestSchema,
   verifyExtractedComponentRelease,
@@ -68,7 +70,10 @@ export interface FixedLiveComponentDeploymentOptions {
   immutableReleaseRoot: string
   controlRoot: string
   componentRoots: FixedLiveComponentRoots
-  verifyStoppedState(request: StoppedStateCheckRequest): Promise<StoppedStateProof>
+  verifyStoppedState(
+    request: StoppedStateCheckRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<StoppedStateProof>
   limits: ComponentArchiveLimits
   now?: () => Date
 }
@@ -306,17 +311,22 @@ export class FixedLiveComponentDeployment {
     for (const file of manifest.files) assertSupportedRelativePath(component, file.relativePath)
   }
 
-  async publishCandidate(input: unknown): Promise<FixedLiveComponentDeploymentReceipt> {
+  async publishCandidate(
+    input: unknown,
+    hostMutation: HostMutationOperationScope
+  ): Promise<FixedLiveComponentDeploymentReceipt> {
+    hostMutation.assertActive()
     const request = parseSupportedCandidateRequest(input)
-    return await this.#serialize(async () => {
-      const roots = await this.#prepareRoots()
-      return await this.#withLock(roots, async () => {
+    const result = await this.#serialize(async () => {
+      const roots = await this.#prepareRoots(hostMutation)
+      return await this.#withLock(roots, hostMutation, async () => {
+        hostMutation.assertActive()
         const fingerprint = fingerprintRequest(request)
         const receipt = await this.#readReceipt(roots, request.requestId)
         if (receipt !== null) {
           assertReceiptIdentity(receipt, request)
           const journal = await this.#readJournal(roots, request.requestId)
-          if (journal !== null) await this.#cleanupTransaction(roots, journal)
+          if (journal !== null) await this.#cleanupTransaction(roots, journal, hostMutation)
           if (receipt.status === 'rolled-back') throw new ComponentUpdateActivationError('UPDATE_LIVE_ALREADY_ROLLED_BACK')
           return { ...receipt, reused: true }
         }
@@ -326,30 +336,37 @@ export class FixedLiveComponentDeployment {
             throw new ComponentUpdateActivationError('UPDATE_LIVE_IDEMPOTENCY_CONFLICT')
           }
           if (existing.phase === 'published') {
-            await this.#verifyCandidateLive(existing)
+            await this.#verifyCandidateLive(existing, hostMutation)
             return makeReceipt(existing, 'published', this.#timestamp(), true)
           }
-          await this.#rollbackJournal(roots, existing)
+          await this.#rollbackJournal(roots, existing, hostMutation)
           throw new ComponentUpdateActivationError('UPDATE_LIVE_PUBLISH_INTERRUPTED')
         }
         await this.#assertNoOtherJournal(roots, request.requestId)
-        await this.#requireStopped(request, 'before-publish')
-        const journal = await this.#prepareJournal(roots, request, fingerprint)
+        await this.#requireStopped(request, 'before-publish', hostMutation)
+        const journal = await this.#prepareJournal(roots, request, fingerprint, hostMutation)
         try {
-          await this.#requireStopped(request, 'before-publish')
+          await this.#requireStopped(request, 'before-publish', hostMutation)
         } catch (error) {
-          await this.#cleanupTransaction(roots, journal).catch(() => undefined)
-          await this.#removeCreatedDirectories(journal).catch(() => undefined)
+          if (error instanceof HostMutationLeaseError) throw error
+          await ignoreCleanupFailureUnlessLeaseLost(
+            this.#cleanupTransaction(roots, journal, hostMutation)
+          )
+          await ignoreCleanupFailureUnlessLeaseLost(
+            this.#removeCreatedDirectories(journal, hostMutation)
+          )
           throw error
         }
         try {
-          await this.#applyCandidate(roots, journal)
+          await this.#applyCandidate(roots, journal, hostMutation)
           const published = { ...journal, phase: 'published' as const }
-          await this.#writeJournal(roots, published)
-          await this.#verifyCandidateLive(published)
+          await this.#writeJournal(roots, published, hostMutation)
+          await this.#verifyCandidateLive(published, hostMutation)
           return makeReceipt(published, 'published', this.#timestamp(), false)
         } catch (error) {
-          await this.#rollbackJournal(roots, journal).catch((rollbackError: unknown) => {
+          if (error instanceof HostMutationLeaseError) throw error
+          await this.#rollbackJournal(roots, journal, hostMutation).catch((rollbackError: unknown) => {
+            if (rollbackError instanceof HostMutationLeaseError) throw rollbackError
             throw new ComponentUpdateActivationError('UPDATE_LIVE_ROLLBACK_FAILED', { cause: rollbackError })
           })
           if (error instanceof ComponentUpdateActivationError) throw error
@@ -357,104 +374,123 @@ export class FixedLiveComponentDeployment {
         }
       })
     })
+    hostMutation.assertActive()
+    return result
   }
 
-  async commitCandidate(input: unknown): Promise<FixedLiveComponentDeploymentReceipt> {
+  async commitCandidate(
+    input: unknown,
+    hostMutation: HostMutationOperationScope
+  ): Promise<FixedLiveComponentDeploymentReceipt> {
+    hostMutation.assertActive()
     const request = parseSupportedCandidateRequest(input)
-    return await this.#serialize(async () => {
-      const roots = await this.#prepareRoots()
-      return await this.#withLock(roots, async () => {
+    const result = await this.#serialize(async () => {
+      const roots = await this.#prepareRoots(hostMutation)
+      return await this.#withLock(roots, hostMutation, async () => {
         const existingReceipt = await this.#readReceipt(roots, request.requestId)
         if (existingReceipt !== null) {
           assertReceiptIdentity(existingReceipt, request)
           if (existingReceipt.status !== 'committed') throw new ComponentUpdateActivationError('UPDATE_LIVE_ALREADY_ROLLED_BACK')
           const journal = await this.#readJournal(roots, request.requestId)
-          if (journal !== null) await this.#cleanupTransaction(roots, journal)
+          if (journal !== null) await this.#cleanupTransaction(roots, journal, hostMutation)
           return { ...existingReceipt, reused: true }
         }
         const journal = await this.#requireJournal(roots, request)
         if (journal.phase !== 'published') throw new ComponentUpdateActivationError('UPDATE_LIVE_NOT_PUBLISHED')
-        await this.#verifyCandidateLive(journal)
-        await this.#writeState(roots, journal.candidateState)
+        await this.#verifyCandidateLive(journal, hostMutation)
+        await this.#writeState(roots, journal.candidateState, hostMutation)
         const receipt = makeReceipt(journal, 'committed', this.#timestamp(), false)
-        await this.#persistReceipt(roots, receipt)
-        await this.#cleanupTransaction(roots, journal)
+        await this.#persistReceipt(roots, receipt, hostMutation)
+        await this.#cleanupTransaction(roots, journal, hostMutation)
         return receipt
       })
     })
+    hostMutation.assertActive()
+    return result
   }
 
-  async rollbackCandidate(input: unknown): Promise<FixedLiveComponentDeploymentReceipt> {
+  async rollbackCandidate(
+    input: unknown,
+    hostMutation: HostMutationOperationScope
+  ): Promise<FixedLiveComponentDeploymentReceipt> {
+    hostMutation.assertActive()
     const request = parseSupportedCandidateRequest(input)
-    return await this.#serialize(async () => {
-      const roots = await this.#prepareRoots()
-      return await this.#withLock(roots, async () => {
+    const result = await this.#serialize(async () => {
+      const roots = await this.#prepareRoots(hostMutation)
+      return await this.#withLock(roots, hostMutation, async () => {
         const existingReceipt = await this.#readReceipt(roots, request.requestId)
         if (existingReceipt !== null) {
           assertReceiptIdentity(existingReceipt, request)
           if (existingReceipt.status !== 'rolled-back') throw new ComponentUpdateActivationError('UPDATE_LIVE_ROLLBACK_UNAVAILABLE')
           const journal = await this.#readJournal(roots, request.requestId)
-          if (journal !== null) await this.#cleanupTransaction(roots, journal)
+          if (journal !== null) await this.#cleanupTransaction(roots, journal, hostMutation)
           return { ...existingReceipt, reused: true }
         }
         const journal = await this.#requireJournal(roots, request)
-        return await this.#rollbackJournal(roots, journal)
+        return await this.#rollbackJournal(roots, journal, hostMutation)
       })
     })
+    hostMutation.assertActive()
+    return result
   }
 
   async reconcileCandidate(
     input: unknown,
-    desired: 'candidate' | 'previous'
+    desired: 'candidate' | 'previous',
+    hostMutation: HostMutationOperationScope
   ): Promise<FixedLiveReconciliationResult> {
+    hostMutation.assertActive()
     const request = parseSupportedCandidateRequest(input)
-    return await this.#serialize(async () => {
-      const roots = await this.#prepareRoots()
-      return await this.#withLock(roots, async () => {
+    const result = await this.#serialize(async () => {
+      const roots = await this.#prepareRoots(hostMutation)
+      return await this.#withLock(roots, hostMutation, async () => {
         const receipt = await this.#readReceipt(roots, request.requestId)
         if (receipt !== null) {
           assertReceiptIdentity(receipt, request)
           if (receipt.status === 'committed') {
             if (desired !== 'candidate') throw new ComponentUpdateActivationError('UPDATE_LIVE_STATE_CONFLICT')
-            await this.#verifyStateAndLive(roots, request.component)
+            await this.#verifyStateAndLive(roots, request.component, hostMutation)
             const journal = await this.#readJournal(roots, request.requestId)
-            if (journal !== null) await this.#cleanupTransaction(roots, journal)
+            if (journal !== null) await this.#cleanupTransaction(roots, journal, hostMutation)
             return 'candidate'
           }
           if (receipt.status === 'rolled-back') {
-            await this.#verifyStateAndLive(roots, request.component)
+            await this.#verifyStateAndLive(roots, request.component, hostMutation)
             const journal = await this.#readJournal(roots, request.requestId)
-            if (journal !== null) await this.#cleanupTransaction(roots, journal)
+            if (journal !== null) await this.#cleanupTransaction(roots, journal, hostMutation)
             return 'previous'
           }
         }
         const journal = await this.#readJournal(roots, request.requestId)
         if (journal === null) {
           if (desired !== 'previous') throw new ComponentUpdateActivationError('UPDATE_LIVE_JOURNAL_MISSING')
-          await this.#verifyStateAndLive(roots, request.component)
+          await this.#verifyStateAndLive(roots, request.component, hostMutation)
           return 'previous'
         }
         if (journal.requestFingerprint !== fingerprintRequest(request) || canonicalJson(journal.request) !== canonicalJson(request)) {
           throw new ComponentUpdateActivationError('UPDATE_LIVE_IDEMPOTENCY_CONFLICT')
         }
         if (desired === 'candidate' && journal.phase === 'published') {
-          await this.#verifyCandidateLive(journal)
+          await this.#verifyCandidateLive(journal, hostMutation)
           return 'candidate'
         }
-        await this.#rollbackJournal(roots, journal)
+        await this.#rollbackJournal(roots, journal, hostMutation)
         return 'previous'
       })
     })
+    hostMutation.assertActive()
+    return result
   }
 
   async #prepareJournal(
     roots: PreparedRoots,
     request: z.infer<typeof candidateRequestSchema>,
-    requestFingerprint: string
+    requestFingerprint: string,
+    hostMutation: HostMutationOperationScope
   ): Promise<LiveDeploymentJournal> {
     const release = await this.#loadImmutableRelease(roots, request)
     this.assertSupportedManifest(request.component, release.manifest)
-    const createdDirectories = await this.#ensureLiveDirectories(request.component)
+    const createdDirectories = await this.#ensureLiveDirectories(request.component, hostMutation)
     let transaction: { root: string; backupRoot: string; candidateRoot: string } | null = null
     const entries: LiveJournalEntry[] = []
     try {
@@ -469,7 +505,7 @@ export class FixedLiveComponentDeployment {
         files: release.manifest.files.map(normalizeManifestFile).sort(compareFiles)
       })
       await this.#assertPathsNotOwnedByAnotherComponent(roots, request.component, candidateState.files)
-      transaction = await this.#createTransactionDirectories(roots, request.requestId)
+      transaction = await this.#createTransactionDirectories(roots, request.requestId, hostMutation)
       const byPath = new Map<string, {
         previousManaged: ComponentReleaseManifestFile | null
         candidate: ComponentReleaseManifestFile | null
@@ -489,7 +525,9 @@ export class FixedLiveComponentDeployment {
       )).entries()) {
         const relativePath = value.candidate?.relativePath ?? value.previousManaged!.relativePath
         const livePath = await this.#resolveLiveTarget(request.component, relativePath)
-        const previous = await snapshotLiveFile(livePath, transaction.backupRoot, index, this.#limits.maximumFileBytes)
+        const previous = await snapshotLiveFile(
+          livePath, transaction.backupRoot, index, this.#limits.maximumFileBytes, hostMutation
+        )
         let candidateSnapshotName: string | null = null
         if (value.candidate !== null) {
           candidateSnapshotName = `candidate-${index}.bin`
@@ -502,7 +540,8 @@ export class FixedLiveComponentDeployment {
             releasePath,
             path.join(transaction.candidateRoot, candidateSnapshotName),
             value.candidate,
-            this.#limits.maximumFileBytes
+            this.#limits.maximumFileBytes,
+            hostMutation
           )
         }
         entries.push({ relativePath, previous, candidate: value.candidate, candidateSnapshotName })
@@ -518,16 +557,27 @@ export class FixedLiveComponentDeployment {
         createdDirectories,
         entries
       })
-      await this.#writeJournal(roots, journal)
+      await this.#writeJournal(roots, journal, hostMutation)
       return journal
     } catch (error) {
-      if (transaction !== null) await cleanupPreparedTransaction(transaction, entries).catch(() => undefined)
-      await this.#removeCreatedDirectoryNames(request.component, createdDirectories).catch(() => undefined)
+      if (error instanceof HostMutationLeaseError) throw error
+      if (transaction !== null) {
+        await ignoreCleanupFailureUnlessLeaseLost(
+          cleanupPreparedTransaction(transaction, entries, hostMutation)
+        )
+      }
+      await ignoreCleanupFailureUnlessLeaseLost(
+        this.#removeCreatedDirectoryNames(request.component, createdDirectories, hostMutation)
+      )
       throw error
     }
   }
 
-  async #applyCandidate(roots: PreparedRoots, journal: LiveDeploymentJournal): Promise<void> {
+  async #applyCandidate(
+    roots: PreparedRoots,
+    journal: LiveDeploymentJournal,
+    hostMutation: HostMutationOperationScope
+  ): Promise<void> {
     const transaction = transactionPaths(roots, journal.request.requestId)
     for (const [index, entry] of journal.entries.entries()) {
       const target = await this.#resolveLiveTarget(journal.request.component, entry.relativePath)
@@ -539,85 +589,119 @@ export class FixedLiveComponentDeployment {
           path.join(transaction.candidateRoot, entry.candidateSnapshotName!),
           siblings.candidate,
           entry.candidate,
-          this.#limits.maximumFileBytes
+          this.#limits.maximumFileBytes,
+          hostMutation
         )
       }
-      if (entry.previous.exists) await rename(target, siblings.previous)
-      if (entry.candidate !== null) await rename(siblings.candidate, target)
+      if (entry.previous.exists) {
+        await activeMutation(hostMutation, async () => await rename(target, siblings.previous))
+      }
+      if (entry.candidate !== null) {
+        await activeMutation(hostMutation, async () => await rename(siblings.candidate, target))
+      }
     }
-    await this.#verifyCandidateLive(journal)
+    await this.#verifyCandidateLive(journal, hostMutation)
   }
 
   async #rollbackJournal(
     roots: PreparedRoots,
-    journalInput: LiveDeploymentJournal
+    journalInput: LiveDeploymentJournal,
+    hostMutation: HostMutationOperationScope
   ): Promise<FixedLiveComponentDeploymentReceipt> {
     const journal = journalInput.phase === 'rolling-back'
       ? journalInput
       : { ...journalInput, phase: 'rolling-back' as const }
-    await this.#writeJournal(roots, journal)
-    await this.#requireStopped(journal.request, 'before-rollback')
+    await this.#writeJournal(roots, journal, hostMutation)
+    await this.#requireStopped(journal.request, 'before-rollback', hostMutation)
     const transaction = transactionPaths(roots, journal.request.requestId)
     for (const [index, entry] of [...journal.entries.entries()].reverse()) {
       const target = await this.#resolveLiveTarget(journal.request.component, entry.relativePath)
       const siblings = liveSiblingPaths(target, journal.request.requestId, index)
-      await unlink(siblings.candidate).catch(() => undefined)
+      await activeMutation(hostMutation, async () => {
+        await unlink(siblings.candidate).catch(() => undefined)
+      })
       if (entry.previous.exists) {
         const restore = siblings.candidate
-        await unlink(restore).catch(() => undefined)
+        await activeMutation(hostMutation, async () => {
+          await unlink(restore).catch(() => undefined)
+        })
         await copyStableFile(
           path.join(transaction.backupRoot, entry.previous.snapshotName!),
           restore,
           { sizeBytes: entry.previous.sizeBytes!, sha256: entry.previous.sha256! },
-          this.#limits.maximumFileBytes
+          this.#limits.maximumFileBytes,
+          hostMutation
         )
         const current = await fileEvidenceIfPresent(target, this.#limits.maximumFileBytes)
         if (current !== null && !evidenceMatches(current, entry.previous)) {
           if (entry.candidate === null || !evidenceMatches(current, entry.candidate)) {
             throw new ComponentUpdateActivationError('UPDATE_LIVE_ROLLBACK_AMBIGUOUS')
           }
-          await unlink(siblings.discard).catch(() => undefined)
-          await rename(target, siblings.discard)
+          await activeMutation(hostMutation, async () => {
+            await unlink(siblings.discard).catch(() => undefined)
+          })
+          await activeMutation(hostMutation, async () => await rename(target, siblings.discard))
         }
-        if (!await pathExists(target)) await rename(restore, target)
-        else await unlink(restore)
+        if (!await pathExists(target)) {
+          await activeMutation(hostMutation, async () => await rename(restore, target))
+        } else {
+          await activeMutation(hostMutation, async () => await unlink(restore))
+        }
       } else {
         const current = await fileEvidenceIfPresent(target, this.#limits.maximumFileBytes)
         if (current !== null) {
           if (entry.candidate === null || !evidenceMatches(current, entry.candidate)) {
             throw new ComponentUpdateActivationError('UPDATE_LIVE_ROLLBACK_AMBIGUOUS')
           }
-          await unlink(siblings.discard).catch(() => undefined)
-          await rename(target, siblings.discard)
+          await activeMutation(hostMutation, async () => {
+            await unlink(siblings.discard).catch(() => undefined)
+          })
+          await activeMutation(hostMutation, async () => await rename(target, siblings.discard))
         }
       }
-      await unlink(siblings.previous).catch(() => undefined)
-      await unlink(siblings.discard).catch(() => undefined)
+      await activeMutation(hostMutation, async () => {
+        await unlink(siblings.previous).catch(() => undefined)
+      })
+      await activeMutation(hostMutation, async () => {
+        await unlink(siblings.discard).catch(() => undefined)
+      })
       await assertTargetMatchesSnapshot(target, entry.previous, this.#limits.maximumFileBytes)
+      hostMutation.assertActive()
     }
-    await this.#writeState(roots, journal.previousState)
+    await this.#writeState(roots, journal.previousState, hostMutation)
     const receipt = makeReceipt(journal, 'rolled-back', this.#timestamp(), false)
-    await this.#persistReceipt(roots, receipt)
-    await this.#cleanupTransaction(roots, journal)
-    await this.#removeCreatedDirectories(journal)
+    await this.#persistReceipt(roots, receipt, hostMutation)
+    await this.#cleanupTransaction(roots, journal, hostMutation)
+    await this.#removeCreatedDirectories(journal, hostMutation)
     return receipt
   }
 
-  async #verifyCandidateLive(journal: LiveDeploymentJournal): Promise<void> {
+  async #verifyCandidateLive(
+    journal: LiveDeploymentJournal,
+    hostMutation: HostMutationOperationScope
+  ): Promise<void> {
     for (const entry of journal.entries) {
+      hostMutation.assertActive()
       const target = await this.#resolveLiveTarget(journal.request.component, entry.relativePath)
       const evidence = await fileEvidenceIfPresent(target, this.#limits.maximumFileBytes)
+      hostMutation.assertActive()
       if (entry.candidate === null ? evidence !== null : evidence === null || !evidenceMatches(evidence, entry.candidate)) {
         throw new ComponentUpdateActivationError('UPDATE_LIVE_CANDIDATE_VERIFICATION_FAILED')
       }
     }
   }
 
-  async #verifyStateAndLive(roots: PreparedRoots, component: ManagedUpdateComponent): Promise<void> {
+  async #verifyStateAndLive(
+    roots: PreparedRoots,
+    component: ManagedUpdateComponent,
+    hostMutation: HostMutationOperationScope
+  ): Promise<void> {
     const state = await this.#loadState(roots, component)
     for (const file of state.files) {
+      hostMutation.assertActive()
       const target = await this.#resolveLiveTarget(component, file.relativePath)
       const evidence = await fileEvidenceIfPresent(target, this.#limits.maximumFileBytes)
+      hostMutation.assertActive()
       if (evidence === null || !evidenceMatches(evidence, file)) {
         throw new ComponentUpdateActivationError('UPDATE_LIVE_STATE_VERIFICATION_FAILED')
       }
@@ -674,7 +758,10 @@ export class FixedLiveComponentDeployment {
     return target
   }
 
-  async #ensureLiveDirectories(component: ManagedUpdateComponent): Promise<LiveCreatedDirectory[]> {
+  async #ensureLiveDirectories(
+    component: ManagedUpdateComponent,
+    hostMutation: HostMutationOperationScope
+  ): Promise<LiveCreatedDirectory[]> {
     const root = path.resolve(this.#componentRoots[component])
     await assertNormalDirectory(root)
     const componentDirectories: readonly LiveCreatedDirectory[] = component === 'bepinex'
@@ -687,25 +774,34 @@ export class FixedLiveComponentDeployment {
         assertDescendant(root, directory)
         const info = await lstat(directory).catch((error: unknown) => isNodeError(error, 'ENOENT') ? null : Promise.reject(error))
         if (info === null) {
-          await mkdir(directory, { recursive: false })
+          await activeMutation(hostMutation, async () => await mkdir(directory, { recursive: false }))
           created.push(relativePath)
         }
         await assertNormalDirectory(directory)
       }
       return created
     } catch (error) {
-      await this.#removeCreatedDirectoryNames(component, created).catch(() => undefined)
+      if (error instanceof HostMutationLeaseError) throw error
+      await ignoreCleanupFailureUnlessLeaseLost(
+        this.#removeCreatedDirectoryNames(component, created, hostMutation)
+      )
       throw error
     }
   }
 
-  async #removeCreatedDirectories(journal: LiveDeploymentJournal): Promise<void> {
-    await this.#removeCreatedDirectoryNames(journal.request.component, journal.createdDirectories)
+  async #removeCreatedDirectories(
+    journal: LiveDeploymentJournal,
+    hostMutation: HostMutationOperationScope
+  ): Promise<void> {
+    await this.#removeCreatedDirectoryNames(
+      journal.request.component, journal.createdDirectories, hostMutation
+    )
   }
 
   async #removeCreatedDirectoryNames(
     component: ManagedUpdateComponent,
-    directories: ReadonlyArray<LiveCreatedDirectory>
+    directories: ReadonlyArray<LiveCreatedDirectory>,
+    hostMutation: HostMutationOperationScope
   ): Promise<void> {
     const root = path.resolve(this.#componentRoots[component])
     for (const relativePath of [...directories].reverse()) {
@@ -716,43 +812,54 @@ export class FixedLiveComponentDeployment {
       if (!info.isDirectory() || info.isSymbolicLink() || !samePath(await realpath(directory), directory)) {
         throw new ComponentUpdateActivationError('UPDATE_LIVE_DIRECTORY_CHANGED')
       }
-      await rmdir(directory).catch((error: unknown) => {
-        if (!isNodeError(error, 'ENOENT') && !isNodeError(error, 'ENOTEMPTY') && !isNodeError(error, 'EEXIST')) throw error
+      await activeMutation(hostMutation, async () => {
+        await rmdir(directory).catch((error: unknown) => {
+          if (!isNodeError(error, 'ENOENT') && !isNodeError(error, 'ENOTEMPTY') && !isNodeError(error, 'EEXIST')) throw error
+        })
       })
     }
   }
 
   async #requireStopped(
     request: z.infer<typeof candidateRequestSchema>,
-    phase: 'before-publish' | 'before-rollback'
+    phase: 'before-publish' | 'before-rollback',
+    hostMutation: HostMutationOperationScope
   ): Promise<void> {
     let proof: StoppedStateProof
     try {
+      hostMutation.assertActive()
       proof = stoppedProofSchema.parse(await this.#verifyStoppedState({
         requestId: request.requestId,
         component: request.component,
         phase
-      }))
+      }, hostMutation))
+      hostMutation.assertActive()
     } catch (error) {
+      if (error instanceof HostMutationLeaseError) throw error
+      hostMutation.assertActive()
       throw new ComponentUpdateActivationError('UPDATE_LIVE_STOP_PROOF_INVALID', { cause: error })
     }
     if (!proof.processStopped || !proof.portClosed) throw new ComponentUpdateActivationError('UPDATE_SERVICE_STILL_RUNNING')
   }
 
-  async #prepareRoots(): Promise<PreparedRoots> {
+  async #prepareRoots(hostMutation: HostMutationOperationScope): Promise<PreparedRoots> {
     await assertNormalDirectory(this.#immutableReleaseRoot)
     const parent = path.dirname(this.#controlRoot)
     await assertNormalDirectory(parent)
-    await mkdir(this.#controlRoot, { recursive: false }).catch((error: unknown) => {
-      if (!isNodeError(error, 'EEXIST')) throw error
+    await activeMutation(hostMutation, async () => {
+      await mkdir(this.#controlRoot, { recursive: false }).catch((error: unknown) => {
+        if (!isNodeError(error, 'EEXIST')) throw error
+      })
     })
     await assertNormalDirectory(this.#controlRoot)
     const names = ['state', 'journals', 'transactions', 'receipts', 'locks'] as const
     const directories: string[] = []
     for (const name of names) {
       const directory = fixedChild(this.#controlRoot, name)
-      await mkdir(directory, { recursive: false }).catch((error: unknown) => {
-        if (!isNodeError(error, 'EEXIST')) throw error
+      await activeMutation(hostMutation, async () => {
+        await mkdir(directory, { recursive: false }).catch((error: unknown) => {
+          if (!isNodeError(error, 'EEXIST')) throw error
+        })
       })
       await assertNormalDirectory(directory)
       directories.push(directory)
@@ -768,15 +875,19 @@ export class FixedLiveComponentDeployment {
     }
   }
 
-  async #createTransactionDirectories(roots: PreparedRoots, requestId: string): Promise<{
+  async #createTransactionDirectories(
+    roots: PreparedRoots,
+    requestId: string,
+    hostMutation: HostMutationOperationScope
+  ): Promise<{
     root: string; backupRoot: string; candidateRoot: string
   }> {
     const root = fixedChild(roots.transactionRoot, requestId)
-    await mkdir(root, { recursive: false })
+    await activeMutation(hostMutation, async () => await mkdir(root, { recursive: false }))
     const backupRoot = fixedChild(root, 'backup')
     const candidateRoot = fixedChild(root, 'candidate')
-    await mkdir(backupRoot, { recursive: false })
-    await mkdir(candidateRoot, { recursive: false })
+    await activeMutation(hostMutation, async () => await mkdir(backupRoot, { recursive: false }))
+    await activeMutation(hostMutation, async () => await mkdir(candidateRoot, { recursive: false }))
     return { root, backupRoot, candidateRoot }
   }
 
@@ -796,8 +907,16 @@ export class FixedLiveComponentDeployment {
     }
   }
 
-  async #writeState(roots: PreparedRoots, state: LiveComponentState): Promise<void> {
-    await writeAtomicJson(fixedChild(roots.stateRoot, `${state.component}.json`), liveStateSchema.parse(state))
+  async #writeState(
+    roots: PreparedRoots,
+    state: LiveComponentState,
+    hostMutation: HostMutationOperationScope
+  ): Promise<void> {
+    await writeAtomicJson(
+      fixedChild(roots.stateRoot, `${state.component}.json`),
+      liveStateSchema.parse(state),
+      hostMutation
+    )
   }
 
   async #readJournal(roots: PreparedRoots, requestId: string): Promise<LiveDeploymentJournal | null> {
@@ -812,8 +931,16 @@ export class FixedLiveComponentDeployment {
     }
   }
 
-  async #writeJournal(roots: PreparedRoots, journal: LiveDeploymentJournal): Promise<void> {
-    await writeAtomicJson(fixedChild(roots.journalRoot, `${journal.request.requestId}.json`), journalSchema.parse(journal))
+  async #writeJournal(
+    roots: PreparedRoots,
+    journal: LiveDeploymentJournal,
+    hostMutation: HostMutationOperationScope
+  ): Promise<void> {
+    await writeAtomicJson(
+      fixedChild(roots.journalRoot, `${journal.request.requestId}.json`),
+      journalSchema.parse(journal),
+      hostMutation
+    )
   }
 
   async #requireJournal(
@@ -852,35 +979,64 @@ export class FixedLiveComponentDeployment {
     }
   }
 
-  async #persistReceipt(roots: PreparedRoots, receipt: FixedLiveComponentDeploymentReceipt): Promise<void> {
+  async #persistReceipt(
+    roots: PreparedRoots,
+    receipt: FixedLiveComponentDeploymentReceipt,
+    hostMutation: HostMutationOperationScope
+  ): Promise<void> {
     const finalPath = fixedChild(roots.receiptRoot, `${receipt.requestId}.json`)
     const existing = await this.#readReceipt(roots, receipt.requestId)
     if (existing !== null) {
       if (canonicalJson(existing) !== canonicalJson(receipt)) throw new ComponentUpdateActivationError('UPDATE_LIVE_IDEMPOTENCY_CONFLICT')
       return
     }
-    await writeImmutableJson(finalPath, receiptSchema.parse({ ...receipt, reused: false }))
+    await writeImmutableJson(
+      finalPath,
+      receiptSchema.parse({ ...receipt, reused: false }),
+      hostMutation
+    )
   }
 
-  async #cleanupTransaction(roots: PreparedRoots, journal: LiveDeploymentJournal): Promise<void> {
+  async #cleanupTransaction(
+    roots: PreparedRoots,
+    journal: LiveDeploymentJournal,
+    hostMutation: HostMutationOperationScope
+  ): Promise<void> {
     const transaction = transactionPaths(roots, journal.request.requestId)
     for (const [index, entry] of journal.entries.entries()) {
-      if (entry.previous.snapshotName !== null) await unlinkIfPresent(path.join(transaction.backupRoot, entry.previous.snapshotName))
-      if (entry.candidateSnapshotName !== null) await unlinkIfPresent(path.join(transaction.candidateRoot, entry.candidateSnapshotName))
+      if (entry.previous.snapshotName !== null) {
+        await activeMutation(hostMutation, async () => {
+          await unlinkIfPresent(path.join(transaction.backupRoot, entry.previous.snapshotName!))
+        })
+      }
+      if (entry.candidateSnapshotName !== null) {
+        await activeMutation(hostMutation, async () => {
+          await unlinkIfPresent(path.join(transaction.candidateRoot, entry.candidateSnapshotName!))
+        })
+      }
       const target = await this.#resolveLiveTarget(journal.request.component, entry.relativePath)
       const siblings = liveSiblingPaths(target, journal.request.requestId, index)
-      for (const candidate of Object.values(siblings)) await unlinkIfPresent(candidate)
+      for (const candidate of Object.values(siblings)) {
+        await activeMutation(hostMutation, async () => await unlinkIfPresent(candidate))
+      }
     }
-    await rmdirIfPresent(transaction.backupRoot)
-    await rmdirIfPresent(transaction.candidateRoot)
-    await rmdirIfPresent(transaction.root)
-    await unlinkIfPresent(fixedChild(roots.journalRoot, `${journal.request.requestId}.json`))
+    await activeMutation(hostMutation, async () => await rmdirIfPresent(transaction.backupRoot))
+    await activeMutation(hostMutation, async () => await rmdirIfPresent(transaction.candidateRoot))
+    await activeMutation(hostMutation, async () => await rmdirIfPresent(transaction.root))
+    await activeMutation(hostMutation, async () => {
+      await unlinkIfPresent(fixedChild(roots.journalRoot, `${journal.request.requestId}.json`))
+    })
   }
 
-  async #withLock<T>(roots: PreparedRoots, operation: () => Promise<T>): Promise<T> {
+  async #withLock<T>(
+    roots: PreparedRoots,
+    hostMutation: HostMutationOperationScope,
+    operation: () => Promise<T>
+  ): Promise<T> {
     const lockPath = fixedChild(roots.lockRoot, 'live.lock')
     const lock = await acquireLock(lockPath)
     try {
+      hostMutation.assertActive()
       return await operation()
     } finally {
       await lock.close().catch(() => undefined)
@@ -943,14 +1099,15 @@ async function snapshotLiveFile(
   livePath: string,
   backupRoot: string,
   index: number,
-  maximumBytes: number
+  maximumBytes: number,
+  hostMutation: HostMutationOperationScope
 ): Promise<FileSnapshot> {
   const evidence = await fileEvidenceIfPresent(livePath, maximumBytes)
   if (evidence === null) return { exists: false, sizeBytes: null, sha256: null, snapshotName: null }
   const snapshotName = `previous-${index}.bin`
   await copyStableFile(livePath, path.join(backupRoot, snapshotName), {
     sizeBytes: evidence.sizeBytes, sha256: evidence.sha256
-  }, maximumBytes)
+  }, maximumBytes, hostMutation)
   return { exists: true, sizeBytes: evidence.sizeBytes, sha256: evidence.sha256, snapshotName }
 }
 
@@ -958,11 +1115,16 @@ async function copyStableFile(
   sourcePath: string,
   destinationPath: string,
   expected: Pick<ComponentReleaseManifestFile, 'sizeBytes' | 'sha256'>,
-  maximumBytes: number
+  maximumBytes: number,
+  hostMutation?: HostMutationOperationScope
 ): Promise<void> {
   await assertNormalFile(sourcePath)
   const source = await open(sourcePath, 'r')
-  const destination = await open(destinationPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+  const destination = hostMutation === undefined
+    ? await open(destinationPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+    : await openActiveFile(hostMutation, destinationPath,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+        0o600)
   try {
     const before = await source.stat({ bigint: true })
     if (!before.isFile() || before.size !== BigInt(expected.sizeBytes) || before.size > BigInt(maximumBytes)) {
@@ -977,20 +1139,31 @@ async function copyStableFile(
       digest.update(buffer.subarray(0, bytesRead))
       let written = 0
       while (written < bytesRead) {
-        const result = await destination.write(buffer, written, bytesRead - written, position + written)
+        const result = hostMutation === undefined
+          ? await destination.write(buffer, written, bytesRead - written, position + written)
+          : await activeMutation(hostMutation, async () => await destination.write(
+              buffer, written, bytesRead - written, position + written
+            ))
         if (result.bytesWritten === 0) throw new ComponentUpdateActivationError('UPDATE_LIVE_WRITE_FAILED')
         written += result.bytesWritten
       }
       position += bytesRead
     }
-    await destination.sync()
+    if (hostMutation === undefined) await destination.sync()
+    else await activeMutation(hostMutation, async () => await destination.sync())
     const after = await source.stat({ bigint: true })
     if (!sameSnapshot(before, after) || digest.digest('hex') !== expected.sha256.toLowerCase()) {
       throw new ComponentUpdateActivationError('UPDATE_LIVE_SOURCE_CHANGED')
     }
   } catch (error) {
     await destination.close().catch(() => undefined)
-    await unlink(destinationPath).catch(() => undefined)
+    if (error instanceof HostMutationLeaseError) throw error
+    if (hostMutation === undefined) await unlink(destinationPath).catch(() => undefined)
+    else {
+      await activeMutation(hostMutation, async () => {
+        await unlink(destinationPath).catch(() => undefined)
+      })
+    }
     throw error
   } finally {
     await source.close()
@@ -998,7 +1171,12 @@ async function copyStableFile(
   await destination.close()
   const copied = await fileEvidenceIfPresent(destinationPath, maximumBytes)
   if (copied === null || copied.sizeBytes !== expected.sizeBytes || copied.sha256 !== expected.sha256.toLowerCase()) {
-    await unlink(destinationPath).catch(() => undefined)
+    if (hostMutation === undefined) await unlink(destinationPath).catch(() => undefined)
+    else {
+      await activeMutation(hostMutation, async () => {
+        await unlink(destinationPath).catch(() => undefined)
+      })
+    }
     throw new ComponentUpdateActivationError('UPDATE_LIVE_COPY_VERIFICATION_FAILED')
   }
 }
@@ -1084,15 +1262,24 @@ function transactionPaths(roots: PreparedRoots, requestId: string): {
 
 async function cleanupPreparedTransaction(
   transaction: { root: string; backupRoot: string; candidateRoot: string },
-  entries: readonly LiveJournalEntry[]
+  entries: readonly LiveJournalEntry[],
+  hostMutation: HostMutationOperationScope
 ): Promise<void> {
   for (const entry of entries) {
-    if (entry.previous.snapshotName !== null) await unlink(path.join(transaction.backupRoot, entry.previous.snapshotName)).catch(() => undefined)
-    if (entry.candidateSnapshotName !== null) await unlink(path.join(transaction.candidateRoot, entry.candidateSnapshotName)).catch(() => undefined)
+    if (entry.previous.snapshotName !== null) {
+      await activeMutation(hostMutation, async () => {
+        await unlink(path.join(transaction.backupRoot, entry.previous.snapshotName!)).catch(() => undefined)
+      })
+    }
+    if (entry.candidateSnapshotName !== null) {
+      await activeMutation(hostMutation, async () => {
+        await unlink(path.join(transaction.candidateRoot, entry.candidateSnapshotName!)).catch(() => undefined)
+      })
+    }
   }
-  await rmdir(transaction.backupRoot).catch(() => undefined)
-  await rmdir(transaction.candidateRoot).catch(() => undefined)
-  await rmdir(transaction.root).catch(() => undefined)
+  await activeMutation(hostMutation, async () => { await rmdir(transaction.backupRoot).catch(() => undefined) })
+  await activeMutation(hostMutation, async () => { await rmdir(transaction.candidateRoot).catch(() => undefined) })
+  await activeMutation(hostMutation, async () => { await rmdir(transaction.root).catch(() => undefined) })
 }
 
 function makeReceipt(
@@ -1215,35 +1402,93 @@ async function readJsonIfPresent(filePath: string): Promise<unknown | null> {
   }
 }
 
-async function writeAtomicJson(filePath: string, value: unknown): Promise<void> {
+async function writeAtomicJson(
+  filePath: string,
+  value: unknown,
+  hostMutation: HostMutationOperationScope
+): Promise<void> {
   const temporary = path.join(path.dirname(filePath), `.partial-${randomUUID()}.json`)
-  const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+  const handle = await openActiveFile(
+    hostMutation, temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600
+  )
   try {
-    await handle.writeFile(`${canonicalJson(value)}\n`, 'utf8')
-    await handle.sync()
+    await activeMutation(hostMutation, async () => await handle.writeFile(`${canonicalJson(value)}\n`, 'utf8'))
+    await activeMutation(hostMutation, async () => await handle.sync())
   } catch (error) {
     await handle.close().catch(() => undefined)
-    await unlink(temporary).catch(() => undefined)
+    if (error instanceof HostMutationLeaseError) throw error
+    await activeMutation(hostMutation, async () => { await unlink(temporary).catch(() => undefined) })
     throw new ComponentUpdateActivationError('UPDATE_LIVE_PERSISTENCE_FAILED', { cause: error })
   }
   await handle.close()
-  try { await rename(temporary, filePath) } catch (error) {
-    await unlink(temporary).catch(() => undefined)
+  try {
+    await activeMutation(hostMutation, async () => await rename(temporary, filePath))
+  } catch (error) {
+    if (error instanceof HostMutationLeaseError) throw error
+    await activeMutation(hostMutation, async () => { await unlink(temporary).catch(() => undefined) })
     throw new ComponentUpdateActivationError('UPDATE_LIVE_PERSISTENCE_FAILED', { cause: error })
   }
 }
 
-async function writeImmutableJson(filePath: string, value: unknown): Promise<void> {
-  const handle = await open(filePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+async function writeImmutableJson(
+  filePath: string,
+  value: unknown,
+  hostMutation: HostMutationOperationScope
+): Promise<void> {
+  const handle = await openActiveFile(
+    hostMutation, filePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600
+  )
   try {
-    await handle.writeFile(`${canonicalJson(value)}\n`, 'utf8')
-    await handle.sync()
+    await activeMutation(hostMutation, async () => await handle.writeFile(`${canonicalJson(value)}\n`, 'utf8'))
+    await activeMutation(hostMutation, async () => await handle.sync())
   } catch (error) {
     await handle.close().catch(() => undefined)
-    await unlink(filePath).catch(() => undefined)
+    if (error instanceof HostMutationLeaseError) throw error
+    await activeMutation(hostMutation, async () => { await unlink(filePath).catch(() => undefined) })
     throw new ComponentUpdateActivationError('UPDATE_LIVE_PERSISTENCE_FAILED', { cause: error })
   }
   await handle.close()
+}
+
+async function activeMutation<T>(
+  hostMutation: HostMutationOperationScope,
+  operation: () => Promise<T>
+): Promise<T> {
+  hostMutation.assertActive()
+  try {
+    const result = await operation()
+    hostMutation.assertActive()
+    return result
+  } catch (error) {
+    if (error instanceof HostMutationLeaseError) throw error
+    hostMutation.assertActive()
+    throw error
+  }
+}
+
+async function ignoreCleanupFailureUnlessLeaseLost(operation: Promise<unknown>): Promise<void> {
+  try {
+    await operation
+  } catch (error) {
+    if (error instanceof HostMutationLeaseError) throw error
+  }
+}
+
+async function openActiveFile(
+  hostMutation: HostMutationOperationScope,
+  filePath: string,
+  flags: number,
+  mode: number
+): Promise<FileHandle> {
+  hostMutation.assertActive()
+  const handle = await open(filePath, flags, mode)
+  try {
+    hostMutation.assertActive()
+    return handle
+  } catch (error) {
+    await handle.close().catch(() => undefined)
+    throw error
+  }
 }
 
 function fixedChild(root: string, child: string): string {
