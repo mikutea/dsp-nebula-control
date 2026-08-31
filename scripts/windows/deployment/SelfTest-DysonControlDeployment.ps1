@@ -20,6 +20,7 @@ $dataRoot = Join-Path $testRoot 'program-data\DysonControl'
 $readinessStopPath = Join-Path $testRoot 'stop-readiness-listener'
 $readinessJob = $null
 $readinessUri = $null
+$taskFixtureEnabled = $false
 
 function Assert-SelfTest {
     param(
@@ -67,11 +68,16 @@ console.log('fictional-dyson-control-$ContentMarker');
     [System.IO.File]::Copy($artifactCommonScript, (Join-Path $releaseVerifierRoot 'DysonReleasePackaging.Common.ps1'), $false)
     [System.IO.File]::Copy($artifactVerifierScript, (Join-Path $releaseVerifierRoot 'Test-DysonControlReleaseArtifact.ps1'), $false)
     $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
+    $requiredEvidenceScripts = @()
+    if (Get-Variable -Name DysonArtifactRequiredEvidenceScripts -Scope Script -ErrorAction SilentlyContinue) {
+        $requiredEvidenceScripts = @($script:DysonArtifactRequiredEvidenceScripts)
+    }
     foreach ($relative in @(
         $script:DysonArtifactRequiredBridgeSources +
         $script:DysonArtifactRequiredBridgeScripts +
         $script:DysonArtifactRequiredMigrationScripts +
-        $script:DysonArtifactRequiredMigrationDocs
+        $script:DysonArtifactRequiredMigrationDocs +
+        $requiredEvidenceScripts
     )) {
         $source = Join-Path $repositoryRoot $relative.Replace('/', '\')
         $destination = Join-Path $Root $relative.Replace('/', '\')
@@ -178,6 +184,230 @@ function Get-ActiveVersion {
     $pointerPath = Join-Path $dataRoot 'state\active-release.json'
     if (-not (Test-Path -LiteralPath $pointerPath -PathType Leaf)) { return $null }
     return [string](([System.IO.File]::ReadAllText($pointerPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json).version)
+}
+
+function Get-ActiveVersionAt {
+    param([Parameter(Mandatory)][string]$DataRoot)
+    $pointerPath = Join-Path $DataRoot 'state\active-release.json'
+    if (-not (Test-Path -LiteralPath $pointerPath -PathType Leaf)) { return $null }
+    return [string](([System.IO.File]::ReadAllText($pointerPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json).version)
+}
+
+function Enable-DysonTaskSchedulerFixture {
+    $global:DysonDeploymentTaskFixture = @{}
+    $global:DysonDeploymentTaskFixtureFailRemovalFor = $null
+    $global:DysonDeploymentTaskFixtureCorruptRegistrationFor = $null
+    $global:DysonDeploymentTaskFixtureFailUnregisterOnceFor = $null
+    $global:DysonDeploymentTaskFixtureQueryFailure = $false
+    $global:DysonDeploymentTaskFixtureStopCalls = New-Object System.Collections.Generic.List[string]
+    $global:DysonDeploymentTaskFixtureStartCalls = New-Object System.Collections.Generic.List[string]
+    $global:DysonDeploymentTaskFixtureUnregisterCalls = New-Object System.Collections.Generic.List[string]
+    Set-Item -Path 'Function:\global:Get-ScheduledTask' -Value {
+        [CmdletBinding()]
+        param([string]$TaskName, [string]$TaskPath)
+        if ($global:DysonDeploymentTaskFixtureQueryFailure) { throw 'fixture scheduler query failed' }
+        $tasks = @(
+            foreach ($value in @($global:DysonDeploymentTaskFixture.Values)) {
+                foreach ($task in @($value)) {
+                    if ($task.PSObject.Properties.Name -notcontains 'TaskName') {
+                        $task | Add-Member -NotePropertyName TaskName -NotePropertyValue ([string]$task.FixtureTaskName)
+                    }
+                    $task
+                }
+            }
+        )
+        if ($PSBoundParameters.ContainsKey('TaskName')) {
+            $tasks = @($tasks | Where-Object {
+                [string]::Equals([string]$_.TaskName, $TaskName, [System.StringComparison]::OrdinalIgnoreCase)
+            })
+        }
+        if ($PSBoundParameters.ContainsKey('TaskPath')) {
+            $tasks = @($tasks | Where-Object {
+                [string]::Equals([string]$_.TaskPath, $TaskPath, [System.StringComparison]::Ordinal)
+            })
+        }
+        return $tasks
+    }
+    Set-Item -Path 'Function:\global:Export-ScheduledTask' -Value {
+        [CmdletBinding()]
+        param([Parameter(Mandatory)][string]$TaskName, [string]$TaskPath)
+        if (-not $global:DysonDeploymentTaskFixture.ContainsKey($TaskName)) { throw 'fixture task missing' }
+        $tasks = @($global:DysonDeploymentTaskFixture[$TaskName])
+        if ($PSBoundParameters.ContainsKey('TaskPath')) {
+            $tasks = @($tasks | Where-Object {
+                [string]::Equals([string]$_.TaskPath, $TaskPath, [System.StringComparison]::Ordinal)
+            })
+        }
+        if ($tasks.Count -ne 1) { throw 'fixture task identity is not unique' }
+        return [string]$tasks[0].Xml
+    }
+    Set-Item -Path 'Function:\global:Stop-ScheduledTask' -Value {
+        [CmdletBinding()]
+        param([Parameter(Mandatory)]$InputObject)
+        if ([string]$global:DysonDeploymentTaskFixtureFailRemovalFor -ceq [string]$InputObject.FixtureTaskName) {
+            throw 'fixture refused to stop the replacement task'
+        }
+        $global:DysonDeploymentTaskFixtureStopCalls.Add([string]$InputObject.FixtureTaskName)
+        $global:DysonDeploymentTaskFixture[[string]$InputObject.FixtureTaskName].State = 'Ready'
+    }
+    Set-Item -Path 'Function:\global:Start-ScheduledTask' -Value {
+        [CmdletBinding(DefaultParameterSetName = 'ByName')]
+        param(
+            [Parameter(ParameterSetName = 'ByName')][string]$TaskName,
+            [Parameter(ParameterSetName = 'ByName')][string]$TaskPath,
+            [Parameter(ParameterSetName = 'ByObject')]$InputObject
+        )
+        if ($PSCmdlet.ParameterSetName -eq 'ByObject') {
+            $global:DysonDeploymentTaskFixtureStartCalls.Add([string]$InputObject.FixtureTaskName)
+            $InputObject.State = 'Running'
+            return
+        }
+        if (-not $global:DysonDeploymentTaskFixture.ContainsKey($TaskName)) { throw 'fixture task missing' }
+        $tasks = @($global:DysonDeploymentTaskFixture[$TaskName])
+        if ($PSBoundParameters.ContainsKey('TaskPath')) {
+            $tasks = @($tasks | Where-Object {
+                [string]::Equals([string]$_.TaskPath, $TaskPath, [System.StringComparison]::Ordinal)
+            })
+        }
+        if ($tasks.Count -ne 1) { throw 'fixture task identity is not unique' }
+        $global:DysonDeploymentTaskFixtureStartCalls.Add([string]$tasks[0].FixtureTaskName)
+        $tasks[0].State = 'Running'
+    }
+    Set-Item -Path 'Function:\global:Unregister-ScheduledTask' -Value {
+        [CmdletBinding(SupportsShouldProcess)]
+        param([Parameter(Mandatory)][string]$TaskName, [string]$TaskPath)
+        $global:DysonDeploymentTaskFixtureUnregisterCalls.Add($TaskName)
+        if ([string]$global:DysonDeploymentTaskFixtureFailUnregisterOnceFor -ceq $TaskName) {
+            $global:DysonDeploymentTaskFixtureFailUnregisterOnceFor = $null
+            throw 'fixture refused the first unregister attempt'
+        }
+        if (-not $global:DysonDeploymentTaskFixture.ContainsKey($TaskName)) { return }
+        if (-not $PSBoundParameters.ContainsKey('TaskPath')) {
+            [void]$global:DysonDeploymentTaskFixture.Remove($TaskName)
+            return
+        }
+        $remaining = @(@($global:DysonDeploymentTaskFixture[$TaskName]) | Where-Object {
+            -not [string]::Equals([string]$_.TaskPath, $TaskPath, [System.StringComparison]::Ordinal)
+        })
+        if ($remaining.Count -eq 0) { [void]$global:DysonDeploymentTaskFixture.Remove($TaskName) }
+        elseif ($remaining.Count -eq 1) { $global:DysonDeploymentTaskFixture[$TaskName] = $remaining[0] }
+        else { $global:DysonDeploymentTaskFixture[$TaskName] = $remaining }
+    }
+    Set-Item -Path 'Function:\global:New-ScheduledTaskAction' -Value {
+        [CmdletBinding()]
+        param([Parameter(Mandatory)][string]$Execute, [string]$Argument)
+        return [pscustomobject]@{ Execute = $Execute; Arguments = $Argument }
+    }
+    Set-Item -Path 'Function:\global:New-ScheduledTaskTrigger' -Value {
+        [CmdletBinding()]
+        param([switch]$AtStartup)
+        return [pscustomobject]@{ Kind = 'AtStartup' }
+    }
+    Set-Item -Path 'Function:\global:New-ScheduledTaskPrincipal' -Value {
+        [CmdletBinding()]
+        param([string]$UserId, [string]$LogonType, [string]$RunLevel)
+        return [pscustomobject]@{ UserId = $UserId; LogonType = $LogonType; RunLevel = $RunLevel }
+    }
+    Set-Item -Path 'Function:\global:New-ScheduledTaskSettingsSet' -Value {
+        [CmdletBinding()]
+        param(
+            [switch]$AllowStartIfOnBatteries,
+            [switch]$DontStopIfGoingOnBatteries,
+            [timespan]$ExecutionTimeLimit,
+            [string]$MultipleInstances,
+            [int]$RestartCount,
+            [timespan]$RestartInterval,
+            [switch]$StartWhenAvailable
+        )
+        return [pscustomobject]@{ MultipleInstances = $MultipleInstances }
+    }
+    Set-Item -Path 'Function:\global:Register-ScheduledTask' -Value {
+        [CmdletBinding(DefaultParameterSetName = 'Definition')]
+        param(
+            [Parameter(Mandatory)][string]$TaskName,
+            [string]$TaskPath = '\',
+            [Parameter(ParameterSetName = 'Definition')]$Action,
+            [Parameter(ParameterSetName = 'Definition')]$Trigger,
+            [Parameter(ParameterSetName = 'Definition')]$Principal,
+            [Parameter(ParameterSetName = 'Definition')]$Settings,
+            [Parameter(ParameterSetName = 'Definition')][string]$Description,
+            [Parameter(ParameterSetName = 'Xml', Mandatory)][string]$Xml,
+            [switch]$Force
+        )
+        if ($PSCmdlet.ParameterSetName -eq 'Xml') {
+            $task = [pscustomobject]@{
+                FixtureTaskName = $TaskName
+                TaskName = $TaskName
+                TaskPath = $TaskPath
+                State = 'Ready'
+                Xml = $Xml
+                Principal = [pscustomobject]@{ UserId = 'fixture-restored'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+                Actions = @()
+                Settings = [pscustomobject]@{ Enabled = $true }
+            }
+        }
+        else {
+            $xmlValue = '<Task><RegistrationInfo><Description>fixture replacement task</Description></RegistrationInfo></Task>'
+            $registeredActions = if ([string]$global:DysonDeploymentTaskFixtureCorruptRegistrationFor -ceq $TaskName) {
+                @()
+            }
+            else { @($Action) }
+            $task = [pscustomobject]@{
+                FixtureTaskName = $TaskName
+                TaskName = $TaskName
+                TaskPath = $TaskPath
+                State = 'Ready'
+                Xml = $xmlValue
+                Principal = $Principal
+                Actions = $registeredActions
+                Settings = [pscustomobject]@{ Enabled = $true }
+            }
+        }
+        $global:DysonDeploymentTaskFixture[$TaskName] = $task
+        return $task
+    }
+}
+
+function Disable-DysonTaskSchedulerFixture {
+    foreach ($name in @(
+        'Get-ScheduledTask', 'Export-ScheduledTask', 'Stop-ScheduledTask', 'Start-ScheduledTask',
+        'Unregister-ScheduledTask', 'New-ScheduledTaskAction', 'New-ScheduledTaskTrigger',
+        'New-ScheduledTaskPrincipal', 'New-ScheduledTaskSettingsSet', 'Register-ScheduledTask'
+    )) {
+        Remove-Item -Path ('Function:\global:' + $name) -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Variable -Name DysonDeploymentTaskFixture -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name DysonDeploymentTaskFixtureFailRemovalFor -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name DysonDeploymentTaskFixtureCorruptRegistrationFor -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name DysonDeploymentTaskFixtureFailUnregisterOnceFor -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name DysonDeploymentTaskFixtureQueryFailure -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name DysonDeploymentTaskFixtureStopCalls -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name DysonDeploymentTaskFixtureStartCalls -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name DysonDeploymentTaskFixtureUnregisterCalls -Scope Global -ErrorAction SilentlyContinue
+}
+
+function Assert-NoInstallPartials {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$DataRoot,
+        [Parameter(Mandatory)][string]$Message
+    )
+    $partials = @()
+    if (Test-Path -LiteralPath $InstallRoot -PathType Container) {
+        $partials += @(Get-ChildItem -LiteralPath $InstallRoot -Force -ErrorAction Stop | Where-Object {
+            $_.Name -like '.bootstrap-*' -or $_.Name -like '.staging-*'
+        })
+        $releaseRoot = Join-Path $InstallRoot 'releases'
+        if (Test-Path -LiteralPath $releaseRoot -PathType Container) {
+            $partials += @(Get-ChildItem -LiteralPath $releaseRoot -Force -ErrorAction Stop | Where-Object { $_.Name -like '.staging-*' })
+        }
+    }
+    if (Test-Path -LiteralPath $DataRoot -PathType Container) {
+        $partials += @(Get-ChildItem -LiteralPath $DataRoot -Force -ErrorAction Stop | Where-Object {
+            $_.Name -like '.config-restore-*' -or $_.Name -like '.config-superseded-*'
+        })
+    }
+    Assert-SelfTest -Condition ($partials.Count -eq 0) -Message $Message
 }
 
 try {
@@ -288,7 +518,7 @@ try {
 
     $exclusiveLockObserved = $false
     $heldLock = [System.IO.FileStream]::new(
-        (Join-Path $dataRoot 'state\deployment.lock'),
+        (Get-DysonDeploymentLockPath -DataRoot $dataRoot),
         [System.IO.FileMode]::OpenOrCreate,
         [System.IO.FileAccess]::ReadWrite,
         [System.IO.FileShare]::None
@@ -396,6 +626,7 @@ try {
 
     $installerRoot = Join-Path $testRoot 'installer-program-files\DysonControl'
     $installerData = Join-Path $testRoot 'installer-program-data\DysonControl'
+    [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($installerData)) | Out-Null
     $installerConfig = Join-Path $testRoot 'fictional-production.env'
     $launcherResultPath = Join-Path $installerData 'data\launcher-result.json'
     [System.IO.File]::WriteAllText(
@@ -514,14 +745,547 @@ try {
     Assert-SelfTest -Condition $lowNodeTaskRejected -Message 'startup-task installation accepted Node 23'
     Assert-SelfTest -Condition ((Get-Item -LiteralPath $taskAuditPath -ErrorAction Stop).Length -eq $taskAuditLength) `
         -Message 'rejected Node 23 startup-task installation changed deployment audit state'
-    $uninstallOutput = & $uninstallScript -InstallRoot $installerRoot -DataRoot $installerData -SkipTaskRemoval -Confirm:$false
+
+    $installSuccessText = ($installerOutput | Out-String)
+    Assert-SelfTest -Condition (-not $installSuccessText.Contains($installerRoot) -and
+        -not $installSuccessText.Contains($installerData) -and
+        $installSuccessText -notmatch '(?i)NT AUTHORITY|<Task') `
+        -Message 'the successful installer receipt disclosed a path, account, or task XML'
+
+    $taskRollbackExistingRoot = Join-Path $testRoot 'task-rollback-existing-program-files\DysonControl'
+    $taskRollbackExistingData = Join-Path $testRoot 'task-rollback-existing-program-data\DysonControl'
+    $taskRollbackNewRoot = Join-Path $testRoot 'task-rollback-new-program-files\DysonControl'
+    $taskRollbackNewData = Join-Path $testRoot 'task-rollback-new-program-data\DysonControl'
+    $taskRemovalFailureRoot = Join-Path $testRoot 'task-removal-failure-program-files\DysonControl'
+    $taskRemovalFailureData = Join-Path $testRoot 'task-removal-failure-program-data\DysonControl'
+    $wrapperLockRoot = Join-Path $testRoot 'wrapper-lock-program-files\DysonControl'
+    $wrapperLockData = Join-Path $testRoot 'wrapper-lock-program-data\DysonControl'
+    foreach ($roots in @(
+        @($taskRollbackExistingRoot, $taskRollbackExistingData),
+        @($taskRollbackNewRoot, $taskRollbackNewData),
+        @($taskRemovalFailureRoot, $taskRemovalFailureData),
+        @($wrapperLockRoot, $wrapperLockData)
+    )) {
+        [void](Invoke-DeploymentJson -Arguments @{
+            Operation = 'Upgrade'; SourcePath = $payloadA; Version = '1.0.0'
+            InstallRoot = $roots[0]; DataRoot = $roots[1]
+        })
+    }
+
+    $closedListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $closedListener.Start()
+    $closedPort = ([System.Net.IPEndPoint]$closedListener.LocalEndpoint).Port
+    $closedListener.Stop()
+    $closedReadinessUri = [uri]("http://127.0.0.1:$closedPort/readyz")
+
+    [System.Environment]::SetEnvironmentVariable('DYSON_DEPLOYMENT_ALLOW_SELFTEST_TASKS', 'true', 'Process')
+    Enable-DysonTaskSchedulerFixture
+    $taskFixtureEnabled = $true
+
+    $schedulerFailureTaskName = 'Dyson-Control-Plane-SelfTest-Scheduler-Failure'
+    $schedulerFailureTaskXml = '<Task><RegistrationInfo><Description>fictional scheduler query failure preimage</Description></RegistrationInfo></Task>'
+    $schedulerFailureTask = [pscustomobject]@{
+        FixtureTaskName = $schedulerFailureTaskName
+        TaskPath = '\'
+        State = 'Running'
+        Xml = $schedulerFailureTaskXml
+        Principal = [pscustomobject]@{ UserId = 'fictional-scheduler-failure'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+        Actions = @()
+        Settings = [pscustomobject]@{ Enabled = $true }
+    }
+    $global:DysonDeploymentTaskFixture[$schedulerFailureTaskName] = $schedulerFailureTask
+    $schedulerFailureTaskAuditLength = (Get-Item -LiteralPath $taskAuditPath -ErrorAction Stop).Length
+    $schedulerFailureTaskAcl = (Get-Acl -LiteralPath $installerData -ErrorAction Stop).Sddl
+    $schedulerFailureTaskPointer = [System.IO.File]::ReadAllText(
+        (Join-Path $installerData 'state\active-release.json'),
+        [System.Text.Encoding]::UTF8
+    )
+    $schedulerFailureInstallRejected = $false
+    $global:DysonDeploymentTaskFixtureQueryFailure = $true
+    try {
+        & $taskScript -InstallRoot $installerRoot -DataRoot $installerData -NodeExecutable $nodeFixtures.node24 `
+            -TaskName $schedulerFailureTaskName -EnvironmentFile (Join-Path $installerData 'config\dyson-control.env') `
+            -SelfTestSkipAdministratorCheck -Confirm:$false | Out-Null
+    }
+    catch { $schedulerFailureInstallRejected = $_.Exception.Message -eq 'The Task Scheduler state could not be queried.' }
+    finally { $global:DysonDeploymentTaskFixtureQueryFailure = $false }
+    Assert-SelfTest -Condition ($schedulerFailureInstallRejected -and
+        $schedulerFailureTask.State -eq 'Running' -and $schedulerFailureTask.Xml -ceq $schedulerFailureTaskXml -and
+        (Get-Item -LiteralPath $taskAuditPath -ErrorAction Stop).Length -eq $schedulerFailureTaskAuditLength -and
+        (Get-Acl -LiteralPath $installerData -ErrorAction Stop).Sddl -eq $schedulerFailureTaskAcl -and
+        [System.IO.File]::ReadAllText(
+            (Join-Path $installerData 'state\active-release.json'),
+            [System.Text.Encoding]::UTF8
+        ) -ceq $schedulerFailureTaskPointer) `
+        -Message 'task installation did not fail closed before mutation when Task Scheduler could not be queried'
+
+    $schedulerFailureUninstallAuditPath = Join-Path $wrapperLockData 'audit\deployment.jsonl'
+    $schedulerFailureUninstallAuditLength = (Get-Item -LiteralPath $schedulerFailureUninstallAuditPath -ErrorAction Stop).Length
+    $schedulerFailureUninstallPointer = [System.IO.File]::ReadAllText(
+        (Join-Path $wrapperLockData 'state\active-release.json'),
+        [System.Text.Encoding]::UTF8
+    )
+    $schedulerFailureUninstallRejected = $false
+    $global:DysonDeploymentTaskFixtureQueryFailure = $true
+    try {
+        & $uninstallScript -InstallRoot $wrapperLockRoot -DataRoot $wrapperLockData `
+            -TaskName $schedulerFailureTaskName -SelfTestSkipAdministratorCheck -Confirm:$false | Out-Null
+    }
+    catch { $schedulerFailureUninstallRejected = $_.Exception.Message -eq 'The Task Scheduler state could not be queried.' }
+    finally { $global:DysonDeploymentTaskFixtureQueryFailure = $false }
+    Assert-SelfTest -Condition ($schedulerFailureUninstallRejected -and
+        $schedulerFailureTask.State -eq 'Running' -and $schedulerFailureTask.Xml -ceq $schedulerFailureTaskXml -and
+        (Test-Path -LiteralPath $wrapperLockRoot -PathType Container) -and
+        (Get-Item -LiteralPath $schedulerFailureUninstallAuditPath -ErrorAction Stop).Length -eq $schedulerFailureUninstallAuditLength -and
+        [System.IO.File]::ReadAllText(
+            (Join-Path $wrapperLockData 'state\active-release.json'),
+            [System.Text.Encoding]::UTF8
+        ) -ceq $schedulerFailureUninstallPointer) `
+        -Message 'uninstall did not fail closed before mutation when Task Scheduler could not be queried'
+    [void]$global:DysonDeploymentTaskFixture.Remove($schedulerFailureTaskName)
+
+    $restartNonRootTaskName = 'Dyson-Control-Plane-SelfTest-Restart-Non-Root'
+    $restartNonRootTask = [pscustomobject]@{
+        FixtureTaskName = $restartNonRootTaskName
+        TaskPath = '\FictionalFolder\'
+        State = 'Running'
+        Xml = '<Task><RegistrationInfo><Description>fictional non-root restart task</Description></RegistrationInfo></Task>'
+        Principal = [pscustomobject]@{ UserId = 'fictional-restart-non-root'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+        Actions = @()
+        Settings = [pscustomobject]@{ Enabled = $true }
+    }
+    $global:DysonDeploymentTaskFixture[$restartNonRootTaskName] = $restartNonRootTask
+    $restartNonRootStopCount = $global:DysonDeploymentTaskFixtureStopCalls.Count
+    $restartNonRootStartCount = $global:DysonDeploymentTaskFixtureStartCalls.Count
+    $restartNonRootRejected = $false
+    $restartNonRootError = $null
+    try { Restart-DysonControlTask -TaskName $restartNonRootTaskName }
+    catch {
+        $restartNonRootError = $_.Exception.Message
+        $restartNonRootRejected = $restartNonRootError -eq 'The fixed control-plane task is unavailable.'
+    }
+    Assert-SelfTest -Condition ($restartNonRootRejected -and $restartNonRootTask.State -eq 'Running' -and
+        $global:DysonDeploymentTaskFixtureStopCalls.Count -eq $restartNonRootStopCount -and
+        $global:DysonDeploymentTaskFixtureStartCalls.Count -eq $restartNonRootStartCount) `
+        -Message ('Restart-DysonControlTask touched a unique task outside the fixed root task path; error: ' + $restartNonRootError)
+    [void]$global:DysonDeploymentTaskFixture.Remove($restartNonRootTaskName)
+
+    $restartAmbiguousTaskName = 'Dyson-Control-Plane-SelfTest-Restart-Ambiguous'
+    $restartAmbiguousRootTask = [pscustomobject]@{
+        FixtureTaskName = $restartAmbiguousTaskName
+        TaskPath = '\'
+        State = 'Running'
+        Xml = '<Task><RegistrationInfo><Description>fictional root restart task</Description></RegistrationInfo></Task>'
+        Principal = [pscustomobject]@{ UserId = 'fictional-restart-root'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+        Actions = @()
+        Settings = [pscustomobject]@{ Enabled = $true }
+    }
+    $restartAmbiguousNonRootTask = [pscustomobject]@{
+        FixtureTaskName = $restartAmbiguousTaskName
+        TaskPath = '\FictionalFolder\'
+        State = 'Ready'
+        Xml = '<Task><RegistrationInfo><Description>fictional duplicate restart task</Description></RegistrationInfo></Task>'
+        Principal = [pscustomobject]@{ UserId = 'fictional-restart-duplicate'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+        Actions = @()
+        Settings = [pscustomobject]@{ Enabled = $true }
+    }
+    $global:DysonDeploymentTaskFixture[$restartAmbiguousTaskName] = @(
+        $restartAmbiguousRootTask,
+        $restartAmbiguousNonRootTask
+    )
+    $restartAmbiguousStopCount = $global:DysonDeploymentTaskFixtureStopCalls.Count
+    $restartAmbiguousStartCount = $global:DysonDeploymentTaskFixtureStartCalls.Count
+    $restartAmbiguousRejected = $false
+    try { Restart-DysonControlTask -TaskName $restartAmbiguousTaskName }
+    catch { $restartAmbiguousRejected = $_.Exception.Message -eq 'The fixed control-plane task identity is not unique.' }
+    Assert-SelfTest -Condition ($restartAmbiguousRejected -and
+        $restartAmbiguousRootTask.State -eq 'Running' -and $restartAmbiguousNonRootTask.State -eq 'Ready' -and
+        $global:DysonDeploymentTaskFixtureStopCalls.Count -eq $restartAmbiguousStopCount -and
+        $global:DysonDeploymentTaskFixtureStartCalls.Count -eq $restartAmbiguousStartCount) `
+        -Message 'Restart-DysonControlTask touched same-name root and non-root tasks before rejecting ambiguity'
+    [void]$global:DysonDeploymentTaskFixture.Remove($restartAmbiguousTaskName)
+
+    $taskRemovalProbeName = 'Dyson-Control-Plane-SelfTest-Removal-Probe'
+    $global:DysonDeploymentTaskFixture[$taskRemovalProbeName] = [pscustomobject]@{
+        FixtureTaskName = $taskRemovalProbeName
+        TaskPath = '\'
+        State = 'Running'
+        Xml = '<Task><RegistrationInfo><Description>fictional removal probe</Description></RegistrationInfo></Task>'
+        Principal = [pscustomobject]@{ UserId = 'fictional-probe'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+        Actions = @()
+        Settings = [pscustomobject]@{ Enabled = $true }
+    }
+    try { Remove-DysonControlTaskForRollback -TaskName $taskRemovalProbeName }
+    catch { throw ('SELFTEST_FAILED: the scheduled-task removal fixture could not exercise compensation: ' + $_.Exception.Message) }
+    Assert-SelfTest -Condition (-not $global:DysonDeploymentTaskFixture.ContainsKey($taskRemovalProbeName)) `
+        -Message 'the scheduled-task removal helper did not verify fixture removal'
+
+    $ambiguousTaskName = 'Dyson-Control-Plane-SelfTest-Ambiguous'
+    $global:DysonDeploymentTaskFixture[$ambiguousTaskName] = @(
+        [pscustomobject]@{
+            FixtureTaskName = $ambiguousTaskName
+            TaskPath = '\'
+            State = 'Ready'
+            Xml = '<Task><RegistrationInfo><Description>fictional ambiguous task one</Description></RegistrationInfo></Task>'
+            Principal = [pscustomobject]@{ UserId = 'fictional-one'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+            Actions = @()
+            Settings = [pscustomobject]@{ Enabled = $true }
+        },
+        [pscustomobject]@{
+            FixtureTaskName = $ambiguousTaskName
+            TaskPath = '\FictionalFolder\'
+            State = 'Ready'
+            Xml = '<Task><RegistrationInfo><Description>fictional ambiguous task two</Description></RegistrationInfo></Task>'
+            Principal = [pscustomobject]@{ UserId = 'fictional-two'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+            Actions = @()
+            Settings = [pscustomobject]@{ Enabled = $true }
+        }
+    )
+    $ambiguousAclBefore = (Get-Acl -LiteralPath $installerData -ErrorAction Stop).Sddl
+    $ambiguousAuditLength = (Get-Item -LiteralPath $taskAuditPath -ErrorAction Stop).Length
+    $ambiguousTaskRejected = $false
+    try {
+        & $taskScript -InstallRoot $installerRoot -DataRoot $installerData -NodeExecutable $nodeFixtures.node24 `
+            -TaskName $ambiguousTaskName -EnvironmentFile (Join-Path $installerData 'config\dyson-control.env') `
+            -SelfTestSkipAdministratorCheck -Confirm:$false | Out-Null
+    }
+    catch { $ambiguousTaskRejected = $_.Exception.Message -eq 'The control-plane task identity is ambiguous.' }
+    Assert-SelfTest -Condition $ambiguousTaskRejected `
+        -Message 'the direct task installer did not reject duplicate task names across task paths'
+    Assert-SelfTest -Condition ((Get-Acl -LiteralPath $installerData -ErrorAction Stop).Sddl -eq $ambiguousAclBefore -and
+        (Get-Item -LiteralPath $taskAuditPath -ErrorAction Stop).Length -eq $ambiguousAuditLength) `
+        -Message 'the ambiguous direct task install changed ACL or audit state before rejecting the task identity'
+    [void]$global:DysonDeploymentTaskFixture.Remove($ambiguousTaskName)
+
+    $nonRootTaskName = 'Dyson-Control-Plane-SelfTest-Non-Root'
+    $nonRootTask = [pscustomobject]@{
+        FixtureTaskName = $nonRootTaskName
+        TaskPath = '\FictionalFolder\'
+        State = 'Ready'
+        Xml = '<Task><RegistrationInfo><Description>fictional non-root task</Description></RegistrationInfo></Task>'
+        Principal = [pscustomobject]@{ UserId = 'fictional-non-root'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+        Actions = @()
+        Settings = [pscustomobject]@{ Enabled = $true }
+    }
+    $global:DysonDeploymentTaskFixture[$nonRootTaskName] = $nonRootTask
+    $nonRootAclBefore = (Get-Acl -LiteralPath $installerData -ErrorAction Stop).Sddl
+    $nonRootAuditLength = (Get-Item -LiteralPath $taskAuditPath -ErrorAction Stop).Length
+    $nonRootTaskRejected = $false
+    try {
+        & $taskScript -InstallRoot $installerRoot -DataRoot $installerData -NodeExecutable $nodeFixtures.node24 `
+            -TaskName $nonRootTaskName -EnvironmentFile (Join-Path $installerData 'config\dyson-control.env') `
+            -SelfTestSkipAdministratorCheck -Confirm:$false | Out-Null
+    }
+    catch { $nonRootTaskRejected = $_.Exception.Message -eq 'The control-plane task must use the fixed root task path.' }
+    Assert-SelfTest -Condition $nonRootTaskRejected `
+        -Message 'the direct task installer accepted a unique same-name task outside the fixed root task path'
+    Assert-SelfTest -Condition ($global:DysonDeploymentTaskFixture[$nonRootTaskName] -eq $nonRootTask -and
+        $nonRootTask.State -eq 'Ready' -and $nonRootTask.TaskPath -ceq '\FictionalFolder\' -and
+        (Get-Acl -LiteralPath $installerData -ErrorAction Stop).Sddl -eq $nonRootAclBefore -and
+        (Get-Item -LiteralPath $taskAuditPath -ErrorAction Stop).Length -eq $nonRootAuditLength) `
+        -Message 'rejecting a non-root task changed its identity, ACL, or audit state'
+    [void]$global:DysonDeploymentTaskFixture.Remove($nonRootTaskName)
+
+    $directFailureTaskName = 'Dyson-Control-Plane-SelfTest-Direct-Failure'
+    $directFailureTaskXml = '<Task><RegistrationInfo><Description>fictional direct-install preimage</Description></RegistrationInfo></Task>'
+    $global:DysonDeploymentTaskFixture[$directFailureTaskName] = [pscustomobject]@{
+        FixtureTaskName = $directFailureTaskName
+        TaskPath = '\'
+        State = 'Ready'
+        Xml = $directFailureTaskXml
+        Principal = [pscustomobject]@{ UserId = 'fictional-direct'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+        Actions = @()
+        Settings = [pscustomobject]@{ Enabled = $true }
+    }
+    $directFailureAclBefore = (Get-Acl -LiteralPath $installerData -ErrorAction Stop).Sddl
+    $global:DysonDeploymentTaskFixtureCorruptRegistrationFor = $directFailureTaskName
+    $directTaskFailureObserved = $false
+    $directTaskFailureError = $null
+    try {
+        & $taskScript -InstallRoot $installerRoot -DataRoot $installerData -NodeExecutable $nodeFixtures.node24 `
+            -TaskName $directFailureTaskName -EnvironmentFile (Join-Path $installerData 'config\dyson-control.env') `
+            -SelfTestSkipAdministratorCheck -Confirm:$false | Out-Null
+    }
+    catch {
+        $directTaskFailureError = $_.Exception.Message
+        $directTaskFailureObserved = $directTaskFailureError -eq 'The installed control-plane task did not match its fixed definition.'
+    }
+    finally { $global:DysonDeploymentTaskFixtureCorruptRegistrationFor = $null }
+    Assert-SelfTest -Condition $directTaskFailureObserved `
+        -Message ('the direct task installer did not preserve the fixed-definition failure after compensation; error: ' + $directTaskFailureError)
+    Assert-SelfTest -Condition ($global:DysonDeploymentTaskFixture.ContainsKey($directFailureTaskName) -and
+        $global:DysonDeploymentTaskFixture[$directFailureTaskName].Xml -ceq $directFailureTaskXml -and
+        $global:DysonDeploymentTaskFixture[$directFailureTaskName].State -ne 'Running' -and
+        (Get-Acl -LiteralPath $installerData -ErrorAction Stop).Sddl -eq $directFailureAclBefore) `
+        -Message 'the direct task installer did not restore its task and ACL preimages after pre-receipt failure'
+
+    $existingTaskName = 'Dyson-Control-Plane-SelfTest-Existing'
+    $existingTaskXml = '<Task><RegistrationInfo><Description>fictional previous task</Description></RegistrationInfo></Task>'
+    $global:DysonDeploymentTaskFixture[$existingTaskName] = [pscustomobject]@{
+        FixtureTaskName = $existingTaskName
+        TaskPath = '\'
+        State = 'Running'
+        Xml = $existingTaskXml
+        Principal = [pscustomobject]@{ UserId = 'fictional-previous'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+        Actions = @()
+        Settings = [pscustomobject]@{ Enabled = $true }
+    }
+    $existingPointerPath = Join-Path $taskRollbackExistingData 'state\active-release.json'
+    $existingPointerBefore = [System.IO.File]::ReadAllText($existingPointerPath, [System.Text.Encoding]::UTF8)
+    $existingAclBefore = (Get-Acl -LiteralPath $taskRollbackExistingData -ErrorAction Stop).Sddl
+    $existingTaskRollbackObserved = $false
+    $existingTaskRollbackError = $null
+    try {
+        & $installScript -SourcePath $payloadInstaller -Version '2.0.0' -NodeExecutable $nodeFixtures.node24 `
+            -InstallRoot $taskRollbackExistingRoot -DataRoot $taskRollbackExistingData `
+            -ConfigurationSource $installerConfig -RegisterStartupTask -StartAfterInstall `
+            -TaskName $existingTaskName -ReadinessUri $closedReadinessUri -ReadinessTimeoutSeconds 1 `
+            -SelfTestSkipAdministratorCheck -Confirm:$false | Out-Null
+    }
+    catch {
+        $existingTaskRollbackObserved = $true
+        $existingTaskRollbackError = $_.Exception.Message
+    }
+    Assert-SelfTest -Condition $existingTaskRollbackObserved `
+        -Message 'a post-task readiness failure did not fail the installer'
+    Assert-SelfTest -Condition ($global:DysonDeploymentTaskFixture.ContainsKey($existingTaskName) -and
+        $global:DysonDeploymentTaskFixture[$existingTaskName].Xml -ceq $existingTaskXml -and
+        $global:DysonDeploymentTaskFixture[$existingTaskName].State -eq 'Running') `
+        -Message ('a post-task readiness failure did not restore the previous task definition and running state; installer error: ' + $existingTaskRollbackError)
+    Assert-SelfTest -Condition ([System.IO.File]::ReadAllText($existingPointerPath, [System.Text.Encoding]::UTF8) -ceq $existingPointerBefore -and
+        (Get-ActiveVersionAt -DataRoot $taskRollbackExistingData) -eq '1.0.0') `
+        -Message 'the existing-task rollback changed the pre-install active release pointer'
+    Assert-SelfTest -Condition ((Get-Acl -LiteralPath $taskRollbackExistingData -ErrorAction Stop).Sddl -eq $existingAclBefore) `
+        -Message 'the existing-task rollback did not restore the deployment data ACL'
+    Assert-SelfTest -Condition (-not (Test-Path -LiteralPath (Join-Path $taskRollbackExistingData 'config\dyson-control.env'))) `
+        -Message 'the existing-task rollback retained configuration created by the failed wrapper'
+    Assert-NoInstallPartials -InstallRoot $taskRollbackExistingRoot -DataRoot $taskRollbackExistingData `
+        -Message 'the existing-task rollback left a partial deployment directory'
+
+    $newTaskName = 'Dyson-Control-Plane-SelfTest-New'
+    $newPointerPath = Join-Path $taskRollbackNewData 'state\active-release.json'
+    $newPointerBefore = [System.IO.File]::ReadAllText($newPointerPath, [System.Text.Encoding]::UTF8)
+    $newAclBefore = (Get-Acl -LiteralPath $taskRollbackNewData -ErrorAction Stop).Sddl
+    $newTaskRollbackObserved = $false
+    try {
+        & $installScript -SourcePath $payloadInstaller -Version '2.0.0' -NodeExecutable $nodeFixtures.node24 `
+            -InstallRoot $taskRollbackNewRoot -DataRoot $taskRollbackNewData `
+            -ConfigurationSource $installerConfig -RegisterStartupTask -StartAfterInstall `
+            -TaskName $newTaskName -ReadinessUri $closedReadinessUri -ReadinessTimeoutSeconds 1 `
+            -SelfTestSkipAdministratorCheck -Confirm:$false | Out-Null
+    }
+    catch { $newTaskRollbackObserved = $true }
+    Assert-SelfTest -Condition $newTaskRollbackObserved `
+        -Message 'a post-new-task readiness failure did not fail the installer'
+    Assert-SelfTest -Condition (-not $global:DysonDeploymentTaskFixture.ContainsKey($newTaskName)) `
+        -Message 'a post-task readiness failure did not remove the newly created task'
+    Assert-SelfTest -Condition ([System.IO.File]::ReadAllText($newPointerPath, [System.Text.Encoding]::UTF8) -ceq $newPointerBefore -and
+        (Get-ActiveVersionAt -DataRoot $taskRollbackNewData) -eq '1.0.0') `
+        -Message 'the new-task rollback changed the pre-install active release pointer'
+    Assert-SelfTest -Condition ((Get-Acl -LiteralPath $taskRollbackNewData -ErrorAction Stop).Sddl -eq $newAclBefore) `
+        -Message 'the new-task rollback did not restore the deployment data ACL'
+    Assert-SelfTest -Condition (-not (Test-Path -LiteralPath (Join-Path $taskRollbackNewData 'config\dyson-control.env'))) `
+        -Message 'the new-task rollback retained configuration created by the failed wrapper'
+    Assert-NoInstallPartials -InstallRoot $taskRollbackNewRoot -DataRoot $taskRollbackNewData `
+        -Message 'the new-task rollback left a partial deployment directory'
+
+    $removalFailureTaskName = 'Dyson-Control-Plane-SelfTest-Removal-Failure'
+    $global:DysonDeploymentTaskFixtureFailRemovalFor = $removalFailureTaskName
+    $removalFailureObserved = $false
+    $removalFailureError = $null
+    try {
+        & $installScript -SourcePath $payloadInstaller -Version '2.0.0' -NodeExecutable $nodeFixtures.node24 `
+            -InstallRoot $taskRemovalFailureRoot -DataRoot $taskRemovalFailureData `
+            -ConfigurationSource $installerConfig -RegisterStartupTask -StartAfterInstall `
+            -TaskName $removalFailureTaskName -ReadinessUri $closedReadinessUri -ReadinessTimeoutSeconds 1 `
+            -SelfTestSkipAdministratorCheck -Confirm:$false | Out-Null
+    }
+    catch {
+        $removalFailureObserved = $true
+        $removalFailureError = $_.Exception.Message
+    }
+    finally { $global:DysonDeploymentTaskFixtureFailRemovalFor = $null }
+    Assert-SelfTest -Condition ($removalFailureObserved -and
+        $removalFailureError -match 'replacement-task-stop-remove' -and
+        $removalFailureError -match 'deployment-state-blocked-by-task' -and
+        $removalFailureError -match 'bootstrap-configuration-blocked' -and
+        $removalFailureError -match 'previous-task-restore-blocked') `
+        -Message 'a replacement-task removal failure did not report every blocked compensation phase'
+    Assert-SelfTest -Condition ($global:DysonDeploymentTaskFixture.ContainsKey($removalFailureTaskName) -and
+        $global:DysonDeploymentTaskFixture[$removalFailureTaskName].State -eq 'Running' -and
+        $global:DysonDeploymentTaskFixture[$removalFailureTaskName].Xml -match 'fixture replacement task') `
+        -Message 'a replacement-task removal failure did not retain the running replacement task'
+    Assert-SelfTest -Condition ((Get-ActiveVersionAt -DataRoot $taskRemovalFailureData) -eq '2.0.0' -and
+        (Test-Path -LiteralPath (Join-Path $taskRemovalFailureRoot 'releases\2.0.0') -PathType Container) -and
+        (Test-Path -LiteralPath (Join-Path $taskRemovalFailureRoot 'bootstrap\Start-DysonControl.ps1') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $taskRemovalFailureData 'config\dyson-control.env') -PathType Leaf)) `
+        -Message 'a replacement-task removal failure destructively rolled back release, bootstrap, or configuration state'
+    Assert-NoInstallPartials -InstallRoot $taskRemovalFailureRoot -DataRoot $taskRemovalFailureData `
+        -Message 'the fail-safe task removal path left a partial deployment directory'
+
+    $wrapperPointerPath = Join-Path $wrapperLockData 'state\active-release.json'
+    $wrapperPointerBefore = [System.IO.File]::ReadAllText($wrapperPointerPath, [System.Text.Encoding]::UTF8)
+    $wrapperLock = Enter-DysonDeploymentLock -DataRoot $wrapperLockData -TimeoutSeconds 1
+    $wrapperLockRejected = $false
+    try {
+        try {
+            & $installScript -SourcePath $payloadInstaller -Version '2.0.0' -NodeExecutable $nodeFixtures.node24 `
+                -InstallRoot $wrapperLockRoot -DataRoot $wrapperLockData -ConfigurationSource $installerConfig `
+                -LockTimeoutSeconds 1 -Confirm:$false | Out-Null
+        }
+        catch { $wrapperLockRejected = $_.Exception.Message -eq 'Another deployment operation still owns the deployment lock.' }
+    }
+    finally { $wrapperLock.Dispose() }
+    Assert-SelfTest -Condition $wrapperLockRejected -Message 'the outer installer transaction did not reject a concurrent owner'
+    Assert-SelfTest -Condition ([System.IO.File]::ReadAllText($wrapperPointerPath, [System.Text.Encoding]::UTF8) -ceq $wrapperPointerBefore -and
+        (Get-ActiveVersionAt -DataRoot $wrapperLockData) -eq '1.0.0') `
+        -Message 'the lock-rejected wrapper changed the active release pointer'
+    Assert-SelfTest -Condition (-not (Test-Path -LiteralPath (Join-Path $wrapperLockRoot 'releases\2.0.0')) -and
+        -not (Test-Path -LiteralPath (Join-Path $wrapperLockData 'config\dyson-control.env'))) `
+        -Message 'the lock-rejected wrapper staged a release or copied configuration'
+    Assert-NoInstallPartials -InstallRoot $wrapperLockRoot -DataRoot $wrapperLockData `
+        -Message 'the lock-rejected wrapper left a partial deployment directory'
+
+    $uninstallLockPointerBefore = [System.IO.File]::ReadAllText($wrapperPointerPath, [System.Text.Encoding]::UTF8)
+    $uninstallLockAuditPath = Join-Path $wrapperLockData 'audit\deployment.jsonl'
+    $uninstallLockAuditLengthBefore = (Get-Item -LiteralPath $uninstallLockAuditPath -ErrorAction Stop).Length
+    $uninstallLock = Enter-DysonDeploymentLock -DataRoot $wrapperLockData -TimeoutSeconds 1
+    $uninstallLockRejected = $false
+    try {
+        try {
+            & $uninstallScript -InstallRoot $wrapperLockRoot -DataRoot $wrapperLockData `
+                -SkipTaskRemoval -LockTimeoutSeconds 1 -Confirm:$false | Out-Null
+        }
+        catch { $uninstallLockRejected = $_.Exception.Message -eq 'Another deployment operation still owns the deployment lock.' }
+    }
+    finally { $uninstallLock.Dispose() }
+    Assert-SelfTest -Condition $uninstallLockRejected `
+        -Message 'the uninstaller did not reject a concurrent deployment-lock owner'
+    Assert-SelfTest -Condition ((Test-Path -LiteralPath $wrapperLockRoot -PathType Container) -and
+        [System.IO.File]::ReadAllText($wrapperPointerPath, [System.Text.Encoding]::UTF8) -ceq $uninstallLockPointerBefore -and
+        (Get-Item -LiteralPath $uninstallLockAuditPath -ErrorAction Stop).Length -eq $uninstallLockAuditLengthBefore) `
+        -Message 'the lock-rejected uninstaller changed install, pointer, or audit state'
+
+    $uninstallRollbackTaskName = 'Dyson-Control-Plane-SelfTest-Uninstall-Rollback'
+    $uninstallRollbackTaskXml = '<Task><RegistrationInfo><Description>fictional uninstall rollback preimage</Description></RegistrationInfo></Task>'
+    $global:DysonDeploymentTaskFixture[$uninstallRollbackTaskName] = [pscustomobject]@{
+        FixtureTaskName = $uninstallRollbackTaskName
+        TaskPath = '\'
+        State = 'Running'
+        Xml = $uninstallRollbackTaskXml
+        Principal = [pscustomobject]@{ UserId = 'fictional-uninstall-rollback'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+        Actions = @()
+        Settings = [pscustomobject]@{ Enabled = $true }
+    }
+    $uninstallRollbackPointerPath = Join-Path $wrapperLockData 'state\active-release.json'
+    $uninstallRollbackPointerBefore = [System.IO.File]::ReadAllText(
+        $uninstallRollbackPointerPath,
+        [System.Text.Encoding]::UTF8
+    )
+
+    $unregisterFailureStopCount = $global:DysonDeploymentTaskFixtureStopCalls.Count
+    $unregisterFailureStartCount = $global:DysonDeploymentTaskFixtureStartCalls.Count
+    $unregisterFailureUnregisterCount = $global:DysonDeploymentTaskFixtureUnregisterCalls.Count
+    $global:DysonDeploymentTaskFixtureFailUnregisterOnceFor = $uninstallRollbackTaskName
+    $unregisterFailureObserved = $false
+    try {
+        & $uninstallScript -InstallRoot $wrapperLockRoot -DataRoot $wrapperLockData `
+            -TaskName $uninstallRollbackTaskName -SelfTestSkipAdministratorCheck -Confirm:$false | Out-Null
+    }
+    catch { $unregisterFailureObserved = $_.Exception.Message -eq 'fixture refused the first unregister attempt' }
+    finally { $global:DysonDeploymentTaskFixtureFailUnregisterOnceFor = $null }
+    Assert-SelfTest -Condition ($unregisterFailureObserved -and
+        $global:DysonDeploymentTaskFixture.ContainsKey($uninstallRollbackTaskName) -and
+        $global:DysonDeploymentTaskFixture[$uninstallRollbackTaskName].TaskPath -ceq '\' -and
+        $global:DysonDeploymentTaskFixture[$uninstallRollbackTaskName].Xml -ceq $uninstallRollbackTaskXml -and
+        $global:DysonDeploymentTaskFixture[$uninstallRollbackTaskName].State -eq 'Running') `
+        -Message 'uninstall did not restore the root task XML and Running state after Stop succeeded and Unregister failed'
+    Assert-SelfTest -Condition ($global:DysonDeploymentTaskFixtureStopCalls.Count -eq ($unregisterFailureStopCount + 1) -and
+        $global:DysonDeploymentTaskFixtureStartCalls.Count -eq ($unregisterFailureStartCount + 1) -and
+        $global:DysonDeploymentTaskFixtureUnregisterCalls.Count -eq ($unregisterFailureUnregisterCount + 2)) `
+        -Message 'the unregister-failure fixture did not exercise stop, failed unregister, removal retry, and restart'
+    Assert-SelfTest -Condition ((Test-Path -LiteralPath $wrapperLockRoot -PathType Container) -and
+        [System.IO.File]::ReadAllText($uninstallRollbackPointerPath, [System.Text.Encoding]::UTF8) -ceq $uninstallRollbackPointerBefore -and
+        (Get-ActiveVersionAt -DataRoot $wrapperLockData) -eq '1.0.0') `
+        -Message 'an unregister failure changed the install root or active release pointer'
+
+    $uninstallReleaseBackupBlocker = Join-Path $wrapperLockData 'snapshots\uninstall-releases'
+    [System.IO.File]::WriteAllText(
+        $uninstallReleaseBackupBlocker,
+        'fictional file that blocks creation of the uninstall release-backup directory',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $postRemovalFailureStopCount = $global:DysonDeploymentTaskFixtureStopCalls.Count
+    $postRemovalFailureStartCount = $global:DysonDeploymentTaskFixtureStartCalls.Count
+    $postRemovalFailureUnregisterCount = $global:DysonDeploymentTaskFixtureUnregisterCalls.Count
+    $postRemovalFailureObserved = $false
+    try {
+        & $uninstallScript -InstallRoot $wrapperLockRoot -DataRoot $wrapperLockData `
+            -TaskName $uninstallRollbackTaskName -SelfTestSkipAdministratorCheck -Confirm:$false | Out-Null
+    }
+    catch { $postRemovalFailureObserved = $true }
+    Assert-SelfTest -Condition ($postRemovalFailureObserved -and
+        $global:DysonDeploymentTaskFixture.ContainsKey($uninstallRollbackTaskName) -and
+        $global:DysonDeploymentTaskFixture[$uninstallRollbackTaskName].TaskPath -ceq '\' -and
+        $global:DysonDeploymentTaskFixture[$uninstallRollbackTaskName].Xml -ceq $uninstallRollbackTaskXml -and
+        $global:DysonDeploymentTaskFixture[$uninstallRollbackTaskName].State -eq 'Running') `
+        -Message 'uninstall did not restore the root task XML and Running state after a post-removal failure'
+    Assert-SelfTest -Condition ($global:DysonDeploymentTaskFixtureStopCalls.Count -eq ($postRemovalFailureStopCount + 1) -and
+        $global:DysonDeploymentTaskFixtureStartCalls.Count -eq ($postRemovalFailureStartCount + 1) -and
+        $global:DysonDeploymentTaskFixtureUnregisterCalls.Count -eq ($postRemovalFailureUnregisterCount + 1)) `
+        -Message 'the post-removal failure fixture did not delete and then restore the root task'
+    Assert-SelfTest -Condition ((Test-Path -LiteralPath $wrapperLockRoot -PathType Container) -and
+        [System.IO.File]::ReadAllText($uninstallRollbackPointerPath, [System.Text.Encoding]::UTF8) -ceq $uninstallRollbackPointerBefore -and
+        (Get-ActiveVersionAt -DataRoot $wrapperLockData) -eq '1.0.0' -and
+        (Test-Path -LiteralPath $uninstallReleaseBackupBlocker -PathType Leaf)) `
+        -Message 'a post-task-removal uninstall failure changed deployment state or consumed its failure fixture'
+
+    $uninstallSuccessTaskName = 'Dyson-Control-Plane-SelfTest-Uninstall-Success'
+    $uninstallSuccessTaskXml = '<Task><RegistrationInfo><Description>fictional successful uninstall task</Description></RegistrationInfo></Task>'
+    $global:DysonDeploymentTaskFixture[$uninstallSuccessTaskName] = [pscustomobject]@{
+        FixtureTaskName = $uninstallSuccessTaskName
+        TaskPath = '\'
+        State = 'Running'
+        Xml = $uninstallSuccessTaskXml
+        Principal = [pscustomobject]@{ UserId = 'fictional-uninstall-success'; LogonType = 'Interactive'; RunLevel = 'Limited' }
+        Actions = @()
+        Settings = [pscustomobject]@{ Enabled = $true }
+    }
+    $uninstallPersistentDataBefore = [System.IO.File]::ReadAllText(
+        $launcherResultPath,
+        [System.Text.Encoding]::UTF8
+    )
+    $uninstallActivePointerBefore = [System.IO.File]::ReadAllText(
+        (Join-Path $installerData 'state\active-release.json'),
+        [System.Text.Encoding]::UTF8
+    )
+    $uninstallOutput = & $uninstallScript -InstallRoot $installerRoot -DataRoot $installerData `
+        -TaskName $uninstallSuccessTaskName -SelfTestSkipAdministratorCheck -Confirm:$false
     $uninstallResult = ($uninstallOutput | Out-String).Trim() | ConvertFrom-Json
-    Assert-SelfTest -Condition ($uninstallResult.state -eq 'uninstalled') -Message 'the reusable uninstaller did not complete'
+    Assert-SelfTest -Condition ($uninstallResult.state -eq 'uninstalled' -and [bool]$uninstallResult.taskRemoved -and
+        -not $global:DysonDeploymentTaskFixture.ContainsKey($uninstallSuccessTaskName)) `
+        -Message 'the reusable uninstaller did not remove its fixed root task'
     Assert-SelfTest -Condition (-not (Test-Path -LiteralPath $installerRoot)) -Message 'uninstall left the active Program Files layout in place'
-    Assert-SelfTest -Condition (Test-Path -LiteralPath $installerData -PathType Container) -Message 'uninstall did not preserve user data by default'
-    Assert-SelfTest -Condition (Test-Path -LiteralPath ([string]$uninstallResult.recoverableReleaseBackup) -PathType Container) -Message 'uninstall did not retain a recoverable release backup'
+    Assert-SelfTest -Condition ((Test-Path -LiteralPath $installerData -PathType Container) -and
+        (Test-Path -LiteralPath $launcherResultPath -PathType Leaf) -and
+        [System.IO.File]::ReadAllText($launcherResultPath, [System.Text.Encoding]::UTF8) -ceq $uninstallPersistentDataBefore) `
+        -Message 'uninstall did not preserve persistent user data byte-for-byte'
+    Assert-SelfTest -Condition ((Test-Path -LiteralPath ([string]$uninstallResult.recoverableReleaseBackup) -PathType Container) -and
+        (Test-Path -LiteralPath (Join-Path ([string]$uninstallResult.recoverableReleaseBackup) 'releases\2.0.0\release-manifest.json') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path ([string]$uninstallResult.recoverableReleaseBackup) 'bootstrap\Start-DysonControl.ps1') -PathType Leaf)) `
+        -Message 'uninstall did not retain a structurally recoverable release backup'
     Assert-SelfTest -Condition (-not (Test-Path -LiteralPath (Join-Path $installerData 'state\active-release.json'))) -Message 'uninstall left a stale active-release pointer'
-    Assert-SelfTest -Condition (Test-Path -LiteralPath ([string]$uninstallResult.activePointerBackup) -PathType Leaf) -Message 'uninstall did not retain the active pointer for rollback'
+    Assert-SelfTest -Condition ((Test-Path -LiteralPath ([string]$uninstallResult.activePointerBackup) -PathType Leaf) -and
+        [System.IO.File]::ReadAllText(
+            [string]$uninstallResult.activePointerBackup,
+            [System.Text.Encoding]::UTF8
+        ) -ceq $uninstallActivePointerBefore) -Message 'uninstall did not retain the exact active pointer for rollback'
+    Assert-SelfTest -Condition (Test-Path -LiteralPath ([string]$uninstallResult.taskDefinitionBackup) -PathType Leaf) `
+        -Message 'uninstall did not retain the fixed root task definition for recovery'
+    Assert-SelfTest -Condition ([System.IO.File]::ReadAllText(
+        [string]$uninstallResult.taskDefinitionBackup,
+        [System.Text.Encoding]::UTF8
+    ) -ceq $uninstallSuccessTaskXml) -Message 'the recoverable task snapshot does not match the removed root task XML'
 
     [ordered]@{
         protocol = 'DYSON_CONTROL_DEPLOYMENT_SELFTEST_V1'
@@ -553,11 +1317,30 @@ try {
         nodeProbeTimeoutRejected = $true
         nodePreviewWasNonExecuting = $true
         nodeRejectionWasNonMutating = $true
+        taskReadinessFailureRestoredPreviousTask = $true
+        taskReadinessFailureRemovedNewTask = $true
+        taskReadinessFailureRestoredAcl = $true
+        ambiguousTaskIdentityRejectedBeforeMutation = $true
+        nonRootTaskIdentityRejectedBeforeMutation = $true
+        schedulerQueryFailureRejectedBeforeMutation = $true
+        restartRejectedNonRootWithoutMutation = $true
+        restartRejectedAmbiguousWithoutMutation = $true
+        directTaskFailureRestoredTaskAndAcl = $true
+        taskRemovalFailureBlockedDestructiveRollback = $true
+        outerInstallLockValidated = $true
+        uninstallLockValidated = $true
+        failedInstallLeftNoPartialOrActiveDrift = $true
+        successfulInstallReceiptWasRedacted = $true
+        uninstallUnregisterFailureRestoredTask = $true
+        uninstallPostRemovalFailureRestoredTask = $true
+        uninstallRemovedRootTaskWithRecoveryAssets = $true
         uninstallPreservedData = $true
         uninstallWasRecoverable = $true
     } | ConvertTo-Json -Depth 5 -Compress
 }
 finally {
+    if ($taskFixtureEnabled) { Disable-DysonTaskSchedulerFixture }
+    Remove-Item Env:DYSON_DEPLOYMENT_ALLOW_SELFTEST_TASKS -ErrorAction SilentlyContinue
     if ($readinessJob) {
         [System.IO.File]::WriteAllText($readinessStopPath, 'stop')
         if ($readinessUri) {

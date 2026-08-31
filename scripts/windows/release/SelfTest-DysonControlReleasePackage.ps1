@@ -71,6 +71,7 @@ try {
         $script:DysonArtifactRequiredBridgeSources +
         $script:DysonArtifactRequiredBridgeScripts +
         $script:DysonArtifactRequiredMigrationScripts +
+        $script:DysonArtifactRequiredEvidenceScripts +
         $script:DysonArtifactRequiredMigrationDocs
     )) {
         Write-FixtureText -Path (Join-Path $artifactRoot $relative.Replace('/', '\')) `

@@ -1,11 +1,28 @@
 Set-StrictMode -Version 2.0
 
+$script:DysonPlatformSecurityModulePath = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+if (-not (Test-Path -LiteralPath $script:DysonPlatformSecurityModulePath -PathType Leaf)) {
+    throw 'The platform security module required by Dyson Control deployment is unavailable.'
+}
+$script:DysonPlatformSecurityModules = @(Import-Module -Name $script:DysonPlatformSecurityModulePath -PassThru -ErrorAction Stop)
+if ($script:DysonPlatformSecurityModules.Count -ne 1 -or
+    -not [string]::Equals(
+        [System.IO.Path]::GetFullPath([string]$script:DysonPlatformSecurityModules[0].Path),
+        [System.IO.Path]::GetFullPath($script:DysonPlatformSecurityModulePath),
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not $script:DysonPlatformSecurityModules[0].ExportedCommands.ContainsKey('Get-Acl') -or
+    -not $script:DysonPlatformSecurityModules[0].ExportedCommands.ContainsKey('Set-Acl')) {
+    throw 'The platform security module required by Dyson Control deployment has an invalid identity.'
+}
+
 $script:DysonDeploymentProtocol = 'DYSON_CONTROL_DEPLOYMENT_V1'
 $script:DysonReleaseManifestName = 'release-manifest.json'
 $script:DysonActivePointerName = 'active-release.json'
 $script:DysonArtifactVerifierProtocol = 'DYSON_CONTROL_RELEASE_ARTIFACT_V1'
 $script:DysonArtifactVerifierRelativePath = 'scripts\windows\release\Test-DysonControlReleaseArtifact.ps1'
 $script:DysonArtifactVerifierCommonRelativePath = 'scripts\windows\release\DysonReleasePackaging.Common.ps1'
+$script:DysonControlTaskPath = '\'
 
 function Get-DysonFullPath {
     param([Parameter(Mandatory)][string]$Path)
@@ -369,14 +386,27 @@ function Write-DysonDeploymentAudit {
     finally { $stream.Dispose() }
 }
 
+function Get-DysonDeploymentLockPath {
+    param([Parameter(Mandatory)][string]$DataRoot)
+
+    $dataFull = (Get-DysonFullPath -Path $DataRoot).TrimEnd('\', '/')
+    $parent = [System.IO.Path]::GetDirectoryName($dataFull)
+    if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-Path -LiteralPath $parent -PathType Container)) {
+        throw 'The deployment data parent directory must exist before acquiring the deployment lock.'
+    }
+    $normalizedIdentity = $dataFull.ToUpperInvariant()
+    $lockRoot = Join-Path $parent '.dyson-control-deployment-locks'
+    return Join-Path $lockRoot ((Get-DysonTextSha256 -Value $normalizedIdentity) + '.lock')
+}
+
 function Enter-DysonDeploymentLock {
     param(
         [Parameter(Mandatory)][string]$DataRoot,
         [ValidateRange(1, 120)][int]$TimeoutSeconds = 30
     )
 
-    $stateRoot = New-DysonDirectory -Path (Join-Path $DataRoot 'state')
-    $lockPath = Join-Path $stateRoot 'deployment.lock'
+    $lockPath = Get-DysonDeploymentLockPath -DataRoot $DataRoot
+    [void](New-DysonDirectory -Path ([System.IO.Path]::GetDirectoryName($lockPath)))
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         try {
@@ -392,6 +422,221 @@ function Enter-DysonDeploymentLock {
             Start-Sleep -Milliseconds 200
         }
     } while ($true)
+}
+
+function Assert-DysonDeploymentLockLease {
+    param(
+        [Parameter(Mandatory)][System.IO.FileStream]$Lease,
+        [Parameter(Mandatory)][string]$DataRoot
+    )
+
+    $expectedPath = Get-DysonFullPath -Path (Get-DysonDeploymentLockPath -DataRoot $DataRoot)
+    try {
+        $actualPath = Get-DysonFullPath -Path $Lease.Name
+        if (-not $Lease.CanRead -or -not $Lease.CanWrite -or
+            -not [string]::Equals($actualPath, $expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'invalid lease'
+        }
+        $probe = $null
+        try {
+            $probe = [System.IO.FileStream]::new(
+                $expectedPath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::ReadWrite
+            )
+            throw 'lease is not exclusive'
+        }
+        catch [System.IO.IOException] { }
+        finally { if ($probe) { $probe.Dispose() } }
+    }
+    catch { throw 'The supplied deployment lock lease is invalid.' }
+}
+
+function Get-DysonTextSha256 {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($Value)
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([System.BitConverter]::ToString($hasher.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $hasher.Dispose() }
+}
+
+function Assert-DysonDeploymentTaskSelfTestScope {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$DataRoot
+    )
+
+    if ($env:DYSON_DEPLOYMENT_ALLOW_SELFTEST_TASKS -ne 'true') {
+        throw 'The task-administrator bypass is reserved for the isolated deployment self-test.'
+    }
+    $temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
+    $requiredPrefix = $temporaryRoot + [System.IO.Path]::DirectorySeparatorChar + 'dyson-control-deployment-selftest-'
+    foreach ($path in @($InstallRoot, $DataRoot)) {
+        $full = (Get-DysonFullPath -Path $path).TrimEnd('\', '/')
+        if (-not $full.StartsWith($requiredPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The task-administrator bypass is outside the isolated deployment self-test root.'
+        }
+    }
+}
+
+function Get-DysonScheduledTasksByExactName {
+    param([Parameter(Mandatory)][string]$TaskName)
+
+    if ($TaskName -notmatch '^[\p{L}\p{N}_. -]{1,128}$') { throw 'The control-plane task name is invalid.' }
+    try { $allTasks = @(Get-ScheduledTask -ErrorAction Stop) }
+    catch { throw 'The Task Scheduler state could not be queried.' }
+    $matches = @(
+        foreach ($task in $allTasks) {
+            if ($null -eq $task -or $task.PSObject.Properties.Name -notcontains 'TaskName') {
+                throw 'The Task Scheduler returned an invalid task record.'
+            }
+            if ([string]::Equals(
+                [string]$task.TaskName,
+                $TaskName,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) { $task }
+        }
+    )
+    return @($matches)
+}
+
+function Get-DysonControlTaskRollbackState {
+    param([Parameter(Mandatory)][string]$TaskName)
+
+    if ($TaskName -notmatch '^[\p{L}\p{N}_. -]{1,128}$') { throw 'The control-plane task name is invalid.' }
+    $matches = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
+    if ($matches.Count -gt 1) { throw 'The control-plane task identity is ambiguous.' }
+    if ($matches.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            taskName = $TaskName
+            taskPath = $script:DysonControlTaskPath
+            present = $false
+            wasRunning = $false
+            xml = $null
+            xmlSha256 = $null
+        }
+    }
+
+    if ($matches[0].PSObject.Properties.Name -notcontains 'TaskPath' -or
+        -not [string]::Equals(
+            [string]$matches[0].TaskPath,
+            $script:DysonControlTaskPath,
+            [System.StringComparison]::Ordinal
+        )) {
+        throw 'The control-plane task must use the fixed root task path.'
+    }
+    $xml = [string](Export-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonControlTaskPath -ErrorAction Stop)
+    if ([string]::IsNullOrWhiteSpace($xml) -or $xml.Length -gt 4MB) {
+        throw 'The control-plane task definition is empty or exceeds its rollback bound.'
+    }
+    return [pscustomobject][ordered]@{
+        taskName = $TaskName
+        taskPath = $script:DysonControlTaskPath
+        present = $true
+        wasRunning = [string]::Equals($matches[0].State.ToString(), 'Running', [System.StringComparison]::OrdinalIgnoreCase)
+        xml = $xml
+        xmlSha256 = Get-DysonTextSha256 -Value $xml
+    }
+}
+
+function Remove-DysonControlTaskForRollback {
+    param([Parameter(Mandatory)][string]$TaskName)
+
+    if ($TaskName -notmatch '^[\p{L}\p{N}_. -]{1,128}$') { throw 'The control-plane task name is invalid.' }
+    $matches = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
+    if ($matches.Count -gt 1) { throw 'The control-plane task identity is ambiguous.' }
+    if ($matches.Count -eq 1) {
+        $task = $matches[0]
+        if ($task.PSObject.Properties.Name -notcontains 'TaskPath' -or
+            -not [string]::Equals(
+                [string]$task.TaskPath,
+                $script:DysonControlTaskPath,
+                [System.StringComparison]::Ordinal
+            )) {
+            throw 'The control-plane task must use the fixed root task path.'
+        }
+        if ([string]::Equals($task.State.ToString(), 'Running', [System.StringComparison]::OrdinalIgnoreCase)) {
+            Stop-ScheduledTask -InputObject $task -ErrorAction Stop
+            $deadline = (Get-Date).AddSeconds(20)
+            do {
+                Start-Sleep -Milliseconds 250
+                $matches = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
+                if ($matches.Count -gt 1) { throw 'The control-plane task identity became ambiguous.' }
+            } while ($matches.Count -eq 1 -and
+                [string]::Equals($matches[0].State.ToString(), 'Running', [System.StringComparison]::OrdinalIgnoreCase) -and
+                (Get-Date) -lt $deadline)
+            if ($matches.Count -eq 1 -and
+                [string]::Equals($matches[0].State.ToString(), 'Running', [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw 'The replacement control-plane task did not stop before rollback.'
+            }
+        }
+        Unregister-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonControlTaskPath -Confirm:$false -ErrorAction Stop
+    }
+    if (@(Get-DysonScheduledTasksByExactName -TaskName $TaskName).Count -ne 0) {
+        throw 'The replacement control-plane task could not be removed for rollback.'
+    }
+}
+
+function Restore-DysonControlTaskRollbackState {
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][string]$TaskName
+    )
+
+    if ([string]$State.taskName -cne $TaskName -or
+        [string]$State.taskPath -cne $script:DysonControlTaskPath -or $State.present -isnot [bool] -or
+        $State.wasRunning -isnot [bool]) {
+        throw 'The control-plane task rollback state is invalid.'
+    }
+    Remove-DysonControlTaskForRollback -TaskName $TaskName
+    if (-not [bool]$State.present) {
+        return [ordered]@{ taskRestored = $false; taskRemoved = $true; previousTaskWasRunning = $false }
+    }
+    if (-not ($State.xml -is [string]) -or [string]::IsNullOrWhiteSpace([string]$State.xml) -or
+        ([string]$State.xml).Length -gt 4MB -or [string]$State.xmlSha256 -notmatch '^[0-9a-f]{64}$' -or
+        (Get-DysonTextSha256 -Value ([string]$State.xml)) -cne [string]$State.xmlSha256) {
+        throw 'The saved control-plane task rollback definition is invalid.'
+    }
+
+    Register-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonControlTaskPath `
+        -Xml ([string]$State.xml) -Force -ErrorAction Stop | Out-Null
+    if ([bool]$State.wasRunning) {
+        Start-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonControlTaskPath -ErrorAction Stop
+    }
+    $startDeadline = (Get-Date).AddSeconds(20)
+    do {
+        $restored = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
+        if ($restored.Count -ne 1) { throw 'The previous control-plane task was not restored uniquely.' }
+        if ($restored[0].PSObject.Properties.Name -notcontains 'TaskPath' -or
+            [string]$restored[0].TaskPath -cne $script:DysonControlTaskPath) {
+            throw 'The previous control-plane task was restored outside the fixed root task path.'
+        }
+        if (-not [bool]$State.wasRunning -or
+            [string]::Equals($restored[0].State.ToString(), 'Running', [System.StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $startDeadline)
+    $restoredXml = [string](Export-ScheduledTask -TaskName $TaskName `
+        -TaskPath $script:DysonControlTaskPath -ErrorAction Stop)
+    if ((Get-DysonTextSha256 -Value $restoredXml) -cne [string]$State.xmlSha256) {
+        throw 'The restored control-plane task definition does not match its rollback state.'
+    }
+    $restoredIsRunning = [string]::Equals(
+        $restored[0].State.ToString(),
+        'Running',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+    if ($restoredIsRunning -ne [bool]$State.wasRunning) {
+        throw 'The restored control-plane task did not return to its previous execution state.'
+    }
+    return [ordered]@{
+        taskRestored = $true
+        taskRemoved = $false
+        previousTaskWasRunning = [bool]$State.wasRunning
+    }
 }
 
 function Copy-DysonPayload {
@@ -717,14 +962,25 @@ function Restart-DysonControlTask {
     param([Parameter(Mandatory)][string]$TaskName)
 
     if ($TaskName -notmatch '^[\p{L}\p{N}_. -]{1,128}$') { throw 'The control-plane task name is invalid.' }
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1
-    if (-not $task -or $task.State.ToString() -eq 'Disabled') { throw 'The fixed control-plane task is unavailable.' }
+    $tasks = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
+    if ($tasks.Count -ne 1) { throw 'The fixed control-plane task identity is not unique.' }
+    $task = $tasks[0]
+    if ($task.PSObject.Properties.Name -notcontains 'TaskPath' -or
+        [string]$task.TaskPath -cne $script:DysonControlTaskPath -or
+        $task.State.ToString() -eq 'Disabled') {
+        throw 'The fixed control-plane task is unavailable.'
+    }
     if ($task.State.ToString() -eq 'Running') {
         Stop-ScheduledTask -InputObject $task -ErrorAction Stop
         $deadline = (Get-Date).AddSeconds(20)
         do {
             Start-Sleep -Milliseconds 250
-            $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1
+            $tasks = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
+            if ($tasks.Count -ne 1 -or $tasks[0].PSObject.Properties.Name -notcontains 'TaskPath' -or
+                [string]$tasks[0].TaskPath -cne $script:DysonControlTaskPath) {
+                throw 'The fixed control-plane task identity changed while restarting.'
+            }
+            $task = $tasks[0]
         } while ($task.State.ToString() -eq 'Running' -and (Get-Date) -lt $deadline)
         if ($task.State.ToString() -eq 'Running') { throw 'The control-plane task did not stop before the restart deadline.' }
     }

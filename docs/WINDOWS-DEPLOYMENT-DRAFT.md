@@ -74,7 +74,6 @@ C:\ProgramData\DysonControl\
   logs\                 # application logs, never release payload
   state\
     active-release.json # atomically replaced current pointer
-    deployment.lock     # cross-process deployment lock
   snapshots\
     deployments\        # pointer + config captured before changes
     tasks\               # replaced startup-task XML
@@ -84,12 +83,22 @@ C:\ProgramData\DysonControl\
     restore-guards\      # private pre-restore compensation guards
   audit\
     deployment.jsonl
+
+C:\ProgramData\.dyson-control-deployment-locks\
+  <data-root-path-sha256>.lock # stable cross-process deployment lock sidecar
 ```
 
 `active-release.json` contains a version, a bounded relative entry point, and the
 SHA-256 of the immutable release payload. The launcher resolves the entry point
 from this pointer on every start. No mutable `current` directory is copied over a
 running release.
+
+The deployment lock is a stable sidecar of the configured DataRoot rather than a
+file inside DataRoot. Install, upgrade, rollback, startup-task installation, and
+uninstall therefore contend on the same lease even while an explicitly approved
+uninstall removes the whole DataRoot. Use one exact absolute DataRoot spelling
+for every operation; path aliases are outside the lock identity contract. The
+small sidecar directory is intentionally retained after uninstall.
 
 ## Release artifact contract
 
@@ -107,6 +116,11 @@ scripts\windows\bridge\Test-DysonControlBridgeCandidate.ps1
 scripts\windows\migration\New-DysonGsManagerSnapshot.ps1
 scripts\windows\migration\Test-DysonGsManagerSnapshot.ps1
 scripts\windows\migration\Restore-DysonGsManagerSnapshot.ps1
+scripts\windows\evidence\DysonPrivateEvidence.Common.ps1
+scripts\windows\evidence\New-DysonAcceptanceEvidenceIndex.ps1
+scripts\windows\evidence\New-DysonPrivateEvidenceBundle.ps1
+scripts\windows\evidence\SelfTest-DysonPrivateEvidenceBundle.ps1
+scripts\windows\evidence\Test-DysonPrivateEvidenceBundle.ps1
 integrations\dyson-control-bridge\DysonControlBridge.csproj
 integrations\dyson-control-bridge\dyson-control-bridge.cfg.example
 docs\GSM-EVALUATION.md
@@ -144,6 +158,82 @@ different payload under an existing version.
 Accepted version labels contain 1-64 characters from letters, numbers, `.`, `_`,
 `+`, and `-`. Release automation should normally pass the repository package
 version or an immutable release tag.
+
+## Private acceptance evidence bundles
+
+The release artifact also contains an exact five-file allowlist under
+`scripts\windows\evidence`. These tools copy operator-produced evidence from a
+fixed staging root into a private, immutable bundle, verify every payload file,
+and emit a separate repository-safe index. The tools themselves are public;
+the evidence bundles are never release inputs and must never be copied into a
+Git checkout or public release asset.
+
+For a fictional run, first create the run directory with the shipped private ACL
+helper, then let the collector write its completed output there and preview the
+publication:
+
+```powershell
+$data = 'C:\ProgramData\FictionalDysonControl'
+$run = 'run-fixture-0001'
+$evidence = 'prd-001-run-0001'
+$commit = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+$payload = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+
+. .\scripts\windows\evidence\DysonPrivateEvidence.Common.ps1
+$staging = Join-Path $data "acceptance\staging\$run"
+[void](New-DysonPrivateEvidenceDirectory -Path $staging -Private)
+
+# A collector writes its private files beneath $staging before publication.
+
+& .\scripts\windows\evidence\New-DysonPrivateEvidenceBundle.ps1 `
+  -DataRoot $data -RunId $run -EvidenceId $evidence `
+  -Kind operator-run -Scope dyson-side-by-side `
+  -SubjectCommit $commit -RuntimePayloadSha256 $payload `
+  -RequirementIds @('PRD-001') -WhatIf
+```
+
+The source must be exactly
+`<DataRoot>\acceptance\staging\<RunId>` and must already have a protected DACL
+owned by the current operator with exactly current-user, SYSTEM, and local
+Administrators full-control entries. Both preview and confirmed publication
+perform this read-only ACL check before inventorying any private filename or
+content; the publisher refuses a broadly accessible staging directory instead
+of silently repairing it after collection. A confirmed run inventories the
+source before and after copying, rejects reparse points, path collisions,
+oversized input and mid-copy changes, applies the same protected ACL to the
+publication, writes a manifest with per-file SHA-256 values, verifies the partial
+bundle, and atomically renames it to
+`<DataRoot>\acceptance\evidence\<EvidenceId>`. Existing evidence IDs are never
+overwritten. Failure output reports only a fixed processing stage and does not
+echo DataRoot, payload filenames, or underlying I/O error text.
+
+Record the returned manifest SHA-256 outside the bundle, then verify the private
+record and create its minimal public index:
+
+```powershell
+$manifestSha256 = '<exact-manifest-sha256-returned-by-the-create-command>'
+
+& .\scripts\windows\evidence\Test-DysonPrivateEvidenceBundle.ps1 `
+  -DataRoot $data -EvidenceId $evidence `
+  -ExpectedManifestSha256 $manifestSha256 `
+  -ExpectedSubjectCommit $commit `
+  -ExpectedRuntimePayloadSha256 $payload
+
+& .\scripts\windows\evidence\New-DysonAcceptanceEvidenceIndex.ps1 `
+  -DataRoot $data -EvidenceId $evidence `
+  -ExpectedManifestSha256 $manifestSha256 `
+  -ExpectedSubjectCommit $commit `
+  -ExpectedRuntimePayloadSha256 $payload `
+  -OutputPath ".\acceptance\evidence\$evidence.json" -WhatIf
+```
+
+Only the second command's confirmed output file may enter
+`acceptance/evidence/`. It contains the opaque ID, evidence kind/scope, exact
+commit and runtime payload hashes, manifest hash, observation time, and bounded
+requirement IDs. It contains no private path, payload filename, content, account,
+endpoint, save, player record, log, task export, or configuration. Run
+`npm run evidence:selftest` before relying on the workflow; this is repository
+tooling evidence and does not prove that any target-host acceptance run occurred.
 
 ## GitHub Release package contract
 
@@ -455,7 +545,9 @@ modify the host.
 & .\scripts\windows\deployment\Uninstall-DysonControl.ps1 -WhatIf
 ```
 
-The default real run stops and removes only `Dyson-Control-Plane`, moves the
+The default real run holds the same deployment lease used by install and upgrade,
+requires `Dyson-Control-Plane` to be globally unique at the fixed root task path
+`\`, stops and removes only that task, moves the
 Program Files tree into a timestamped
 `ProgramData\DysonControl\snapshots\uninstall-releases\<id>` directory, and
 preserves all ProgramData. The JSON result contains the task XML and
@@ -465,9 +557,14 @@ Restoring those exact artifacts is the defined uninstall rollback. Program Files
 and ProgramData must be on the same volume for this atomic, recoverable move;
 otherwise uninstall fails without removing the existing layout.
 
+If task removal stops the task but a later unregister or filesystem step fails,
+the rollback restores the release tree and active pointer first, then restores
+the exact task XML and its prior Running or non-Running state. It never restarts
+the old task against an incompletely restored deployment state.
+
 `-RemoveData` is a separate, explicit destructive choice. It removes the complete
 control-plane ProgramData tree, including the recoverable release copy, after the
-uninstall audit is written. It does not
+uninstall audit is written while the external deployment lease is still held. It does not
 remove the DSP project, game saves, Steam files, or any game task.
 
 ## GSManager parallel-migration snapshot and restore
@@ -729,6 +826,8 @@ It verifies:
 - initial staging and content-identical staging idempotency;
 - rejection of different content under an existing immutable version;
 - rejection of a concurrent mutation while the deployment lock is held;
+- fail-closed task installation and uninstall before mutation when Task Scheduler
+  cannot be queried;
 - activation through the atomic pointer;
 - A-to-B upgrade with a pre-upgrade snapshot;
 - a B-to-C health failure that automatically restores B;
@@ -746,7 +845,12 @@ It verifies:
 - proof that installer/task previews do not execute Node and that rejected Node
   runtimes do not create install/data state, change task audit state, or run the
   active API entry point;
-- uninstall with preserved data and a recoverable release backup.
+- uninstaller rejection of a concurrent deployment-lock owner without task,
+  pointer, install, or audit mutation;
+- fixed-root task removal, task XML/active-pointer/release recovery assets, and
+  byte-for-byte persistent-data preservation on successful uninstall;
+- restoration of the exact task XML and prior Running state when unregister fails
+  after Stop, and when a later uninstall filesystem step fails.
 
 The self-test validates PowerShell 5.1 behavior but cannot prove Task Scheduler,
 service-account ACL inheritance, boot startup, process termination, or real HTTP

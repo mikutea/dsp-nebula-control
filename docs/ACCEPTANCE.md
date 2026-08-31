@@ -23,12 +23,31 @@ Changing a requirement to `verified` requires adding repository-safe evidence
 references. Production-only requirements also require a private signed or
 hashed evidence record; the public manifest alone cannot prove them.
 
-Legacy `{ kind, ref }` entries document implementation and test coverage, but
-they cannot promote a requirement to `verified`. Verification evidence is
-versioned and must include an `evidenceId`, a bounded `scope`, the exact
-40-character lowercase `subjectCommit` that was deployed, and the exact runtime
-artifact `runtimePayloadSha256` that was observed. Evidence for another runtime
-payload cannot release the current artifact.
+Legacy `{ kind, ref }` entries use exactly those two fields and document
+implementation and test coverage, but
+they cannot promote a requirement to `verified`. Every private or versioned
+evidence entry must instead include an `evidenceId`, a bounded `scope`, the exact
+40-character lowercase `subjectCommit` that was deployed, the exact runtime
+artifact `runtimePayloadSha256` that was observed, and a `ref` to its bounded
+public index. Evidence for another runtime payload cannot release the current
+artifact.
+
+Both evidence declaration shapes are exact-key contracts: extra, misspelled, or
+missing fields fail closed. `expiresAt` is deliberately unsupported in protocol
+version 1 because it is not mirrored into the public index or evaluated against
+an authoritative release time; adding expiry requires a future versioned schema
+and explicit release-time enforcement.
+
+The shared PowerShell/validator evidence-ID grammar is
+`^[a-z0-9](?:[a-z0-9._-]{6,126}[a-z0-9])$`: 8–128 ASCII characters,
+beginning and ending with a lowercase letter or digit, with only lowercase
+letters, digits, `.`, `_`, or `-` between them. Consecutive dots and Windows
+device-name stems (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, and
+`LPT1`–`LPT9`) are also rejected. The manifest reference is derived exactly
+from that ID and has no other valid form:
+`acceptance/evidence/<evidenceId>.json`. Backslashes, nested paths, absolute
+paths, traversal, a different filename, and redirected filesystem entries are
+rejected.
 
 Target-host, production, external-client, and cutover evidence stays private.
 The public manifest records only an opaque private-store ID, its SHA-256,
@@ -44,13 +63,73 @@ underlying log, save, player identity, endpoint, task export, or configuration.
   "runtimePayloadSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "opaqueId": "private:prd-001-run-0001",
   "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "observedAt": "2026-08-31T00:00:00.000Z"
+  "observedAt": "2026-08-31T00:00:00.000Z",
+  "ref": "acceptance/evidence/prd-001-run-0001.json"
 }
 ```
 
-The values above are deliberately fictional. The validator rejects duplicate
-evidence IDs, malformed commits/digests/timestamps, missing private-store
-identity, insufficient scope, and runtime-payload drift.
+The referenced public file is generated from a successfully verified private
+bundle by `scripts/windows/evidence/New-DysonAcceptanceEvidenceIndex.ps1`. Its
+complete protocol is:
+
+```json
+{
+  "protocol": "DYSON_ACCEPTANCE_EVIDENCE_INDEX_V1",
+  "schemaVersion": 1,
+  "evidence": {
+    "evidenceId": "prd-001-run-0001",
+    "kind": "operator-run",
+    "scope": "dyson-side-by-side",
+    "subjectCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "runtimePayloadSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "opaqueId": "private:prd-001-run-0001",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "observedAt": "2026-08-31T00:00:00.000Z",
+    "requirementIds": ["PRD-001"]
+  }
+}
+```
+
+The values in both examples are deliberately fictional and do not assert that
+production evidence exists. The index contains no private path, log, payload,
+endpoint, save, player identity, or host export. The validator accepts exactly
+the fields shown, requires protocol/schema version 1, verifies canonical unique
+`requirementIds`, rejects duplicate JSON object keys, and requires every mirrored
+manifest value to equal the index byte-for-value. The requirement containing the
+manifest entry must be listed in `requirementIds`.
+
+One verified bundle may cover several requirements. Each listed requirement may
+reference the same index only with the same `ref` and identical `evidenceId`,
+`kind`, `scope`, `subjectCommit`, `runtimePayloadSha256`, `opaqueId`, `sha256`, and
+`observedAt`. Duplicate declarations within one requirement and conflicting
+reuse across requirements fail closed.
+
+The current PowerShell generator verifies and indexes private-bundle kinds and
+scopes. Repository-scoped `{ kind, ref }` entries remain valid legacy supporting
+evidence. If repository evidence uses the versioned metadata form, it is also
+index-bound and subject to the same strict protocol and equality checks; its
+scope is not silently promoted to a private or production scope.
+
+The repository-safe generation step is performed only after the private bundle
+has been collected and verified. Using fictional placeholders, the shape is:
+
+```powershell
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+  -File scripts/windows/evidence/New-DysonAcceptanceEvidenceIndex.ps1 `
+  -DataRoot 'C:\ProgramData\FictionalDysonControl' `
+  -EvidenceId prd-001-run-0001 `
+  -ExpectedManifestSha256 <exact-lowercase-private-manifest-sha256> `
+  -ExpectedSubjectCommit <exact-40-character-candidate-commit> `
+  -ExpectedRuntimePayloadSha256 <exact-lowercase-runtime-payload-sha256> `
+  -OutputPath acceptance/evidence/prd-001-run-0001.json -WhatIf
+```
+
+Do not hand-copy private output into the repository. Review the generated index,
+then rerun the same command without `-WhatIf` and add the matching manifest entry
+to every requirement named by that index.
+The validator rejects malformed commits/digests/timestamps, missing store
+identity, insufficient scope, runtime-payload drift, unknown fields, unsafe
+paths, symlinks/junctions/reparse points, and index/manifest mismatches.
 
 This avoids an impossible Git self-reference. The release process is explicitly
 two-stage:
@@ -68,6 +147,13 @@ the final tag. Any such change requires a new candidate deployment and evidence
 run.
 
 ## Priorities
+
+The manifest release policy is also exact: it contains only
+`blockingPriorities: ["P0", "P1"]`, `releaseReadyState: "verified"`, and
+`productionEvidenceLivesOutsideRepository: true`. Empty, reordered, duplicate,
+partial, extended, or otherwise altered blocker sets are rejected, and blocker
+calculation uses the fixed P0/P1 contract rather than trusting mutable manifest
+input.
 
 - `P0` protects saves, credentials, access, lifecycle integrity, recovery,
   networking, and production cutover. A failed `P0` prohibits production use.

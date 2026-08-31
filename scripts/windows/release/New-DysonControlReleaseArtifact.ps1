@@ -112,6 +112,7 @@ $apiDist = Assert-DysonArtifactPlainDirectory -Path (Join-Path $repository 'apps
 $webDist = Assert-DysonArtifactPlainDirectory -Path (Join-Path $repository 'apps\web\dist')
 $windowsScripts = Assert-DysonArtifactPlainDirectory -Path (Join-Path $repository 'scripts\windows')
 $migrationScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'migration')
+$evidenceScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'evidence')
 $bridgeSourceRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $repository 'integrations\dyson-control-bridge')
 $apiPackagePath = Join-Path $repository 'apps\api\package.json'
 $apiLockPath = Join-Path $repository 'apps\api\package-lock.json'
@@ -180,6 +181,7 @@ $runtimeSessionScripts = @(
     'Test-DysonInteractiveSession.ps1'
 )
 $runtimeMigrationScripts = @($script:DysonArtifactRequiredMigrationScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+$runtimeEvidenceScripts = @($script:DysonArtifactRequiredEvidenceScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
 $runtimeBridgeScripts = @($script:DysonArtifactRequiredBridgeScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
 $bridgeSourceFiles = @($script:DysonArtifactRequiredBridgeSources | ForEach-Object { [System.IO.Path]::GetFileName($_) })
 $scriptFiles = @()
@@ -208,6 +210,11 @@ foreach ($name in $runtimeMigrationScripts) {
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required GSManager migration script is missing: $name" }
     $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/migration/$name" }
 }
+foreach ($name in $runtimeEvidenceScripts) {
+    $source = Join-Path $evidenceScriptRoot $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required private acceptance evidence script is missing: $name" }
+    $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/evidence/$name" }
+}
 foreach ($name in $runtimeBridgeScripts) {
     $source = Join-Path (Join-Path $windowsScripts 'bridge') $name
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required Bridge delivery script is missing: $name" }
@@ -219,6 +226,13 @@ $actualMigrationFiles = @(Get-DysonArtifactPlainFiles -Root $migrationScriptRoot
 $expectedMigrationFiles = @($runtimeMigrationScripts | Sort-Object -CaseSensitive)
 if ([string]::Join("`n", $actualMigrationFiles) -ne [string]::Join("`n", $expectedMigrationFiles)) {
     throw 'The GSManager migration source tree contains files outside its release allowlist.'
+}
+$actualEvidenceFiles = @(Get-DysonArtifactPlainFiles -Root $evidenceScriptRoot | ForEach-Object {
+    Get-DysonArtifactRelativePath -Root $evidenceScriptRoot -File $_.FullName
+} | Sort-Object -CaseSensitive)
+$expectedEvidenceFiles = @($runtimeEvidenceScripts | Sort-Object -CaseSensitive)
+if ([string]::Join("`n", $actualEvidenceFiles) -ne [string]::Join("`n", $expectedEvidenceFiles)) {
+    throw 'The private acceptance evidence source tree contains files outside its release allowlist.'
 }
 $bridgeFiles = @()
 foreach ($name in $bridgeSourceFiles) {
@@ -283,6 +297,7 @@ $preview = [ordered]@{
     builtWebFiles = $webFiles.Count
     runtimeWindowsScripts = $scriptFiles.Count
     gsManagerMigrationScripts = $runtimeMigrationScripts.Count
+    privateAcceptanceEvidenceScripts = $runtimeEvidenceScripts.Count
     migrationDocuments = $migrationDocFiles.Count
     publicBridgeSourceFiles = $bridgeFiles.Count
     privateBridgeDllPackaged = $false
@@ -336,6 +351,7 @@ try {
         privateBridgeBinariesPackaged = $false
         gsManagerParallelMigrationPackaged = $true
         migrationDocumentationPackaged = $true
+        privateAcceptanceEvidenceToolingPackaged = $true
         productionChanged = $false
     } | ConvertTo-DysonArtifactJsonLine
 }

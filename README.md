@@ -238,16 +238,19 @@ the target host.
 
 The control-plane deployment scripts under `scripts/windows/deployment` support
 temporary-root self-testing, immutable release staging, an atomic active pointer,
-AtStartup execution without RDP, exact-version deep loopback readiness checks, guarded
-upgrade/rollback, and a recoverable uninstall that preserves ProgramData by
-default. They install Dyson Control only; they do not silently start, stop, or
-remove DSP, Nebula, or GSManager.
+AtStartup execution without RDP, exact-version deep loopback readiness checks,
+one stable cross-process transaction lock, guarded upgrade/rollback, and a
+recoverable uninstall that preserves ProgramData by default. Task identity is
+globally checked and fixed to the root Task Scheduler path; query failures stop
+before mutation. They install Dyson Control only; they do not silently start,
+stop, or remove DSP, Nebula, or GSManager.
 
 Run the repository-safe checks before using a package:
 
 ```powershell
 npm run powershell:check
 npm run deployment:selftest
+npm run evidence:selftest
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
   -File scripts/windows/bridge/SelfTest-DysonControlBridge.ps1
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
@@ -261,7 +264,10 @@ reboot, health, rollback, uninstall, or production verification.
 
 The public release artifact ships the Bridge source, project file, disabled
 configuration template, bounded Windows build/verify/install tools, the exact
-GSManager migration script set, and the GSManager/Windows migration guides. It does
+GSManager migration script set, private-acceptance bundle/index tooling, and the
+GSManager/Windows migration guides. Private staging must already carry the exact
+protected operator/SYSTEM/Administrators ACL before either preview or publish;
+only the minimal generated index belongs in Git. The artifact does
 not ship `DysonControlBridge.dll`, PDB files, or DSP/Unity/BepInEx/Nebula
 assemblies. A private candidate must be built and verified on a Windows host
 that lawfully has those exact local files; see the

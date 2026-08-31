@@ -85,6 +85,11 @@ try {
         'New-DysonGsManagerSnapshot.ps1', 'Restore-DysonGsManagerSnapshot.ps1',
         'SelfTest-DysonGsManagerMigration.ps1', 'Test-DysonGsManagerSnapshot.ps1'
     )
+    $evidenceScripts = @(
+        'DysonPrivateEvidence.Common.ps1', 'New-DysonAcceptanceEvidenceIndex.ps1',
+        'New-DysonPrivateEvidenceBundle.ps1', 'SelfTest-DysonPrivateEvidenceBundle.ps1',
+        'Test-DysonPrivateEvidenceBundle.ps1'
+    )
     $migrationDocs = @('docs/GSM-EVALUATION.md', 'docs/WINDOWS-DEPLOYMENT-DRAFT.md')
     $bridgeScripts = @(
         'Build-DysonControlBridgeCandidate.ps1', 'DysonBridge.Common.ps1',
@@ -116,6 +121,10 @@ try {
     foreach ($name in $migrationScripts) {
         Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\migration\$name") `
             -Destination (Join-Path $fixtureRoot "scripts\windows\migration\$name")
+    }
+    foreach ($name in $evidenceScripts) {
+        Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\evidence\$name") `
+            -Destination (Join-Path $fixtureRoot "scripts\windows\evidence\$name")
     }
     foreach ($name in $bridgeScripts) {
         Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\bridge\$name") `
@@ -150,6 +159,8 @@ try {
         -Message 'artifact verification did not attest the public-source/private-binary Bridge boundary'
     Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.gsManagerParallelMigrationPackaged -and [bool]$verifiedA.migrationDocumentationPackaged) `
         -Message 'artifact verification did not attest the GSManager parallel-migration tools and documentation'
+    Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.privateAcceptanceEvidenceToolingPackaged) `
+        -Message 'artifact verification did not attest the private acceptance evidence tooling'
     Assert-ReleaseSelfTest -Condition ($verifiedA.payloadSha256 -eq $verifiedB.payloadSha256) -Message 'identical inputs produced different payload hashes'
     $manifestA = [System.IO.File]::ReadAllText((Join-Path $artifactA 'artifact-manifest.json'), [System.Text.Encoding]::UTF8)
     $manifestB = [System.IO.File]::ReadAllText((Join-Path $artifactB 'artifact-manifest.json'), [System.Text.Encoding]::UTF8)
@@ -188,6 +199,15 @@ try {
         Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA "scripts\windows\migration\$name") -PathType Leaf) `
             -Message "a GSManager migration script was omitted from the public artifact: $name"
     }
+    foreach ($name in $evidenceScripts) {
+        Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA "scripts\windows\evidence\$name") -PathType Leaf) `
+            -Message "a private acceptance evidence tool was omitted from the public artifact: $name"
+    }
+    $packagedEvidenceSelfTest = Convert-LastJsonResult -Output (& (Join-Path $artifactA `
+        'scripts\windows\evidence\SelfTest-DysonPrivateEvidenceBundle.ps1'))
+    Assert-ReleaseSelfTest -Condition ($packagedEvidenceSelfTest.protocol -eq 'DYSON_PRIVATE_ACCEPTANCE_EVIDENCE_SELFTEST_V1' -and
+        $packagedEvidenceSelfTest.state -eq 'passed' -and -not [bool]$packagedEvidenceSelfTest.productionChanged) `
+        -Message 'the packaged private acceptance evidence tools did not pass their self-contained self-test'
     foreach ($relative in $migrationDocs) {
         Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA $relative.Replace('/', '\')) -PathType Leaf) `
             -Message "GSManager migration documentation was omitted from the public artifact: $relative"
@@ -238,6 +258,22 @@ try {
     catch { $migrationExtraRejected = $true }
     Assert-ReleaseSelfTest -Condition $migrationExtraRejected -Message 'an extra GSManager migration script was accepted'
     Remove-Item -LiteralPath (Join-Path $artifactB 'scripts\windows\migration\Unexpected-Migration.ps1') -Force
+
+    $requiredEvidenceScript = Join-Path $artifactB 'scripts\windows\evidence\Test-DysonPrivateEvidenceBundle.ps1'
+    $requiredEvidenceScriptBackup = Join-Path $testRoot 'required-evidence-script.backup'
+    [System.IO.File]::Move($requiredEvidenceScript, $requiredEvidenceScriptBackup)
+    $evidenceMissingRejected = $false
+    try { & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null }
+    catch { $evidenceMissingRejected = $true }
+    Assert-ReleaseSelfTest -Condition $evidenceMissingRejected -Message 'an artifact missing a required private evidence script was accepted'
+    [System.IO.File]::Move($requiredEvidenceScriptBackup, $requiredEvidenceScript)
+
+    Write-FixtureText -Path (Join-Path $artifactB 'scripts\windows\evidence\Unexpected-Evidence.ps1') -Value "throw 'unexpected evidence tool'`n"
+    $evidenceExtraRejected = $false
+    try { & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null }
+    catch { $evidenceExtraRejected = $true }
+    Assert-ReleaseSelfTest -Condition $evidenceExtraRejected -Message 'an extra private acceptance evidence script was accepted'
+    Remove-Item -LiteralPath (Join-Path $artifactB 'scripts\windows\evidence\Unexpected-Evidence.ps1') -Force
 
     $installRoot = Join-Path $testRoot 'deployment-install'
     $dataRoot = Join-Path $testRoot 'deployment-data'
@@ -351,6 +387,10 @@ try {
         privateBridgeBinariesExcluded = $true
         gsManagerParallelMigrationPackaged = $true
         migrationDocumentationPackaged = $true
+        privateAcceptanceEvidenceToolingPackaged = $true
+        packagedEvidenceSelfTestPassed = $true
+        evidenceMissingFileRejected = $true
+        evidenceExtraFileRejected = $true
         migrationMissingFileRejected = $true
         migrationExtraFileRejected = $true
         bridgeExtraFileRejected = $true

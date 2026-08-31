@@ -11,7 +11,8 @@ param(
     [ValidatePattern('^[\p{L}\p{N}_. -]{1,128}$')][string]$ControlTaskName = 'Dyson-Control-Plane',
     [uri]$ReadinessUri,
     [ValidateRange(1, 300)][int]$ReadinessTimeoutSeconds = 30,
-    [ValidateRange(1, 120)][int]$LockTimeoutSeconds = 30
+    [ValidateRange(1, 120)][int]$LockTimeoutSeconds = 30,
+    [Parameter(DontShow)][System.IO.FileStream]$ExistingDeploymentLock
 )
 
 $ErrorActionPreference = 'Stop'
@@ -85,7 +86,15 @@ if (-not $PSCmdlet.ShouldProcess("$installFull; $dataFull", $description)) {
 
 [void](New-DysonDirectory -Path $installFull)
 [void](New-DysonDirectory -Path $dataFull)
-$deploymentLock = Enter-DysonDeploymentLock -DataRoot $dataFull -TimeoutSeconds $LockTimeoutSeconds
+$ownsDeploymentLock = $false
+if ($ExistingDeploymentLock) {
+    Assert-DysonDeploymentLockLease -Lease $ExistingDeploymentLock -DataRoot $dataFull
+    $deploymentLock = $ExistingDeploymentLock
+}
+else {
+    $deploymentLock = Enter-DysonDeploymentLock -DataRoot $dataFull -TimeoutSeconds $LockTimeoutSeconds
+    $ownsDeploymentLock = $true
+}
 $snapshot = $null
 $result = $null
 $operationCode = $Operation.ToUpperInvariant()
@@ -233,5 +242,5 @@ catch {
     throw
 }
 finally {
-    if ($deploymentLock) { $deploymentLock.Dispose() }
+    if ($ownsDeploymentLock -and $deploymentLock) { $deploymentLock.Dispose() }
 }

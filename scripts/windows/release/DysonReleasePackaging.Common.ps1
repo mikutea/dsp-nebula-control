@@ -31,6 +31,13 @@ $script:DysonArtifactRequiredMigrationScripts = @(
     'scripts/windows/migration/SelfTest-DysonGsManagerMigration.ps1',
     'scripts/windows/migration/Test-DysonGsManagerSnapshot.ps1'
 )
+$script:DysonArtifactRequiredEvidenceScripts = @(
+    'scripts/windows/evidence/DysonPrivateEvidence.Common.ps1',
+    'scripts/windows/evidence/New-DysonAcceptanceEvidenceIndex.ps1',
+    'scripts/windows/evidence/New-DysonPrivateEvidenceBundle.ps1',
+    'scripts/windows/evidence/SelfTest-DysonPrivateEvidenceBundle.ps1',
+    'scripts/windows/evidence/Test-DysonPrivateEvidenceBundle.ps1'
+)
 $script:DysonArtifactRequiredMigrationDocs = @(
     'docs/GSM-EVALUATION.md',
     'docs/WINDOWS-DEPLOYMENT-DRAFT.md'
@@ -208,6 +215,7 @@ function Assert-DysonArtifactAllowedFile {
     $allowedBridgeSources = @($script:DysonArtifactRequiredBridgeSources | ForEach-Object { $_.ToLowerInvariant() })
     $allowedBridgeScripts = @($script:DysonArtifactRequiredBridgeScripts | ForEach-Object { $_.ToLowerInvariant() })
     $allowedMigrationScripts = @($script:DysonArtifactRequiredMigrationScripts | ForEach-Object { $_.ToLowerInvariant() })
+    $allowedEvidenceScripts = @($script:DysonArtifactRequiredEvidenceScripts | ForEach-Object { $_.ToLowerInvariant() })
     $allowedMigrationDocs = @($script:DysonArtifactRequiredMigrationDocs | ForEach-Object { $_.ToLowerInvariant() })
     if ($lower.StartsWith('integrations/dyson-control-bridge/') -and $lower -notin $allowedBridgeSources) {
         throw "The public Bridge source package contains a path outside its exact allowlist: $RelativePath"
@@ -217,6 +225,9 @@ function Assert-DysonArtifactAllowedFile {
     }
     if ($lower.StartsWith('scripts/windows/migration/') -and $lower -notin $allowedMigrationScripts) {
         throw "The GSManager migration tools contain a path outside their exact allowlist: $RelativePath"
+    }
+    if ($lower.StartsWith('scripts/windows/evidence/') -and $lower -notin $allowedEvidenceScripts) {
+        throw "The private acceptance evidence tools contain a path outside their exact allowlist: $RelativePath"
     }
     if ($lower.StartsWith('docs/') -and $lower -notin $allowedMigrationDocs) {
         throw "The release documentation contains a path outside its exact allowlist: $RelativePath"
@@ -390,6 +401,13 @@ function Test-DysonControlReleaseArtifactCore {
             throw 'The GSManager parallel-migration delivery package is incomplete.'
         }
     }
+    foreach ($requiredEvidencePath in $script:DysonArtifactRequiredEvidenceScripts) {
+        $requiredEvidenceFile = Get-DysonArtifactFullPath -Path (Join-Path $root $requiredEvidencePath.Replace('/', '\'))
+        if (-not (Test-DysonArtifactPathWithin -Candidate $requiredEvidenceFile -Parent $root) -or
+            -not (Test-Path -LiteralPath $requiredEvidenceFile -PathType Leaf)) {
+            throw 'The private acceptance evidence delivery package is incomplete.'
+        }
+    }
     $inventory = Get-DysonArtifactInventory -Root $root
     if ($inventory.payloadSha256 -ne [string]$manifest.payloadSha256 -or
         $inventory.fileCount -ne [int]$manifest.fileCount -or
@@ -438,5 +456,6 @@ function Test-DysonControlReleaseArtifactCore {
         privateBridgeBinariesPackaged = $false
         gsManagerParallelMigrationPackaged = $true
         migrationDocumentationPackaged = $true
+        privateAcceptanceEvidenceToolingPackaged = $true
     }
 }

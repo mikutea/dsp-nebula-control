@@ -40,9 +40,14 @@ Add-Check -Code 'FIXED_LAUNCHER' -Passed (Test-Path -LiteralPath $launcherPath -
 $taskState = 'not-checked'
 if ($IncludeTask) {
     try {
-        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1
+        $tasks = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
+        if ($tasks.Count -ne 1) { throw 'The control-plane task identity is not unique.' }
+        $task = $tasks[0]
         $taskState = $task.State.ToString().ToLowerInvariant()
-        $taskValid = $task.Actions.Count -eq 1 -and $task.Actions[0].Arguments -like '*Start-DysonControl.ps1*' -and
+        $taskActions = @($task.Actions | Where-Object { $null -ne $_ })
+        $taskValid = $task.PSObject.Properties.Name -contains 'TaskPath' -and
+            [string]$task.TaskPath -ceq $script:DysonControlTaskPath -and
+            $taskActions.Count -eq 1 -and $taskActions[0].Arguments -like '*Start-DysonControl.ps1*' -and
             $task.Principal.LogonType.ToString() -eq 'ServiceAccount'
         Add-Check -Code 'CONTROL_TASK' -Passed $taskValid -Summary 'The fixed control-plane startup task has a service-account principal.'
     }
