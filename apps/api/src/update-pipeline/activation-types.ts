@@ -1,4 +1,8 @@
 import type { CompatibilityDecision } from '../updates/compatibility.js'
+import type {
+  HostMutationOperationCoordinator,
+  HostMutationOperationScope
+} from '../host-mutation/operation-coordinator.js'
 import type { TrustedCompatibilityAssertion } from './trusted-compatibility.js'
 import { UpdatePipelineError } from './errors.js'
 
@@ -66,9 +70,18 @@ export interface FixedUpdateSmokeResult {
 }
 
 export interface ComponentUpdateActivationAdapters {
-  verifyStoppedState(request: StoppedStateCheckRequest): Promise<StoppedStateProof>
-  createSaveProtectionPoint(request: SaveProtectionPointRequest): Promise<SaveProtectionPointReceipt>
-  smoke(request: FixedUpdateSmokeRequest): Promise<FixedUpdateSmokeResult>
+  verifyStoppedState(
+    request: StoppedStateCheckRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<StoppedStateProof>
+  createSaveProtectionPoint(
+    request: SaveProtectionPointRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<SaveProtectionPointReceipt>
+  smoke(
+    request: FixedUpdateSmokeRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<FixedUpdateSmokeResult>
 }
 
 export interface ComponentUpdateActivationOptions extends ComponentUpdateActivationAdapters {
@@ -79,6 +92,11 @@ export interface ComponentUpdateActivationOptions extends ComponentUpdateActivat
   compatibilityVerifier: {
     assertCurrent(receiptId: unknown, candidate: unknown): Promise<TrustedCompatibilityAssertion>
   }
+  /**
+   * Shared host-wide mutation coordinator. Execute/reconcile fail closed when
+   * it is absent; read-only preview and inspection remain available.
+   */
+  hostMutationCoordinator?: HostMutationOperationCoordinator
   maximumArchiveBytes?: number
   maximumFileBytes?: number
   maximumExpandedBytes?: number

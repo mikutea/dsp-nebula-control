@@ -712,9 +712,12 @@ export async function buildApplication(
               control: bepInExRoot
             },
             compatibilityVerifier: trustedCompatibilityService,
-            verifyStoppedState: (request) => runtimeAdapters.verifyStoppedState(request),
-            createSaveProtectionPoint: (request) => runtimeAdapters.createSaveProtectionPoint(request),
-            smoke: (request) => runtimeAdapters.smoke(request)
+            hostMutationCoordinator,
+            verifyStoppedState: (request, hostMutation) =>
+              runtimeAdapters.verifyStoppedState(request, hostMutation),
+            createSaveProtectionPoint: (request, hostMutation) =>
+              runtimeAdapters.createSaveProtectionPoint(request, hostMutation),
+            smoke: (request, hostMutation) => runtimeAdapters.smoke(request, hostMutation)
           })
         })()
       : null

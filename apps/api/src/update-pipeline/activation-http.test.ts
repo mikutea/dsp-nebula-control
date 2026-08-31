@@ -206,6 +206,27 @@ describe('component update activation HTTP contract', () => {
     expect(service.execute).not.toHaveBeenCalled()
   })
 
+  it.each([
+    ['UPDATE_HOST_LEASE_DIRTY', 'recovery-required'],
+    ['UPDATE_HOST_LEASE_LOST', 'recovery-required'],
+    ['UPDATE_HOST_LEASE_RECOVERY_REQUIRED', 'recovery-required'],
+    ['UPDATE_HOST_LEASE_BUSY', 'unavailable'],
+    ['UPDATE_HOST_LEASE_UNAVAILABLE', 'unavailable']
+  ] as const)('classifies startup host lease failure %s as %s without retrying', async (code, phase) => {
+    const service = createService({
+      reconcile: vi.fn(async () => { throw new ComponentUpdateActivationError(code) })
+    })
+    const controller = new ComponentUpdateActivationHttpController({ service, mutationGate: () => true })
+
+    await controller.initialize()
+    expect((await controller.recoveryStatus({})).body).toEqual({ ok: true, data: expect.objectContaining({
+      phase,
+      failureCode: code,
+      mutationBlocked: true
+    }) })
+    expect(service.reconcile).toHaveBeenCalledOnce()
+  })
+
   it('maps an unknown startup failure to one stable unavailable code without reflecting details', async () => {
     const service = createService({
       reconcile: vi.fn(async () => { throw new Error('C:\\private\\token=do-not-reflect') })
@@ -264,10 +285,15 @@ describe('component update activation HTTP contract', () => {
     })
   })
 
-  it('preserves a same-UUID conflict as 409 and a busy lock as 423', async () => {
+  it('preserves conflicts, local/host lock contention, and host lease failures as stable HTTP codes', async () => {
     for (const [code, statusCode] of [
       ['UPDATE_IDEMPOTENCY_CONFLICT', 409],
-      ['UPDATE_ACTIVATION_LOCK_BUSY', 423]
+      ['UPDATE_ACTIVATION_LOCK_BUSY', 423],
+      ['UPDATE_HOST_LEASE_BUSY', 423],
+      ['UPDATE_HOST_LEASE_DIRTY', 503],
+      ['UPDATE_HOST_LEASE_LOST', 503],
+      ['UPDATE_HOST_LEASE_RECOVERY_REQUIRED', 503],
+      ['UPDATE_HOST_LEASE_UNAVAILABLE', 503]
     ] as const) {
       const service = createService({
         execute: vi.fn(async () => { throw new ComponentUpdateActivationError(code) })

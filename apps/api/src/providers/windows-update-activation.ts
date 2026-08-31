@@ -6,6 +6,7 @@ import {
   type LifecycleOperationContext,
   type StatusProvider
 } from '../domain.js'
+import type { HostMutationOperationScope } from '../host-mutation/operation-coordinator.js'
 import {
   type ComponentUpdateActivationAdapters,
   type FixedUpdateSmokeRequest,
@@ -153,30 +154,43 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     this.#componentVersionProbe = options.componentVersionProbe
   }
 
-  async verifyStoppedState(input: StoppedStateCheckRequest): Promise<StoppedStateProof> {
+  async verifyStoppedState(
+    input: StoppedStateCheckRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<StoppedStateProof> {
+    hostMutation.assertActive()
     const request = parseRequest(stoppedRequestSchema, input)
     const context = createLifecycleContext(
       request.requestId,
-      `update-stop-check:${request.component}:${request.phase}:${request.requestId}`
+      `update-stop-check:${request.component}:${request.phase}:${request.requestId}`,
+      hostMutation.signal
     )
     try {
       stoppedLifecycleResultSchema.parse(await this.#lifecycleAdapter.verifyStopped(context))
+      hostMutation.assertActive()
       return { processStopped: true, portClosed: true }
     } catch {
+      hostMutation.assertActive()
       throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_STOP_PROOF_FAILED')
     }
   }
 
-  async createSaveProtectionPoint(input: SaveProtectionPointRequest): Promise<SaveProtectionPointReceipt> {
+  async createSaveProtectionPoint(
+    input: SaveProtectionPointRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<SaveProtectionPointReceipt> {
+    hostMutation.assertActive()
     const request = parseRequest(protectionRequestSchema, input)
     const context = createLifecycleContext(
       request.requestId,
-      `update-save-protection:${request.component}:${request.requestId}`
+      `update-save-protection:${request.component}:${request.requestId}`,
+      hostMutation.signal
     )
     try {
       const result = protectionLifecycleResultSchema.parse(
         await this.#lifecycleAdapter.createProtectionPoint(context)
       )
+      hostMutation.assertActive()
       return {
         requestId: request.requestId,
         status: 'succeeded',
@@ -185,15 +199,23 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
         durable: true
       }
     } catch {
+      hostMutation.assertActive()
       throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_SAVE_PROTECTION_FAILED')
     }
   }
 
-  async smoke(input: FixedUpdateSmokeRequest): Promise<FixedUpdateSmokeResult> {
+  async smoke(
+    input: FixedUpdateSmokeRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<FixedUpdateSmokeResult> {
+    hostMutation.assertActive()
     const request = parseRequest(smokeRequestSchema, input)
     const expectedVersion = normalizeExpectedVersion(request.component, request.expectedVersion)
     const smokeRequestId = deriveWindowsUpdateSmokeRequestId(request)
     const controller = new AbortController()
+    const abortFromHostMutation = () => controller.abort(hostMutation.signal.reason)
+    if (hostMutation.signal.aborted) abortFromHostMutation()
+    else hostMutation.signal.addEventListener('abort', abortFromHostMutation, { once: true })
     const context = createLifecycleContext(smokeRequestId, `update-smoke:${smokeRequestId}`, controller.signal)
     let attemptedStart = false
     let stoppedProven = false
@@ -203,19 +225,27 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     try {
       attemptedStart = true
       try {
+        hostMutation.assertActive()
         startLifecycleResultSchema.parse(await this.#lifecycleAdapter.requestStart(context))
+        hostMutation.assertActive()
       } catch {
+        hostMutation.assertActive()
         throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_SMOKE_START_FAILED')
       }
 
       try {
+        hostMutation.assertActive()
         runningLifecycleResultSchema.parse(await this.#lifecycleAdapter.verifyRunning(context))
+        hostMutation.assertActive()
       } catch {
+        hostMutation.assertActive()
         throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_SMOKE_RUNNING_UNPROVEN')
       }
 
       const status = await this.#collectBoundedStatus()
+      hostMutation.assertActive()
       const observedVersion = await this.#observeComponentVersion(request.component, status, controller.signal)
+      hostMutation.assertActive()
       const loadingHealthy = status.versions.gameLoaded === true && status.versions.compatible === true &&
         status.versions.warnings.length === 0
       const normalizedBepInEx = normalizeStatusVersion(status.versions.bepInEx, 'bepinex')
@@ -233,14 +263,20 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
       }
 
       try {
+        hostMutation.assertActive()
         stopLifecycleResultSchema.parse(await this.#lifecycleAdapter.requestGracefulStop(context))
+        hostMutation.assertActive()
       } catch {
+        hostMutation.assertActive()
         throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_SMOKE_STOP_FAILED')
       }
       try {
+        hostMutation.assertActive()
         stoppedLifecycleResultSchema.parse(await this.#lifecycleAdapter.verifyStopped(context))
+        hostMutation.assertActive()
         stoppedProven = true
       } catch {
+        hostMutation.assertActive()
         throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_SMOKE_STOP_VERIFICATION_FAILED')
       }
     } catch (error) {
@@ -259,9 +295,11 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
           stoppedProven = false
         }
       }
+      hostMutation.signal.removeEventListener('abort', abortFromHostMutation)
       controller.abort()
     }
 
+    hostMutation.assertActive()
     if (!stoppedProven) {
       throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_SMOKE_STOP_UNPROVEN')
     }

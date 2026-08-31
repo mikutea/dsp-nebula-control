@@ -19,6 +19,14 @@ import type { FileHandle } from 'node:fs/promises'
 import { hostname, uptime } from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
+import { HostMutationLeaseError } from '../host-mutation/lease.js'
+import {
+  HostMutationOperationCoordinatorError,
+  hostMutationReturn,
+  hostMutationThrow,
+  type HostMutationOperationCoordinator,
+  type HostMutationOperationScope
+} from '../host-mutation/operation-coordinator.js'
 import {
   type CompatibilityDecision,
   type NormalizedRuntimeInventory
@@ -114,6 +122,12 @@ interface StoredTransaction {
   fileCount: number
   expandedBytes: number
   activatedAt: string
+}
+
+interface ActivationHostMutationContext {
+  readonly scope: HostMutationOperationScope
+  markPossibleWrite(): void
+  resolvePossibleWrite(): void
 }
 
 interface StoredActiveState {
@@ -310,7 +324,9 @@ export class ComponentUpdateActivationService {
   readonly #createSaveProtectionPoint: ComponentUpdateActivationOptions['createSaveProtectionPoint']
   readonly #smoke: ComponentUpdateActivationOptions['smoke']
   readonly #compatibilityVerifier: ComponentUpdateActivationOptions['compatibilityVerifier']
+  readonly #hostMutationCoordinator: HostMutationOperationCoordinator | null
   readonly #liveDeployment: FixedLiveComponentDeployment
+  #activeHostMutationContext: ActivationHostMutationContext | null = null
   #tail: Promise<void> = Promise.resolve()
 
   constructor(options: ComponentUpdateActivationOptions) {
@@ -346,11 +362,19 @@ export class ComponentUpdateActivationService {
       throw new ComponentUpdateActivationError('UPDATE_COMPATIBILITY_VERIFIER_INVALID')
     }
     this.#compatibilityVerifier = options.compatibilityVerifier
+    this.#hostMutationCoordinator = options.hostMutationCoordinator ?? null
     this.#liveDeployment = new FixedLiveComponentDeployment({
       immutableReleaseRoot: path.join(this.#controlRoot, 'releases'),
       controlRoot: path.join(this.#controlRoot, 'live-deployment'),
       componentRoots: options.liveComponentRoots,
-      verifyStoppedState: options.verifyStoppedState,
+      verifyStoppedState: async (request) => {
+        const context = this.#activeHostMutationContext
+        if (context === null) throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE')
+        context.scope.assertActive()
+        const proof = await this.#verifyStoppedState(request, context.scope)
+        context.scope.assertActive()
+        return proof
+      },
       limits: this.#limits,
       now: this.#now
     })
@@ -382,104 +406,119 @@ export class ComponentUpdateActivationService {
     return await this.#serialize(async () => {
       await this.#initialize()
       return await this.#withCrossInstanceLock(async () => {
-        await this.#reconcilePendingTransactions()
-        const fingerprint = requestFingerprint(request)
-        const existing = await this.#readReceipt(request.requestId)
-        if (existing !== null) return handleExistingReceipt(existing, fingerprint)
+        return await this.#runHostMutation(
+          { operation: 'component-update-activation', requestId: request.requestId },
+          async (context) => {
+            await this.#reconcilePendingTransactions(context)
+            const fingerprint = requestFingerprint(request)
+            const existing = await this.#readReceipt(request.requestId)
+            if (existing !== null) return handleExistingReceipt(existing, fingerprint)
 
-        let state = await this.#loadState(true)
-        const releaseId = createReleaseId(request)
-        let fileCount = 0
-        let expandedBytes = 0
-        let protectionBackupId: string | null = null
-        let journalPersisted = false
-        try {
-          if (state.recoveryRequired) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_REQUIRED')
-          if (request.expectedRevision !== state.revision) throw new ComponentUpdateActivationError('UPDATE_REVISION_CONFLICT')
-          await this.#assertHistoryCapacity(request.requestId, true)
-          const staged = await this.#loadStagedArtifact(request)
-          await this.#evaluateCandidateCompatibility(request, state)
-          const inspected = await inspectComponentArchive({
-            archivePath: staged.artifactPath,
-            expectedComponent: request.component,
-            expectedVersion: request.targetVersion,
-            expectedArtifactId: request.artifactId,
-            limits: this.#limits
-          })
-          assertStagedContentManifest(request, staged.manifest, inspected.manifest)
-          this.#liveDeployment.assertSupportedManifest(request.component, inspected.manifest)
-          fileCount = inspected.summary.fileCount
-          expandedBytes = inspected.summary.expandedBytes
-          await this.#assembleImmutableRelease(request, staged, inspected.manifest, releaseId)
-          await this.#requireStopped({ requestId: request.requestId, component: request.component, phase: 'before-protection' })
-          const protection = await this.#createProtection(request)
-          protectionBackupId = protection.backupId
+            let state = await this.#loadState(true)
+            const releaseId = createReleaseId(request)
+            let fileCount = 0
+            let expandedBytes = 0
+            let protectionBackupId: string | null = null
+            let journalPersisted = false
+            try {
+              if (state.recoveryRequired) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_REQUIRED')
+              if (request.expectedRevision !== state.revision) throw new ComponentUpdateActivationError('UPDATE_REVISION_CONFLICT')
+              await this.#assertHistoryCapacity(request.requestId, true)
+              const staged = await this.#loadStagedArtifact(request)
+              await this.#evaluateCandidateCompatibility(request, state)
+              const inspected = await inspectComponentArchive({
+                archivePath: staged.artifactPath,
+                expectedComponent: request.component,
+                expectedVersion: request.targetVersion,
+                expectedArtifactId: request.artifactId,
+                limits: this.#limits
+              })
+              assertStagedContentManifest(request, staged.manifest, inspected.manifest)
+              this.#liveDeployment.assertSupportedManifest(request.component, inspected.manifest)
+              fileCount = inspected.summary.fileCount
+              expandedBytes = inspected.summary.expandedBytes
+              await this.#assembleImmutableRelease(request, staged, inspected.manifest, releaseId)
+              await this.#requireStopped(
+                { requestId: request.requestId, component: request.component, phase: 'before-protection' },
+                context
+              )
+              const protection = await this.#createProtection(request, context)
+              protectionBackupId = protection.backupId
 
-          state = await this.#loadState(true)
-          if (state.recoveryRequired) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_REQUIRED')
-          if (request.expectedRevision !== state.revision) throw new ComponentUpdateActivationError('UPDATE_REVISION_CONFLICT')
-          const stagedAgain = await this.#loadStagedArtifact(request)
-          if (stagedAgain.manifest.sha256 !== staged.manifest.sha256 || stagedAgain.manifest.sizeBytes !== staged.manifest.sizeBytes) {
-            throw new ComponentUpdateActivationError('UPDATE_STAGED_ARTIFACT_CHANGED')
-          }
-          if (canonicalJson(stagedAgain.manifest.componentManifest ?? null) !==
-              canonicalJson(staged.manifest.componentManifest ?? null)) {
-            throw new ComponentUpdateActivationError('UPDATE_STAGED_ARTIFACT_CHANGED')
-          }
-          await this.#evaluateCandidateCompatibility(request, state)
-          await this.#verifyImmutableRelease(request, releaseId, inspected.manifest)
-          await this.#requireStopped({ requestId: request.requestId, component: request.component, phase: 'before-publish' })
+              state = await this.#loadState(true)
+              if (state.recoveryRequired) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_REQUIRED')
+              if (request.expectedRevision !== state.revision) throw new ComponentUpdateActivationError('UPDATE_REVISION_CONFLICT')
+              const stagedAgain = await this.#loadStagedArtifact(request)
+              if (stagedAgain.manifest.sha256 !== staged.manifest.sha256 || stagedAgain.manifest.sizeBytes !== staged.manifest.sizeBytes) {
+                throw new ComponentUpdateActivationError('UPDATE_STAGED_ARTIFACT_CHANGED')
+              }
+              if (canonicalJson(stagedAgain.manifest.componentManifest ?? null) !==
+                  canonicalJson(staged.manifest.componentManifest ?? null)) {
+                throw new ComponentUpdateActivationError('UPDATE_STAGED_ARTIFACT_CHANGED')
+              }
+              await this.#evaluateCandidateCompatibility(request, state)
+              await this.#verifyImmutableRelease(request, releaseId, inspected.manifest)
+              await this.#requireStopped(
+                { requestId: request.requestId, component: request.component, phase: 'before-publish' },
+                context
+              )
 
-          const activatedAt = this.#timestamp()
-          const transaction: StoredTransaction = {
-            requestId: request.requestId,
-            requestFingerprint: fingerprint,
-            component: request.component,
-            artifactId: request.artifactId,
-            targetVersion: request.targetVersion,
-            compatibilityReceiptId: request.compatibilityReceiptId,
-            releaseId,
-            previousRevision: state.revision,
-            protectionBackupId: protection.backupId,
-            fileCount,
-            expandedBytes,
-            activatedAt
+              const activatedAt = this.#timestamp()
+              const transaction: StoredTransaction = {
+                requestId: request.requestId,
+                requestFingerprint: fingerprint,
+                component: request.component,
+                artifactId: request.artifactId,
+                targetVersion: request.targetVersion,
+                compatibilityReceiptId: request.compatibilityReceiptId,
+                releaseId,
+                previousRevision: state.revision,
+                protectionBackupId: protection.backupId,
+                fileCount,
+                expandedBytes,
+                activatedAt
+              }
+              await this.#persistHistory(request.requestId, state)
+              context.markPossibleWrite()
+              await this.#persistJournal(transaction)
+              journalPersisted = true
+              context.scope.assertActive()
+              await this.#liveDeployment.publishCandidate(transactionToLiveRequest(transaction))
+              context.scope.assertActive()
+              const candidateState = buildCandidateState(state, request, releaseId, transaction)
+              await this.#writeActiveState(candidateState, context)
+              return await this.#finishActivatedTransaction(transaction, state, candidateState, 'candidate', context)
+            } catch (error) {
+              if (error instanceof HostMutationLeaseError) throw error
+              if (error instanceof CandidateHandledError) return error.receipt
+              const normalized = normalizeError(error)
+              const current = await this.#loadState(true).catch(() => state)
+              if (journalPersisted || (current.lastTransaction?.requestId === request.requestId &&
+                  current.lastTransaction.requestFingerprint === fingerprint)) {
+                // The active switch is durable but its receipt is not. Leave the
+                // immutable journal pending so restart reconciliation can prove the
+                // candidate or compensate; never record a misleading terminal fail.
+                throw new ComponentUpdateActivationError(normalized.code, { cause: normalized })
+              }
+              const receipt = createReceipt({
+                request,
+                releaseId,
+                status: 'failed',
+                previousRevision: state.revision,
+                resultingRevision: current.revision,
+                protectionBackupId,
+                failureCode: normalized.code,
+                rollbackVerified: false,
+                recoveryRequired: current.recoveryRequired,
+                fileCount,
+                expandedBytes,
+                completedAt: this.#timestamp()
+              })
+              await this.#persistReceipt(fingerprint, receipt).catch(() => undefined)
+              throw new ComponentUpdateActivationError(normalized.code, { cause: normalized, receipt })
+            }
           }
-          await this.#persistHistory(request.requestId, state)
-          await this.#persistJournal(transaction)
-          journalPersisted = true
-          await this.#liveDeployment.publishCandidate(transactionToLiveRequest(transaction))
-          const candidateState = buildCandidateState(state, request, releaseId, transaction)
-          await this.#writeActiveState(candidateState)
-          return await this.#finishActivatedTransaction(transaction, state, candidateState, 'candidate')
-        } catch (error) {
-          if (error instanceof CandidateHandledError) return error.receipt
-          const normalized = normalizeError(error)
-          const current = await this.#loadState(true).catch(() => state)
-          if (journalPersisted || (current.lastTransaction?.requestId === request.requestId &&
-              current.lastTransaction.requestFingerprint === fingerprint)) {
-            // The active switch is durable but its receipt is not. Leave the
-            // immutable journal pending so restart reconciliation can prove the
-            // candidate or compensate; never record a misleading terminal fail.
-            throw new ComponentUpdateActivationError(normalized.code, { cause: normalized })
-          }
-          const receipt = createReceipt({
-            request,
-            releaseId,
-            status: 'failed',
-            previousRevision: state.revision,
-            resultingRevision: current.revision,
-            protectionBackupId,
-            failureCode: normalized.code,
-            rollbackVerified: false,
-            recoveryRequired: current.recoveryRequired,
-            fileCount,
-            expandedBytes,
-            completedAt: this.#timestamp()
-          })
-          await this.#persistReceipt(fingerprint, receipt).catch(() => undefined)
-          throw new ComponentUpdateActivationError(normalized.code, { cause: normalized, receipt })
-        }
+        )
       })
     })
   }
@@ -487,7 +526,10 @@ export class ComponentUpdateActivationService {
   async reconcile(): Promise<ComponentUpdateActivationReceipt | null> {
     return await this.#serialize(async () => {
       await this.#initialize()
-      return await this.#withCrossInstanceLock(async () => await this.#reconcilePendingTransactions())
+      return await this.#withCrossInstanceLock(async () => await this.#runHostMutation(
+        { operation: 'component-update-reconciliation', requestId: randomUUID() },
+        async (context) => await this.#reconcilePendingTransactions(context)
+      ))
     })
   }
 
@@ -570,7 +612,8 @@ export class ComponentUpdateActivationService {
     transaction: StoredTransaction,
     previousState: StoredActiveState,
     candidateState: StoredActiveState,
-    phase: 'candidate' | 'reconcile-candidate'
+    phase: 'candidate' | 'reconcile-candidate',
+    context: ActivationHostMutationContext
   ): Promise<ComponentUpdateActivationReceipt> {
     const request = transactionToRequest(transaction)
     let candidateFailure = 'UPDATE_SMOKE_FAILED'
@@ -582,16 +625,20 @@ export class ComponentUpdateActivationService {
         phase,
         expectedVersion: transaction.targetVersion,
         expectedReleaseId: transaction.releaseId
-      })
+      }, context)
       healthy = smokeIsHealthy(result, transaction.component, transaction.targetVersion)
       if (!healthy) candidateFailure = 'UPDATE_SMOKE_UNHEALTHY'
     } catch (error) {
+      if (error instanceof HostMutationLeaseError) throw error
       candidateFailure = normalizeError(error).code === 'UPDATE_SMOKE_INVALID'
         ? 'UPDATE_SMOKE_INVALID'
         : 'UPDATE_SMOKE_FAILED'
     }
     if (healthy) {
+      context.scope.assertActive()
+      context.markPossibleWrite()
       await this.#liveDeployment.commitCandidate(transactionToLiveRequest(transaction))
+      context.scope.assertActive()
       const receipt = createReceipt({
         request,
         releaseId: transaction.releaseId,
@@ -616,14 +663,15 @@ export class ComponentUpdateActivationService {
         requestId: transaction.requestId,
         component: transaction.component,
         phase: 'before-rollback'
-      })
+      }, context)
       stoppedForRollback = true
-    } catch {
+    } catch (error) {
+      if (error instanceof HostMutationLeaseError) throw error
       stoppedForRollback = false
     }
     if (!stoppedForRollback) {
       const recoveryState = buildRecoveryState(candidateState, transaction)
-      await this.#writeActiveState(recoveryState)
+      await this.#writeActiveState(recoveryState, context)
       const receipt = createReceipt({
         request,
         releaseId: transaction.releaseId,
@@ -643,11 +691,15 @@ export class ComponentUpdateActivationService {
     }
 
     try {
+      context.scope.assertActive()
+      context.markPossibleWrite()
       await this.#liveDeployment.rollbackCandidate(transactionToLiveRequest(transaction))
-      await this.#writeActiveState(previousState)
+      context.scope.assertActive()
+      await this.#writeActiveState(previousState, context)
     } catch (error) {
+      if (error instanceof HostMutationLeaseError) throw error
       const recoveryState = buildRecoveryState(candidateState, transaction)
-      await this.#writeActiveState(recoveryState)
+      await this.#writeActiveState(recoveryState, context)
       const normalized = normalizeError(error)
       const receipt = createReceipt({
         request,
@@ -678,9 +730,10 @@ export class ComponentUpdateActivationService {
         phase: 'rollback',
         expectedVersion: previousComponent?.version ?? null,
         expectedReleaseId: previousComponent?.releaseId ?? null
-      })
+      }, context)
       rollbackVerified = smokeIsHealthy(rollback, transaction.component, previousComponent?.version ?? null)
-    } catch {
+    } catch (error) {
+      if (error instanceof HostMutationLeaseError) throw error
       rollbackVerified = false
     }
     if (rollbackVerified) {
@@ -703,7 +756,7 @@ export class ComponentUpdateActivationService {
     }
 
     const recoveryState = buildRecoveryState(previousState, transaction)
-    await this.#writeActiveState(recoveryState)
+    await this.#writeActiveState(recoveryState, context)
     const receipt = createReceipt({
       request,
       releaseId: transaction.releaseId,
@@ -722,9 +775,14 @@ export class ComponentUpdateActivationService {
     return receipt
   }
 
-  async #reconcilePendingTransactions(): Promise<ComponentUpdateActivationReceipt | null> {
+  async #reconcilePendingTransactions(
+    context: ActivationHostMutationContext
+  ): Promise<ComponentUpdateActivationReceipt | null> {
     const journals = await this.#readPendingJournals()
     if (journals.length === 0) return null
+    // Any unresolved durable journal is evidence that a prior host write may
+    // already have happened, even before this reconciliation performs I/O.
+    context.markPossibleWrite()
     if (journals.length > 1) throw new ComponentUpdateActivationError('UPDATE_RECONCILIATION_AMBIGUOUS')
     const journal = journals[0]!
     const existing = await this.#readReceipt(journal.transaction.requestId)
@@ -743,36 +801,49 @@ export class ComponentUpdateActivationService {
       }
       let liveResult: 'candidate' | 'previous'
       try {
+        context.scope.assertActive()
         liveResult = await this.#liveDeployment.reconcileCandidate(
           transactionToLiveRequest(journal.transaction),
           'candidate'
         )
+        context.scope.assertActive()
       } catch (error) {
-        return await this.#recordLiveReconciliationFailure(journal.transaction, state, error)
+        if (error instanceof HostMutationLeaseError) throw error
+        return await this.#recordLiveReconciliationFailure(journal.transaction, state, error, context)
       }
       if (liveResult === 'previous') {
-        await this.#writeActiveState(previousState)
-        return await this.#finishInterruptedPrevious(journal.transaction, previousState)
+        await this.#writeActiveState(previousState, context)
+        return await this.#finishInterruptedPrevious(journal.transaction, previousState, context)
       }
-      return await this.#finishActivatedTransaction(journal.transaction, previousState, state, 'reconcile-candidate')
+      return await this.#finishActivatedTransaction(
+        journal.transaction,
+        previousState,
+        state,
+        'reconcile-candidate',
+        context
+      )
     }
     if (state.revision === previousState.revision) {
       try {
+        context.scope.assertActive()
         await this.#liveDeployment.reconcileCandidate(
           transactionToLiveRequest(journal.transaction),
           'previous'
         )
+        context.scope.assertActive()
       } catch (error) {
-        return await this.#recordLiveReconciliationFailure(journal.transaction, previousState, error)
+        if (error instanceof HostMutationLeaseError) throw error
+        return await this.#recordLiveReconciliationFailure(journal.transaction, previousState, error, context)
       }
-      return await this.#finishInterruptedPrevious(journal.transaction, previousState)
+      return await this.#finishInterruptedPrevious(journal.transaction, previousState, context)
     }
     throw new ComponentUpdateActivationError('UPDATE_RECONCILIATION_UNCERTAIN')
   }
 
   async #finishInterruptedPrevious(
     transaction: StoredTransaction,
-    previousState: StoredActiveState
+    previousState: StoredActiveState,
+    context: ActivationHostMutationContext
   ): Promise<ComponentUpdateActivationReceipt> {
     const previousComponent = previousState.components.find((component) => component.component === transaction.component)
     let rollbackVerified = false
@@ -783,14 +854,15 @@ export class ComponentUpdateActivationService {
         phase: 'rollback',
         expectedVersion: previousComponent?.version ?? null,
         expectedReleaseId: previousComponent?.releaseId ?? null
-      })
+      }, context)
       rollbackVerified = smokeIsHealthy(smoke, transaction.component, previousComponent?.version ?? null)
-    } catch {
+    } catch (error) {
+      if (error instanceof HostMutationLeaseError) throw error
       rollbackVerified = false
     }
     if (!rollbackVerified) {
       const recoveryState = buildRecoveryState(previousState, transaction)
-      await this.#writeActiveState(recoveryState)
+      await this.#writeActiveState(recoveryState, context)
       const failed = journalToReceipt(
         transaction,
         recoveryState,
@@ -819,10 +891,11 @@ export class ComponentUpdateActivationService {
   async #recordLiveReconciliationFailure(
     transaction: StoredTransaction,
     state: StoredActiveState,
-    error: unknown
+    error: unknown,
+    context: ActivationHostMutationContext
   ): Promise<ComponentUpdateActivationReceipt> {
     const recoveryState = buildRecoveryState(state, transaction)
-    await this.#writeActiveState(recoveryState)
+    await this.#writeActiveState(recoveryState, context)
     const normalized = normalizeError(error)
     const failed = journalToReceipt(
       transaction,
@@ -966,39 +1039,65 @@ export class ComponentUpdateActivationService {
     return { manifest, artifactPath }
   }
 
-  async #requireStopped(request: StoppedStateCheckRequest): Promise<void> {
+  async #requireStopped(
+    request: StoppedStateCheckRequest,
+    context: ActivationHostMutationContext
+  ): Promise<void> {
     let proof: StoppedStateProof
     try {
-      proof = stoppedProofSchema.parse(await this.#verifyStoppedState(request))
+      context.scope.assertActive()
+      proof = stoppedProofSchema.parse(await this.#verifyStoppedState(request, context.scope))
+      context.scope.assertActive()
     } catch (error) {
+      context.scope.assertActive()
+      if (error instanceof HostMutationLeaseError) throw error
       throw new ComponentUpdateActivationError('UPDATE_STOP_PROOF_INVALID', { cause: error })
     }
     if (!proof.processStopped || !proof.portClosed) throw new ComponentUpdateActivationError('UPDATE_SERVICE_STILL_RUNNING')
   }
 
-  async #createProtection(request: NormalizedActivationRequest): Promise<SaveProtectionPointReceipt> {
+  async #createProtection(
+    request: NormalizedActivationRequest,
+    context: ActivationHostMutationContext
+  ): Promise<SaveProtectionPointReceipt> {
     let receipt: SaveProtectionPointReceipt
     try {
+      context.scope.assertActive()
+      context.markPossibleWrite()
       receipt = saveProtectionReceiptSchema.parse(await this.#createSaveProtectionPoint({
         requestId: request.requestId,
         purpose: 'component-update',
         component: request.component,
         targetVersion: request.targetVersion,
         expectedRevision: request.expectedRevision
-      }))
+      }, context.scope))
+      context.scope.assertActive()
     } catch (error) {
+      context.scope.assertActive()
+      if (error instanceof HostMutationLeaseError) throw error
       throw new ComponentUpdateActivationError('UPDATE_SAVE_PROTECTION_FAILED', { cause: error })
     }
     if (receipt.requestId !== request.requestId) throw new ComponentUpdateActivationError('UPDATE_SAVE_PROTECTION_MISMATCH')
+    // A valid durable, request-bound protection receipt closes this adapter
+    // write window. Later precondition failures are ordinary safe rejections.
+    context.resolvePossibleWrite()
     return receipt
   }
 
-  async #smokeChecked(request: FixedUpdateSmokeRequest): Promise<FixedUpdateSmokeResult> {
+  async #smokeChecked(
+    request: FixedUpdateSmokeRequest,
+    context: ActivationHostMutationContext
+  ): Promise<FixedUpdateSmokeResult> {
     try {
-      const result = smokeResultSchema.parse(await this.#smoke(request))
+      context.scope.assertActive()
+      context.markPossibleWrite()
+      const result = smokeResultSchema.parse(await this.#smoke(request, context.scope))
+      context.scope.assertActive()
       if (result.component !== request.component) throw new ComponentUpdateActivationError('UPDATE_SMOKE_INVALID')
       return result
     } catch (error) {
+      context.scope.assertActive()
+      if (error instanceof HostMutationLeaseError) throw error
       if (error instanceof ComponentUpdateActivationError) throw error
       throw new ComponentUpdateActivationError('UPDATE_SMOKE_INVALID', { cause: error })
     }
@@ -1112,14 +1211,22 @@ export class ComponentUpdateActivationService {
     }
   }
 
-  async #writeActiveState(state: StoredActiveState): Promise<void> {
+  async #writeActiveState(
+    state: StoredActiveState,
+    context: ActivationHostMutationContext
+  ): Promise<void> {
     validateStoredStateRevision(state)
     const activePath = managedChild(this.#controlRoot, 'active.json')
     const temporary = managedChild(this.#controlRoot, `.active-${randomUUID()}.tmp`)
+    context.scope.assertActive()
+    context.markPossibleWrite()
     await writeFile(temporary, `${canonicalJson(state)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
     try {
+      context.scope.assertActive()
       await rename(temporary, activePath)
+      context.scope.assertActive()
     } catch (error) {
+      if (error instanceof HostMutationLeaseError) throw error
       await unlink(temporary).catch(() => undefined)
       throw new ComponentUpdateActivationError('UPDATE_ACTIVE_SWITCH_FAILED', { cause: error })
     }
@@ -1206,6 +1313,79 @@ export class ComponentUpdateActivationService {
     else {
       const info = await lstat(this.#controlRoot).catch((error: unknown) => isNodeError(error, 'ENOENT') ? null : Promise.reject(error))
       if (info !== null) await assertDirectory(this.#controlRoot, this.#projectRoot)
+    }
+  }
+
+  async #runHostMutation<T extends ComponentUpdateActivationReceipt | null>(
+    request: Readonly<{ operation: string; requestId: string }>,
+    operation: (context: ActivationHostMutationContext) => Promise<T>
+  ): Promise<T> {
+    if (this.#hostMutationCoordinator === null) {
+      throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE')
+    }
+    try {
+      return await this.#hostMutationCoordinator.runExclusive(
+        request,
+        async (scope) => {
+          let possibleWrite = false
+          const context: ActivationHostMutationContext = {
+            scope,
+            markPossibleWrite: () => { possibleWrite = true },
+            resolvePossibleWrite: () => { possibleWrite = false }
+          }
+          if (this.#activeHostMutationContext !== null) {
+            return hostMutationThrow<T>(
+              new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE'),
+              'abandon'
+            )
+          }
+          this.#activeHostMutationContext = context
+          try {
+            scope.assertActive()
+            const result = await operation(context)
+            scope.assertActive()
+            // A returned activation/reconciliation result is a durable terminal
+            // boundary. Recovery receipts still abandon below; healthy or
+            // proven rolled-back terminals may release after state validation.
+            context.resolvePossibleWrite()
+            const state = await this.#loadState(true)
+            const recoveryRequired = result?.recoveryRequired === true || state.recoveryRequired
+            return hostMutationReturn(result, recoveryRequired ? 'abandon' : 'release')
+          } catch (error) {
+            // Let the generic coordinator translate lease loss and preserve its
+            // broker-owned abandon semantics. Domain failures are classified
+            // explicitly below so a safe rejection can release the host lease.
+            if (error instanceof HostMutationLeaseError) throw error
+            const abandon = await this.#mustAbandonHostLease(error, possibleWrite)
+            return hostMutationThrow<T>(error, abandon ? 'abandon' : 'release')
+          } finally {
+            this.#activeHostMutationContext = null
+          }
+        }
+      )
+    } catch (error) {
+      if (error instanceof ComponentUpdateActivationError) throw error
+      if (error instanceof HostMutationOperationCoordinatorError) {
+        throw new ComponentUpdateActivationError(mapHostMutationCoordinatorCode(error.code))
+      }
+      if (error instanceof HostMutationLeaseError) {
+        throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_LOST')
+      }
+      throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE')
+    }
+  }
+
+  async #mustAbandonHostLease(error: unknown, possibleWrite: boolean): Promise<boolean> {
+    if (possibleWrite) return true
+    if (error instanceof ComponentUpdateActivationError) {
+      if (error.receipt?.recoveryRequired === true || hostLeaseRecoveryCodes.has(error.code)) return true
+    }
+    try {
+      return (await this.#loadState(true)).recoveryRequired
+    } catch {
+      // If the durable state cannot be proven, releasing would allow another
+      // host mutation to proceed across an unknown activation boundary.
+      return true
     }
   }
 
@@ -1776,6 +1956,28 @@ function normalizeError(error: unknown): ComponentUpdateActivationError {
   return error instanceof ComponentUpdateActivationError
     ? error
     : new ComponentUpdateActivationError('UPDATE_ACTIVATION_FAILED', { cause: error })
+}
+
+const hostLeaseRecoveryCodes = new Set([
+  'UPDATE_ACTIVE_STATE_INVALID',
+  'UPDATE_JOURNAL_CONFLICT',
+  'UPDATE_JOURNAL_DIRECTORY_INVALID',
+  'UPDATE_JOURNAL_INVALID',
+  'UPDATE_RECEIPT_INVALID',
+  'UPDATE_RECONCILIATION_AMBIGUOUS',
+  'UPDATE_RECONCILIATION_UNCERTAIN',
+  'UPDATE_RECOVERY_REQUIRED',
+  'UPDATE_STATE_REVISION_INVALID'
+])
+
+function mapHostMutationCoordinatorCode(code: string): string {
+  switch (code) {
+    case 'HOST_MUTATION_LEASE_BUSY': return 'UPDATE_HOST_LEASE_BUSY'
+    case 'HOST_MUTATION_LEASE_DIRTY': return 'UPDATE_HOST_LEASE_DIRTY'
+    case 'HOST_MUTATION_LEASE_RECOVERY_REQUIRED': return 'UPDATE_HOST_LEASE_RECOVERY_REQUIRED'
+    case 'HOST_MUTATION_LEASE_LOST': return 'UPDATE_HOST_LEASE_LOST'
+    default: return 'UPDATE_HOST_LEASE_UNAVAILABLE'
+  }
 }
 
 class CandidateHandledError extends Error {

@@ -4,6 +4,15 @@ import path from 'node:path'
 import { hostname, tmpdir, uptime } from 'node:os'
 import { deflateRawSync } from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
+import { HostMutationLeaseError } from '../host-mutation/lease.js'
+import {
+  HostMutationOperationCoordinatorError,
+  type HostMutationDisposition,
+  type HostMutationOperationCoordinator,
+  type HostMutationOperationOutcome,
+  type HostMutationOperationRequest,
+  type HostMutationOperationScope
+} from '../host-mutation/operation-coordinator.js'
 import {
   ComponentUpdateActivationError,
   ComponentUpdateActivationService,
@@ -73,7 +82,8 @@ describe('component update activation transaction', () => {
       payloads: [{ name: payloadName, bytes: Buffer.from(`${component}-binary`) }]
     })
     const controlled = createAdapters()
-    const service = createService(fixture, controlled.adapters)
+    const coordinator = new TestHostMutationCoordinator()
+    const service = createService(fixture, controlled.adapters, { hostMutationCoordinator: coordinator })
     const request = makeRequest(component, targetVersion, staged, initialComponentUpdateRevision)
 
     const plan = await service.preview(request)
@@ -90,6 +100,8 @@ describe('component update activation transaction', () => {
     ])
     expect(controlled.protectionCalls).toBe(1)
     expect(controlled.smokeCalls).toEqual(['candidate'])
+    expect(coordinator.assertActiveCalls).toBeGreaterThanOrEqual(15)
+    expect(coordinator.dispositions).toEqual(['release'])
     const repeated = await service.execute(request)
     expect(repeated).toMatchObject({ status: 'succeeded', reused: true })
     expect(controlled.protectionCalls).toBe(1)
@@ -299,6 +311,136 @@ describe('component update activation transaction', () => {
     expect(brokenProtection.protectionCalls).toBe(1)
   })
 
+  it('keeps read-only preview available but fails execute and reconcile closed without the shared host lease coordinator', async () => {
+    const fixture = await createFixture()
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage())
+    const request = makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
+    const service = new ComponentUpdateActivationService({
+      projectRoot: fixture.projectRoot,
+      stagingRoot: fixture.stagingRoot,
+      liveComponentRoots: liveComponentRoots(fixture),
+      compatibilityVerifier: createCompatibilityVerifier(),
+      ...createAdapters().adapters
+    })
+
+    await expect(service.preview(request)).resolves.toMatchObject({ dryRun: true })
+    await expect(service.execute(request)).rejects.toMatchObject({ code: 'UPDATE_HOST_LEASE_UNAVAILABLE' })
+    await expect(service.reconcile()).rejects.toMatchObject({ code: 'UPDATE_HOST_LEASE_UNAVAILABLE' })
+  })
+
+  it('acquires the local activation lock before the host lease and releases the lease for a safe preflight rejection', async () => {
+    const fixture = await createFixture()
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage())
+    const coordinator = new TestHostMutationCoordinator()
+    const lockPath = path.join(fixture.projectRoot, '.dyson-control-updates', '.locks', 'activation.lock')
+    coordinator.onEnter = async () => {
+      expect((await lstat(lockPath)).isFile()).toBe(true)
+    }
+    const request = makeRequest('nebula', '0.9.1', staged, 'f'.repeat(64))
+
+    await expect(createService(fixture, createAdapters().adapters, { hostMutationCoordinator: coordinator }).execute(request))
+      .rejects.toMatchObject({ code: 'UPDATE_REVISION_CONFLICT' })
+    expect(coordinator.requests).toEqual([{
+      operation: 'component-update-activation',
+      requestId: request.requestId
+    }])
+    expect(coordinator.dispositions).toEqual(['release'])
+  })
+
+  it('forwards the active lease signal and borrow arguments to every lifecycle adapter call', async () => {
+    const fixture = await createFixture()
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage())
+    const coordinator = new TestHostMutationCoordinator()
+    const observedScopes: HostMutationOperationScope[] = []
+    const controlled = createAdapters({
+      stoppedVerifier: async (_request, hostMutation) => {
+        observedScopes.push(hostMutation)
+        return { processStopped: true, portClosed: true }
+      },
+      protection: async (request, hostMutation) => {
+        observedScopes.push(hostMutation)
+        return {
+          requestId: request.requestId,
+          status: 'succeeded',
+          backupId: `backup-${request.requestId}`,
+          pairProtected: true,
+          durable: true
+        }
+      },
+      smoke: async (request, hostMutation) => {
+        observedScopes.push(hostMutation)
+        return smokeResult(request, true)
+      }
+    })
+
+    await expect(createService(fixture, controlled.adapters, { hostMutationCoordinator: coordinator }).execute(
+      makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
+    )).resolves.toMatchObject({ status: 'succeeded' })
+    expect(observedScopes.length).toBeGreaterThanOrEqual(6)
+    for (const scope of observedScopes) {
+      expect(scope.signal).toBe(coordinator.controller.signal)
+      expect(scope.toPowerShellBorrowArguments()).toEqual(coordinator.borrowArguments)
+    }
+  })
+
+  it('maps an adapter cancellation wrapper to host lease lost when the shared signal is aborted', async () => {
+    const fixture = await createFixture()
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage())
+    const coordinator = new TestHostMutationCoordinator()
+    const controlled = createAdapters({
+      stoppedVerifier: async (_request, hostMutation) => {
+        expect(hostMutation.signal).toBe(coordinator.controller.signal)
+        coordinator.controller.abort()
+        throw new Error('adapter wrapped cancellation')
+      }
+    })
+
+    await expect(createService(fixture, controlled.adapters, { hostMutationCoordinator: coordinator }).execute(
+      makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
+    )).rejects.toMatchObject({ code: 'UPDATE_HOST_LEASE_LOST' })
+    expect(controlled.protectionCalls).toBe(0)
+    expect(coordinator.abandoned).toBe(true)
+  })
+
+  it('stops before smoke and abandons when the lease is lost immediately after live publish', async () => {
+    const fixture = await createFixture()
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage())
+    const coordinator = new TestHostMutationCoordinator()
+    const controlled = createAdapters()
+    let assertionsAfterFinalStopProof = 0
+    coordinator.onAssertActive = () => {
+      if (controlled.stopPhases.length === 4 && ++assertionsAfterFinalStopProof === 2) {
+        throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+      }
+    }
+
+    await expect(createService(fixture, controlled.adapters, { hostMutationCoordinator: coordinator }).execute(
+      makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
+    )).rejects.toMatchObject({ code: 'UPDATE_HOST_LEASE_LOST' })
+    expect(controlled.smokeCalls).toEqual([])
+    expect(coordinator.abandoned).toBe(true)
+  })
+
+  it.each([
+    ['HOST_MUTATION_LEASE_BUSY', 'UPDATE_HOST_LEASE_BUSY'],
+    ['HOST_MUTATION_LEASE_DIRTY', 'UPDATE_HOST_LEASE_DIRTY'],
+    ['HOST_MUTATION_LEASE_RECOVERY_REQUIRED', 'UPDATE_HOST_LEASE_RECOVERY_REQUIRED'],
+    ['HOST_MUTATION_LEASE_LOST', 'UPDATE_HOST_LEASE_LOST'],
+    ['HOST_MUTATION_LEASE_UNAVAILABLE', 'UPDATE_HOST_LEASE_UNAVAILABLE']
+  ] as const)('maps host coordinator failure %s to %s without entering adapters', async (hostCode, updateCode) => {
+    const fixture = await createFixture()
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage())
+    const controlled = createAdapters()
+    const coordinator = new TestHostMutationCoordinator()
+    coordinator.acquireError = new HostMutationOperationCoordinatorError(hostCode)
+
+    await expect(createService(fixture, controlled.adapters, { hostMutationCoordinator: coordinator }).execute(
+      makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
+    )).rejects.toMatchObject({ code: updateCode })
+    expect(controlled.stopPhases).toEqual([])
+    expect(controlled.protectionCalls).toBe(0)
+  })
+
   it('rejects compatibility evidence drift and optimistic revision conflicts before any lifecycle gate', async () => {
     const fixture = await createFixture()
     const staged = await stageComponent(fixture.stagingRoot, defaultStage())
@@ -390,12 +532,16 @@ describe('component update activation transaction', () => {
         ? smokeResult(request, true)
         : smokeResult(request, false)
     })
-    const recoveryService = createService(recoveryFixture, recoveryAdapters.adapters)
+    const recoveryCoordinator = new TestHostMutationCoordinator()
+    const recoveryService = createService(recoveryFixture, recoveryAdapters.adapters, {
+      hostMutationCoordinator: recoveryCoordinator
+    })
     const installed = await recoveryService.execute(makeRequest('nebula', '0.9.1', recoveryV1, initialComponentUpdateRevision))
     const failed = await recoveryService.execute(makeRequest(
       'nebula', '0.9.2', recoveryV2, installed.resultingRevision, baseInventory({ nebula: '0.9.1' })
     ))
     expect(failed).toMatchObject({ status: 'rollback-failed', recoveryRequired: true, rollbackVerified: false })
+    expect(recoveryCoordinator.dispositions.at(-1)).toBe('abandon')
     expect((await recoveryService.getState()).recoveryRequired).toBe(true)
     const v3 = await stageComponent(recoveryFixture.stagingRoot, defaultStage({ artifactId: 'nebula-artifact-1003', targetVersion: '0.9.3' }))
     await expect(recoveryService.execute(makeRequest(
@@ -412,11 +558,20 @@ describe('component update activation transaction', () => {
     const receipt = await firstService.execute(request)
     await rm(path.join(fixture.projectRoot, '.dyson-control-updates', 'receipts', `${request.requestId}.json`))
 
-    const restarted = createService(fixture, controlled.adapters)
+    const reconciliationCoordinator = new TestHostMutationCoordinator()
+    const restarted = createService(fixture, controlled.adapters, {
+      hostMutationCoordinator: reconciliationCoordinator
+    })
     const reconciled = await restarted.reconcile()
     expect(reconciled).toMatchObject({ requestId: request.requestId, status: 'succeeded' })
     expect(controlled.protectionCalls).toBe(1)
     expect(controlled.smokeCalls).toContain('reconcile-candidate')
+    expect(reconciliationCoordinator.requests).toHaveLength(1)
+    expect(reconciliationCoordinator.requests[0]).toMatchObject({
+      operation: 'component-update-reconciliation'
+    })
+    expect(reconciliationCoordinator.requests[0]).not.toHaveProperty('recovery')
+    expect(reconciliationCoordinator.dispositions).toEqual(['release'])
     expect((await restarted.getReceipt(request.requestId))?.resultingRevision).toBe(receipt.resultingRevision)
   })
 
@@ -438,10 +593,12 @@ describe('component update activation transaction', () => {
         return { processStopped: true, portClosed: true }
       }
     })
+    const coordinator = new TestHostMutationCoordinator()
     const request = makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
 
-    await expect(createService(fixture, controlled.adapters).execute(request))
+    await expect(createService(fixture, controlled.adapters, { hostMutationCoordinator: coordinator }).execute(request))
       .rejects.toMatchObject({ code: 'UPDATE_ACTIVE_SWITCH_FAILED' })
+    expect(coordinator.dispositions).toEqual(['abandon'])
     expect(await readFile(liveFile, 'utf8')).toBe('candidate-nebula')
     await rm(path.join(fixture.projectRoot, '.dyson-control-updates', 'active.json'), { recursive: true })
 
@@ -634,19 +791,21 @@ function createAdapters(options: {
   stopped?: boolean
   protectionValid?: boolean
   stoppedVerifier?: ComponentUpdateActivationAdapters['verifyStoppedState']
+  protection?: ComponentUpdateActivationAdapters['createSaveProtectionPoint']
   smoke?: ComponentUpdateActivationAdapters['smoke']
 } = {}) {
   const stopPhases: string[] = []
   const smokeCalls: string[] = []
   let protectionCalls = 0
   const adapters: ComponentUpdateActivationAdapters = {
-    verifyStoppedState: async (request) => {
+    verifyStoppedState: async (request, hostMutation) => {
       stopPhases.push(request.phase)
-      if (options.stoppedVerifier !== undefined) return await options.stoppedVerifier(request)
+      if (options.stoppedVerifier !== undefined) return await options.stoppedVerifier(request, hostMutation)
       return { processStopped: options.stopped ?? true, portClosed: options.stopped ?? true }
     },
-    createSaveProtectionPoint: async (request) => {
+    createSaveProtectionPoint: async (request, hostMutation) => {
       protectionCalls++
+      if (options.protection !== undefined) return await options.protection(request, hostMutation)
       if (options.protectionValid === false) return { requestId: request.requestId, status: 'succeeded', backupId: 'bad' } as never
       return {
         requestId: request.requestId,
@@ -656,9 +815,9 @@ function createAdapters(options: {
         durable: true
       }
     },
-    smoke: async (request) => {
+    smoke: async (request, hostMutation) => {
       smokeCalls.push(request.phase)
-      return options.smoke === undefined ? smokeResult(request, true) : await options.smoke(request)
+      return options.smoke === undefined ? smokeResult(request, true) : await options.smoke(request, hostMutation)
     }
   }
   return {
@@ -684,17 +843,66 @@ function smokeResult(request: FixedUpdateSmokeRequest, healthy: boolean) {
 function createService(
   fixture: Fixture,
   adapters: ComponentUpdateActivationAdapters,
-  limits: Partial<{ maximumArchiveBytes: number; maximumFileBytes: number; maximumExpandedBytes: number; maximumFiles: number; maximumHistoryEntries: number }> = {}
+  limits: Partial<{
+    maximumArchiveBytes: number
+    maximumFileBytes: number
+    maximumExpandedBytes: number
+    maximumFiles: number
+    maximumHistoryEntries: number
+    hostMutationCoordinator: HostMutationOperationCoordinator
+  }> = {}
 ): ComponentUpdateActivationService {
   return new ComponentUpdateActivationService({
     projectRoot: fixture.projectRoot,
     stagingRoot: fixture.stagingRoot,
     liveComponentRoots: liveComponentRoots(fixture),
     compatibilityVerifier: createCompatibilityVerifier(),
+    hostMutationCoordinator: limits.hostMutationCoordinator ?? new TestHostMutationCoordinator(),
     now: () => new Date('2026-08-30T12:00:00.000Z'),
     ...adapters,
     ...limits
   })
+}
+
+class TestHostMutationCoordinator implements HostMutationOperationCoordinator {
+  readonly requests: HostMutationOperationRequest[] = []
+  readonly dispositions: HostMutationDisposition[] = []
+  readonly controller = new AbortController()
+  readonly borrowArguments = ['-LeaseInstanceId', 'test-instance', '-LeaseToken', 'test-token'] as const
+  assertActiveCalls = 0
+  acquireError: unknown = null
+  onEnter: ((request: HostMutationOperationRequest) => void | Promise<void>) | null = null
+  onAssertActive: (() => void) | null = null
+  abandoned = false
+
+  async runExclusive<T>(
+    request: HostMutationOperationRequest,
+    operation: (scope: HostMutationOperationScope) => Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>
+  ): Promise<T> {
+    this.requests.push({ ...request })
+    if (this.acquireError !== null) throw this.acquireError
+    await this.onEnter?.(request)
+    try {
+      const outcome = await operation({
+        signal: this.controller.signal,
+        assertActive: () => {
+          this.assertActiveCalls++
+          if (this.controller.signal.aborted) {
+            throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+          }
+          this.onAssertActive?.()
+        },
+        toPowerShellBorrowArguments: () => this.borrowArguments
+      })
+      this.dispositions.push(outcome.disposition)
+      if (outcome.disposition === 'abandon') this.abandoned = true
+      if (outcome.kind === 'throw') throw outcome.error
+      return outcome.value
+    } catch (error) {
+      if (error instanceof HostMutationLeaseError) this.abandoned = true
+      throw error
+    }
+  }
 }
 
 function createCompatibilityVerifier() {

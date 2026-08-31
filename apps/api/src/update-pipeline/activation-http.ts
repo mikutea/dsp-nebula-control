@@ -289,6 +289,9 @@ function safeRecoveryFailureCode(error: unknown): string {
 function recoveryFailureRequiresOperator(error: unknown, code: string): boolean {
   if (error instanceof ComponentUpdateActivationError && error.receipt?.recoveryRequired === true) return true
   return code === 'UPDATE_RECOVERY_REQUIRED' ||
+    code === 'UPDATE_HOST_LEASE_DIRTY' ||
+    code === 'UPDATE_HOST_LEASE_LOST' ||
+    code === 'UPDATE_HOST_LEASE_RECOVERY_REQUIRED' ||
     code === 'UPDATE_RECONCILIATION_AMBIGUOUS' ||
     code === 'UPDATE_RECONCILIATION_UNCERTAIN' ||
     code === 'UPDATE_INTERRUPTED'
@@ -384,6 +387,7 @@ const conflictCodes = new Set([
 
 const lockedCodes = new Set([
   'UPDATE_ACTIVATION_LOCK_BUSY',
+  'UPDATE_HOST_LEASE_BUSY',
   'UPDATE_SERVICE_STILL_RUNNING'
 ])
 
@@ -452,6 +456,10 @@ const unavailableCodes = new Set([
   'UPDATE_HISTORY_INVALID',
   'UPDATE_HISTORY_LIMIT_INVALID',
   'UPDATE_HISTORY_MISSING',
+  'UPDATE_HOST_LEASE_DIRTY',
+  'UPDATE_HOST_LEASE_LOST',
+  'UPDATE_HOST_LEASE_RECOVERY_REQUIRED',
+  'UPDATE_HOST_LEASE_UNAVAILABLE',
   'UPDATE_JOURNAL_DIRECTORY_INVALID',
   'UPDATE_JOURNAL_INVALID',
   'UPDATE_LIMITS_INVALID',

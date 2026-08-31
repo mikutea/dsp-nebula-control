@@ -10,6 +10,7 @@ import type {
   StatusProvider
 } from '../domain.js'
 import type { FixedUpdateSmokeRequest } from '../update-pipeline/activation-types.js'
+import type { HostMutationOperationScope } from '../host-mutation/operation-coordinator.js'
 import {
   WindowsUpdateActivationAdapterError,
   WindowsUpdateActivationAdapters,
@@ -19,6 +20,11 @@ import {
 
 const requestId = '11111111-1111-4111-8111-111111111111'
 const revision = 'a'.repeat(64)
+const hostMutationScope: HostMutationOperationScope = {
+  signal: new AbortController().signal,
+  assertActive: () => undefined,
+  toPowerShellBorrowArguments: () => []
+}
 
 describe('Windows component update activation adapters', () => {
   it('strictly maps stopped proof and a verified save protection point', async () => {
@@ -28,14 +34,14 @@ describe('Windows component update activation adapters', () => {
       requestId,
       component: 'nebula',
       phase: 'before-protection'
-    })).resolves.toEqual({ processStopped: true, portClosed: true })
+    }, hostMutationScope)).resolves.toEqual({ processStopped: true, portClosed: true })
     await expect(fixture.adapter.createSaveProtectionPoint({
       requestId,
       purpose: 'component-update',
       component: 'nebula',
       targetVersion: '0.9.22',
       expectedRevision: revision
-    })).resolves.toEqual({
+    }, hostMutationScope)).resolves.toEqual({
       requestId,
       status: 'succeeded',
       backupId: `save:${requestId}`,
@@ -49,6 +55,9 @@ describe('Windows component update activation adapters', () => {
     ])
     expect(fixture.lifecycle.contexts.every((entry) => entry.context.action === 'restart')).toBe(true)
     expect(fixture.lifecycle.contexts.every((entry) => entry.context.protectionPointId === null)).toBe(true)
+    expect(fixture.lifecycle.contexts.every(
+      (entry) => entry.context.signal === hostMutationScope.signal
+    )).toBe(true)
   })
 
   it('rejects incomplete stopped evidence and an unverified or unbounded protection receipt', async () => {
@@ -59,7 +68,7 @@ describe('Windows component update activation adapters', () => {
     }
     await expect(stopped.adapter.verifyStoppedState({
       requestId, component: 'nebula', phase: 'before-publish'
-    })).rejects.toEqual(expect.objectContaining<Partial<WindowsUpdateActivationAdapterError>>({
+    }, hostMutationScope)).rejects.toEqual(expect.objectContaining<Partial<WindowsUpdateActivationAdapterError>>({
       code: 'WINDOWS_UPDATE_STOP_PROOF_FAILED'
     }))
 
@@ -71,7 +80,7 @@ describe('Windows component update activation adapters', () => {
     }
     await expect(protection.adapter.createSaveProtectionPoint({
       requestId, purpose: 'component-update', component: 'nebula', targetVersion: '0.9.22', expectedRevision: revision
-    })).rejects.toEqual(expect.objectContaining<Partial<WindowsUpdateActivationAdapterError>>({
+    }, hostMutationScope)).rejects.toEqual(expect.objectContaining<Partial<WindowsUpdateActivationAdapterError>>({
       code: 'WINDOWS_UPDATE_SAVE_PROTECTION_FAILED'
     }))
 
@@ -82,7 +91,7 @@ describe('Windows component update activation adapters', () => {
     }
     await expect(protection.adapter.createSaveProtectionPoint({
       requestId, purpose: 'component-update', component: 'nebula', targetVersion: '0.9.22', expectedRevision: revision
-    })).rejects.toMatchObject({ code: 'WINDOWS_UPDATE_SAVE_PROTECTION_FAILED' })
+    }, hostMutationScope)).rejects.toMatchObject({ code: 'WINDOWS_UPDATE_SAVE_PROTECTION_FAILED' })
   })
 
   it('runs the fixed smoke sequence and returns the server to proven stopped state', async () => {
@@ -90,7 +99,7 @@ describe('Windows component update activation adapters', () => {
     const request = smokeRequest('nebula', 'candidate', '0.9.22')
     const expectedContextId = deriveWindowsUpdateSmokeRequestId(request)
 
-    await expect(fixture.adapter.smoke(request)).resolves.toEqual({
+    await expect(fixture.adapter.smoke(request, hostMutationScope)).resolves.toEqual({
       component: 'nebula',
       observedVersion: '0.9.22',
       versionMatches: true,
@@ -111,11 +120,11 @@ describe('Windows component update activation adapters', () => {
   it('derives the same lifecycle context for an idempotent smoke and separates phase/component contexts', async () => {
     const first = createFixture()
     const request = smokeRequest('nebula', 'candidate', '0.9.22')
-    await first.adapter.smoke(request)
+    await first.adapter.smoke(request, hostMutationScope)
     const firstIds = first.lifecycle.contexts.map((entry) => entry.context.requestId)
     first.events.length = 0
     first.lifecycle.contexts.length = 0
-    await first.adapter.smoke(request)
+    await first.adapter.smoke(request, hostMutationScope)
     expect(first.lifecycle.contexts.map((entry) => entry.context.requestId)).toEqual(firstIds)
 
     expect(deriveWindowsUpdateSmokeRequestId(request)).not.toBe(deriveWindowsUpdateSmokeRequestId({
@@ -128,7 +137,9 @@ describe('Windows component update activation adapters', () => {
 
   it('uses only the construction-time fixed probe for bridge/control and reports a version mismatch', async () => {
     const fixture = createFixture({ probedVersion: '0.2.1' })
-    const result = await fixture.adapter.smoke(smokeRequest('bridge', 'candidate', '0.2.0'))
+    const result = await fixture.adapter.smoke(
+      smokeRequest('bridge', 'candidate', '0.2.0'), hostMutationScope
+    )
 
     expect(result).toMatchObject({
       component: 'bridge', observedVersion: '0.2.1', versionMatches: false,
@@ -151,7 +162,9 @@ describe('Windows component update activation adapters', () => {
     status.connections[0] = { ...status.connections[0]!, status: 'warning' }
     const fixture = createFixture({ status })
 
-    await expect(fixture.adapter.smoke(smokeRequest('nebula', 'candidate', '0.9.22'))).resolves.toMatchObject({
+    await expect(fixture.adapter.smoke(
+      smokeRequest('nebula', 'candidate', '0.9.22'), hostMutationScope
+    )).resolves.toMatchObject({
       versionMatches: true,
       bepInExLoaded: false,
       nebulaLoaded: false,
@@ -165,7 +178,9 @@ describe('Windows component update activation adapters', () => {
     const fixture = createFixture()
     fixture.lifecycle.startFailures = 1
 
-    await expect(fixture.adapter.smoke(smokeRequest('nebula', 'candidate', '0.9.22')))
+    await expect(fixture.adapter.smoke(
+      smokeRequest('nebula', 'candidate', '0.9.22'), hostMutationScope
+    ))
       .rejects.toMatchObject({ code: 'WINDOWS_UPDATE_SMOKE_START_FAILED' })
     expect(fixture.events).toEqual(['start', 'stop', 'verify-stopped'])
   })
@@ -174,7 +189,9 @@ describe('Windows component update activation adapters', () => {
     const fixture = createFixture()
     fixture.lifecycle.stopFailures = 1
 
-    await expect(fixture.adapter.smoke(smokeRequest('nebula', 'candidate', '0.9.22')))
+    await expect(fixture.adapter.smoke(
+      smokeRequest('nebula', 'candidate', '0.9.22'), hostMutationScope
+    ))
       .rejects.toMatchObject({ code: 'WINDOWS_UPDATE_SMOKE_STOP_FAILED' })
     expect(fixture.events).toEqual([
       'start', 'verify-running', 'status', 'stop', 'stop', 'verify-stopped'
@@ -183,12 +200,16 @@ describe('Windows component update activation adapters', () => {
 
   it('compensates status/probe exceptions and never reports success from provider failure', async () => {
     const statusFailure = createFixture({ statusFailure: true })
-    await expect(statusFailure.adapter.smoke(smokeRequest('nebula', 'candidate', '0.9.22')))
+    await expect(statusFailure.adapter.smoke(
+      smokeRequest('nebula', 'candidate', '0.9.22'), hostMutationScope
+    ))
       .rejects.toMatchObject({ code: 'WINDOWS_UPDATE_SMOKE_STATUS_FAILED' })
     expect(statusFailure.events).toEqual(['start', 'verify-running', 'status', 'stop', 'verify-stopped'])
 
     const probeFailure = createFixture({ probeFailure: true })
-    await expect(probeFailure.adapter.smoke(smokeRequest('control', 'candidate', '0.2.0')))
+    await expect(probeFailure.adapter.smoke(
+      smokeRequest('control', 'candidate', '0.2.0'), hostMutationScope
+    ))
       .rejects.toMatchObject({ code: 'WINDOWS_UPDATE_SMOKE_VERSION_PROBE_FAILED' })
     expect(probeFailure.events).toEqual([
       'start', 'verify-running', 'status', 'probe:control', 'stop', 'verify-stopped'
@@ -200,7 +221,9 @@ describe('Windows component update activation adapters', () => {
     fixture.lifecycle.stopFailures = 2
     fixture.lifecycle.verifyStoppedFailures = 1
 
-    await expect(fixture.adapter.smoke(smokeRequest('nebula', 'candidate', '0.9.22')))
+    await expect(fixture.adapter.smoke(
+      smokeRequest('nebula', 'candidate', '0.9.22'), hostMutationScope
+    ))
       .rejects.toMatchObject({ code: 'WINDOWS_UPDATE_SMOKE_STOP_UNPROVEN' })
     expect(fixture.events).toEqual([
       'start', 'verify-running', 'status', 'stop', 'stop', 'verify-stopped'
@@ -214,7 +237,7 @@ describe('Windows component update activation adapters', () => {
       path: 'C:\\Fictional\\payload',
       command: 'not-allowed',
       url: 'https://untrusted.invalid'
-    } as never)).rejects.toMatchObject({ code: 'WINDOWS_UPDATE_REQUEST_INVALID' })
+    } as never, hostMutationScope)).rejects.toMatchObject({ code: 'WINDOWS_UPDATE_REQUEST_INVALID' })
     expect(fixture.events).toEqual([])
 
     const disabled = new FakeLifecycleAdapter([])
