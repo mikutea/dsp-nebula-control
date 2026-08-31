@@ -10,6 +10,9 @@ export interface WindowsProviderOptions {
   projectRoot: string
   scriptRoot: string
   timeoutMs: number
+  gamePort?: number
+  serverTaskName?: string
+  stopTaskName?: string
 }
 
 export class WindowsProvider implements StatusProvider {
@@ -22,11 +25,16 @@ export class WindowsProvider implements StatusProvider {
 
   async collectStatus(): Promise<ServerStatus> {
     const scriptPath = await this.#resolveScript('Get-DysonStatus.ps1')
-    const output = await this.#runPowerShell(scriptPath, ['-ProjectRoot', this.#options.projectRoot])
+    const output = await this.#runPowerShell(scriptPath, [
+      '-ProjectRoot', this.#options.projectRoot,
+      '-GamePort', String(this.#options.gamePort ?? 8469),
+      '-ServerTaskName', this.#options.serverTaskName ?? 'Dyson-Nebula-Server',
+      '-StopTaskName', this.#options.stopTaskName ?? 'Dyson-Nebula-Stop'
+    ])
     const parsed = serverStatusSchema.parse(JSON.parse(output) as unknown)
     return {
       ...parsed,
-      capabilities: { refresh: true, save: false, gracefulStop: false, restart: false }
+      capabilities: { refresh: true, start: false, save: false, gracefulStop: false, restart: false }
     }
   }
 
@@ -35,7 +43,8 @@ export class WindowsProvider implements StatusProvider {
     const output = await this.#runPowerShell(scriptPath, [
       '-ProjectRoot', this.#options.projectRoot,
       '-AllowedScriptRoot', this.#options.scriptRoot,
-      '-Action', action
+      '-Action', action,
+      '-GamePort', String(this.#options.gamePort ?? 8469)
     ])
     const parsed = lifecyclePreviewSchema.parse(JSON.parse(output) as unknown)
     const blockers = parsed.blockers.includes('execution-disabled')

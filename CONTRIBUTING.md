@@ -1,7 +1,8 @@
 # Contributing
 
 Dyson Control welcomes focused issues and pull requests. Before changing code,
-read `AGENTS.md`, `docs/ARCHITECTURE.md`, and `docs/SECURITY.md`.
+read `AGENTS.md`, `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, and
+`docs/ACCEPTANCE.md`.
 
 ## Development
 
@@ -18,6 +19,15 @@ Run the complete local gate before opening a pull request:
 npm run check
 ```
 
+Before a public tag or release, also run the real repository/history scan and
+verify the generated artifact directory. Unlike its self-test, this gate is
+expected to fail on a dirty development tree:
+
+```powershell
+npm run public-release:check
+node scripts/public-release/check.mjs --history --artifact <artifact-directory>
+```
+
 ## Safety requirements
 
 - Never commit game binaries, Steam credentials/state, real saves, player
@@ -28,3 +38,6 @@ npm run check
   integration test, and documented rollback behavior.
 - Treat matching `.dsv` and `.server` files as one atomic save unit.
 - Examples and screenshots must use fictional data and `example.com`.
+- Do not mark an acceptance requirement `verified` unless its evidence directly
+  proves the complete criterion at the required unit, integration, installation,
+  or production scope. Production evidence remains outside the public repository.

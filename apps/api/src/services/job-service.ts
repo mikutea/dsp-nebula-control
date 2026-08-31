@@ -33,13 +33,20 @@ export class JobService {
     return this.#latestStatus
   }
 
-  async previewLifecycle(action: LifecycleAction, actor: string): Promise<{ job: JobRecord; preview: LifecyclePreview }> {
+  async previewLifecycle(
+    action: LifecycleAction,
+    actor: string,
+    collectPreview: (action: LifecycleAction) => Promise<LifecyclePreview> =
+      (selectedAction) => this.#provider.previewLifecycle(selectedAction)
+  ): Promise<{ job: JobRecord; preview: LifecyclePreview }> {
     const kinds: Record<LifecycleAction, JobKind> = {
+      start: 'game.start.preview',
       save: 'game.save.preview',
       'graceful-stop': 'game.stop.preview',
       restart: 'game.restart.preview'
     }
     const labels: Record<LifecycleAction, string> = {
+      start: '启动',
       save: '保存',
       'graceful-stop': '优雅停服',
       restart: '重启'
@@ -51,7 +58,7 @@ export class JobService {
     this.#events.publish({ type: 'job.updated', data: job })
 
     try {
-      const preview = await this.#provider.previewLifecycle(action)
+      const preview = await collectPreview(action)
       const finishedAt = new Date()
       job = this.#database.updateJob(job.id, {
         state: 'succeeded',

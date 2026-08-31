@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { serverStatusSchema } from '../domain.js'
+import { DemoProvider } from './demo.js'
 import { WindowsProvider } from './windows.js'
 
 const temporaryRoots: string[] = []
@@ -12,6 +14,36 @@ afterEach(async () => {
 })
 
 describe('Windows status provider', () => {
+  it('rejects non-finite, negative, partial, identifying, and inconsistent host telemetry', async () => {
+    const baseline = await new DemoProvider().collectStatus()
+    const invalid = [
+      mutate(baseline, (status) => { status.host.cpuCores!.samples![0]!.percent = Number.NaN }),
+      mutate(baseline, (status) => { status.host.network!.receiveBytesPerSecond = -1 }),
+      mutate(baseline, (status) => { status.host.network!.sendBytesPerSecond = null }),
+      mutate(baseline, (status) => { status.host.projectVolume!.availableBytes = status.host.projectVolume!.totalBytes! + 1 }),
+      mutate(baseline, (status) => { status.host.saveVolume!.usedPercent = 12.34 }),
+      mutate(baseline, (status) => { status.host.cpuCores!.samples!.pop() }),
+      mutate(baseline, (status) => {
+        Object.assign(status.host.cpuCores!, { samples: null, unavailableReason: 'volume-unavailable' })
+      }),
+      mutate(baseline, (status) => {
+        Object.assign(status.host.projectVolume!, {
+          totalBytes: null, availableBytes: null, usedPercent: null,
+          unavailableReason: 'network-counters-unavailable'
+        })
+      }),
+      mutate(baseline, (status) => {
+        Object.assign(status.host.network!, { interfaceName: 'fictional-adapter' })
+      })
+    ]
+    for (const value of invalid) expect(serverStatusSchema.safeParse(value).success).toBe(false)
+    expect(serverStatusSchema.parse(baseline).host.network).toMatchObject({
+      receiveBytesPerSecond: 1_250_000,
+      sampledInterfaceCount: 2,
+      unavailableReason: null
+    })
+  })
+
   it('parses a fictional read-only installation without returning host paths', async () => {
     const projectRoot = await mkdtemp(path.join(tmpdir(), 'dyson-control-fixture-'))
     temporaryRoots.push(projectRoot)
@@ -53,7 +85,8 @@ describe('Windows status provider', () => {
     const provider = new WindowsProvider({
       projectRoot,
       scriptRoot: path.join(repositoryRoot, 'scripts', 'windows'),
-      timeoutMs: 30_000
+      timeoutMs: 30_000,
+      gamePort: 65432
     })
     const status = await provider.collectStatus()
 
@@ -67,8 +100,44 @@ describe('Windows status provider', () => {
       backupManifestPresent: true, backupPairPresent: true
     })
     expect(status.host.logicalProcessors).toBeGreaterThan(0)
-    expect(status.capabilities).toEqual({ refresh: true, save: false, gracefulStop: false, restart: false })
-    expect(JSON.stringify(status)).not.toContain(projectRoot)
+    if (status.host.cpuCores?.samples === null) {
+      expect(status.host.cpuCores.unavailableReason).toMatch(/^(?:cim-unavailable|inconsistent-sample)$/)
+    } else {
+      expect(status.host.cpuCores?.unavailableReason).toBeNull()
+      expect(status.host.cpuCores?.samples).toHaveLength(status.host.logicalProcessors!)
+      expect(status.host.cpuCores?.samples.map((sample) => sample.index)).toEqual(
+        Array.from({ length: status.host.logicalProcessors! }, (_, index) => index)
+      )
+    }
+    expect(status.host.projectVolume).toMatchObject({ unavailableReason: null })
+    expect(status.host.projectVolume?.totalBytes).toBeGreaterThan(0)
+    expect(status.host.projectVolume?.availableBytes).toBeGreaterThanOrEqual(0)
+    expect(status.host.saveVolume).toMatchObject({
+      unavailableReason: null,
+      totalBytes: status.host.projectVolume?.totalBytes
+    })
+    expect(status.host.saveVolume?.availableBytes).toBeGreaterThanOrEqual(0)
+    // Both roots are on the fixture volume, but PowerShell samples them at
+    // different instants and the filesystem can allocate blocks in between.
+    // Equality of the stable total proves the shared capacity boundary without
+    // asserting a volatile free-space counter.
+    if (status.host.network?.unavailableReason === null) {
+      expect(status.host.network.sampledInterfaceCount).toBeGreaterThan(0)
+      expect(status.host.network.receiveBytesPerSecond).toBeGreaterThanOrEqual(0)
+      expect(status.host.network.sendBytesPerSecond).toBeGreaterThanOrEqual(0)
+    } else {
+      expect(status.host.network?.unavailableReason).toMatch(
+        /^(?:network-counters-unavailable|no-eligible-network-interface|inconsistent-sample)$/
+      )
+      expect(status.host.network?.sampledInterfaceCount).toBeNull()
+    }
+    expect(status.capabilities).toEqual({ refresh: true, start: false, save: false, gracefulStop: false, restart: false })
+    expect(status.connections.find((connection) => connection.id === 'game-port')).toMatchObject({
+      label: 'Game port 65432'
+    })
+    const serializedStatus = JSON.stringify(status)
+    expect(serializedStatus).not.toContain(projectRoot)
+    expect(serializedStatus).not.toMatch(/(?:interfaceName|interfaceId|macAddress|ipAddress|volumeId|driveLetter)/i)
 
     const preview = await provider.previewLifecycle('graceful-stop')
     expect(preview).toMatchObject({
@@ -86,9 +155,27 @@ describe('Windows status provider', () => {
     expect(preview.blockers).not.toContain('backup-pair-unverified')
     expect(JSON.stringify(preview)).not.toContain(projectRoot)
 
+    await writeFile(path.join(projectRoot, 'server', 'DSPGAME.exe'), 'fictional-executable', 'utf8')
+    const startPreview = await provider.previewLifecycle('start')
+    expect(startPreview).toMatchObject({
+      action: 'start', allowed: false, executionEnabled: false,
+      rollback: { strategy: 'no-op', ready: true }
+    })
+    expect(startPreview.blockers).toContain('server-task-missing')
+    expect(startPreview.blockers).not.toContain('managed-process-unverified')
+    expect(startPreview.blockers).not.toContain('game-port-listening')
+    expect(startPreview.checks.find((check) => check.id === 'managed-process')).toMatchObject({ status: 'pass' })
+    expect(startPreview.checks.find((check) => check.id === 'game-port')).toMatchObject({ status: 'pass' })
+
     await writeFile(path.join(backupRoot, 'Fictional_Save.dsv'), 'tampered-backup', 'utf8')
     const tamperedPreview = await provider.previewLifecycle('restart')
     expect(tamperedPreview.checks.find((check) => check.id === 'backup-pair')?.status).toBe('block')
     expect(tamperedPreview.blockers).toContain('backup-pair-unverified')
   }, 45_000)
 })
+
+function mutate<T>(input: T, change: (value: T) => void): T {
+  const value = structuredClone(input)
+  change(value)
+  return value
+}

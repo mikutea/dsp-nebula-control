@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>DysonControlBridge</AssemblyName>
+    <RootNamespace>DysonControl.Bridge</RootNamespace>
+    <Version>0.1.0</Version>
+    <DysonServerRoot Condition="'$(DysonServerRoot)' == ''">$(MSBuildThisFileDirectory)..\..\..\server</DysonServerRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="protocol-tests\**\*.cs" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <Reference Include="BepInEx">
+      <HintPath>$(DysonServerRoot)\BepInEx\core\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(DysonServerRoot)\BepInEx\core\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(DysonServerRoot)\DSPGAME_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(DysonServerRoot)\DSPGAME_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(DysonServerRoot)\DSPGAME_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="NebulaAPI">
+      <HintPath>$(DysonServerRoot)\BepInEx\plugins\nebula-NebulaMultiplayerModApi\NebulaAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="NebulaModel">
+      <HintPath>$(DysonServerRoot)\BepInEx\plugins\nebula-NebulaMultiplayerMod\NebulaModel.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

@@ -7,7 +7,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': 'http://127.0.0.1:13010',
-      '/healthz': 'http://127.0.0.1:13010'
+      '/healthz': 'http://127.0.0.1:13010',
+      '/readyz': 'http://127.0.0.1:13010'
     }
   }
 })
