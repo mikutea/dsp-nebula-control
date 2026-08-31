@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const POLICY_ID = 'dyson-public-release-hygiene'
-export const POLICY_VERSION = '1.3.0'
+export const POLICY_VERSION = '1.4.0'
 
 export const DEFAULT_LIMITS = Object.freeze({
   maximumWorktreeFiles: 50_000,
@@ -112,6 +112,12 @@ export const EXACT_ALLOWLIST = Object.freeze([
   },
   {
     scope: 'history',
+    ruleId: 'HIGH_ENTROPY_SECRET_ASSIGNMENT',
+    path: 'scripts/public-release/scanner.mjs',
+    blobId: 'f9117ffbcd2c3d8636c35bccbc04d13907e678c0'
+  },
+  {
+    scope: 'history',
     ruleId: 'SECRET_LITERAL_ASSIGNMENT',
     path: 'apps/api/src/config.test.ts',
     blobId: '718d0f9d877e2ce7ecb9c3bbac0c6552312bdb88'
@@ -131,8 +137,20 @@ export const EXACT_ALLOWLIST = Object.freeze([
   {
     scope: 'history',
     ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'scripts/public-release/scanner.mjs',
+    blobId: 'f9117ffbcd2c3d8636c35bccbc04d13907e678c0'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
     path: 'scripts/public-release/scanner.test.mjs',
     blobId: '7dd287661db2099d9ea50d04e37f7c7a89246337'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'scripts/public-release/scanner.test.mjs',
+    blobId: '8ead511c515b359e28ed7a0e327a5aec11bf2b74'
   },
   {
     scope: 'history',
@@ -151,7 +169,30 @@ export const EXACT_ALLOWLIST = Object.freeze([
     ruleId: 'UNC_PATH',
     path: 'scripts/public-release/scanner.mjs',
     blobId: '79caf486091e9f257d3f54cf365d2ed0a1a4e013'
+  },
+  {
+    scope: 'history',
+    ruleId: 'UNC_PATH',
+    path: 'scripts/public-release/scanner.mjs',
+    blobId: 'f9117ffbcd2c3d8636c35bccbc04d13907e678c0'
   }
+])
+
+// These are the only non-runtime-tree files admitted by the release artifact
+// protocol. Keep this list exact: docs/** and integrations/** are not trusted
+// as categories merely because the artifact builder selected reviewed files
+// from those trees.
+export const ARTIFACT_EXACT_ALLOWED_PATHS = Object.freeze([
+  'docs/GSM-EVALUATION.md',
+  'docs/WINDOWS-DEPLOYMENT-DRAFT.md',
+  'integrations/dyson-control-bridge/BridgeFileStore.cs',
+  'integrations/dyson-control-bridge/BridgeProtocol.cs',
+  'integrations/dyson-control-bridge/DysonControlBridge.csproj',
+  'integrations/dyson-control-bridge/DysonControlBridgePlugin.cs',
+  'integrations/dyson-control-bridge/GameSaveAdapter.cs',
+  'integrations/dyson-control-bridge/PlayerRosterPublisher.cs',
+  'integrations/dyson-control-bridge/README.md',
+  'integrations/dyson-control-bridge/dyson-control-bridge.cfg.example'
 ])
 
 // These are public package registries, source forges, standards bodies, and
@@ -164,6 +205,7 @@ export const PUBLIC_REFERENCE_HOSTS = Object.freeze([
   'github.com',
   'objects.githubusercontent.com',
   'opencollective.com',
+  'react.dev',
   'release-assets.githubusercontent.com',
   'registry.npmjs.org',
   'ca.trufo.ai',
@@ -188,11 +230,23 @@ for (const entry of EXACT_ALLOWLIST) {
   allowlistKeys.add(key)
 }
 
+const artifactPathKeys = new Set()
+for (const artifactPath of ARTIFACT_EXACT_ALLOWED_PATHS) {
+  if (!/^[A-Za-z0-9._+@/-]{1,1024}$/.test(artifactPath) || artifactPath.startsWith('/')
+      || artifactPath.includes('..') || /[*?[\]{}]/.test(artifactPath)) {
+    throw new Error('Public release policy contains a non-exact artifact path')
+  }
+  const key = artifactPath.toLocaleLowerCase('en-US')
+  if (artifactPathKeys.has(key)) throw new Error('Public release policy contains a duplicate artifact path')
+  artifactPathKeys.add(key)
+}
+
 export const POLICY_SHA256 = createHash('sha256').update(JSON.stringify({
   id: POLICY_ID,
   version: POLICY_VERSION,
   rules: RULE_IDS,
   allowlist: EXACT_ALLOWLIST,
+  artifactExactAllowedPaths: ARTIFACT_EXACT_ALLOWED_PATHS,
   publicReferenceHosts: PUBLIC_REFERENCE_HOSTS,
   limits: DEFAULT_LIMITS
 })).digest('hex')

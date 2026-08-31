@@ -4,6 +4,7 @@ import { lstat, opendir, readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import {
+  ARTIFACT_EXACT_ALLOWED_PATHS,
   DEFAULT_LIMITS,
   EXACT_ALLOWLIST,
   POLICY_ID,
@@ -17,6 +18,9 @@ const execFileAsync = promisify(execFile)
 const policyRuleIds = new Set(RULE_IDS)
 const exactAllowlist = new Set(EXACT_ALLOWLIST.map((entry) =>
   allowlistKey(entry.scope, entry.ruleId, entry.path, entry.blobId)
+))
+const artifactExactAllowedPaths = new Set(ARTIFACT_EXACT_ALLOWED_PATHS.map((entry) =>
+  entry.toLocaleLowerCase('en-US')
 ))
 const publicReferenceHosts = new Set(PUBLIC_REFERENCE_HOSTS)
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true })
@@ -487,6 +491,7 @@ function scanArtifactPathContract(relativePath, collector) {
     || lower === 'apps/api/package.json' || lower === 'apps/api/package-lock.json'
     || lower.startsWith('apps/api/dist/') || lower.startsWith('apps/api/node_modules/')
     || lower.startsWith('apps/web/dist/') || lower.startsWith('scripts/windows/')
+    || artifactExactAllowedPaths.has(lower)
   const nodeModuleIndex = segments.indexOf('node_modules')
   const nodeModulesAllowed = nodeModuleIndex < 0
     || (segments.length >= 4 && segments[0] === 'apps' && segments[1] === 'api' && segments[2] === 'node_modules')

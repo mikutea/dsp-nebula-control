@@ -58,15 +58,16 @@ describe('public release hygiene gate', () => {
     await write(repository, 'references.txt', [
       'https://release-assets.githubusercontent.com/fictional/signed.zip',
       'https://objects.githubusercontent.com/fictional/signed.zip',
-      'https://gcdn.thunderstore.io/package/Fictional/ServerHelper/1.2.3/'
+      'https://gcdn.thunderstore.io/package/Fictional/ServerHelper/1.2.3/',
+      'https://react.dev/errors/418'
     ].join('\n'))
     await commitAll(repository, 'fixed public GitHub content host references')
 
     const evidence = await runPublicReleaseScan({ repositoryRoot: repository })
     assert.equal(evidence.passed, true)
 
-    const lookalikeHost = ['release-assets', 'githubusercontent', 'invalidly-real', 'net'].join('.')
-    await write(repository, 'references.txt', `https://${lookalikeHost}/not-official.zip\n`)
+    const lookalikeHost = ['react', 'dev', 'invalidly-real', 'net'].join('.')
+    await write(repository, 'references.txt', `https://${lookalikeHost}/errors/418\n`)
     const rejected = await runPublicReleaseScan({ repositoryRoot: repository })
     assertRules(rejected, ['PRODUCTION_ENDPOINT', 'REPOSITORY_DIRTY'])
   })
@@ -225,6 +226,55 @@ describe('public release hygiene gate', () => {
     const tampered = await runPublicReleaseScan({ repositoryRoot: repository, artifactPath: artifact })
     assertRules(tampered, ['ARTIFACT_MANIFEST_INVALID'])
     assert.equal(canonicalEvidenceJson(tampered).includes(repository), false)
+  })
+
+  it('accepts only the exact Bridge sources and migration docs in the artifact protocol', async () => {
+    const repository = await newRepository()
+    await write(repository, 'README.md', 'Fictional repository\n')
+    await commitAll(repository, 'fixture')
+    const artifact = await mkdtemp(path.join(tmpdir(), 'dyson-public-release-contract-artifact-'))
+    temporaryRoots.push(artifact)
+    const protocolFiles = [
+      { path: 'apps/api/dist/index.js', bytes: Buffer.from('export const fixture = true\n') },
+      { path: 'docs/GSM-EVALUATION.md', bytes: Buffer.from('# Fictional GSM evaluation\n') },
+      { path: 'docs/WINDOWS-DEPLOYMENT-DRAFT.md', bytes: Buffer.from('# Fictional deployment draft\n') },
+      { path: 'integrations/dyson-control-bridge/BridgeFileStore.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      { path: 'integrations/dyson-control-bridge/BridgeProtocol.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      { path: 'integrations/dyson-control-bridge/DysonControlBridge.csproj', bytes: Buffer.from('<Project />\n') },
+      { path: 'integrations/dyson-control-bridge/DysonControlBridgePlugin.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      { path: 'integrations/dyson-control-bridge/GameSaveAdapter.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      { path: 'integrations/dyson-control-bridge/PlayerRosterPublisher.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      { path: 'integrations/dyson-control-bridge/README.md', bytes: Buffer.from('# Fictional Bridge\n') },
+      { path: 'integrations/dyson-control-bridge/dyson-control-bridge.cfg.example', bytes: Buffer.from('Enabled=false\n') }
+    ]
+    for (const file of protocolFiles) {
+      await mkdir(path.dirname(path.join(artifact, ...file.path.split('/'))), { recursive: true })
+      await writeFile(path.join(artifact, ...file.path.split('/')), file.bytes)
+    }
+    await writeFile(path.join(artifact, 'artifact-manifest.json'), JSON.stringify(buildArtifactManifestForFixture(protocolFiles)))
+
+    const valid = await runPublicReleaseScan({ repositoryRoot: repository, artifactPath: artifact })
+    assert.equal(valid.passed, true)
+    assert.equal(valid.findings.some((entry) => entry.ruleId === 'ARTIFACT_PATH_NOT_ALLOWED'), false)
+
+    const unexpectedFiles = [
+      { path: 'docs/UNREVIEWED.md', bytes: Buffer.from('# Unreviewed fixture\n') },
+      { path: 'integrations/dyson-control-bridge/Unreviewed.cs', bytes: Buffer.from('namespace Fictional;\n') }
+    ]
+    for (const file of unexpectedFiles) {
+      await writeFile(path.join(artifact, ...file.path.split('/')), file.bytes)
+    }
+    await writeFile(path.join(artifact, 'artifact-manifest.json'), JSON.stringify(buildArtifactManifestForFixture([
+      ...protocolFiles, ...unexpectedFiles
+    ])))
+
+    const rejected = await runPublicReleaseScan({ repositoryRoot: repository, artifactPath: artifact })
+    assert.deepEqual(
+      rejected.findings.filter((entry) => entry.ruleId === 'ARTIFACT_PATH_NOT_ALLOWED').map((entry) => entry.path),
+      ['docs/UNREVIEWED.md', 'integrations/dyson-control-bridge/Unreviewed.cs']
+    )
+    assert.equal(rejected.findings.some((entry) => entry.ruleId === 'ARTIFACT_MANIFEST_INVALID'), false)
+    assert.equal(rejected.passed, false)
   })
 
   it('suppresses only generic vendored examples while retaining high-signal artifact blocks', async () => {
