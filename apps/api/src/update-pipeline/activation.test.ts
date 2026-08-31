@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { hostname, tmpdir, uptime } from 'node:os'
 import { deflateRawSync } from 'node:zlib'
@@ -11,7 +12,9 @@ import {
   type HostMutationOperationCoordinator,
   type HostMutationOperationOutcome,
   type HostMutationOperationRequest,
-  type HostMutationOperationScope
+  type HostMutationOperationScope,
+  type HostMutationRecoveryOperationCoordinator,
+  type HostMutationRecoveryOperationRequest
 } from '../host-mutation/operation-coordinator.js'
 import {
   ComponentUpdateActivationError,
@@ -607,6 +610,569 @@ describe('component update activation transaction', () => {
     expect(await readFile(liveFile, 'utf8')).toBe('previous-nebula')
   })
 
+  it('proves the exact interrupted request before touching the recovery broker and fails closed without it', async () => {
+    const emptyFixture = await createFixture()
+    const emptyRecoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    await expect(createService(emptyFixture, createAdapters().adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: emptyRecoveryCoordinator
+    }).recoverInterrupted(randomUUID())).rejects.toMatchObject({
+      code: 'UPDATE_RECOVERY_NOT_PENDING'
+    })
+    expect(emptyRecoveryCoordinator.requests).toEqual([])
+
+    const interrupted = await prepareInterruptedActivation()
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const service = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+
+    await expect(service.recoverInterrupted(randomUUID())).rejects.toMatchObject({
+      code: 'UPDATE_RECOVERY_REQUEST_MISMATCH'
+    })
+    expect(recoveryCoordinator.requests).toEqual([])
+
+    const withoutRecoveryCapability = createService(
+      interrupted.fixture,
+      interrupted.controlled.adapters,
+      { hostMutationCoordinator: new TestHostMutationCoordinator() }
+    )
+    await expect(withoutRecoveryCapability.recoverInterrupted(interrupted.request.requestId))
+      .rejects.toMatchObject({ code: 'UPDATE_HOST_LEASE_UNAVAILABLE' })
+    expect(recoveryCoordinator.requests).toEqual([])
+  })
+
+  it('keeps ordinary restart reconciliation on the ordinary lease path', async () => {
+    const interrupted = await prepareInterruptedActivation()
+    const ordinaryCoordinator = new TestHostMutationCoordinator()
+    ordinaryCoordinator.acquireError = new HostMutationOperationCoordinatorError(
+      'HOST_MUTATION_LEASE_RECOVERY_REQUIRED'
+    )
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const service = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: ordinaryCoordinator,
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+
+    await expect(service.reconcile()).rejects.toMatchObject({
+      code: 'UPDATE_HOST_LEASE_RECOVERY_REQUIRED'
+    })
+    expect(ordinaryCoordinator.requests).toHaveLength(1)
+    expect(ordinaryCoordinator.requests[0]).toMatchObject({
+      operation: 'component-update-reconciliation'
+    })
+    expect(ordinaryCoordinator.requests[0]).not.toHaveProperty('recovery')
+    expect(recoveryCoordinator.requests).toEqual([])
+  })
+
+  it('recovers one exact interrupted activation and replays its durable terminal receipt idempotently', async () => {
+    const interrupted = await prepareInterruptedActivation()
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const ordinaryCoordinator = new TestHostMutationCoordinator()
+    const service = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: ordinaryCoordinator,
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+
+    const recovered = await service.recoverInterrupted(interrupted.request.requestId)
+    expect(recovered).toMatchObject({
+      requestId: interrupted.request.requestId,
+      status: 'rolled-back',
+      rollbackVerified: true,
+      recoveryRequired: false,
+      reused: false
+    })
+    expect(recoveryCoordinator.requests).toEqual([{
+      expectedOperation: 'component-update-activation',
+      expectedRequestId: interrupted.request.requestId
+    }])
+    expect(recoveryCoordinator.dispositions).toEqual(['release'])
+    expect(ordinaryCoordinator.requests).toEqual([])
+    expect((await service.getState()).recoveryRequired).toBe(false)
+    expect(await readFile(interrupted.liveFile, 'utf8')).toBe('previous-nebula')
+
+    await expect(service.recoverInterrupted(interrupted.request.requestId)).resolves.toMatchObject({
+      status: 'rolled-back',
+      reused: true,
+      recoveryRequired: false
+    })
+    expect(recoveryCoordinator.requests).toHaveLength(2)
+    expect(recoveryCoordinator.dispositions).toEqual(['release'])
+  })
+
+  it('abandons the recovery lease when durable evidence changes after acquisition', async () => {
+    const interrupted = await prepareInterruptedActivation()
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    recoveryCoordinator.onEnter = async () => {
+      await writeFile(path.join(
+        interrupted.fixture.projectRoot,
+        '.dyson-control-updates',
+        'transactions',
+        `${interrupted.request.requestId}.json`
+      ), '{}\n')
+    }
+    const service = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+
+    await expect(service.recoverInterrupted(interrupted.request.requestId)).rejects.toMatchObject({
+      code: 'UPDATE_JOURNAL_INVALID'
+    })
+    expect(recoveryCoordinator.requests).toEqual([{
+      expectedOperation: 'component-update-activation',
+      expectedRequestId: interrupted.request.requestId
+    }])
+    expect(recoveryCoordinator.dispositions).toEqual(['abandon'])
+    expect(recoveryCoordinator.abandoned).toBe(true)
+  })
+
+  it('rejects a recovery receipt that is not fully bound to its journal before broker entry', async () => {
+    const interrupted = await prepareInterruptedActivation()
+    const firstCoordinator = new TestHostMutationRecoveryCoordinator()
+    const failing = createService(interrupted.fixture, createAdapters({
+      smoke: async (request) => smokeResult(request, false)
+    }).adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: firstCoordinator
+    })
+    await expect(failing.recoverInterrupted(interrupted.request.requestId)).resolves.toMatchObject({
+      status: 'rollback-failed',
+      recoveryRequired: true
+    })
+
+    const receiptPath = path.join(
+      interrupted.fixture.projectRoot,
+      '.dyson-control-updates',
+      'receipts',
+      `${interrupted.request.requestId}.json`
+    )
+    const envelope = JSON.parse(await readFile(receiptPath, 'utf8')) as {
+      receipt: { protectionBackupId: string }
+    }
+    envelope.receipt.protectionBackupId = 'unrelated-backup'
+    await writeFile(receiptPath, `${JSON.stringify(envelope)}\n`)
+
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const service = createService(interrupted.fixture, createAdapters().adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+    await expect(service.recoverInterrupted(interrupted.request.requestId)).rejects.toMatchObject({
+      code: 'UPDATE_RECOVERY_EVIDENCE_INVALID'
+    })
+    expect(recoveryCoordinator.requests).toEqual([])
+  })
+
+  it('converges strict hard-exit history, journal, and partial-lock evidence only under recovery', async () => {
+    const interrupted = await prepareInterruptedActivation()
+    const controlRoot = path.join(interrupted.fixture.projectRoot, '.dyson-control-updates')
+    const historyPath = path.join(controlRoot, 'history', `${interrupted.request.requestId}.json`)
+    const journalPath = path.join(controlRoot, 'transactions', `${interrupted.request.requestId}.json`)
+    const historyTemporary = `${historyPath}.${randomUUID()}.tmp`
+    const journalTemporary = `${journalPath}.${randomUUID()}.tmp`
+    await rename(historyPath, historyTemporary)
+    await rename(journalPath, journalTemporary)
+    const lockPath = path.join(controlRoot, '.locks', 'activation.lock')
+    await writeFile(lockPath, '')
+
+    const ordinaryCoordinator = new TestHostMutationCoordinator()
+    const ordinary = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: ordinaryCoordinator
+    })
+    await expect(ordinary.reconcile()).rejects.toMatchObject({
+      code: 'UPDATE_ACTIVATION_LOCK_BUSY'
+    })
+    expect(await pathExists(lockPath)).toBe(true)
+    expect(await pathExists(historyTemporary)).toBe(true)
+    expect(await pathExists(journalTemporary)).toBe(true)
+    expect(ordinaryCoordinator.requests).toEqual([])
+
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const recovery = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+    await expect(recovery.recoverInterrupted(interrupted.request.requestId)).resolves.toMatchObject({
+      status: 'rolled-back',
+      recoveryRequired: false
+    })
+    expect(recoveryCoordinator.dispositions).toEqual(['release'])
+    expect(await pathExists(lockPath)).toBe(false)
+    expect(await pathExists(historyTemporary)).toBe(false)
+    expect(await pathExists(journalTemporary)).toBe(false)
+    expect(await pathExists(historyPath)).toBe(true)
+    expect(await pathExists(journalPath)).toBe(true)
+  })
+
+  it('re-enters the exact recovery broker when a terminal receipt outlives broker release', async () => {
+    const interrupted = await prepareInterruptedActivation()
+    const firstCoordinator = new TestHostMutationRecoveryCoordinator()
+    const first = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: firstCoordinator
+    })
+    await expect(first.recoverInterrupted(interrupted.request.requestId)).resolves.toMatchObject({
+      status: 'rolled-back'
+    })
+    const liveBefore = await readFile(interrupted.liveFile, 'utf8')
+
+    // A fresh pending coordinator models hard exit after the terminal recovery
+    // receipt became durable but before the broker persisted release.
+    const pendingCoordinator = new TestHostMutationRecoveryCoordinator()
+    const retried = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: pendingCoordinator
+    })
+    await expect(retried.recoverInterrupted(interrupted.request.requestId)).resolves.toMatchObject({
+      status: 'rolled-back',
+      reused: true
+    })
+    expect(pendingCoordinator.requests).toEqual([{
+      expectedOperation: 'component-update-activation',
+      expectedRequestId: interrupted.request.requestId
+    }])
+    expect(pendingCoordinator.dispositions).toEqual(['release'])
+    expect(await readFile(interrupted.liveFile, 'utf8')).toBe(liveBefore)
+  })
+
+  it('releases an exact abandoned broker binding after an ordinary succeeded receipt is durable', async () => {
+    const fixture = await createFixture()
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-terminal-success',
+      targetVersion: '0.9.1'
+    }))
+    const controlled = createAdapters()
+    const request = makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
+    const receipt = await createService(fixture, controlled.adapters).execute(request)
+    expect(receipt).toMatchObject({ status: 'succeeded', recoveryRequired: false })
+    const liveFile = path.join(
+      fixture.liveRoot,
+      'plugins',
+      'nebula-NebulaMultiplayerMod',
+      'Nebula.dll'
+    )
+    const liveBefore = await readFile(liveFile, 'utf8')
+    const stopPhasesBefore = [...controlled.stopPhases]
+    const smokeCallsBefore = [...controlled.smokeCalls]
+    const protectionCallsBefore = controlled.protectionCalls
+
+    // A fresh pending coordinator models hard exit after the ordinary terminal
+    // receipt became durable but before the broker persisted RELEASE.
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const restarted = createService(fixture, controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+    await expect(restarted.recoverInterrupted(request.requestId)).resolves.toMatchObject({
+      requestId: request.requestId,
+      status: 'succeeded',
+      reused: true
+    })
+    expect(recoveryCoordinator.requests).toEqual([{
+      expectedOperation: 'component-update-activation',
+      expectedRequestId: request.requestId
+    }])
+    expect(recoveryCoordinator.dispositions).toEqual(['release'])
+    expect(await readFile(liveFile, 'utf8')).toBe(liveBefore)
+    expect(controlled.stopPhases).toEqual(stopPhasesBefore)
+    expect(controlled.smokeCalls).toEqual(smokeCallsBefore)
+    expect(controlled.protectionCalls).toBe(protectionCallsBefore)
+  })
+
+  it('releases an exact abandoned broker binding after an ordinary rolled-back receipt is durable', async () => {
+    const fixture = await createFixture()
+    const v1 = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-terminal-rollback-v1',
+      targetVersion: '0.9.1'
+    }))
+    const v2 = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-terminal-rollback-v2',
+      targetVersion: '0.9.2',
+      payloads: [{
+        name: 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll',
+        bytes: Buffer.from('nebula-v2')
+      }]
+    }))
+    const controlled = createAdapters({
+      smoke: async (request) => request.phase === 'candidate' && request.expectedVersion === '0.9.2'
+        ? smokeResult(request, false)
+        : smokeResult(request, true)
+    })
+    const service = createService(fixture, controlled.adapters)
+    const installed = await service.execute(makeRequest(
+      'nebula', '0.9.1', v1, initialComponentUpdateRevision
+    ))
+    const request = makeRequest(
+      'nebula', '0.9.2', v2, installed.resultingRevision, baseInventory({ nebula: '0.9.1' })
+    )
+    const receipt = await service.execute(request)
+    expect(receipt).toMatchObject({ status: 'rolled-back', recoveryRequired: false })
+    const liveFile = path.join(
+      fixture.liveRoot,
+      'plugins',
+      'nebula-NebulaMultiplayerMod',
+      'Nebula.dll'
+    )
+    const liveBefore = await readFile(liveFile, 'utf8')
+    const stopPhasesBefore = [...controlled.stopPhases]
+    const smokeCallsBefore = [...controlled.smokeCalls]
+    const protectionCallsBefore = controlled.protectionCalls
+
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const restarted = createService(fixture, controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+    await expect(restarted.recoverInterrupted(request.requestId)).resolves.toMatchObject({
+      requestId: request.requestId,
+      status: 'rolled-back',
+      reused: true
+    })
+    expect(recoveryCoordinator.requests).toEqual([{
+      expectedOperation: 'component-update-activation',
+      expectedRequestId: request.requestId
+    }])
+    expect(recoveryCoordinator.dispositions).toEqual(['release'])
+    expect(await readFile(liveFile, 'utf8')).toBe(liveBefore)
+    expect(controlled.stopPhases).toEqual(stopPhasesBefore)
+    expect(controlled.smokeCalls).toEqual(smokeCallsBefore)
+    expect(controlled.protectionCalls).toBe(protectionCallsBefore)
+  })
+
+  it('replays an ordinary terminal only after the broker proves recovery is not required', async () => {
+    const fixture = await createFixture()
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-terminal-clean-broker',
+      targetVersion: '0.9.1'
+    }))
+    const controlled = createAdapters()
+    const request = makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
+    await createService(fixture, controlled.adapters).execute(request)
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    recoveryCoordinator.recoveryPending = false
+    const restarted = createService(fixture, controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+
+    await expect(restarted.recoverInterrupted(request.requestId)).resolves.toMatchObject({
+      requestId: request.requestId,
+      status: 'succeeded',
+      reused: true
+    })
+    expect(recoveryCoordinator.requests).toEqual([{
+      expectedOperation: 'component-update-activation',
+      expectedRequestId: request.requestId
+    }])
+    expect(recoveryCoordinator.dispositions).toEqual([])
+  })
+
+  it('releases an exact abandoned broker binding for a proven pre-journal failed receipt', async () => {
+    const fixture = await createFixture()
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-terminal-failed',
+      targetVersion: '0.9.1'
+    }))
+    const controlled = createAdapters({ stopped: false })
+    const request = makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
+    await expect(createService(fixture, controlled.adapters).execute(request)).rejects.toMatchObject({
+      code: 'UPDATE_SERVICE_STILL_RUNNING',
+      receipt: expect.objectContaining({ status: 'failed', recoveryRequired: false })
+    })
+    const stopPhasesBefore = [...controlled.stopPhases]
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const restarted = createService(fixture, controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+
+    await expect(restarted.recoverInterrupted(request.requestId)).resolves.toMatchObject({
+      requestId: request.requestId,
+      status: 'failed',
+      reused: true
+    })
+    expect(recoveryCoordinator.dispositions).toEqual(['release'])
+    expect(controlled.stopPhases).toEqual(stopPhasesBefore)
+  })
+
+  it('never treats a terminal receipt persisted at lease loss as broker release', async () => {
+    const interrupted = await prepareInterruptedActivation()
+    const recoveryReceiptPath = path.join(
+      interrupted.fixture.projectRoot,
+      '.dyson-control-updates',
+      'recovery-receipts',
+      `${interrupted.request.requestId}.json`
+    )
+    const lostCoordinator = new TestHostMutationRecoveryCoordinator()
+    lostCoordinator.onAssertActive = () => {
+      if (existsSync(recoveryReceiptPath)) lostCoordinator.controller.abort()
+    }
+    const lost = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: lostCoordinator
+    })
+    await expect(lost.recoverInterrupted(interrupted.request.requestId)).rejects.toMatchObject({
+      code: 'UPDATE_HOST_LEASE_LOST'
+    })
+    expect(await pathExists(recoveryReceiptPath)).toBe(true)
+    expect(lostCoordinator.abandoned).toBe(true)
+    expect(lostCoordinator.dispositions).toEqual([])
+
+    const retryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const retry = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: retryCoordinator
+    })
+    await expect(retry.recoverInterrupted(interrupted.request.requestId)).resolves.toMatchObject({
+      status: 'rolled-back',
+      reused: true
+    })
+    expect(retryCoordinator.requests).toHaveLength(1)
+    expect(retryCoordinator.dispositions).toEqual(['release'])
+  })
+
+  it('maps recovery lease loss without releasing the consumed recovery binding', async () => {
+    const interrupted = await prepareInterruptedActivation()
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    recoveryCoordinator.onEnter = () => recoveryCoordinator.controller.abort()
+    const service = createService(interrupted.fixture, interrupted.controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+
+    await expect(service.recoverInterrupted(interrupted.request.requestId)).rejects.toMatchObject({
+      code: 'UPDATE_HOST_LEASE_LOST'
+    })
+    expect(recoveryCoordinator.requests).toHaveLength(1)
+    expect(recoveryCoordinator.dispositions).toEqual([])
+    expect(recoveryCoordinator.abandoned).toBe(true)
+  })
+
+  it('abandons a failed recovery and later appends a proven terminal receipt without overwriting evidence', async () => {
+    const interrupted = await prepareInterruptedActivation()
+    const failingAdapters = createAdapters({
+      smoke: async (request) => smokeResult(request, false)
+    })
+    const firstRecoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const failingService = createService(interrupted.fixture, failingAdapters.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: firstRecoveryCoordinator
+    })
+
+    const failed = await failingService.recoverInterrupted(interrupted.request.requestId)
+    expect(failed).toMatchObject({
+      status: 'rollback-failed',
+      recoveryRequired: true,
+      rollbackVerified: false
+    })
+    expect(firstRecoveryCoordinator.dispositions).toEqual(['abandon'])
+    expect((await failingService.getState()).recoveryRequired).toBe(true)
+
+    // Simulate a later recovery crash after restoring the durable previous
+    // active state but before appending its terminal recovery receipt.
+    const controlRoot = path.join(interrupted.fixture.projectRoot, '.dyson-control-updates')
+    const history = JSON.parse(await readFile(
+      path.join(controlRoot, 'history', `${interrupted.request.requestId}.json`),
+      'utf8'
+    )) as { state: unknown }
+    await writeFile(path.join(controlRoot, 'active.json'), `${JSON.stringify(history.state)}\n`)
+
+    const healthyRecoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    const healthyService = createService(interrupted.fixture, createAdapters().adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: healthyRecoveryCoordinator
+    })
+    const recovered = await healthyService.recoverInterrupted(interrupted.request.requestId)
+    expect(recovered).toMatchObject({
+      status: 'rolled-back',
+      recoveryRequired: false,
+      rollbackVerified: true
+    })
+    expect(healthyRecoveryCoordinator.dispositions).toEqual(['release'])
+
+    const original = JSON.parse(await readFile(
+      path.join(controlRoot, 'receipts', `${interrupted.request.requestId}.json`),
+      'utf8'
+    )) as { receipt: { status: string; recoveryRequired: boolean } }
+    const terminal = JSON.parse(await readFile(
+      path.join(controlRoot, 'recovery-receipts', `${interrupted.request.requestId}.json`),
+      'utf8'
+    )) as { receipt: { status: string; recoveryRequired: boolean } }
+    expect(original.receipt).toMatchObject({ status: 'rollback-failed', recoveryRequired: true })
+    expect(terminal.receipt).toMatchObject({ status: 'rolled-back', recoveryRequired: false })
+  })
+
+  it('replays an existing receipt without consuming an unrelated recovery lease', async () => {
+    const fixture = await createFixture()
+    const v1 = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-replay-v1',
+      targetVersion: '0.9.1'
+    }))
+    const v1Adapters = createAdapters()
+    const firstRequest = makeRequest('nebula', '0.9.1', v1, initialComponentUpdateRevision)
+    const firstReceipt = await createService(fixture, v1Adapters.adapters).execute(firstRequest)
+    const activePath = path.join(fixture.projectRoot, '.dyson-control-updates', 'active.json')
+    const previousActive = await readFile(activePath, 'utf8')
+
+    const v2 = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-replay-v2',
+      targetVersion: '0.9.2',
+      payloads: [{
+        name: 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll',
+        bytes: Buffer.from('nebula-v2')
+      }]
+    }))
+    let publishProofs = 0
+    const interruptedAdapters = createAdapters({
+      stoppedVerifier: async (request) => {
+        if (request.phase === 'before-publish' && ++publishProofs === 2) {
+          await rm(activePath)
+          await mkdir(activePath)
+        }
+        return { processStopped: true, portClosed: true }
+      }
+    })
+    const secondRequest = makeRequest(
+      'nebula',
+      '0.9.2',
+      v2,
+      firstReceipt.resultingRevision,
+      baseInventory({ nebula: '0.9.1' })
+    )
+    await expect(createService(fixture, interruptedAdapters.adapters).execute(secondRequest))
+      .rejects.toMatchObject({ code: 'UPDATE_ACTIVE_SWITCH_FAILED' })
+    await rm(activePath, { recursive: true, force: true })
+    await writeFile(activePath, previousActive)
+
+    const recoveryCoordinator = new TestHostMutationRecoveryCoordinator()
+    recoveryCoordinator.acquireError = new HostMutationOperationCoordinatorError(
+      'HOST_MUTATION_LEASE_RECOVERY_MISMATCH'
+    )
+    const service = createService(fixture, interruptedAdapters.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator(),
+      hostMutationRecoveryCoordinator: recoveryCoordinator
+    })
+    await expect(service.recoverInterrupted(firstRequest.requestId)).resolves.toMatchObject({
+      requestId: firstRequest.requestId,
+      status: 'succeeded',
+      reused: true
+    })
+    expect(recoveryCoordinator.requests).toEqual([{
+      expectedOperation: 'component-update-activation',
+      expectedRequestId: firstRequest.requestId
+    }])
+    expect(recoveryCoordinator.dispositions).toEqual([])
+    expect(await pathExists(path.join(
+      fixture.projectRoot,
+      '.dyson-control-updates',
+      'transactions',
+      `${secondRequest.requestId}.json`
+    ))).toBe(true)
+    expect(await service.getReceipt(secondRequest.requestId)).toBeNull()
+  })
+
   it('bounds immutable history, offers cleanup only as a recoverable dry-run, and never deletes automatically', async () => {
     const fixture = await createFixture()
     const v1 = await stageComponent(fixture.stagingRoot, defaultStage({ artifactId: 'nebula-artifact-2001', targetVersion: '0.9.1' }))
@@ -840,6 +1406,51 @@ function smokeResult(request: FixedUpdateSmokeRequest, healthy: boolean) {
   }
 }
 
+async function prepareInterruptedActivation() {
+  const fixture = await createFixture()
+  const liveFile = path.join(
+    fixture.liveRoot,
+    'plugins',
+    'nebula-NebulaMultiplayerMod',
+    'Nebula.dll'
+  )
+  await mkdir(path.dirname(liveFile), { recursive: true })
+  await writeFile(liveFile, 'previous-nebula')
+  const staged = await stageComponent(fixture.stagingRoot, defaultStage({
+    artifactId: 'nebula-artifact-explicit-recovery',
+    payloads: [{
+      name: 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll',
+      bytes: Buffer.from('candidate-nebula')
+    }]
+  }))
+  let publishProofs = 0
+  const controlled = createAdapters({
+    stoppedVerifier: async (request) => {
+      if (request.phase === 'before-publish' && ++publishProofs === 2) {
+        await mkdir(path.join(fixture.projectRoot, '.dyson-control-updates', 'active.json'))
+      }
+      return { processStopped: true, portClosed: true }
+    }
+  })
+  const request = makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
+  let failure: unknown
+  try {
+    await createService(fixture, controlled.adapters, {
+      hostMutationCoordinator: new TestHostMutationCoordinator()
+    }).execute(request)
+  } catch (error) {
+    failure = error
+  }
+  if (!(failure instanceof ComponentUpdateActivationError) || failure.code !== 'UPDATE_ACTIVE_SWITCH_FAILED') {
+    throw failure ?? new Error('interrupted activation fixture unexpectedly succeeded')
+  }
+  await rm(path.join(fixture.projectRoot, '.dyson-control-updates', 'active.json'), {
+    recursive: true,
+    force: true
+  })
+  return { fixture, liveFile, request, controlled }
+}
+
 function createService(
   fixture: Fixture,
   adapters: ComponentUpdateActivationAdapters,
@@ -850,6 +1461,7 @@ function createService(
     maximumFiles: number
     maximumHistoryEntries: number
     hostMutationCoordinator: HostMutationOperationCoordinator
+    hostMutationRecoveryCoordinator: HostMutationRecoveryOperationCoordinator
   }> = {}
 ): ComponentUpdateActivationService {
   return new ComponentUpdateActivationService({
@@ -896,6 +1508,53 @@ class TestHostMutationCoordinator implements HostMutationOperationCoordinator {
       })
       this.dispositions.push(outcome.disposition)
       if (outcome.disposition === 'abandon') this.abandoned = true
+      if (outcome.kind === 'throw') throw outcome.error
+      return outcome.value
+    } catch (error) {
+      if (error instanceof HostMutationLeaseError) this.abandoned = true
+      throw error
+    }
+  }
+}
+
+class TestHostMutationRecoveryCoordinator implements HostMutationRecoveryOperationCoordinator {
+  readonly requests: HostMutationRecoveryOperationRequest[] = []
+  readonly dispositions: HostMutationDisposition[] = []
+  readonly controller = new AbortController()
+  acquireError: unknown = null
+  onEnter: ((request: HostMutationRecoveryOperationRequest) => void | Promise<void>) | null = null
+  onAssertActive: (() => void) | null = null
+  abandoned = false
+  recoveryPending = true
+
+  async runRecoveryExclusive<T>(
+    request: HostMutationRecoveryOperationRequest,
+    operation: (
+      scope: HostMutationOperationScope
+    ) => Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>
+  ): Promise<T> {
+    this.requests.push({ ...request })
+    if (this.acquireError !== null) throw this.acquireError
+    if (!this.recoveryPending) {
+      throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED')
+    }
+    await this.onEnter?.(request)
+    try {
+      const outcome = await operation({
+        signal: this.controller.signal,
+        assertActive: () => {
+          if (this.controller.signal.aborted) {
+            throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+          }
+          this.onAssertActive?.()
+        },
+        toPowerShellBorrowArguments: () => [
+          '-LeaseInstanceId', 'recovery-test-instance', '-LeaseToken', 'recovery-test-token'
+        ]
+      })
+      this.dispositions.push(outcome.disposition)
+      if (outcome.disposition === 'abandon') this.abandoned = true
+      else this.recoveryPending = false
       if (outcome.kind === 'throw') throw outcome.error
       return outcome.value
     } catch (error) {

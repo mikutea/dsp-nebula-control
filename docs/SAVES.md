@@ -95,6 +95,17 @@ configured backup root. Every move is journaled, idempotent, and compensated in
 reverse on failure; a separately confirmed restore transaction returns the
 entire retired set to the active catalogue.
 
+Each preview selects at most 128 oldest eligible backup IDs and reports the
+remaining eligible count as deferred; execution must match that exact bounded
+batch. Protection pins are derived fail-closed from durable lifecycle, restore,
+and component-update state and receipts, including legal interrupted-operation
+terminal receipts. An Administrator can resume an exact interrupted annotate,
+retire, restore, or purge journal only through
+`POST /api/v1/backups/retention/recover` with its original UUID, operation,
+server-bound identifiers and `RECOVER_RETENTION_OPERATION`. This recovery uses
+the shared host recovery lease and cannot be triggered by an ordinary retention
+request.
+
 Permanent pruning is a distinct second-stage transaction. It defaults to a
 seven-day retirement grace period, requires a fresh purge preview digest and
 the literal `PURGE_RETIRED_BACKUPS`, preflights the complete batch, refuses

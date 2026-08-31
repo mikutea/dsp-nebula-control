@@ -23,7 +23,8 @@ import type {
   JobRecord, LifecycleAction, LifecycleCheckId, LifecycleCheckStatus,
   LifecycleExecutionPhase, LifecycleExecutionResult, LifecyclePreview, NavKey,
   ClientProfileArchiveDownload, GeneratedClientProfile,
-  ModDeploymentOperation, ModDeploymentPreview, ModDeploymentReceipt, ModDeploymentRecoveryPlan,
+  ModDeploymentOperation, ModDeploymentPreview, ModDeploymentReceipt,
+  ModDeploymentRecoveryDesired, ModDeploymentRecoveryPlan, ModDeploymentRecoveryStatus,
   ModDeploymentRequest, ModDeploymentStateSummary, ModServerLockEntry,
   LateGameQualificationReport, ObservabilityQualificationEnvelope,
   NumericMetricAggregate, ObservabilityDownsamplePoint, ObservabilityDownsampleResult,
@@ -1078,6 +1079,7 @@ function featureBody(
   if (active === 'mods') return <ModWorkspace
     demo={provider === 'demo'}
     canMutate={hasPermission(user, 'mods.mutate')}
+    canRecover={user.role === 'administrator' && hasPermission(user, 'mods.mutate')}
     canAcquire={hasPermission(user, 'updates.stage')}
     canImport={hasPermission(user, 'mods.mutate')}
   />
@@ -1114,17 +1116,25 @@ interface SelectedModDeploymentRequest {
 export function ModWorkspace({
   demo,
   canMutate = true,
+  canRecover = true,
   canAcquire = true,
   canImport = true
 }: {
   demo: boolean
   canMutate?: boolean
+  canRecover?: boolean
   canAcquire?: boolean
   canImport?: boolean
 }) {
   const [state, setState] = useState<ModDeploymentStateSummary | null>(null)
   const [recovery, setRecovery] = useState<ModDeploymentRecoveryPlan | null>(null)
+  const [recoveryStatus, setRecoveryStatus] = useState<ModDeploymentRecoveryStatus | null>(null)
   const [executionEnabled, setExecutionEnabled] = useState(false)
+  const [recoveryExecutionEnabled, setRecoveryExecutionEnabled] = useState(false)
+  const [recoveryRequestId, setRecoveryRequestId] = useState('')
+  const [recoveryDesired, setRecoveryDesired] = useState<ModDeploymentRecoveryDesired>('previous')
+  const [recoveryConfirmation, setRecoveryConfirmation] = useState('')
+  const [recovering, setRecovering] = useState(false)
   const [selected, setSelected] = useState<SelectedModDeploymentRequest | null>(null)
   const [preview, setPreview] = useState<ModDeploymentPreview | null>(null)
   const [receipt, setReceipt] = useState<ModDeploymentReceipt | null>(null)
@@ -1142,16 +1152,27 @@ export function ModWorkspace({
   const load = useCallback(async (signal?: AbortSignal, showLoading = true) => {
     if (showLoading) setLoading(true)
     try {
-      const [stateResult, recoveryResult] = await Promise.all([
+      const [stateResult, recoveryResult, recoveryStatusResult] = await Promise.all([
         api.modDeploymentState(signal),
-        api.modDeploymentRecovery(signal)
+        api.modDeploymentRecovery(signal),
+        api.modDeploymentRecoveryStatus(signal)
       ])
       setState(stateResult.data)
       setRecovery(recoveryResult.data)
+      setRecoveryStatus(recoveryStatusResult.data)
       setExecutionEnabled(stateResult.meta.executionEnabled)
+      setRecoveryExecutionEnabled(recoveryStatusResult.meta.executionEnabled)
+      if (recoveryStatusResult.data.phase === 'recovery-required' && recoveryStatusResult.data.requestId) {
+        setRecoveryRequestId(recoveryStatusResult.data.requestId)
+        setRecoveryDesired((current) => recoveryStatusResult.data.allowedDesired.includes(current)
+          ? current
+          : recoveryStatusResult.data.allowedDesired[0] ?? 'previous')
+      }
       setError('')
     } catch (reason) {
       if (signal?.aborted) return
+      setRecoveryStatus(null)
+      setRecoveryExecutionEnabled(false)
       setError(formatModWorkspaceError(reason, '模组托管状态暂不可用。'))
     } finally {
       if (!signal?.aborted && showLoading) setLoading(false)
@@ -1184,6 +1205,12 @@ export function ModWorkspace({
   const confirmationPhrase = preview
     ? `EXECUTE ${preview.operation.toUpperCase()} ${preview.package.dependencyId}`
     : ''
+  const recoveryConfirmationPhrase = 'RECOVER_MOD_DEPLOYMENT'
+  const mutationBlockedByRecovery = recoveryStatus === null || recoveryStatus.phase !== 'ready'
+  const exactRecoveryRequest = recoveryStatus?.phase === 'recovery-required' &&
+    recoveryStatus.requestId !== null && recoveryRequestId.trim().toLowerCase() === recoveryStatus.requestId
+  const recoveryDesiredAllowed = recoveryStatus?.phase === 'recovery-required' &&
+    recoveryStatus.allowedDesired.includes(recoveryDesired)
   const operationNeedsStaging = selected
     ? ['install', 'update', 'enable'].includes(selected.value.operation)
     : false
@@ -1304,7 +1331,8 @@ export function ModWorkspace({
   }
 
   async function executeDeployment(): Promise<void> {
-    if (!selected || !preview || confirmation !== confirmationPhrase || !executionEnabled || !canMutate) return
+    if (!selected || !preview || confirmation !== confirmationPhrase || !executionEnabled || !canMutate ||
+        mutationBlockedByRecovery) return
     const sequence = ++operationSequenceRef.current
     setExecuting(true)
     setError('')
@@ -1317,10 +1345,67 @@ export function ModWorkspace({
       await load(undefined, false)
     } catch (reason) {
       if (sequence === operationSequenceRef.current) {
+        if (reason instanceof ApiError && [
+          'MOD_DEPLOYMENT_RECOVERY_REQUIRED',
+          'MOD_DEPLOYMENT_HOST_LEASE_DIRTY',
+          'MOD_DEPLOYMENT_HOST_LEASE_RECOVERY_REQUIRED',
+          'MOD_DEPLOYMENT_HOST_LEASE_LOST'
+        ].includes(reason.code ?? '')) {
+          setRecoveryRequestId(selected.value.requestId)
+          await load(undefined, false)
+        }
         setError(formatModWorkspaceError(reason, '模组部署执行失败；请求与预演证据保持不变。'))
       }
     } finally {
       if (sequence === operationSequenceRef.current) setExecuting(false)
+    }
+  }
+
+  async function recoverDeployment(): Promise<void> {
+    if (!canRecover || !recoveryExecutionEnabled || !exactRecoveryRequest || !recoveryDesiredAllowed ||
+        recoveryConfirmation !== recoveryConfirmationPhrase) return
+    const sequence = ++operationSequenceRef.current
+    const requestId = recoveryRequestId.trim().toLowerCase()
+    setRecovering(true)
+    setError('')
+    try {
+      const recovered = await api.recoverModDeployment(requestId, recoveryDesired)
+      if (sequence !== operationSequenceRef.current) return
+      if (recovered.data.requestId !== requestId || recovered.data.status === 'rollback-failed') {
+        setError('显式恢复回执未证明安全终态；模组写入继续保持锁定。')
+        return
+      }
+      const [nextState, nextStatus, nextCleanup] = await Promise.all([
+        api.modDeploymentState(),
+        api.modDeploymentRecoveryStatus(),
+        api.modDeploymentRecovery()
+      ])
+      if (sequence !== operationSequenceRef.current) return
+      const expectedRevision = recovered.data.status === 'succeeded'
+        ? recovered.data.newRevision
+        : recovered.data.previousRevision
+      if (nextStatus.data.phase !== 'ready' || expectedRevision === null ||
+          nextState.data.revision !== expectedRevision) {
+        setRecoveryStatus(nextStatus.data)
+        setRecoveryExecutionEnabled(nextStatus.meta.executionEnabled)
+        setError('恢复后状态未与持久回执收敛；模组写入继续保持锁定。')
+        return
+      }
+      setState(nextState.data)
+      setExecutionEnabled(nextState.meta.executionEnabled)
+      setRecoveryStatus(nextStatus.data)
+      setRecoveryExecutionEnabled(nextStatus.meta.executionEnabled)
+      setRecovery(nextCleanup.data)
+      setReceipt(recovered.data)
+      setPreview(null)
+      setConfirmation('')
+      setRecoveryConfirmation('')
+    } catch (reason) {
+      if (sequence === operationSequenceRef.current) {
+        setError(formatModWorkspaceError(reason, '模组显式恢复失败；所有持久证据保持 fail-closed。'))
+      }
+    } finally {
+      if (sequence === operationSequenceRef.current) setRecovering(false)
     }
   }
 
@@ -1365,7 +1450,7 @@ export function ModWorkspace({
       <div><span>ACTIVE REVISION</span><strong>{state ? shortHash(state.revision, 14) : 'UNAVAILABLE'}</strong><small>{state ? `${state.packages.length} 个托管包` : '等待固定根目录状态'}</small></div>
       <div><span>ENABLED</span><strong>{state?.enabledCount ?? '—'}</strong><small>活动载荷</small></div>
       <div><span>DISABLED</span><strong>{state?.disabledCount ?? '—'}</strong><small>可恢复记录</small></div>
-      <div className={executionEnabled ? 'gate-open' : 'gate-closed'}><span>MUTATION GATE</span><strong>{executionEnabled ? 'ENABLED' : 'FAIL-CLOSED'}</strong><small>{executionEnabled ? '仍需精确确认与双停服证明' : '仅允许读取和预演'}</small></div>
+      <div className={executionEnabled && !mutationBlockedByRecovery ? 'gate-open' : 'gate-closed'}><span>MUTATION GATE</span><strong>{executionEnabled && !mutationBlockedByRecovery ? 'ENABLED' : 'FAIL-CLOSED'}</strong><small>{mutationBlockedByRecovery ? '必须先完成精确恢复或证明恢复状态正常' : executionEnabled ? '仍需精确确认与双停服证明' : '仅允许读取和预演'}</small></div>
     </section>
 
     <div className="mod-workspace-grid">
@@ -1417,8 +1502,8 @@ export function ModWorkspace({
     {preview && <section className="mod-execution-confirm">
       <div><TriangleAlert size={22} /><span><strong>精确确认原子发布</strong><small>输入 <code>{confirmationPhrase}</code>。服务端会重新核验 revision，并在发布前后执行两次 stopped gate；失败后自动回滚。</small></span></div>
       <input aria-label="模组部署精确确认" value={confirmation} disabled={!canMutate} onChange={(event) => setConfirmation(event.target.value)} placeholder={confirmationPhrase} />
-      <button type="button" className="confirm-execute" disabled={executing || !canMutate || !executionEnabled || confirmation !== confirmationPhrase}
-        onClick={() => void executeDeployment()}>{executing ? '原子发布中…' : !canMutate ? '需要 Administrator' : executionEnabled ? '执行模组事务' : '写操作未启用'}</button>
+      <button type="button" className="confirm-execute" disabled={executing || !canMutate || !executionEnabled || mutationBlockedByRecovery || confirmation !== confirmationPhrase}
+        onClick={() => void executeDeployment()}>{executing ? '原子发布中…' : !canMutate ? '需要 Administrator' : mutationBlockedByRecovery ? '等待恢复状态收敛' : executionEnabled ? '执行模组事务' : '写操作未启用'}</button>
     </section>}
 
     {receipt && <section className={`mod-deployment-receipt status-${receipt.status}`} aria-live="polite">
@@ -1427,6 +1512,27 @@ export function ModWorkspace({
       <code>{receipt.newRevision ? shortHash(receipt.newRevision, 16) : 'REVISION UNKNOWN'}</code>
       <b>{formatBytes(receipt.payloadSizeBytes)}</b>
     </section>}
+
+    <section className={`mod-explicit-recovery status-${recoveryStatus?.phase ?? 'unavailable'}`}>
+      <header><div><Undo2 size={17} /><span><strong>显式事务恢复</strong><small>独立开关 · 精确 request ID · 共享主机恢复租约</small></span></div><b>{recoveryStatus?.phase === 'ready' ? 'READY' : recoveryStatus?.phase === 'recovery-required' ? 'RECOVERY REQUIRED' : 'UNAVAILABLE'}</b></header>
+      {recoveryStatus?.phase === 'recovery-required' ? <>
+        <div className="mod-explicit-recovery-grid">
+          <label><span>中断 REQUEST ID</span><input aria-label="模组恢复 request ID" value={recoveryRequestId} readOnly /></label>
+          <label><span>恢复目标</span><select aria-label="模组恢复目标" value={recoveryDesired}
+            onChange={(event) => { setRecoveryDesired(event.target.value as ModDeploymentRecoveryDesired); setRecoveryConfirmation('') }}>
+            {recoveryStatus.allowedDesired.map((desired) => <option key={desired} value={desired}>{desired === 'candidate' ? '提交候选终态' : '回到上一终态'}</option>)}
+          </select></label>
+          <label><span>精确确认</span><input aria-label="模组恢复精确确认" value={recoveryConfirmation}
+            onChange={(event) => setRecoveryConfirmation(event.target.value)} placeholder={recoveryConfirmationPhrase} /></label>
+        </div>
+        <p><TriangleAlert size={15} />只允许恢复中断的 {recoveryStatus.operation ?? '未知'} 事务；服务端会在恢复租约内重新读取证据，网页不能指定路径或伪造 transaction。</p>
+        <button type="button" className="confirm-execute" disabled={recovering || !canRecover || !recoveryExecutionEnabled ||
+          !exactRecoveryRequest || !recoveryDesiredAllowed || recoveryConfirmation !== recoveryConfirmationPhrase}
+          onClick={() => void recoverDeployment()}>{recovering ? '正在核验并收敛…' : !canRecover ? '需要 Administrator' : !recoveryExecutionEnabled ? '恢复开关未启用' : '执行精确恢复'}</button>
+      </> : <p><ShieldCheck size={15} />{recoveryStatus?.phase === 'ready'
+        ? '没有发现未收敛的模组部署事务；普通部署仍需独立写入开关和停服证明。'
+        : '恢复状态不可用；普通模组写入保持 fail-closed。'}</p>}
+    </section>
 
     <section className="mod-recovery-panel">
       <header><div><Undo2 size={16} /><strong>恢复与清理要求</strong></div><span>只读计划 · 不提供浏览器删除</span></header>

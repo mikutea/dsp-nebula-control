@@ -53,6 +53,24 @@ describe('backup retention routes', () => {
     })
     expect(accepted.statusCode).toBe(201)
     expect(controller.annotate).toHaveBeenCalledWith({ requestId: 'opaque' })
+
+    const deniedRecovery = await app.inject({
+      method: 'POST',
+      url: '/api/v1/backups/retention/recover',
+      headers: { 'x-test-role': 'operator' },
+      payload: { operation: 'retire', requestId: 'opaque' }
+    })
+    expect(deniedRecovery.statusCode).toBe(403)
+    expect(controller.recover).not.toHaveBeenCalled()
+
+    const acceptedRecovery = await app.inject({
+      method: 'POST',
+      url: '/api/v1/backups/retention/recover',
+      headers: { 'x-test-role': 'administrator' },
+      payload: { operation: 'retire', requestId: 'opaque' }
+    })
+    expect(acceptedRecovery.statusCode).toBe(200)
+    expect(controller.recover).toHaveBeenCalledWith({ operation: 'retire', requestId: 'opaque' })
   })
 
   it('marks query-parameter smuggling so the strict controller can reject it', async () => {
@@ -116,6 +134,7 @@ function createController(): BackupRetentionRoutesController {
     execute: vi.fn(async () => ({ statusCode: 201, body: { data: {} } })),
     restore: vi.fn(async () => ({ statusCode: 201, body: { data: {} } })),
     previewPurge: vi.fn(async () => ok),
-    purge: vi.fn(async () => ({ statusCode: 201, body: { data: {} } }))
+    purge: vi.fn(async () => ({ statusCode: 201, body: { data: {} } })),
+    recover: vi.fn(async () => ({ statusCode: 200, body: { data: {} } }))
   }
 }

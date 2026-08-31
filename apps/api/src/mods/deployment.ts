@@ -20,7 +20,8 @@ import {
   hostMutationReturn,
   hostMutationThrow,
   type HostMutationOperationCoordinator,
-  type HostMutationOperationScope
+  type HostMutationOperationScope,
+  type HostMutationRecoveryOperationCoordinator
 } from '../host-mutation/operation-coordinator.js'
 import { sha256Schema } from '../updates/version.js'
 import { parseThunderstoreDependency, thunderstoreDependencyIdSchema } from './dependency.js'
@@ -53,6 +54,7 @@ import {
   type ModDeploymentPreview,
   type ModDeploymentReceipt,
   type ModDeploymentReceiptHistoryPage,
+  type ModDeploymentRecoveryStatus,
   type ModDeploymentRequest,
   type ModDeploymentServiceOptions,
   type ModDeploymentStateSummary,
@@ -67,8 +69,12 @@ const STATE_FORMAT = 'dyson-control-active-mod-deployment' as const
 const RECEIPT_FORMAT = 'dyson-control-mod-deployment-receipt' as const
 const RECEIPT_ENVELOPE_FORMAT = 'dyson-control-mod-deployment-receipt-envelope' as const
 const RECEIPT_HISTORY_FORMAT = 'dyson-control-mod-deployment-receipt-history' as const
+const RECOVERY_JOURNAL_FORMAT = 'dyson-control-mod-deployment-recovery-journal' as const
+const TRANSACTION_LOCK_FORMAT = 'dyson-control-mod-deployment-transaction-lock' as const
 const MAX_MOD_DEPLOYMENT_RECEIPT_BYTES = 16 * 1024
+const MAX_MOD_DEPLOYMENT_RECOVERY_JOURNAL_BYTES = 16 * 1024 * 1024
 const MAX_SNAPSHOTS_DEFAULT = 8
+const MAX_MOD_DEPLOYMENT_TREE_ENTRIES = 2_048
 
 const relativePayloadPathSchema = z.string().min(5).max(240).refine(isSafePayloadRelativePath)
 const stagedFileSchema: z.ZodType<StagedModPackageFile> = z.strictObject({
@@ -151,15 +157,98 @@ interface LoadedStoredReceipt {
   receipt: ModDeploymentReceipt
 }
 
+interface RecoveryReceiptDirectoryEvidence {
+  readonly final: ReadonlyMap<string, LoadedStoredReceipt>
+  readonly pendingRequestIds: ReadonlySet<string>
+}
+
 interface ReceiptHistoryCursor {
   persistedAt: string
   requestId: string
 }
 
+interface DirectoryContentSummary {
+  sha256: string
+  fileCount: number
+  directoryCount: number
+  totalBytes: number
+}
+
+type RecoveryJournalPhase =
+  | 'prepared'
+  | 'forward-live-to-snapshot-intent'
+  | 'forward-live-to-snapshot-completed'
+  | 'forward-pending-to-live-intent'
+  | 'forward-pending-to-live-completed'
+  | 'rollback-live-to-failed-intent'
+  | 'rollback-live-to-failed-completed'
+  | 'rollback-snapshot-to-live-intent'
+  | 'rollback-snapshot-to-live-completed'
+
+interface ModDeploymentRecoveryJournal {
+  format: typeof RECOVERY_JOURNAL_FORMAT
+  schemaVersion: 1
+  request: ModDeploymentRequest
+  fingerprint: string
+  previousRevision: string
+  nextRevision: string
+  paths: {
+    pending: string
+    snapshot: string
+    failed: string
+  }
+  previousState: ActiveModState
+  nextState: ActiveModState
+  previousSummary: DirectoryContentSummary
+  candidateSummary: DirectoryContentSummary
+  successReceipt: ModDeploymentReceipt
+  rolledBackReceipt: ModDeploymentReceipt
+  phase: RecoveryJournalPhase
+}
+
+interface TransactionLockIdentity {
+  dev: string
+  ino: string
+  birthtimeNs: string
+}
+
+interface TransactionLockRecord {
+  format: typeof TRANSACTION_LOCK_FORMAT
+  schemaVersion: 1
+  owner: string
+  journal: { requestId: string; fingerprint: string } | null
+  identity: TransactionLockIdentity
+}
+
+interface OwnedTransactionLock {
+  path: string
+  handle: FileHandle
+  record: TransactionLockRecord
+}
+
+type RecoveryLayout =
+  | 'previous'
+  | 'snapshot-only'
+  | 'candidate'
+  | 'failed-candidate'
+  | 'restored-previous'
+
 class UnknownModDeploymentWriteError extends ModDeploymentError {
   constructor() {
     super('MOD_DEPLOYMENT_EXECUTION_FAILED')
     this.name = 'UnknownModDeploymentWriteError'
+  }
+}
+
+class CompletedLiveRenameFault extends Error {
+  readonly journal: ModDeploymentRecoveryJournal
+  readonly faultPhase: ModDeploymentFaultPhase
+
+  constructor(journal: ModDeploymentRecoveryJournal, faultPhase: ModDeploymentFaultPhase, cause: unknown) {
+    super('MOD_DEPLOYMENT_POST_RENAME_FAULT', { cause })
+    this.name = 'CompletedLiveRenameFault'
+    this.journal = journal
+    this.faultPhase = faultPhase
   }
 }
 
@@ -228,6 +317,63 @@ const storedReceiptEnvelopeSchema = z.strictObject({
   receipt: publicReceiptSchema
 })
 
+const directoryContentSummarySchema: z.ZodType<DirectoryContentSummary> = z.strictObject({
+  sha256: sha256Schema,
+  fileCount: z.number().int().nonnegative().max(MAX_MOD_DEPLOYMENT_TREE_ENTRIES),
+  directoryCount: z.number().int().nonnegative().max(MAX_MOD_DEPLOYMENT_TREE_ENTRIES),
+  totalBytes: z.number().int().nonnegative().max(MAX_DEPLOYED_MOD_TOTAL_BYTES + MAX_MOD_DEPLOYMENT_MANIFEST_BYTES)
+})
+
+const recoveryJournalPhaseSchema = z.enum([
+  'prepared',
+  'forward-live-to-snapshot-intent',
+  'forward-live-to-snapshot-completed',
+  'forward-pending-to-live-intent',
+  'forward-pending-to-live-completed',
+  'rollback-live-to-failed-intent',
+  'rollback-live-to-failed-completed',
+  'rollback-snapshot-to-live-intent',
+  'rollback-snapshot-to-live-completed'
+])
+
+const recoveryJournalSchema: z.ZodType<ModDeploymentRecoveryJournal> = z.strictObject({
+  format: z.literal(RECOVERY_JOURNAL_FORMAT),
+  schemaVersion: z.literal(1),
+  request: requestSchema,
+  fingerprint: sha256Schema,
+  previousRevision: sha256Schema,
+  nextRevision: sha256Schema,
+  paths: z.strictObject({
+    pending: z.string().regex(/^pending\/[0-9a-f-]{36}$/),
+    snapshot: z.string().regex(/^snapshots\/snapshot-[0-9a-f]{16}-[0-9a-f-]{36}$/),
+    failed: z.string().regex(/^recovery\/failed-[0-9a-f-]{36}$/)
+  }),
+  previousState: activeStateSchema,
+  nextState: activeStateSchema,
+  previousSummary: directoryContentSummarySchema,
+  candidateSummary: directoryContentSummarySchema,
+  successReceipt: publicReceiptSchema,
+  rolledBackReceipt: publicReceiptSchema,
+  phase: recoveryJournalPhaseSchema
+})
+
+const transactionLockIdentitySchema: z.ZodType<TransactionLockIdentity> = z.strictObject({
+  dev: z.string().regex(/^\d+$/),
+  ino: z.string().regex(/^\d+$/),
+  birthtimeNs: z.string().regex(/^\d+$/)
+})
+
+const transactionLockRecordSchema: z.ZodType<TransactionLockRecord> = z.strictObject({
+  format: z.literal(TRANSACTION_LOCK_FORMAT),
+  schemaVersion: z.literal(1),
+  owner: z.string().uuid(),
+  journal: z.strictObject({
+    requestId: z.string().uuid(),
+    fingerprint: sha256Schema
+  }).nullable(),
+  identity: transactionLockIdentitySchema
+})
+
 const receiptRequestIdSchema = z.string().uuid().transform((value) => value.toLowerCase())
 const receiptHistoryQuerySchema = z.strictObject({
   cursor: z.string().min(1).max(MAX_MOD_DEPLOYMENT_HISTORY_CURSOR_LENGTH)
@@ -248,6 +394,7 @@ export class ModDeploymentService {
   readonly #controlRoot: string
   readonly #verifyStoppedState: ModDeploymentServiceOptions['verifyStoppedState']
   readonly #hostMutationCoordinator: HostMutationOperationCoordinator | null
+  readonly #hostMutationRecoveryCoordinator: HostMutationRecoveryOperationCoordinator | null
   readonly #readPlatformInventory: NonNullable<ModDeploymentServiceOptions['readPlatformInventory']> | null
   readonly #faultInjector: ModDeploymentServiceOptions['faultInjector']
   readonly #now: () => Date
@@ -258,7 +405,9 @@ export class ModDeploymentService {
     if (!isAbsolute(options.stagingRoot) || !isAbsolute(options.pluginsRoot) ||
         typeof options.verifyStoppedState !== 'function' ||
         (options.hostMutationCoordinator !== undefined &&
-          typeof options.hostMutationCoordinator.runExclusive !== 'function')) {
+          typeof options.hostMutationCoordinator.runExclusive !== 'function') ||
+        (options.hostMutationRecoveryCoordinator !== undefined &&
+          typeof options.hostMutationRecoveryCoordinator.runRecoveryExclusive !== 'function')) {
       throw new ModDeploymentError('MOD_DEPLOYMENT_ROOT_INVALID')
     }
     this.#stagingRoot = resolve(options.stagingRoot)
@@ -271,6 +420,7 @@ export class ModDeploymentService {
     }
     this.#verifyStoppedState = options.verifyStoppedState
     this.#hostMutationCoordinator = options.hostMutationCoordinator ?? null
+    this.#hostMutationRecoveryCoordinator = options.hostMutationRecoveryCoordinator ?? null
     this.#readPlatformInventory = options.readPlatformInventory ?? null
     this.#faultInjector = options.faultInjector
     this.#now = options.now ?? (() => new Date())
@@ -301,6 +451,7 @@ export class ModDeploymentService {
     const request = parseRequest(input)
     const fingerprint = requestFingerprint(request)
     return this.#exclusive(async () => this.#withFileLock(request.requestId, async () => {
+      await this.#assertNoRecoveryJournal()
       const stored = await this.#readReceipt(request.requestId)
       if (stored !== null) {
         if (stored.fingerprint !== fingerprint) throw new ModDeploymentError('MOD_DEPLOYMENT_IDEMPOTENCY_CONFLICT')
@@ -320,7 +471,90 @@ export class ModDeploymentService {
       await this.#assertPlatformLockCurrent(request)
       const prepared = await this.#prepare(request, current)
       return this.#executePreparedWithHostMutation(prepared)
-    }))
+    }, { requestId: request.requestId, fingerprint }, 'MOD_DEPLOYMENT_RECOVERY_REQUIRED'))
+  }
+
+  async reconcileInterrupted(
+    requestIdInput: unknown,
+    desiredInput: 'candidate' | 'previous',
+    hostMutationScope: HostMutationOperationScope
+  ): Promise<ModDeploymentReceipt> {
+    const requestId = receiptRequestIdSchema.safeParse(requestIdInput)
+    const desired = z.enum(['candidate', 'previous']).safeParse(desiredInput)
+    if (!requestId.success || !desired.success) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_REQUEST_INVALID')
+    }
+    this.#assertHostMutationActive(hostMutationScope)
+    return this.#exclusive(async () => {
+      this.#assertHostMutationActive(hostMutationScope)
+      await this.#readRecoveryOperationEvidence(requestId.data, desired.data)
+      this.#assertHostMutationActive(hostMutationScope)
+      const receipt = await this.#reconcileInterruptedTransaction(requestId.data, desired.data, hostMutationScope)
+      this.#assertHostMutationActive(hostMutationScope)
+      return receipt
+    })
+  }
+
+  async recoverInterrupted(
+    requestIdInput: unknown,
+    desiredInput: 'candidate' | 'previous'
+  ): Promise<ModDeploymentReceipt> {
+    const requestId = receiptRequestIdSchema.safeParse(requestIdInput)
+    const desired = z.enum(['candidate', 'previous']).safeParse(desiredInput)
+    if (!requestId.success || !desired.success) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_REQUEST_INVALID')
+    }
+    const coordinator = this.#hostMutationRecoveryCoordinator
+    if (coordinator === null) throw new ModDeploymentError('MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE')
+
+    const evidence = await this.#exclusive(async () =>
+      this.#readRecoveryOperationEvidence(requestId.data, desired.data))
+    try {
+      return await coordinator.runRecoveryExclusive({
+        expectedOperation: `mod-deployment-${evidence.operation}`,
+        expectedRequestId: requestId.data
+      }, async (scope) => {
+        try {
+          this.#assertHostMutationActive(scope)
+          const receipt = await this.reconcileInterrupted(requestId.data, desired.data, scope)
+          this.#assertHostMutationActive(scope)
+          const persisted = await this.#exclusive(async () =>
+            this.#readCompletedReconciliation(requestId.data, desired.data))
+          if (persisted === null ||
+              JSON.stringify({ ...persisted, reused: false }) !== JSON.stringify({ ...receipt, reused: false })) {
+            return hostMutationThrow<ModDeploymentReceipt>(
+              new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED'),
+              'abandon'
+            )
+          }
+          return hostMutationReturn(receipt, 'release')
+        } catch (error) {
+          if (error instanceof HostMutationOperationCoordinatorError) throw error
+          return hostMutationThrow<ModDeploymentReceipt>(
+            error instanceof ModDeploymentError
+              ? error
+              : new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED'),
+            'abandon'
+          )
+        }
+      })
+    } catch (error) {
+      if (error instanceof ModDeploymentError) throw error
+      if (error instanceof HostMutationOperationCoordinatorError) {
+        if (error.code === 'HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED') {
+          const replay = await this.#exclusive(async () =>
+            this.#readCompletedReconciliation(requestId.data, desired.data))
+          if (replay !== null) return replay
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        throw new ModDeploymentError(mapHostMutationCoordinatorError(error.code))
+      }
+      throw new ModDeploymentError('MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE')
+    }
+  }
+
+  async recoveryStatus(): Promise<ModDeploymentRecoveryStatus> {
+    return this.#exclusive(async () => this.#readRecoveryStatus())
   }
 
   async getReceipt(input: unknown): Promise<ModDeploymentReceipt | null> {
@@ -512,6 +746,10 @@ export class ModDeploymentService {
     await this.#assertStopped(hostMutationScope)
     const pendingRoot = await this.#pendingPath(prepared.request.requestId)
     await this.#buildPendingTree(prepared, pendingRoot)
+    this.#assertHostMutationActive(hostMutationScope)
+    await syncDirectoryTree(pendingRoot)
+    await syncDirectory(dirname(pendingRoot))
+    this.#assertHostMutationActive(hostMutationScope)
     await this.#injectFault('after-pending-built')
     await this.#assertStopped(hostMutationScope)
     await this.#assertPlatformLockWithinHostMutation(prepared.request, hostMutationScope)
@@ -519,42 +757,77 @@ export class ModDeploymentService {
     const snapshotsRoot = await this.#ensureControlDirectory('snapshots')
     const snapshotId = `snapshot-${prepared.current.revision.slice(0, 16)}-${prepared.request.requestId}`
     const snapshotRoot = join(snapshotsRoot, snapshotId)
+    const recoveryRoot = await this.#ensureControlDirectory('recovery')
+    const failedRoot = join(recoveryRoot, `failed-${prepared.request.requestId}`)
     await assertPathDoesNotExist(snapshotRoot)
+    await assertPathDoesNotExist(failedRoot)
+    const previousSummary = await summarizeDirectoryContents(this.#pluginsRoot)
+    const candidateSummary = await summarizeDirectoryContents(pendingRoot)
+    let journal = createRecoveryJournal(
+      prepared,
+      previousSummary,
+      candidateSummary,
+      snapshotId
+    )
+    await this.#writeRecoveryJournal(journal, true, hostMutationScope)
     let snapshotCreated = false
     let published = false
     try {
-      this.#assertHostMutationActive(hostMutationScope)
-      await rename(this.#pluginsRoot, snapshotRoot)
+      journal = await this.#recordedRename(
+        journal,
+        'forward-live-to-snapshot-intent',
+        'forward-live-to-snapshot-completed',
+        this.#pluginsRoot,
+        snapshotRoot,
+        'after-snapshot',
+        hostMutationScope
+      )
       snapshotCreated = true
-      await this.#injectFault('after-snapshot')
-      this.#assertHostMutationActive(hostMutationScope)
-      await rename(pendingRoot, this.#pluginsRoot)
+      journal = await this.#recordedRename(
+        journal,
+        'forward-pending-to-live-intent',
+        'forward-pending-to-live-completed',
+        pendingRoot,
+        this.#pluginsRoot,
+        'after-publish',
+        hostMutationScope
+      )
       published = true
-      await this.#injectFault('after-publish')
       const receipt = successReceipt(prepared)
-      await this.#writeReceipt(prepared.fingerprint, receipt)
+      await this.#writeReceipt(prepared.fingerprint, receipt, hostMutationScope)
+      await this.#removeRecoveryJournal(prepared.request.requestId, hostMutationScope)
       this.#assertHostMutationActive(hostMutationScope)
       return receipt
-    } catch (error) {
-      if (error instanceof HostMutationOperationCoordinatorError) throw error
+    } catch (caught) {
+      if (caught instanceof HostMutationOperationCoordinatorError) throw caught
+      if (caught instanceof CompletedLiveRenameFault) {
+        journal = caught.journal
+        if (caught.faultPhase === 'after-snapshot') snapshotCreated = true
+        if (caught.faultPhase === 'after-publish') published = true
+      }
       if (!snapshotCreated) {
-        if (error instanceof ModDeploymentError) throw error
         throw new UnknownModDeploymentWriteError()
       }
-      const rollbackSucceeded = await this.#rollbackPublication(
-        prepared.request.requestId,
+      const rollback = await this.#rollbackPublication(
+        journal,
         snapshotRoot,
+        failedRoot,
         published,
         hostMutationScope
       )
-      const receipt = rollbackReceipt(prepared, rollbackSucceeded)
+      journal = rollback.journal
+      const receipt = rollbackReceipt(prepared, rollback.succeeded)
       try {
-        await this.#writeReceipt(prepared.fingerprint, receipt)
-      } catch {
-        if (rollbackSucceeded) throw new UnknownModDeploymentWriteError()
+        await this.#writeReceipt(prepared.fingerprint, receipt, hostMutationScope)
+        if (rollback.succeeded) {
+          await this.#removeRecoveryJournal(prepared.request.requestId, hostMutationScope)
+        }
+      } catch (error) {
+        if (error instanceof HostMutationOperationCoordinatorError) throw error
+        if (rollback.succeeded) throw new UnknownModDeploymentWriteError()
         // The unresolved publication already requires an abandoned lease; preserve that result.
       }
-      if (rollbackSucceeded) this.#assertHostMutationActive(hostMutationScope)
+      if (rollback.succeeded) this.#assertHostMutationActive(hostMutationScope)
       return receipt
     }
   }
@@ -636,27 +909,792 @@ export class ModDeploymentService {
   }
 
   async #rollbackPublication(
-    requestId: string,
+    journalInput: ModDeploymentRecoveryJournal,
     snapshotRoot: string,
+    failedRoot: string,
     published: boolean,
     hostMutationScope: HostMutationOperationScope | null
-  ): Promise<boolean> {
+  ): Promise<{ succeeded: boolean; journal: ModDeploymentRecoveryJournal }> {
+    let journal = journalInput
     try {
       if (published) {
-        const recoveryRoot = await this.#ensureControlDirectory('recovery')
-        const failedRoot = join(recoveryRoot, `failed-${requestId}`)
         await assertPathDoesNotExist(failedRoot)
-        this.#assertHostMutationActive(hostMutationScope)
-        await rename(this.#pluginsRoot, failedRoot)
+        journal = await this.#recordedRename(
+          journal,
+          'rollback-live-to-failed-intent',
+          'rollback-live-to-failed-completed',
+          this.#pluginsRoot,
+          failedRoot,
+          'after-rollback-failed-move',
+          hostMutationScope
+        )
       }
-      this.#assertHostMutationActive(hostMutationScope)
-      await rename(snapshotRoot, this.#pluginsRoot)
+      journal = await this.#recordedRename(
+        journal,
+        'rollback-snapshot-to-live-intent',
+        'rollback-snapshot-to-live-completed',
+        snapshotRoot,
+        this.#pluginsRoot,
+        'after-rollback-restore',
+        hostMutationScope
+      )
       await assertDirectoryBoundary(this.#pluginsRoot, dirname(this.#pluginsRoot))
-      return true
+      return { succeeded: true, journal }
     } catch (error) {
       if (error instanceof HostMutationOperationCoordinatorError) throw error
-      return false
+      if (error instanceof CompletedLiveRenameFault) journal = error.journal
+      return { succeeded: false, journal }
     }
+  }
+
+  async #recordedRename(
+    journal: ModDeploymentRecoveryJournal,
+    intentPhase: RecoveryJournalPhase,
+    completedPhase: RecoveryJournalPhase,
+    source: string,
+    destination: string,
+    faultPhase: ModDeploymentFaultPhase,
+    hostMutationScope: HostMutationOperationScope | null
+  ): Promise<ModDeploymentRecoveryJournal> {
+    const intent = recoveryJournalSchema.parse({ ...journal, phase: intentPhase })
+    if (journal.phase !== intentPhase) {
+      await this.#writeRecoveryJournal(intent, false, hostMutationScope)
+    }
+    let renamed = false
+    try {
+      this.#assertHostMutationActive(hostMutationScope)
+      await rename(source, destination)
+      renamed = true
+      await syncRenameParents(source, destination)
+      this.#assertHostMutationActive(hostMutationScope)
+      await this.#injectFault(faultPhase)
+      const completed = recoveryJournalSchema.parse({ ...intent, phase: completedPhase })
+      await this.#writeRecoveryJournal(completed, false, hostMutationScope)
+      return completed
+    } catch (error) {
+      if (error instanceof HostMutationOperationCoordinatorError) throw error
+      if (renamed) throw new CompletedLiveRenameFault(intent, faultPhase, error)
+      throw error
+    }
+  }
+
+  async #assertNoRecoveryJournal(): Promise<void> {
+    const root = join(this.#controlRoot, 'journals')
+    const info = await lstat(root).catch((error: unknown) => isMissingError(error) ? null : Promise.reject(error))
+    if (info === null) {
+      await this.#ensureControlDirectory('journals')
+      return
+    }
+    await assertDirectoryBoundary(root, this.#controlRoot)
+    const entries = await readdir(root, { withFileTypes: true })
+    if (entries.length !== 0) throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+  }
+
+  async #readRecoveryJournal(requestId: string): Promise<ModDeploymentRecoveryJournal> {
+    const root = join(this.#controlRoot, 'journals')
+    await assertDirectoryBoundary(root, this.#controlRoot)
+    const entries = await readdir(root, { withFileTypes: true })
+    if (entries.length !== 1 || !entries[0]!.isFile() || entries[0]!.isSymbolicLink() ||
+        entries[0]!.name !== `${requestId}.json`) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    const filePath = join(root, entries[0]!.name)
+    let journal: ModDeploymentRecoveryJournal
+    try {
+      journal = recoveryJournalSchema.parse(await readStableBoundedJson(filePath))
+    } catch {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    validateRecoveryJournal(journal)
+    if (journal.request.requestId !== requestId) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    return journal
+  }
+
+  async #readRecoveryJournalFile(filePath: string, requestId: string): Promise<ModDeploymentRecoveryJournal> {
+    let journal: ModDeploymentRecoveryJournal
+    try {
+      journal = recoveryJournalSchema.parse(await readStableBoundedJson(filePath))
+    } catch {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    validateRecoveryJournal(journal)
+    if (journal.request.requestId !== requestId) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    return journal
+  }
+
+  async #recoverPendingRecoveryJournal(
+    requestId: string,
+    lock: OwnedTransactionLock,
+    hostMutationScope: HostMutationOperationScope
+  ): Promise<ModDeploymentRecoveryJournal> {
+    const evidence = await this.#inspectRecoveryJournalEvidence(requestId, lock)
+    if (evidence.pendingPath === null) return evidence.journal
+    this.#assertHostMutationActive(hostMutationScope)
+    await rename(evidence.pendingPath, evidence.finalPath)
+    await syncDirectory(dirname(evidence.finalPath))
+    this.#assertHostMutationActive(hostMutationScope)
+    return evidence.journal
+  }
+
+  async #inspectRecoveryJournalEvidence(
+    requestId: string,
+    lock: OwnedTransactionLock
+  ): Promise<{
+      journal: ModDeploymentRecoveryJournal
+      pendingPath: string | null
+      finalPath: string
+      layout: RecoveryLayout
+    }> {
+    const root = join(this.#controlRoot, 'journals')
+    await assertDirectoryBoundary(root, this.#controlRoot)
+    const finalPath = join(root, `${requestId}.json`)
+    const pendingPath = join(root, `${requestId}.pending`)
+    const entries = await readdir(root, { withFileTypes: true })
+    const allowedNames = new Set([`${requestId}.json`, `${requestId}.pending`])
+    if (entries.length < 1 || entries.length > 2 || entries.some((entry) =>
+      !entry.isFile() || entry.isSymbolicLink() || !allowedNames.has(entry.name))) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+
+    const pendingExists = entries.some((entry) => entry.name === `${requestId}.pending`)
+    if (!pendingExists) {
+      const journal = await this.#readRecoveryJournal(requestId)
+      return {
+        journal,
+        pendingPath: null,
+        finalPath,
+        layout: await this.#classifyRecoveryLayout(journal)
+      }
+    }
+
+    const pending = await this.#readRecoveryJournalFile(pendingPath, requestId)
+    if (lock.record.journal?.fingerprint !== pending.fingerprint) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    const finalExists = entries.some((entry) => entry.name === `${requestId}.json`)
+    if (finalExists) {
+      const current = await this.#readRecoveryJournalFile(finalPath, requestId)
+      if (!sameRecoveryJournalBinding(current, pending) ||
+          !isRecoveryJournalTransitionAllowed(current.phase, pending.phase)) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+    } else if (pending.phase !== 'prepared') {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    const layout = await this.#classifyRecoveryLayout(pending)
+    return { journal: pending, pendingPath, finalPath, layout }
+  }
+
+  async #writeRecoveryJournal(
+    journalInput: ModDeploymentRecoveryJournal,
+    initial: boolean,
+    hostMutationScope: HostMutationOperationScope | null
+  ): Promise<void> {
+    const journal = recoveryJournalSchema.parse(journalInput)
+    validateRecoveryJournal(journal)
+    const root = initial
+      ? await this.#ensureControlDirectory('journals')
+      : join(this.#controlRoot, 'journals')
+    if (!initial) await assertDirectoryBoundary(root, this.#controlRoot)
+    const filePath = join(root, `${journal.request.requestId}.json`)
+    const pendingPath = join(root, `${journal.request.requestId}.pending`)
+    if (initial) await assertPathDoesNotExist(filePath)
+    else {
+      const existing = await this.#readRecoveryJournal(journal.request.requestId)
+      if (!sameRecoveryJournalBinding(existing, journal) ||
+          !isRecoveryJournalTransitionAllowed(existing.phase, journal.phase)) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+    }
+    await assertPathDoesNotExist(pendingPath)
+    this.#assertHostMutationActive(hostMutationScope)
+    await writeJsonAtomic(
+      filePath,
+      pendingPath,
+      journal,
+      () => this.#assertHostMutationActive(hostMutationScope),
+      async () => this.#injectFault('after-journal-pending-synced')
+    )
+    this.#assertHostMutationActive(hostMutationScope)
+  }
+
+  async #removeRecoveryJournal(
+    requestId: string,
+    hostMutationScope: HostMutationOperationScope | null
+  ): Promise<void> {
+    const root = join(this.#controlRoot, 'journals')
+    const filePath = join(root, `${requestId}.json`)
+    this.#assertHostMutationActive(hostMutationScope)
+    await unlink(filePath)
+    await syncDirectory(root)
+    this.#assertHostMutationActive(hostMutationScope)
+  }
+
+  async #readResidualTransactionLock(
+    requestId?: string,
+    readOnly = false
+  ): Promise<OwnedTransactionLock> {
+    const lockPath = join(this.#controlRoot, 'transaction.lock')
+    let handle: FileHandle | null = null
+    try {
+      await assertDirectoryBoundary(this.#controlRoot, dirname(this.#controlRoot))
+      handle = await open(lockPath, readOnly ? constants.O_RDONLY : constants.O_RDWR)
+      const before = await handle.stat({ bigint: true })
+      const pathBefore = await lstat(lockPath, { bigint: true })
+      const content = await handle.readFile('utf8')
+      const after = await handle.stat({ bigint: true })
+      const pathAfter = await lstat(lockPath, { bigint: true })
+      const record = transactionLockRecordSchema.parse(JSON.parse(content) as unknown)
+      const identity = transactionLockIdentity(before)
+      if (!sameFileSnapshot(before, after) || !sameFileSnapshot(pathBefore, pathAfter) ||
+          !sameTransactionLockIdentity(identity, transactionLockIdentity(after)) ||
+          !sameTransactionLockIdentity(identity, transactionLockIdentity(pathBefore)) ||
+          !sameTransactionLockIdentity(identity, transactionLockIdentity(pathAfter)) ||
+          !sameTransactionLockIdentity(identity, record.identity) ||
+          (requestId !== undefined &&
+            (record.owner !== requestId || record.journal?.requestId !== requestId))) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      return { path: lockPath, handle, record }
+    } catch (error) {
+      await handle?.close().catch(() => undefined)
+      if (error instanceof ModDeploymentError) throw error
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+  }
+
+  async #reconcileInterruptedTransaction(
+    requestId: string,
+    desired: 'candidate' | 'previous',
+    hostMutationScope: HostMutationOperationScope
+  ): Promise<ModDeploymentReceipt> {
+    const completed = await this.#replayCompletedReconciliation(requestId, desired, hostMutationScope)
+    if (completed !== null) return completed
+    const lock = await this.#readResidualTransactionLock(requestId)
+    let released = false
+    try {
+      const journalPath = join(this.#controlRoot, 'journals', `${requestId}.json`)
+      const journalPendingPath = join(this.#controlRoot, 'journals', `${requestId}.pending`)
+      if (!await pathExists(journalPath) && !await pathExists(journalPendingPath)) {
+        let terminal = await this.#readReceipt(requestId, false)
+        const receiptPending = await pathExists(join(this.#controlRoot, 'receipts', `${requestId}.pending`))
+        if (terminal !== null && receiptPending) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        if (terminal === null && receiptPending) {
+          const committed = await this.#readCommittedReceiptPendingEvidence(requestId, lock)
+          await this.#publishMatchingPendingReceipt(
+            committed.fingerprint, committed.receipt, hostMutationScope
+          )
+          terminal = await this.#readReceipt(requestId, false)
+        }
+        if (terminal === null || terminal.fingerprint !== lock.record.journal!.fingerprint ||
+            (terminal.receipt.status !== 'succeeded' && terminal.receipt.status !== 'rolled-back')) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        if ((terminal.receipt.status === 'succeeded' && desired !== 'candidate') ||
+            (terminal.receipt.status === 'rolled-back' && desired !== 'previous')) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_TARGET_NOT_ALLOWED')
+        }
+        this.#assertHostMutationActive(hostMutationScope)
+        await this.#releaseOwnedLock(lock, hostMutationScope)
+        released = true
+        return { ...terminal.receipt, reused: true }
+      }
+
+      const journal = await this.#recoverPendingRecoveryJournal(requestId, lock, hostMutationScope)
+      if (lock.record.journal!.fingerprint !== journal.fingerprint) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      let currentJournal = journal
+      let layout = await this.#classifyRecoveryLayout(currentJournal)
+      const existing = await this.#readReceipt(requestId, false)
+      if (existing !== null &&
+          await pathExists(join(this.#controlRoot, 'receipts', `${requestId}.pending`))) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      if (existing !== null && (existing.fingerprint !== journal.fingerprint ||
+          (JSON.stringify(existing.receipt) !== JSON.stringify(journal.successReceipt) &&
+           JSON.stringify(existing.receipt) !== JSON.stringify(journal.rolledBackReceipt)))) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      if (existing !== null) {
+        const success = JSON.stringify(existing.receipt) === JSON.stringify(journal.successReceipt)
+        const rolledBack = JSON.stringify(existing.receipt) === JSON.stringify(journal.rolledBackReceipt)
+        if ((success && layout !== 'candidate') ||
+            (rolledBack && layout !== 'previous' && layout !== 'restored-previous')) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        if ((success && desired !== 'candidate') || (rolledBack && desired !== 'previous')) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_TARGET_NOT_ALLOWED')
+        }
+        await this.#removeRecoveryJournal(requestId, hostMutationScope)
+        await this.#releaseOwnedLock(lock, hostMutationScope)
+        released = true
+        return { ...existing.receipt, reused: true }
+      }
+
+      if (layout === 'candidate' && desired === 'candidate') {
+        const receipt = await this.#persistRecoveryReceipt(
+          journal.fingerprint, journal.successReceipt, existing, hostMutationScope
+        )
+        await this.#removeRecoveryJournal(requestId, hostMutationScope)
+        await this.#releaseOwnedLock(lock, hostMutationScope)
+        released = true
+        return receipt
+      }
+
+      if (layout === 'snapshot-only' || layout === 'candidate' || layout === 'failed-candidate') {
+        await this.#assertStopped(hostMutationScope)
+        const revalidated = await this.#classifyRecoveryLayout(currentJournal)
+        if (revalidated !== layout) throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+
+      const paths = this.#recoveryPaths(currentJournal)
+      if (layout === 'candidate') {
+        currentJournal = await this.#recordedRename(
+          currentJournal,
+          'rollback-live-to-failed-intent',
+          'rollback-live-to-failed-completed',
+          paths.live,
+          paths.failed,
+          'after-rollback-failed-move',
+          hostMutationScope
+        )
+        layout = 'failed-candidate'
+      }
+      if (layout === 'snapshot-only' || layout === 'failed-candidate') {
+        currentJournal = await this.#recordedRename(
+          currentJournal,
+          'rollback-snapshot-to-live-intent',
+          'rollback-snapshot-to-live-completed',
+          paths.snapshot,
+          paths.live,
+          'after-rollback-restore',
+          hostMutationScope
+        )
+      }
+      const finalLayout = await this.#classifyRecoveryLayout(currentJournal)
+      if (finalLayout !== 'previous' && finalLayout !== 'restored-previous') {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      const receipt = await this.#persistRecoveryReceipt(
+        journal.fingerprint, journal.rolledBackReceipt, existing, hostMutationScope
+      )
+      await this.#removeRecoveryJournal(requestId, hostMutationScope)
+      await this.#releaseOwnedLock(lock, hostMutationScope)
+      released = true
+      return receipt
+    } catch (error) {
+      if (error instanceof CompletedLiveRenameFault) {
+        throw error.cause
+      }
+      throw error
+    } finally {
+      if (!released) await lock.handle.close().catch(() => undefined)
+    }
+  }
+
+  async #replayCompletedReconciliation(
+    requestId: string,
+    desired: 'candidate' | 'previous',
+    hostMutationScope: HostMutationOperationScope
+  ): Promise<ModDeploymentReceipt | null> {
+    this.#assertHostMutationActive(hostMutationScope)
+    const completed = await this.#readCompletedReconciliation(requestId, desired)
+    this.#assertHostMutationActive(hostMutationScope)
+    return completed
+  }
+
+  async #readCompletedReconciliation(
+    requestId: string,
+    desired: 'candidate' | 'previous'
+  ): Promise<ModDeploymentReceipt | null> {
+    const lockPath = join(this.#controlRoot, 'transaction.lock')
+    if (await pathExists(lockPath)) return null
+
+    const journalsRoot = join(this.#controlRoot, 'journals')
+    const journalRootInfo = await lstat(journalsRoot).catch((error: unknown) =>
+      isMissingError(error) ? null : Promise.reject(error))
+    if (journalRootInfo !== null) {
+      await assertDirectoryBoundary(journalsRoot, this.#controlRoot)
+      if ((await readdir(journalsRoot)).length !== 0) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+    }
+
+    const receiptsRoot = join(this.#controlRoot, 'receipts')
+    if (await pathExists(join(receiptsRoot, `${requestId}.pending`))) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    const stored = await this.#readReceipt(requestId, false)
+    if (stored === null) return null
+
+    const current = await this.#loadState(false)
+    if (stored.receipt.status === 'succeeded') {
+      if (current.lastTransaction?.requestId !== requestId ||
+          current.lastTransaction.fingerprint !== stored.fingerprint ||
+          JSON.stringify(stored.receipt) !== JSON.stringify(receiptFromCommittedState(current))) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      if (desired !== 'candidate') {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_TARGET_NOT_ALLOWED')
+      }
+    } else if (stored.receipt.status === 'rolled-back') {
+      if (stored.receipt.newRevision !== stored.receipt.previousRevision ||
+          stored.receipt.rollback !== 'succeeded' ||
+          stored.receipt.errorCode !== 'MOD_DEPLOYMENT_EXECUTION_FAILED' ||
+          current.revision !== stored.receipt.previousRevision) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      if (desired !== 'previous') {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_TARGET_NOT_ALLOWED')
+      }
+    } else {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    return { ...stored.receipt, reused: true }
+  }
+
+  async #readRecoveryStatus(): Promise<ModDeploymentRecoveryStatus> {
+    try {
+      const controlInfo = await lstat(this.#controlRoot).catch((error: unknown) =>
+        isMissingError(error) ? null : Promise.reject(error))
+      if (controlInfo === null) {
+        const current = await this.#loadState(false)
+        if (current.lastTransaction !== null) throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        return { phase: 'ready', requestId: null, operation: null, allowedDesired: [] }
+      }
+      await assertDirectoryBoundary(this.#controlRoot, dirname(this.#controlRoot))
+
+      const receiptEvidence = await this.#readRecoveryReceiptDirectoryEvidence()
+      if ([...receiptEvidence.final.values()].some((entry) => entry.receipt.status === 'rollback-failed')) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      const journalEntries = await this.#readRecoveryJournalDirectoryEntries()
+      const lockPath = join(this.#controlRoot, 'transaction.lock')
+      if (!await pathExists(lockPath)) {
+        if (journalEntries.length !== 0 || receiptEvidence.pendingRequestIds.size !== 0) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        const current = await this.#loadState(false)
+        this.#assertCleanLiveReceipt(current, receiptEvidence.final)
+        return { phase: 'ready', requestId: null, operation: null, allowedDesired: [] }
+      }
+
+      const lock = await this.#readResidualTransactionLock(undefined, true)
+      try {
+        const binding = lock.record.journal
+        if (binding === null || lock.record.owner !== binding.requestId) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        const requestId = binding.requestId
+        if ([...receiptEvidence.pendingRequestIds].some((value) => value !== requestId)) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        const journalNames = new Set([`${requestId}.json`, `${requestId}.pending`])
+        if (journalEntries.some((entry) => !journalNames.has(entry))) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+
+        if (journalEntries.length !== 0) {
+          const evidence = await this.#inspectRecoveryJournalEvidence(requestId, lock)
+          if (evidence.journal.fingerprint !== binding.fingerprint) {
+            throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+          }
+          const finalReceipt = receiptEvidence.final.get(requestId) ?? null
+          const hasPendingReceipt = receiptEvidence.pendingRequestIds.has(requestId)
+          if (finalReceipt !== null && hasPendingReceipt) {
+            throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+          }
+          const allowedDesired = await this.#allowedDesiredForRecoveryEvidence(
+            evidence.journal,
+            evidence.layout,
+            finalReceipt,
+            hasPendingReceipt
+          )
+          return {
+            phase: 'recovery-required',
+            requestId,
+            operation: evidence.journal.request.operation,
+            allowedDesired
+          }
+        }
+
+        const terminal = receiptEvidence.final.get(requestId) ?? null
+        const hasPendingReceipt = receiptEvidence.pendingRequestIds.has(requestId)
+        if (terminal !== null && hasPendingReceipt) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        if (terminal !== null) {
+          if (terminal.fingerprint !== binding.fingerprint) {
+            throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+          }
+          const allowedDesired = this.#validateTerminalReceiptAgainstLive(
+            terminal,
+            await this.#loadState(false)
+          )
+          return {
+            phase: 'recovery-required',
+            requestId,
+            operation: terminal.receipt.operation,
+            allowedDesired
+          }
+        }
+        if (hasPendingReceipt) {
+          const committed = await this.#readCommittedReceiptPendingEvidence(requestId, lock)
+          return {
+            phase: 'recovery-required',
+            requestId,
+            operation: committed.receipt.operation,
+            allowedDesired: ['candidate']
+          }
+        }
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      } finally {
+        await lock.handle.close().catch(() => undefined)
+      }
+    } catch {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+  }
+
+  async #readRecoveryJournalDirectoryEntries(): Promise<string[]> {
+    const root = join(this.#controlRoot, 'journals')
+    const info = await lstat(root).catch((error: unknown) => isMissingError(error) ? null : Promise.reject(error))
+    if (info === null) return []
+    await assertDirectoryBoundary(root, this.#controlRoot)
+    const entries = await readdir(root, { withFileTypes: true })
+    if (entries.length > 2 || entries.some((entry) => !entry.isFile() || entry.isSymbolicLink())) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    return entries.map((entry) => entry.name)
+  }
+
+  async #readRecoveryReceiptDirectoryEvidence(): Promise<RecoveryReceiptDirectoryEvidence> {
+    const root = join(this.#controlRoot, 'receipts')
+    const info = await lstat(root).catch((error: unknown) => isMissingError(error) ? null : Promise.reject(error))
+    if (info === null) return { final: new Map(), pendingRequestIds: new Set() }
+    await assertDirectoryBoundary(root, this.#controlRoot)
+    const entries = await readdir(root, { withFileTypes: true })
+    if (entries.length > MAX_MOD_DEPLOYMENT_RECEIPT_ENTRIES) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    const final = new Map<string, LoadedStoredReceipt>()
+    const pendingRequestIds = new Set<string>()
+    for (const entry of entries) {
+      const match = /^([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(json|pending)$/.exec(entry.name)
+      if (!entry.isFile() || entry.isSymbolicLink() || match === null) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      const requestId = match[1]!
+      if (match[2] === 'pending') {
+        if (pendingRequestIds.has(requestId)) throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        pendingRequestIds.add(requestId)
+      } else {
+        if (final.has(requestId)) throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        const stored = await this.#readReceipt(requestId, false)
+        if (stored === null || !isReceiptSemanticallyConsistent(stored.receipt)) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        final.set(requestId, stored)
+      }
+    }
+    return { final, pendingRequestIds }
+  }
+
+  #assertCleanLiveReceipt(
+    current: ActiveModState,
+    receipts: ReadonlyMap<string, LoadedStoredReceipt>
+  ): void {
+    const transaction = current.lastTransaction
+    if (transaction === null) return
+    const stored = receipts.get(transaction.requestId)
+    if (stored === undefined || stored.fingerprint !== transaction.fingerprint ||
+        JSON.stringify(stored.receipt) !== JSON.stringify(receiptFromCommittedState(current))) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+  }
+
+  #validateTerminalReceiptAgainstLive(
+    stored: LoadedStoredReceipt,
+    current: ActiveModState
+  ): Array<'candidate' | 'previous'> {
+    if (stored.receipt.status === 'succeeded') {
+      if (current.lastTransaction?.requestId !== stored.receipt.requestId ||
+          current.lastTransaction.fingerprint !== stored.fingerprint ||
+          JSON.stringify(stored.receipt) !== JSON.stringify(receiptFromCommittedState(current))) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      return ['candidate']
+    }
+    if (stored.receipt.status === 'rolled-back' &&
+        stored.receipt.newRevision === stored.receipt.previousRevision &&
+        stored.receipt.rollback === 'succeeded' &&
+        stored.receipt.errorCode === 'MOD_DEPLOYMENT_EXECUTION_FAILED' &&
+        current.revision === stored.receipt.previousRevision) {
+      return ['previous']
+    }
+    throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+  }
+
+  async #allowedDesiredForRecoveryEvidence(
+    journal: ModDeploymentRecoveryJournal,
+    layout: RecoveryLayout,
+    finalReceipt: LoadedStoredReceipt | null,
+    hasPendingReceipt: boolean
+  ): Promise<Array<'candidate' | 'previous'>> {
+    if (finalReceipt !== null) {
+      if (finalReceipt.fingerprint !== journal.fingerprint) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      if (JSON.stringify(finalReceipt.receipt) === JSON.stringify(journal.successReceipt) &&
+          layout === 'candidate') return ['candidate']
+      if (JSON.stringify(finalReceipt.receipt) === JSON.stringify(journal.rolledBackReceipt) &&
+          (layout === 'previous' || layout === 'restored-previous')) return ['previous']
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    if (hasPendingReceipt) {
+      const root = join(this.#controlRoot, 'receipts')
+      const pending = await this.#readStoredReceiptFile(
+        join(root, `${journal.request.requestId}.pending`), root, journal.request.requestId
+      )
+      if (pending.fingerprint !== journal.fingerprint) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      if (JSON.stringify(pending.receipt) === JSON.stringify(journal.successReceipt) &&
+          layout === 'candidate') return ['candidate']
+      if (JSON.stringify(pending.receipt) === JSON.stringify(journal.rolledBackReceipt) &&
+          (layout === 'previous' || layout === 'restored-previous')) return ['previous']
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    return layout === 'candidate' ? ['candidate', 'previous'] : ['previous']
+  }
+
+  async #readRecoveryOperationEvidence(
+    requestId: string,
+    desired: 'candidate' | 'previous'
+  ): Promise<{ operation: ModDeploymentOperation }> {
+    const completed = await this.#readCompletedReconciliation(requestId, desired)
+    if (completed !== null) return { operation: completed.operation }
+    const status = await this.#readRecoveryStatus()
+    if (status.phase !== 'recovery-required' || status.requestId !== requestId || status.operation === null) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    if (!status.allowedDesired.includes(desired)) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_TARGET_NOT_ALLOWED')
+    }
+    return { operation: status.operation }
+  }
+
+  async #readCommittedReceiptPendingEvidence(
+    requestId: string,
+    lock: OwnedTransactionLock
+  ): Promise<{ fingerprint: string; receipt: ModDeploymentReceipt }> {
+    const fingerprint = lock.record.journal?.fingerprint
+    const current = await this.#loadState(false)
+    if (fingerprint === undefined || current.lastTransaction?.requestId !== requestId ||
+        current.lastTransaction.fingerprint !== fingerprint) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    const receipt = receiptFromCommittedState(current)
+    const receiptsRoot = join(this.#controlRoot, 'receipts')
+    const pendingPath = join(receiptsRoot, `${requestId}.pending`)
+    const pending = await this.#readStoredReceiptFile(pendingPath, receiptsRoot, requestId)
+    if (pending.fingerprint !== fingerprint ||
+        JSON.stringify(pending.receipt) !== JSON.stringify(receipt)) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    return { fingerprint, receipt }
+  }
+
+  async #persistRecoveryReceipt(
+    fingerprint: string,
+    expected: ModDeploymentReceipt,
+    existing: LoadedStoredReceipt | null,
+    hostMutationScope: HostMutationOperationScope
+  ): Promise<ModDeploymentReceipt> {
+    if (existing !== null) {
+      if (existing.fingerprint !== fingerprint || JSON.stringify(existing.receipt) !== JSON.stringify(expected)) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      return { ...existing.receipt, reused: true }
+    }
+    if (await this.#publishMatchingPendingReceipt(fingerprint, expected, hostMutationScope)) {
+      return { ...expected, reused: false }
+    }
+    await this.#writeReceipt(fingerprint, expected, hostMutationScope)
+    return { ...expected, reused: false }
+  }
+
+  async #publishMatchingPendingReceipt(
+    fingerprint: string,
+    expected: ModDeploymentReceipt,
+    hostMutationScope: HostMutationOperationScope
+  ): Promise<boolean> {
+    const receiptsRoot = join(this.#controlRoot, 'receipts')
+    const pendingPath = join(receiptsRoot, `${expected.requestId}.pending`)
+    if (!await pathExists(pendingPath)) return false
+    await assertDirectoryBoundary(receiptsRoot, this.#controlRoot)
+    const pending = await this.#readStoredReceiptFile(pendingPath, receiptsRoot, expected.requestId)
+    if (pending.fingerprint !== fingerprint ||
+        JSON.stringify(pending.receipt) !== JSON.stringify({ ...expected, reused: false })) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    const finalPath = join(receiptsRoot, `${expected.requestId}.json`)
+    await assertPathDoesNotExist(finalPath)
+    this.#assertHostMutationActive(hostMutationScope)
+    await rename(pendingPath, finalPath)
+    await syncDirectory(receiptsRoot)
+    this.#assertHostMutationActive(hostMutationScope)
+    return true
+  }
+
+  #recoveryPaths(journal: ModDeploymentRecoveryJournal): {
+    live: string; pending: string; snapshot: string; failed: string
+  } {
+    const resolveRelative = (relativePath: string): string => {
+      const candidate = resolve(this.#controlRoot, ...relativePath.split('/'))
+      if (!isPathWithin(this.#controlRoot, candidate)) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      return candidate
+    }
+    return {
+      live: this.#pluginsRoot,
+      pending: resolveRelative(journal.paths.pending),
+      snapshot: resolveRelative(journal.paths.snapshot),
+      failed: resolveRelative(journal.paths.failed)
+    }
+  }
+
+  async #classifyRecoveryLayout(journal: ModDeploymentRecoveryJournal): Promise<RecoveryLayout> {
+    const paths = this.#recoveryPaths(journal)
+    const [live, pending, snapshot, failed] = await Promise.all([
+      summarizeDirectoryIfPresent(paths.live),
+      summarizeDirectoryIfPresent(paths.pending),
+      summarizeDirectoryIfPresent(paths.snapshot),
+      summarizeDirectoryIfPresent(paths.failed)
+    ])
+    let layout: RecoveryLayout | null = null
+    if (matchesSummary(live, journal.previousSummary) && matchesSummary(pending, journal.candidateSummary) &&
+        snapshot === null && failed === null) layout = 'previous'
+    else if (live === null && matchesSummary(pending, journal.candidateSummary) &&
+        matchesSummary(snapshot, journal.previousSummary) && failed === null) layout = 'snapshot-only'
+    else if (matchesSummary(live, journal.candidateSummary) && pending === null &&
+        matchesSummary(snapshot, journal.previousSummary) && failed === null) layout = 'candidate'
+    else if (live === null && pending === null && matchesSummary(snapshot, journal.previousSummary) &&
+        matchesSummary(failed, journal.candidateSummary)) layout = 'failed-candidate'
+    else if (matchesSummary(live, journal.previousSummary) && pending === null && snapshot === null &&
+        matchesSummary(failed, journal.candidateSummary)) layout = 'restored-previous'
+    if (layout === null || !phaseAllowsRecoveryLayout(journal.phase, layout)) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    }
+    return layout
   }
 
   async #verifyStagedPackage(target: ServerModLockEntry): Promise<VerifiedStagedPackage> {
@@ -682,8 +1720,9 @@ export class ModDeploymentService {
     return { manifest, payloadRoot, totalSizeBytes: sumPayloadBytes(manifest.files) }
   }
 
-  async #loadState(): Promise<ActiveModState> {
-    await this.#ensureRoots()
+  async #loadState(ensureRoots = true): Promise<ActiveModState> {
+    if (ensureRoots) await this.#ensureRoots()
+    else await assertDirectoryBoundary(this.#pluginsRoot, dirname(this.#pluginsRoot))
     const entries = await readdir(this.#pluginsRoot, { withFileTypes: true })
     const manifestEntry = entries.find((entry) => entry.name === ACTIVE_MANIFEST_NAME)
     if (manifestEntry === undefined) {
@@ -778,8 +1817,16 @@ export class ModDeploymentService {
     return candidate
   }
 
-  async #readReceipt(requestId: string): Promise<LoadedStoredReceipt | null> {
-    const receiptsRoot = await this.#ensureControlDirectory('receipts')
+  async #readReceipt(requestId: string, createRoot = true): Promise<LoadedStoredReceipt | null> {
+    const receiptsRoot = createRoot
+      ? await this.#ensureControlDirectory('receipts')
+      : join(this.#controlRoot, 'receipts')
+    if (!createRoot) {
+      const rootInfo = await lstat(receiptsRoot).catch((error: unknown) =>
+        isMissingError(error) ? null : Promise.reject(error))
+      if (rootInfo === null) return null
+      await assertDirectoryBoundary(receiptsRoot, this.#controlRoot)
+    }
     const receiptPath = join(receiptsRoot, `${requestId}.json`)
     try {
       await assertRegularFileBoundary(receiptPath, receiptsRoot)
@@ -787,14 +1834,23 @@ export class ModDeploymentService {
       if (isMissingError(error)) return null
       throw error
     }
+    return this.#readStoredReceiptFile(receiptPath, receiptsRoot, requestId)
+  }
+
+  async #readStoredReceiptFile(
+    receiptPath: string,
+    receiptsRoot: string,
+    requestId: string
+  ): Promise<LoadedStoredReceipt> {
     try {
-      const metadata = await lstat(receiptPath)
-      if (metadata.size > MAX_MOD_DEPLOYMENT_RECEIPT_BYTES) {
+      await assertRegularFileBoundary(receiptPath, receiptsRoot)
+      const metadata = await lstat(receiptPath, { bigint: true })
+      if (metadata.size > BigInt(MAX_MOD_DEPLOYMENT_RECEIPT_BYTES)) {
         throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
       }
       const raw = await readBoundedJson(receiptPath)
-      const currentMetadata = await lstat(receiptPath)
-      if (metadata.size !== currentMetadata.size || metadata.mtimeMs !== currentMetadata.mtimeMs) {
+      const currentMetadata = await lstat(receiptPath, { bigint: true })
+      if (!sameFileSnapshot(metadata, currentMetadata)) {
         throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
       }
       const envelope = storedReceiptEnvelopeSchema.safeParse(raw)
@@ -842,15 +1898,21 @@ export class ModDeploymentService {
     return stored.sort(compareReceiptHistory)
   }
 
-  async #writeReceipt(fingerprint: string, receipt: ModDeploymentReceipt): Promise<void> {
+  async #writeReceipt(
+    fingerprint: string,
+    receipt: ModDeploymentReceipt,
+    hostMutationScope: HostMutationOperationScope | null = null
+  ): Promise<void> {
     const receiptsRoot = await this.#ensureControlDirectory('receipts')
     const finalPath = join(receiptsRoot, `${receipt.requestId}.json`)
     const pendingPath = join(receiptsRoot, `${receipt.requestId}.pending`)
     await assertPathDoesNotExist(finalPath)
+    await assertPathDoesNotExist(pendingPath)
     const persistedAt = this.#now()
     if (!(persistedAt instanceof Date) || !Number.isFinite(persistedAt.getTime())) {
       throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
     }
+    this.#assertHostMutationActive(hostMutationScope)
     await writeJsonExclusive(pendingPath, {
       format: RECEIPT_ENVELOPE_FORMAT,
       schemaVersion: 1,
@@ -858,7 +1920,12 @@ export class ModDeploymentService {
       persistedAt: persistedAt.toISOString(),
       receipt: { ...receipt, reused: false }
     })
+    this.#assertHostMutationActive(hostMutationScope)
+    await this.#injectFault('after-receipt-pending-synced')
+    this.#assertHostMutationActive(hostMutationScope)
     await rename(pendingPath, finalPath)
+    await syncDirectory(receiptsRoot)
+    this.#assertHostMutationActive(hostMutationScope)
   }
 
   async #ensureRoots(): Promise<void> {
@@ -869,10 +1936,13 @@ export class ModDeploymentService {
     } catch (error) {
       if (!isAlreadyExistsError(error)) throw new ModDeploymentError('MOD_DEPLOYMENT_ROOT_INVALID')
     }
+    await syncDirectory(dirname(this.#controlRoot))
     await assertDirectoryBoundary(this.#controlRoot, dirname(this.#controlRoot))
   }
 
-  async #ensureControlDirectory(name: 'snapshots' | 'recovery' | 'pending' | 'receipts'): Promise<string> {
+  async #ensureControlDirectory(
+    name: 'snapshots' | 'recovery' | 'pending' | 'receipts' | 'journals'
+  ): Promise<string> {
     await this.#ensureRoots()
     const candidate = join(this.#controlRoot, name)
     try {
@@ -880,29 +1950,114 @@ export class ModDeploymentService {
     } catch (error) {
       if (!isAlreadyExistsError(error)) throw new ModDeploymentError('MOD_DEPLOYMENT_ROOT_INVALID')
     }
+    await syncDirectory(this.#controlRoot)
     await assertDirectoryBoundary(candidate, this.#controlRoot)
     return candidate
   }
 
-  async #withFileLock<T>(owner: string, action: () => Promise<T>): Promise<T> {
-    await this.#ensureRoots()
+  async #withFileLock<T>(
+    owner: string,
+    action: () => Promise<T>,
+    journal: TransactionLockRecord['journal'] = null,
+    existingCode: 'MOD_DEPLOYMENT_BUSY' | 'MOD_DEPLOYMENT_RECOVERY_REQUIRED' = 'MOD_DEPLOYMENT_BUSY'
+  ): Promise<T> {
+    const controlInfo = await lstat(this.#controlRoot).catch((error: unknown) => isMissingError(error) ? null : Promise.reject(error))
+    if (controlInfo === null) await this.#ensureRoots()
+    else await assertDirectoryBoundary(this.#controlRoot, dirname(this.#controlRoot))
     const lockPath = join(this.#controlRoot, 'transaction.lock')
-    let handle: FileHandle | null = null
+    let lock: OwnedTransactionLock | null = null
+    let creatingHandle: FileHandle | null = null
     try {
-      handle = await open(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
-      await handle.writeFile(`${owner}\n`, 'utf8')
+      const handle = await open(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR, 0o600)
+      creatingHandle = handle
+      const identity = transactionLockIdentity(await handle.stat({ bigint: true }))
+      const record = transactionLockRecordSchema.parse({
+        format: TRANSACTION_LOCK_FORMAT,
+        schemaVersion: 1,
+        owner,
+        journal,
+        identity
+      })
+      lock = { path: lockPath, handle, record }
+      creatingHandle = null
+      await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, 'utf8')
       await handle.sync()
+      await syncDirectory(this.#controlRoot)
     } catch (error) {
-      await handle?.close().catch(() => undefined)
-      if (handle !== null) await unlink(lockPath).catch(() => undefined)
-      if (isAlreadyExistsError(error)) throw new ModDeploymentError('MOD_DEPLOYMENT_BUSY')
+      await creatingHandle?.close().catch(() => undefined)
+      if (lock !== null) await this.#discardNewOwnedLock(lock).catch(() => undefined)
+      if (isAlreadyExistsError(error)) throw new ModDeploymentError(existingCode)
       throw new ModDeploymentError('MOD_DEPLOYMENT_ROOT_INVALID')
     }
     try {
       return await action()
     } finally {
-      await handle.close().catch(() => undefined)
-      await unlink(lockPath).catch(() => undefined)
+      const journalRoot = join(this.#controlRoot, 'journals')
+      if (journal !== null &&
+          (await pathExists(join(journalRoot, `${journal.requestId}.json`)) ||
+           await pathExists(join(journalRoot, `${journal.requestId}.pending`)) ||
+           await pathExists(join(this.#controlRoot, 'receipts', `${journal.requestId}.pending`)))) {
+        await lock.handle.close().catch(() => undefined)
+      } else {
+        await this.#releaseOwnedLock(lock)
+      }
+    }
+  }
+
+  async #discardNewOwnedLock(lock: OwnedTransactionLock): Promise<void> {
+    try {
+      const handleIdentity = transactionLockIdentity(await lock.handle.stat({ bigint: true }))
+      const pathIdentity = transactionLockIdentity(await lstat(lock.path, { bigint: true }))
+      if (sameTransactionLockIdentity(handleIdentity, pathIdentity) &&
+          sameTransactionLockIdentity(handleIdentity, lock.record.identity)) {
+        await unlink(lock.path)
+        await syncDirectory(this.#controlRoot)
+      }
+    } finally {
+      await lock.handle.close().catch(() => undefined)
+    }
+  }
+
+  async #releaseOwnedLock(
+    lock: OwnedTransactionLock,
+    hostMutationScope: HostMutationOperationScope | null = null
+  ): Promise<void> {
+    try {
+      const handleBefore = await lock.handle.stat({ bigint: true })
+      const handleIdentity = transactionLockIdentity(handleBefore)
+      const before = await lstat(lock.path, { bigint: true })
+      const pathIdentity = transactionLockIdentity(before)
+      const raw = await readFile(lock.path, 'utf8')
+      const after = await lstat(lock.path, { bigint: true })
+      const handleAfter = await lock.handle.stat({ bigint: true })
+      const afterIdentity = transactionLockIdentity(after)
+      const parsed = transactionLockRecordSchema.safeParse(JSON.parse(raw) as unknown)
+      if (!sameTransactionLockIdentity(handleIdentity, lock.record.identity) ||
+          !sameTransactionLockIdentity(pathIdentity, lock.record.identity) ||
+          !sameTransactionLockIdentity(afterIdentity, lock.record.identity) ||
+          !sameFileSnapshot(handleBefore, handleAfter) || !sameFileSnapshot(before, after) ||
+          !parsed.success || JSON.stringify(parsed.data) !== JSON.stringify(lock.record)) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      this.#assertHostMutationActive(hostMutationScope)
+      const finalIdentity = transactionLockIdentity(await lstat(lock.path, { bigint: true }))
+      if (!sameTransactionLockIdentity(finalIdentity, lock.record.identity)) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      // Node has no portable delete-by-handle primitive. This final pathname
+      // deletion is therefore valid only for cooperative writers serialized by
+      // the shared host-mutation lease. An out-of-band writer replacing this
+      // pathname inside the final lstat-to-unlink window is outside that model.
+      this.#assertHostMutationActive(hostMutationScope)
+      await unlink(lock.path)
+      await syncDirectory(this.#controlRoot)
+      this.#assertHostMutationActive(hostMutationScope)
+    } catch (error) {
+      if (error instanceof HostMutationOperationCoordinatorError) throw error
+      if (error instanceof ModDeploymentError) throw error
+      throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    } finally {
+      await lock.handle.close().catch(() => undefined)
     }
   }
 
@@ -1184,6 +2339,99 @@ function rollbackReceipt(prepared: PreparedDeployment, succeeded: boolean): ModD
   }
 }
 
+function isReceiptSemanticallyConsistent(receipt: ModDeploymentReceipt): boolean {
+  if (!receipt.recoveryPointCreated || receipt.reused) return false
+  if (receipt.status === 'succeeded') {
+    return receipt.newRevision !== null && receipt.rollback === 'not-needed' && receipt.errorCode === null
+  }
+  if (receipt.status === 'rolled-back') {
+    return receipt.newRevision === receipt.previousRevision && receipt.rollback === 'succeeded' &&
+      receipt.errorCode === 'MOD_DEPLOYMENT_EXECUTION_FAILED' && receipt.recoverablePayloadPreserved
+  }
+  return receipt.newRevision === null && receipt.rollback === 'failed' &&
+    receipt.errorCode === 'MOD_DEPLOYMENT_ROLLBACK_FAILED' && receipt.recoverablePayloadPreserved
+}
+
+function createRecoveryJournal(
+  prepared: PreparedDeployment,
+  previousSummary: DirectoryContentSummary,
+  candidateSummary: DirectoryContentSummary,
+  snapshotId: string
+): ModDeploymentRecoveryJournal {
+  return recoveryJournalSchema.parse({
+    format: RECOVERY_JOURNAL_FORMAT,
+    schemaVersion: 1,
+    request: prepared.request,
+    fingerprint: prepared.fingerprint,
+    previousRevision: prepared.current.revision,
+    nextRevision: prepared.next.revision,
+    paths: {
+      pending: `pending/${prepared.request.requestId}`,
+      snapshot: `snapshots/${snapshotId}`,
+      failed: `recovery/failed-${prepared.request.requestId}`
+    },
+    previousState: prepared.current,
+    nextState: prepared.next,
+    previousSummary,
+    candidateSummary,
+    successReceipt: successReceipt(prepared),
+    rolledBackReceipt: rollbackReceipt(prepared, true),
+    phase: 'prepared'
+  })
+}
+
+function validateRecoveryJournal(journal: ModDeploymentRecoveryJournal): void {
+  const requestId = journal.request.requestId
+  if (journal.fingerprint !== requestFingerprint(journal.request) ||
+      journal.previousRevision !== journal.previousState.revision ||
+      journal.nextRevision !== journal.nextState.revision ||
+      journal.previousState.revision !== computeStateRevision(
+        journal.previousState.packages, journal.previousState.lastTransaction
+      ) ||
+      journal.nextState.revision !== computeStateRevision(journal.nextState.packages, journal.nextState.lastTransaction) ||
+      journal.paths.pending !== `pending/${requestId}` ||
+      journal.paths.snapshot !== `snapshots/snapshot-${journal.previousRevision.slice(0, 16)}-${requestId}` ||
+      journal.paths.failed !== `recovery/failed-${requestId}`) {
+    throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+  }
+  validateManagedPackages(journal.previousState.packages)
+  validateManagedPackages(journal.nextState.packages)
+  const transaction = journal.nextState.lastTransaction
+  if (transaction === null || transaction.requestId !== requestId ||
+      transaction.fingerprint !== journal.fingerprint ||
+      transaction.previousRevision !== journal.previousRevision ||
+      transaction.operation !== journal.request.operation ||
+      transaction.package.dependencyId !== journal.request.package.dependencyId ||
+      transaction.package.version !== journal.request.package.version ||
+      transaction.recoverablePayloadPreserved !== (
+        journal.request.operation === 'remove' || journal.request.operation === 'disable' ||
+        journal.request.operation === 'update'
+      )) {
+    throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+  }
+  const success = journal.successReceipt
+  const rolledBack = journal.rolledBackReceipt
+  if (success.requestId !== requestId || success.operation !== journal.request.operation ||
+      success.package.dependencyId !== journal.request.package.dependencyId ||
+      success.package.version !== journal.request.package.version || success.status !== 'succeeded' ||
+      success.previousRevision !== journal.previousRevision || success.newRevision !== journal.nextRevision ||
+      success.rollback !== 'not-needed' || success.errorCode !== null || success.reused ||
+      !success.recoveryPointCreated ||
+      success.recoverablePayloadPreserved !== transaction.recoverablePayloadPreserved ||
+      rolledBack.requestId !== requestId || rolledBack.operation !== journal.request.operation ||
+      rolledBack.package.dependencyId !== journal.request.package.dependencyId ||
+      rolledBack.package.version !== journal.request.package.version || rolledBack.status !== 'rolled-back' ||
+      rolledBack.previousRevision !== journal.previousRevision || rolledBack.newRevision !== journal.previousRevision ||
+      rolledBack.rollback !== 'succeeded' || rolledBack.errorCode !== 'MOD_DEPLOYMENT_EXECUTION_FAILED' ||
+      rolledBack.reused || !rolledBack.recoveryPointCreated || !rolledBack.recoverablePayloadPreserved ||
+      success.payloadFileCount !== transaction.payloadFileCount ||
+      rolledBack.payloadFileCount !== transaction.payloadFileCount ||
+      success.payloadSizeBytes !== transaction.payloadSizeBytes ||
+      rolledBack.payloadSizeBytes !== transaction.payloadSizeBytes) {
+    throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+  }
+}
+
 function receiptFromCommittedState(state: ActiveModState): ModDeploymentReceipt {
   const transaction = state.lastTransaction
   if (transaction === null) throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
@@ -1337,6 +2585,18 @@ async function readBoundedJson(filePath: string): Promise<unknown> {
   }
 }
 
+async function readStableBoundedJson(filePath: string): Promise<unknown> {
+  const before = await lstat(filePath, { bigint: true })
+  if (!before.isFile() || before.isSymbolicLink() || before.size < 1n ||
+      before.size > BigInt(MAX_MOD_DEPLOYMENT_RECOVERY_JOURNAL_BYTES)) {
+    throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+  }
+  const content = await readFile(filePath, 'utf8')
+  const after = await lstat(filePath, { bigint: true })
+  if (!sameFileSnapshot(before, after)) throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+  return JSON.parse(content) as unknown
+}
+
 async function writeJsonExclusive(filePath: string, value: unknown): Promise<void> {
   const content = `${JSON.stringify(value, null, 2)}\n`
   if (Buffer.byteLength(content, 'utf8') > MAX_MOD_DEPLOYMENT_MANIFEST_BYTES) {
@@ -1348,6 +2608,250 @@ async function writeJsonExclusive(filePath: string, value: unknown): Promise<voi
     await handle.sync()
   } finally {
     await handle.close()
+  }
+}
+
+async function writeJsonAtomic(
+  filePath: string,
+  temporary: string,
+  value: unknown,
+  assertActive: () => void,
+  afterPendingSynced: () => Promise<void>
+): Promise<void> {
+  const content = `${JSON.stringify(value, null, 2)}\n`
+  if (Buffer.byteLength(content, 'utf8') > MAX_MOD_DEPLOYMENT_RECOVERY_JOURNAL_BYTES) {
+    throw new ModDeploymentError('MOD_DEPLOYMENT_MANIFEST_INVALID')
+  }
+  let handle: FileHandle | null = null
+  try {
+    assertActive()
+    handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+    assertActive()
+    await handle.writeFile(content, 'utf8')
+    assertActive()
+    await handle.sync()
+    assertActive()
+    await handle.close()
+    handle = null
+    await afterPendingSynced()
+    assertActive()
+    await rename(temporary, filePath)
+    await syncDirectory(dirname(filePath))
+    assertActive()
+  } catch (error) {
+    await handle?.close().catch(() => undefined)
+    if (error instanceof HostMutationOperationCoordinatorError) throw error
+    await unlink(temporary).catch(() => undefined)
+    throw error
+  }
+}
+
+async function syncRenameParents(source: string, destination: string): Promise<void> {
+  const sourceParent = dirname(source)
+  const destinationParent = dirname(destination)
+  await syncDirectory(sourceParent)
+  if (!samePath(sourceParent, destinationParent)) await syncDirectory(destinationParent)
+}
+
+async function syncDirectoryTree(root: string): Promise<void> {
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true })
+    for (const entry of entries) {
+      const value = join(directory, entry.name)
+      if (entry.isSymbolicLink()) throw new ModDeploymentError('MOD_DEPLOYMENT_ROOT_LINK_REJECTED')
+      if (entry.isDirectory()) await visit(value)
+      else if (entry.isFile()) {
+        const handle = await open(value, constants.O_RDWR)
+        try { await handle.sync() } finally { await handle.close() }
+      } else throw new ModDeploymentError('MOD_DEPLOYMENT_PAYLOAD_TYPE_INVALID')
+    }
+    await syncDirectory(directory)
+  }
+  await visit(root)
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  let handle: FileHandle | null = null
+  try {
+    handle = await open(directory, constants.O_RDONLY)
+    await handle.sync()
+  } catch (error) {
+    if (process.platform !== 'win32' || !isDirectorySyncUnsupported(error)) throw error
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+function isDirectorySyncUnsupported(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error &&
+    (error.code === 'EINVAL' || error.code === 'EPERM' || error.code === 'EACCES' || error.code === 'EISDIR')
+}
+
+async function summarizeDirectoryIfPresent(root: string): Promise<DirectoryContentSummary | null> {
+  let info
+  try {
+    info = await lstat(root)
+  } catch (error) {
+    if (isMissingError(error)) return null
+    throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+  }
+  if (!info.isDirectory() || info.isSymbolicLink() || !samePath(await realpath(root), root)) {
+    throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+  }
+  return summarizeDirectoryContents(root)
+}
+
+async function summarizeDirectoryContents(root: string): Promise<DirectoryContentSummary> {
+  await assertDirectoryBoundary(root, dirname(root))
+  const rootBefore = await lstat(root, { bigint: true })
+  const hash = createHash('sha256')
+  let fileCount = 0
+  let directoryCount = 0
+  let totalBytes = 0
+  let totalEntries = 0
+  const visit = async (directory: string, prefix: string): Promise<void> => {
+    const entries = (await readdir(directory, { withFileTypes: true }))
+      .sort((left, right) => compareText(left.name, right.name))
+    const normalized = new Set<string>()
+    for (const entry of entries) {
+      const key = entry.name.toLowerCase()
+      if (normalized.has(key) || entry.isSymbolicLink()) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      normalized.add(key)
+      totalEntries += 1
+      if (totalEntries > MAX_MOD_DEPLOYMENT_TREE_ENTRIES) {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+      const relativePath = prefix === '' ? entry.name : `${prefix}/${entry.name}`
+      const fullPath = join(directory, entry.name)
+      if (entry.isDirectory()) {
+        directoryCount += 1
+        hash.update(`d\0${relativePath}\n`, 'utf8')
+        await assertDirectoryBoundary(fullPath, root)
+        await visit(fullPath, relativePath)
+      } else if (entry.isFile()) {
+        fileCount += 1
+        const before = await lstat(fullPath, { bigint: true })
+        if (!before.isFile() || before.isSymbolicLink()) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        totalBytes += Number(before.size)
+        if (!Number.isSafeInteger(totalBytes) ||
+            totalBytes > MAX_DEPLOYED_MOD_TOTAL_BYTES + MAX_MOD_DEPLOYMENT_MANIFEST_BYTES) {
+          throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+        }
+        hash.update(`f\0${relativePath}\0${before.size.toString()}\n`, 'utf8')
+        for await (const chunk of createReadStream(fullPath)) hash.update(chunk as Buffer)
+        const after = await lstat(fullPath, { bigint: true })
+        if (!sameFileSnapshot(before, after)) throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      } else {
+        throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      }
+    }
+  }
+  await visit(root, '')
+  const rootAfter = await lstat(root, { bigint: true })
+  if (!sameFileSnapshot(rootBefore, rootAfter)) {
+    throw new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+  }
+  return directoryContentSummarySchema.parse({
+    sha256: hash.digest('hex'), fileCount, directoryCount, totalBytes
+  })
+}
+
+function sameFileSnapshot(
+  left: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint },
+  right: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint }
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
+    left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs
+}
+
+function transactionLockIdentity(
+  stats: { dev: bigint; ino: bigint; birthtimeNs: bigint }
+): TransactionLockIdentity {
+  return transactionLockIdentitySchema.parse({
+    dev: stats.dev.toString(),
+    ino: stats.ino.toString(),
+    birthtimeNs: stats.birthtimeNs.toString()
+  })
+}
+
+function sameTransactionLockIdentity(left: TransactionLockIdentity, right: TransactionLockIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.birthtimeNs === right.birthtimeNs
+}
+
+function matchesSummary(
+  actual: DirectoryContentSummary | null,
+  expected: DirectoryContentSummary
+): boolean {
+  return actual !== null && actual.sha256 === expected.sha256 && actual.fileCount === expected.fileCount &&
+    actual.directoryCount === expected.directoryCount && actual.totalBytes === expected.totalBytes
+}
+
+function phaseAllowsRecoveryLayout(phase: RecoveryJournalPhase, layout: RecoveryLayout): boolean {
+  const allowed: Record<RecoveryJournalPhase, readonly RecoveryLayout[]> = {
+    prepared: ['previous'],
+    'forward-live-to-snapshot-intent': ['previous', 'snapshot-only'],
+    'forward-live-to-snapshot-completed': ['snapshot-only'],
+    'forward-pending-to-live-intent': ['snapshot-only', 'candidate'],
+    'forward-pending-to-live-completed': ['candidate'],
+    'rollback-live-to-failed-intent': ['candidate', 'failed-candidate'],
+    'rollback-live-to-failed-completed': ['failed-candidate'],
+    'rollback-snapshot-to-live-intent': ['snapshot-only', 'failed-candidate', 'previous', 'restored-previous'],
+    'rollback-snapshot-to-live-completed': ['previous', 'restored-previous']
+  }
+  return allowed[phase].includes(layout)
+}
+
+function sameRecoveryJournalBinding(
+  left: ModDeploymentRecoveryJournal,
+  right: ModDeploymentRecoveryJournal
+): boolean {
+  const { phase: _leftPhase, ...leftBinding } = left
+  const { phase: _rightPhase, ...rightBinding } = right
+  return JSON.stringify(leftBinding) === JSON.stringify(rightBinding)
+}
+
+function isRecoveryJournalTransitionAllowed(
+  previous: RecoveryJournalPhase,
+  next: RecoveryJournalPhase
+): boolean {
+  const transitions: Record<RecoveryJournalPhase, readonly RecoveryJournalPhase[]> = {
+    prepared: ['forward-live-to-snapshot-intent'],
+    'forward-live-to-snapshot-intent': [
+      'forward-live-to-snapshot-completed',
+      'rollback-snapshot-to-live-intent'
+    ],
+    'forward-live-to-snapshot-completed': [
+      'forward-pending-to-live-intent',
+      'rollback-snapshot-to-live-intent'
+    ],
+    'forward-pending-to-live-intent': [
+      'forward-pending-to-live-completed',
+      'rollback-live-to-failed-intent',
+      'rollback-snapshot-to-live-intent'
+    ],
+    'forward-pending-to-live-completed': ['rollback-live-to-failed-intent'],
+    'rollback-live-to-failed-intent': [
+      'rollback-live-to-failed-completed',
+      'rollback-snapshot-to-live-intent'
+    ],
+    'rollback-live-to-failed-completed': ['rollback-snapshot-to-live-intent'],
+    'rollback-snapshot-to-live-intent': ['rollback-snapshot-to-live-completed'],
+    'rollback-snapshot-to-live-completed': []
+  }
+  return transitions[previous].includes(next)
+}
+
+async function pathExists(value: string): Promise<boolean> {
+  try {
+    await lstat(value)
+    return true
+  } catch (error) {
+    if (isMissingError(error)) return false
+    throw error
   }
 }
 
@@ -1500,6 +3004,10 @@ function mapHostMutationCoordinatorError(
   if (code === 'HOST_MUTATION_LEASE_DIRTY') return 'MOD_DEPLOYMENT_HOST_LEASE_DIRTY'
   if (code === 'HOST_MUTATION_LEASE_RECOVERY_REQUIRED') {
     return 'MOD_DEPLOYMENT_HOST_LEASE_RECOVERY_REQUIRED'
+  }
+  if (code === 'HOST_MUTATION_LEASE_RECOVERY_MISMATCH' ||
+      code === 'HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED') {
+    return 'MOD_DEPLOYMENT_RECOVERY_REQUIRED'
   }
   if (code === 'HOST_MUTATION_LEASE_LOST') return 'MOD_DEPLOYMENT_HOST_LEASE_LOST'
   return 'MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE'

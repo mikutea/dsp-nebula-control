@@ -32,6 +32,7 @@ function fixtureController() {
     })),
     preview: vi.fn(async (input: unknown) => ({ statusCode: 200, body: { ok: true, data: { kind: 'preview', input } } })),
     execute: vi.fn(async (input: unknown) => ({ statusCode: 202, body: { ok: true, data: { kind: 'receipt', input } } })),
+    recover: vi.fn(async (input: unknown) => ({ statusCode: 202, body: { ok: true, data: { kind: 'recovery-receipt', input } } })),
     getReceipt: vi.fn(async (input: unknown) => ({ statusCode: 200, body: { ok: true, data: { kind: 'receipt', input } } })),
     history: vi.fn(async (input: unknown) => ({ statusCode: 200, body: { ok: true, data: { kind: 'state', input } } })),
     previewCleanup: vi.fn(async (input: unknown) => ({ statusCode: 200, body: { ok: true, data: { kind: 'cleanup', input } } }))
@@ -75,6 +76,17 @@ describe('component update activation routes', () => {
     })
     expect(execute.statusCode).toBe(202)
     expect(controller.execute).toHaveBeenCalledOnce()
+
+    const recover = await application.app.inject({
+      method: 'POST', url: '/api/v1/updates/activation/recovery', headers: { origin },
+      cookies: { dyson_session: cookie },
+      payload: { requestId: request.requestId, confirmation: 'RECOVER_COMPONENT_UPDATE' }
+    })
+    expect(recover.statusCode).toBe(202)
+    expect(controller.recover).toHaveBeenCalledWith({
+      requestId: request.requestId,
+      confirmation: 'RECOVER_COMPONENT_UPDATE'
+    })
 
     const receipt = await application.app.inject({
       method: 'GET', url: `/api/v1/updates/activation/receipts/${request.requestId}`,
@@ -128,6 +140,99 @@ describe('component update activation routes', () => {
     expect(execute.statusCode).toBe(403)
     expect(execute.json().error.code).toBe('AUTHORIZATION_DENIED')
     expect(controller.execute).not.toHaveBeenCalled()
+
+    const recover = await application.app.inject({
+      method: 'POST', url: '/api/v1/updates/activation/recovery', headers: { origin },
+      cookies: { dyson_session: cookie }, payload: {}
+    })
+    expect(recover.statusCode).toBe(403)
+    expect(recover.json().error.code).toBe('AUTHORIZATION_DENIED')
+    expect(controller.recover).not.toHaveBeenCalled()
+  })
+
+  it('keeps explicit recovery independently gated from ordinary activation in default controller wiring', async () => {
+    const requestId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    const revision = '0'.repeat(64)
+    const interrupted = {
+      format: 'dyson-control-component-update-receipt' as const,
+      schemaVersion: 1 as const,
+      requestId,
+      component: 'nebula' as const,
+      artifactId: 'nebula-artifact-0001',
+      compatibilityReceiptId: '118f47a0-7d5b-7abc-8def-0123456789ab',
+      targetVersion: '0.9.1',
+      releaseId: `nebula-${'e'.repeat(32)}`,
+      status: 'rollback-failed' as const,
+      previousRevision: revision,
+      resultingRevision: revision,
+      protectionBackupId: 'fictional-backup-0001',
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackVerified: false,
+      recoveryRequired: true,
+      fileCount: 7,
+      expandedBytes: 262_144,
+      completedAt: '2026-08-30T12:30:00.000Z',
+      reused: false
+    }
+    const terminal = {
+      ...interrupted,
+      status: 'rolled-back' as const,
+      rollbackVerified: true,
+      recoveryRequired: false,
+      completedAt: '2026-08-30T12:31:00.000Z'
+    }
+    let recovered = false
+    const service = {
+      preview: vi.fn(async () => ({ kind: 'unused-preview' })),
+      execute: vi.fn(async () => ({ kind: 'must-not-execute' })),
+      reconcile: vi.fn(async () => interrupted),
+      recoverInterrupted: vi.fn(async () => { recovered = true; return terminal }),
+      getReceipt: vi.fn(async () => recovered ? terminal : interrupted),
+      getState: vi.fn(async () => ({
+        revision,
+        recoveryRequired: !recovered,
+        components: [],
+        historyEntries: 1
+      })),
+      previewCleanup: vi.fn(async () => ({
+        format: 'dyson-control-component-update-cleanup-plan' as const,
+        schemaVersion: 1 as const,
+        dryRun: true as const,
+        executeSupported: false as const,
+        candidates: []
+      }))
+    } as unknown as NonNullable<ApplicationDependencies['componentUpdateActivationService']>
+    const config = loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'demo', DYSON_PUBLIC_ORIGIN: origin,
+      DYSON_DEV_ADMIN_PASSWORD: 'fictional-administrator-password'
+    })
+    config.updateActivationEnabled = true
+    config.updateActivationRecoveryEnabled = false
+    application = await buildApplication(config, { componentUpdateActivationService: service })
+    let cookie = await login('administrator', 'fictional-administrator-password')
+    const payload = { requestId, confirmation: 'RECOVER_COMPONENT_UPDATE' }
+
+    const disabled = await application.app.inject({
+      method: 'POST', url: '/api/v1/updates/activation/recovery', headers: { origin },
+      cookies: { dyson_session: cookie }, payload
+    })
+    expect(disabled.statusCode).toBe(423)
+    expect(service.recoverInterrupted).not.toHaveBeenCalled()
+
+    await application.close()
+    application = null
+    recovered = false
+    config.updateActivationEnabled = false
+    config.updateActivationRecoveryEnabled = true
+    application = await buildApplication(config, { componentUpdateActivationService: service })
+    cookie = await login('administrator', 'fictional-administrator-password')
+    const enabled = await application.app.inject({
+      method: 'POST', url: '/api/v1/updates/activation/recovery', headers: { origin },
+      cookies: { dyson_session: cookie }, payload
+    })
+    expect(enabled.statusCode).toBe(202)
+    expect(service.recoverInterrupted).toHaveBeenCalledWith(requestId)
+    expect(service.execute).not.toHaveBeenCalled()
   })
 
   it('returns an explicit unavailable state when no activation adapter is configured', async () => {

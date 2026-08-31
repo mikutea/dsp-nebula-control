@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import {
   BackupRetentionError,
+  MAX_RETIREMENT_EXECUTION_BATCH,
   type BackupRetentionErrorCode
 } from './retention-execution.js'
 import {
@@ -44,6 +45,18 @@ const purgeRequestSchema = purgePreviewRequestSchema.extend({
   purgePreviewDigest: digestSchema,
   confirmation: confirmationSchema
 }).strict()
+const recoveryRequestSchema = z.discriminatedUnion('operation', [
+  z.strictObject({ operation: z.literal('annotate'), requestId: requestIdSchema, confirmation: confirmationSchema }),
+  z.strictObject({ operation: z.literal('retire'), requestId: requestIdSchema, confirmation: confirmationSchema }),
+  z.strictObject({
+    operation: z.literal('restore'), requestId: requestIdSchema,
+    retirementRequestId: requestIdSchema, confirmation: confirmationSchema
+  }),
+  z.strictObject({
+    operation: z.literal('purge'), requestId: requestIdSchema,
+    retirementRequestId: requestIdSchema, confirmation: confirmationSchema
+  })
+])
 
 const annotationSchema = z.strictObject({
   backupId: backupIdSchema,
@@ -89,6 +102,11 @@ const retentionPreviewSchema = z.strictObject({
   referenceTime: isoDateSchema,
   policy: retentionPolicySchema,
   plan: retentionPlanSchema,
+  executionBatch: z.strictObject({
+    maximumCandidates: z.literal(MAX_RETIREMENT_EXECUTION_BATCH),
+    selectedBackupIds: z.array(backupIdSchema).max(MAX_RETIREMENT_EXECUTION_BATCH),
+    deferredCandidateCount: z.number().int().nonnegative().max(MAX_DIRECTORY_ENTRIES)
+  }),
   excluded: z.array(z.strictObject({
     backupId: backupIdSchema,
     reason: z.enum(['created-at-unavailable', 'redirected-entry'])
@@ -155,12 +173,19 @@ const purgeMutationResultSchema = z.strictObject({
   receipt: purgeReceiptSchema,
   reused: z.boolean()
 })
+const recoveryResultSchema = z.strictObject({
+  operation: z.enum(['annotate', 'retire', 'restore', 'purge']),
+  requestId: requestIdSchema,
+  retirementRequestId: requestIdSchema.nullable(),
+  outcome: z.enum(['receipt-republished', 'rolled-back', 'resume-required', 'already-terminal'])
+})
 
 export const backupRetentionHttpConfirmations = Object.freeze({
   annotate: 'UPDATE_BACKUP_ANNOTATION',
   retire: 'RETIRE_BACKUPS',
   restore: 'RESTORE_RETIRED_BACKUPS',
   purge: 'PURGE_RETIRED_BACKUPS'
+  , recover: 'RECOVER_RETENTION_OPERATION'
 } as const)
 
 export interface BackupRetentionHttpService {
@@ -171,10 +196,11 @@ export interface BackupRetentionHttpService {
   restore(input: unknown): Promise<unknown>
   previewPurge(input: unknown): Promise<unknown>
   purge(input: unknown): Promise<unknown>
+  recoverInterrupted(input: unknown): Promise<unknown>
 }
 
 export type BackupRetentionMutationContext = Readonly<{
-  operation: 'annotate' | 'retire' | 'restore' | 'purge'
+  operation: 'annotate' | 'retire' | 'restore' | 'purge' | 'recovery'
 }>
 
 export type BackupRetentionMutationGate = (
@@ -305,6 +331,25 @@ export class BackupRetentionHttpController {
     }
   }
 
+  async recover(input: unknown): Promise<BackupRetentionHttpResult<z.output<typeof recoveryResultSchema>>> {
+    try {
+      const request = recoveryRequestSchema.parse(input)
+      assertConfirmation(request.confirmation, backupRetentionHttpConfirmations.recover)
+      await this.#assertMutationAllowed({ operation: 'recovery' })
+      const result = parseCoreOutput(recoveryResultSchema,
+        await this.#service.recoverInterrupted(request))
+      if (result.operation !== request.operation || result.requestId !== request.requestId ||
+          result.retirementRequestId !== (
+            request.operation === 'restore' || request.operation === 'purge'
+              ? request.retirementRequestId
+              : null
+          )) throw responseInvalid()
+      return success(200, result)
+    } catch (error) {
+      return failureFrom(error)
+    }
+  }
+
   async #mutationEnabled(context: BackupRetentionMutationContext): Promise<boolean> {
     try {
       return await this.#mutationGate(context) === true
@@ -338,6 +383,13 @@ function assertPreviewIdentifiersUnique(preview: z.output<typeof retentionPrevie
     ...preview.excluded.map((entry) => entry.backupId)
   ]
   assertUnique(ids)
+  assertUnique(preview.executionBatch.selectedBackupIds)
+  const deletable = new Set(preview.plan.delete.map((entry) => entry.backupId))
+  if (preview.executionBatch.selectedBackupIds.some((backupId) => !deletable.has(backupId)) ||
+      preview.executionBatch.deferredCandidateCount !==
+        preview.plan.delete.length - preview.executionBatch.selectedBackupIds.length) {
+    throw responseInvalid()
+  }
 }
 
 function assertUnique(values: readonly string[]): void {
@@ -378,14 +430,15 @@ function failureFrom(error: unknown): BackupRetentionHttpResult<never> {
 function statusForCoreCode(code: BackupRetentionErrorCode): number {
   if (code === 'SAVE_RETENTION_REQUEST_INVALID') return 400
   if (code === 'SAVE_RETENTION_OPERATION_NOT_FOUND') return 404
-  if (code === 'SAVE_RETENTION_LOCK_BUSY') return 423
+  if (code === 'SAVE_RETENTION_LOCK_BUSY' || code === 'SAVE_RETENTION_HOST_LEASE_BUSY') return 423
   if ([
     'SAVE_RETENTION_IDEMPOTENCY_CONFLICT',
     'SAVE_RETENTION_PLAN_CHANGED',
     'SAVE_RETENTION_BACKUP_CHANGED',
     'SAVE_RETENTION_OPERATION_NOT_RESTORABLE',
     'SAVE_RETENTION_ANNOTATION_CONFLICT',
-    'SAVE_RETENTION_PURGE_TOO_EARLY'
+    'SAVE_RETENTION_PURGE_TOO_EARLY',
+    'SAVE_RETENTION_BATCH_LIMIT_EXCEEDED'
   ].includes(code)) return 409
   return 503
 }
@@ -404,6 +457,11 @@ function publicMessage(code: string): string {
     SAVE_RETENTION_OPERATION_NOT_RESTORABLE: '备份保留事务当前不可恢复',
     SAVE_RETENTION_ANNOTATION_CONFLICT: '备份备注版本已经变化',
     SAVE_RETENTION_PURGE_TOO_EARLY: '退役等待期尚未结束',
+    SAVE_RETENTION_BATCH_LIMIT_EXCEEDED: '本次备份保留批次超过可恢复事务上限',
+    SAVE_RETENTION_HOST_LEASE_BUSY: '另一项宿主变更正在执行',
+    SAVE_RETENTION_HOST_LEASE_RECOVERY_REQUIRED: '宿主变更租约需要显式恢复',
+    SAVE_RETENTION_HOST_LEASE_LOST: '备份保留操作已失去宿主变更租约',
+    SAVE_RETENTION_HOST_LEASE_UNAVAILABLE: '宿主变更租约暂不可用',
     SAVE_RETENTION_RECOVERY_REQUIRED: '备份保留事务需要人工核验',
     SAVE_RETENTION_STORAGE_UNAVAILABLE: '备份保留存储暂不可用',
     SAVE_RETENTION_FAILED: '备份保留事务未完成',

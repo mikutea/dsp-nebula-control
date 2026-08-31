@@ -6,7 +6,7 @@ import { api, ApiError } from './api'
 import type {
   ComponentCandidatePreparationReceipt,
   ServerStatus, SessionUser, UpdateActivationPlan, UpdateActivationReceipt,
-  UpdateActivationRequest, UpdateActivationState, UpdateCleanupPlan,
+  UpdateActivationRecoveryStatus, UpdateActivationRequest, UpdateActivationState, UpdateCleanupPlan,
   UpdateCompatibilityReceipt, UpdateCompatibilityStatus
 } from './model'
 
@@ -89,6 +89,49 @@ describe('component update activation workspace', () => {
     expect(execute).not.toHaveBeenCalled()
   })
 
+  it('keeps ordinary activation fail-closed when recovery status is unavailable', async () => {
+    mockStateReads()
+    vi.spyOn(api, 'updateActivationRecoveryStatus').mockRejectedValue(
+      new ApiError(503, '恢复状态暂不可用。', 'UPDATE_ACTIVATION_HTTP_RECOVERY_UNAVAILABLE')
+    )
+    vi.spyOn(api, 'previewUpdateActivation').mockImplementation(async (request) => ({ data: planFixture(request) }))
+    const execute = vi.spyOn(api, 'executeUpdateActivation')
+    render(<VersionUpdateWorkspace status={statusFixture()} demo={false} user={administrator()} />)
+
+    expect((await screen.findByRole('alert')).textContent).toContain('UPDATE_ACTIVATION_HTTP_RECOVERY_UNAVAILABLE')
+    await loadPreparedNebulaDraft()
+    await prepareCompatibilityEvidence()
+    fireEvent.click(screen.getByRole('button', { name: '生成激活预演' }))
+    await screen.findByText('DRY-RUN 已生成，执行仍未发生')
+
+    expect((screen.getByLabelText('组件激活精确确认') as HTMLInputElement).disabled).toBe(true)
+    const button = screen.getByRole('button', { name: '恢复状态保持锁定' }) as HTMLButtonElement
+    expect(button.disabled).toBe(true)
+    fireEvent.click(button)
+    expect(execute).not.toHaveBeenCalled()
+  })
+
+  it('keeps ordinary activation fail-closed when the recovery coordinator reports blocked', async () => {
+    const requestId = '55555555-5555-4555-8555-555555555555'
+    mockStateReads()
+    vi.spyOn(api, 'updateActivationRecoveryStatus').mockResolvedValue({
+      data: recoveryStatusFixture(requestId, true)
+    })
+    vi.spyOn(api, 'previewUpdateActivation').mockImplementation(async (request) => ({ data: planFixture(request) }))
+    const execute = vi.spyOn(api, 'executeUpdateActivation')
+    render(<VersionUpdateWorkspace status={statusFixture()} demo={false} user={administrator()} />)
+
+    expect(await screen.findByText('组件事务需要显式恢复')).toBeTruthy()
+    await loadPreparedNebulaDraft()
+    await prepareCompatibilityEvidence()
+    fireEvent.click(screen.getByRole('button', { name: '生成激活预演' }))
+    await screen.findByText('DRY-RUN 已生成，执行仍未发生')
+
+    expect((screen.getByLabelText('组件激活精确确认') as HTMLInputElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: '恢复状态保持锁定' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(execute).not.toHaveBeenCalled()
+  })
+
   it('renders DSP and cleanup as non-activatable surfaces and exposes no host transport inputs', async () => {
     const preview = vi.spyOn(api, 'previewUpdateActivation')
     const execute = vi.spyOn(api, 'executeUpdateActivation')
@@ -135,13 +178,58 @@ describe('component update activation workspace', () => {
     expect((screen.getByRole('button', { name: '服务端门禁已关闭' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
+  it('reloads durable state immediately after ordinary activation enters recovery-required', async () => {
+    const requestId = requestFixture().requestId
+    vi.spyOn(api, 'updateActivationState')
+      .mockResolvedValueOnce({ data: stateFixture() })
+      .mockResolvedValue({ data: { ...stateFixture(), recoveryRequired: true } })
+    const recoveryStatus = vi.spyOn(api, 'updateActivationRecoveryStatus')
+      .mockResolvedValueOnce({ data: recoveryStatusFixture() })
+      .mockResolvedValue({ data: recoveryStatusFixture(requestId, true) })
+    vi.spyOn(api, 'updateActivationCleanupPreview').mockResolvedValue({ data: cleanupFixture() })
+    vi.spyOn(api, 'updateCompatibilityStatus').mockResolvedValue({ data: compatibilityStatusFixture() })
+    vi.spyOn(api, 'prepareUpdateCompatibility').mockImplementation(async (request) => ({
+      data: compatibilityReceiptFixture(request.requestId)
+    }))
+    vi.spyOn(api, 'updateCompatibilityReceipt').mockImplementation(async (receiptId) => ({
+      data: compatibilityReceiptFixture(receiptId)
+    }))
+    vi.spyOn(api, 'componentCandidatePreparationReceipt').mockImplementation(async (receiptId) => ({
+      data: preparationReceiptFixture(receiptId)
+    }))
+    vi.spyOn(api, 'previewUpdateActivation').mockImplementation(async (request) => ({ data: planFixture(request) }))
+    vi.spyOn(api, 'executeUpdateActivation').mockRejectedValue(
+      new ApiError(503, '回滚无法证明安全终态。', 'UPDATE_ROLLBACK_SMOKE_FAILED')
+    )
+    render(<VersionUpdateWorkspace status={statusFixture()} demo={false} user={administrator()} />)
+
+    await screen.findByText('4 个托管组件')
+    await loadPreparedNebulaDraft()
+    await prepareCompatibilityEvidence()
+    fireEvent.click(screen.getByRole('button', { name: '生成激活预演' }))
+    await screen.findByText('DRY-RUN 已生成，执行仍未发生')
+    fireEvent.change(screen.getByLabelText('组件激活精确确认'), {
+      target: { value: 'ACTIVATE_NEBULA_UPDATE' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '提交服务端激活门禁' }))
+
+    expect(await screen.findByText('组件事务需要显式恢复')).toBeTruthy()
+    expect(recoveryStatus).toHaveBeenCalledTimes(2)
+    expect((screen.getByRole('button', { name: '恢复状态保持锁定' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it('aborts both bounded state reads when the workspace unmounts', async () => {
     let stateSignal: AbortSignal | undefined
+    let recoverySignal: AbortSignal | undefined
     let cleanupSignal: AbortSignal | undefined
     let compatibilitySignal: AbortSignal | undefined
     vi.spyOn(api, 'updateActivationState').mockImplementation(async (signal) => {
       stateSignal = signal
       return { data: stateFixture() }
+    })
+    vi.spyOn(api, 'updateActivationRecoveryStatus').mockImplementation(async (signal) => {
+      recoverySignal = signal
+      return { data: recoveryStatusFixture() }
     })
     vi.spyOn(api, 'updateActivationCleanupPreview').mockImplementation(async (signal) => {
       cleanupSignal = signal
@@ -155,13 +243,56 @@ describe('component update activation workspace', () => {
     await screen.findByText('4 个托管组件')
     view.unmount()
     expect(stateSignal?.aborted).toBe(true)
+    expect(recoverySignal?.aborted).toBe(true)
     expect(cleanupSignal?.aborted).toBe(true)
     expect(compatibilitySignal?.aborted).toBe(true)
+  })
+
+  it('lets an Administrator perform only the exact broker-bound recovery and then clears the panel', async () => {
+    const requestId = '55555555-5555-4555-8555-555555555555'
+    vi.spyOn(api, 'updateActivationState')
+      .mockResolvedValueOnce({ data: { ...stateFixture(), recoveryRequired: true } })
+      .mockResolvedValue({ data: stateFixture() })
+    vi.spyOn(api, 'updateActivationRecoveryStatus')
+      .mockResolvedValueOnce({ data: recoveryStatusFixture(requestId, true) })
+      .mockResolvedValue({ data: recoveryStatusFixture(requestId, false) })
+    vi.spyOn(api, 'updateActivationCleanupPreview').mockResolvedValue({ data: cleanupFixture() })
+    vi.spyOn(api, 'updateCompatibilityStatus').mockResolvedValue({ data: compatibilityStatusFixture() })
+    const recovered = {
+      ...receiptFixture({ ...requestFixture(), requestId }),
+      status: 'rolled-back' as const,
+      resultingRevision: '1'.repeat(64),
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackVerified: true,
+      recoveryRequired: false
+    }
+    const recover = vi.spyOn(api, 'recoverUpdateActivation').mockResolvedValue({ data: recovered })
+    vi.spyOn(api, 'updateActivationReceipt').mockResolvedValue({ data: recovered })
+
+    render(<VersionUpdateWorkspace status={statusFixture()} demo={false} user={administrator()} />)
+    expect(await screen.findByText('组件事务需要显式恢复')).toBeTruthy()
+    expect((screen.getByLabelText('待恢复组件事务 UUID') as HTMLInputElement).value).toBe(requestId)
+    const button = screen.getByRole('button', { name: '执行精确显式恢复' }) as HTMLButtonElement
+    expect(button.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('组件恢复精确确认'), {
+      target: { value: 'RECOVER_COMPONENT_UPDATE' }
+    })
+    expect(button.disabled).toBe(false)
+    fireEvent.click(button)
+
+    await waitFor(() => expect(recover).toHaveBeenCalledWith(
+      requestId,
+      'RECOVER_COMPONENT_UPDATE',
+      expect.any(AbortSignal)
+    ))
+    await waitFor(() => expect(screen.queryByText('组件事务需要显式恢复')).toBeNull())
+    expect(await screen.findByText('已由 receipts/:requestId 重新读取')).toBeTruthy()
   })
 })
 
 function mockStateReads(): void {
   vi.spyOn(api, 'updateActivationState').mockResolvedValue({ data: stateFixture() })
+  vi.spyOn(api, 'updateActivationRecoveryStatus').mockResolvedValue({ data: recoveryStatusFixture() })
   vi.spyOn(api, 'updateActivationCleanupPreview').mockResolvedValue({ data: cleanupFixture() })
   vi.spyOn(api, 'updateCompatibilityStatus').mockResolvedValue({ data: compatibilityStatusFixture() })
   vi.spyOn(api, 'prepareUpdateCompatibility').mockImplementation(async (request) => ({
@@ -173,6 +304,20 @@ function mockStateReads(): void {
   vi.spyOn(api, 'componentCandidatePreparationReceipt').mockImplementation(async (requestId) => ({
     data: preparationReceiptFixture(requestId)
   }))
+}
+
+function recoveryStatusFixture(
+  requestId: string | null = null,
+  required = false
+): UpdateActivationRecoveryStatus {
+  return {
+    schemaVersion: 1,
+    phase: required ? 'recovery-required' : 'ready',
+    mutationBlocked: required,
+    recoveryRequired: required,
+    failureCode: required ? 'UPDATE_RECOVERY_REQUIRED' : null,
+    reconciledRequestId: requestId
+  }
 }
 
 async function loadPreparedNebulaDraft(): Promise<void> {

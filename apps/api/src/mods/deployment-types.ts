@@ -1,6 +1,9 @@
 import type { ClientParityManifest, ServerModLock } from './manifest.js'
 import type { ModPlatformLock } from './platform-lock.js'
-import type { HostMutationOperationCoordinator } from '../host-mutation/operation-coordinator.js'
+import type {
+  HostMutationOperationCoordinator,
+  HostMutationRecoveryOperationCoordinator
+} from '../host-mutation/operation-coordinator.js'
 
 export const MAX_STAGED_MOD_FILES = 128
 export const MAX_STAGED_MOD_FILE_BYTES = 512 * 1024 * 1024
@@ -138,13 +141,28 @@ export interface ModDeploymentCleanupPlan {
   candidates: ModDeploymentCleanupCandidate[]
 }
 
-export type ModDeploymentFaultPhase = 'after-pending-built' | 'after-snapshot' | 'after-publish'
+export interface ModDeploymentRecoveryStatus {
+  phase: 'ready' | 'recovery-required'
+  requestId: string | null
+  operation: ModDeploymentOperation | null
+  allowedDesired: Array<'candidate' | 'previous'>
+}
+
+export type ModDeploymentFaultPhase =
+  | 'after-pending-built'
+  | 'after-journal-pending-synced'
+  | 'after-receipt-pending-synced'
+  | 'after-snapshot'
+  | 'after-publish'
+  | 'after-rollback-failed-move'
+  | 'after-rollback-restore'
 
 export interface ModDeploymentServiceOptions {
   stagingRoot: string
   pluginsRoot: string
   verifyStoppedState: (signal?: AbortSignal) => Promise<ModStoppedStateProof>
   hostMutationCoordinator?: HostMutationOperationCoordinator
+  hostMutationRecoveryCoordinator?: HostMutationRecoveryOperationCoordinator
   readPlatformInventory?: () => Promise<{
     inventoryRevision: string
     inventory: { nebula: string; bepInEx: string }
@@ -166,6 +184,7 @@ export type ModDeploymentErrorCode =
   | 'MOD_DEPLOYMENT_REVISION_CONFLICT'
   | 'MOD_DEPLOYMENT_IDEMPOTENCY_CONFLICT'
   | 'MOD_DEPLOYMENT_RECOVERY_REQUIRED'
+  | 'MOD_DEPLOYMENT_RECOVERY_TARGET_NOT_ALLOWED'
   | 'MOD_DEPLOYMENT_UNMANAGED_CONTENT'
   | 'MOD_DEPLOYMENT_STATE_INVALID'
   | 'MOD_DEPLOYMENT_MANIFEST_INVALID'

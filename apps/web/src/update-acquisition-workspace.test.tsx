@@ -326,6 +326,14 @@ describe('managed artifact acquisition workspace', () => {
 
 function mockActivationReads(): void {
   vi.spyOn(api, 'updateActivationState').mockResolvedValue({ data: activationStateFixture() })
+  vi.spyOn(api, 'updateActivationRecoveryStatus').mockResolvedValue({ data: {
+    schemaVersion: 1,
+    phase: 'ready',
+    mutationBlocked: false,
+    recoveryRequired: false,
+    failureCode: null,
+    reconciledRequestId: null
+  } })
   vi.spyOn(api, 'updateActivationCleanupPreview').mockResolvedValue({ data: cleanupFixture() })
   vi.spyOn(api, 'updateCompatibilityStatus').mockResolvedValue({ data: compatibilityStatusFixture() })
 }

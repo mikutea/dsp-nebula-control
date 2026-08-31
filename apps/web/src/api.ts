@@ -12,7 +12,8 @@ import type {
   ThunderstoreModImportPlan, ThunderstoreModImportReceipt, VerifiedModLockReceiptRequest,
   VerifiedModManifestPreview,
   PlayerCapabilitiesProjection, PlayerRoster, SessionUser,
-  ModDeploymentPreview, ModDeploymentReceipt, ModDeploymentRecoveryPlan, ModDeploymentRequest,
+  ModDeploymentPreview, ModDeploymentReceipt, ModDeploymentRecoveryDesired,
+  ModDeploymentRecoveryPlan, ModDeploymentRecoveryStatus, ModDeploymentRequest,
   ModDeploymentStateSummary,
   LateGameQualificationReport, ObservabilityDownsampleResult, ObservabilityQualificationEnvelope,
   ObservabilityAlertEnvelope, ObservabilityAlertEpisode,
@@ -24,6 +25,7 @@ import type {
   SavePairRevision, SavePairTransferDownload, SaveTransactionResult, ServerStatus,
   StructuredLogFilters, StructuredLogPage, StructuredLogReadRequest,
   UpdateActivationConfirmation, UpdateActivationPlan, UpdateActivationReceipt,
+  UpdateActivationRecoveryConfirmation, UpdateActivationRecoveryStatus,
   UpdateActivationRequest, UpdateActivationState, UpdateCleanupPlan,
   UpdateCompatibilityPreparationRequest, UpdateCompatibilityReceipt, UpdateCompatibilityStatus
 } from './model'
@@ -214,6 +216,9 @@ export const api = {
   updateActivationState: (signal?: AbortSignal) => activationRequest<UpdateActivationState>(
     '/api/v1/updates/activation/state', { signal }
   ),
+  updateActivationRecoveryStatus: (signal?: AbortSignal) => activationRequest<UpdateActivationRecoveryStatus>(
+    '/api/v1/updates/activation/recovery', { signal }
+  ),
   updateActivationCleanupPreview: (signal?: AbortSignal) => activationRequest<UpdateCleanupPlan>(
     '/api/v1/updates/activation/cleanup/preview', { signal }
   ),
@@ -228,6 +233,13 @@ export const api = {
   ) => activationRequest<UpdateActivationReceipt>('/api/v1/updates/activation/execute', {
     method: 'POST', signal, body: JSON.stringify({ ...input, confirmation })
   }),
+  recoverUpdateActivation: (
+    requestId: string,
+    confirmation: UpdateActivationRecoveryConfirmation,
+    signal?: AbortSignal
+  ) => activationRequest<UpdateActivationReceipt>('/api/v1/updates/activation/recovery', {
+    method: 'POST', signal, body: JSON.stringify({ requestId, confirmation })
+  }),
   updateActivationReceipt: (requestId: string, signal?: AbortSignal) =>
     activationRequest<UpdateActivationReceipt>(
       `/api/v1/updates/activation/receipts/${encodeURIComponent(requestId)}`, { signal }
@@ -239,6 +251,18 @@ export const api = {
   modDeploymentRecovery: (signal?: AbortSignal) => request<{
     data: ModDeploymentRecoveryPlan
   }>('/api/v1/mods/deployment/recovery', { signal }),
+  modDeploymentRecoveryStatus: (signal?: AbortSignal) => readModDeploymentRecoveryStatus(signal),
+  recoverModDeployment: (
+    requestId: string,
+    desired: ModDeploymentRecoveryDesired,
+    signal?: AbortSignal
+  ) => request<{ data: ModDeploymentReceipt }>('/api/v1/mods/deployment/recovery/execute', {
+    method: 'POST', signal, body: JSON.stringify({
+      requestId,
+      desired,
+      confirmation: 'RECOVER_MOD_DEPLOYMENT'
+    })
+  }),
   previewModDeployment: (input: ModDeploymentRequest) => request<{
     data: ModDeploymentPreview
     meta: { executionEnabled: boolean }
@@ -1122,6 +1146,48 @@ async function activationRequest<T>(path: string, init?: RequestInit): Promise<{
   return { data: body.data }
 }
 
+async function readModDeploymentRecoveryStatus(signal?: AbortSignal): Promise<{
+  data: ModDeploymentRecoveryStatus
+  meta: { executionEnabled: boolean }
+}> {
+  const result = await request<{ data: unknown; meta: unknown }>(
+    '/api/v1/mods/deployment/recovery/status', { signal }
+  )
+  const status = normalizeModDeploymentRecoveryStatus(result.data)
+  if (status === null || !hasExactKeys(result.meta, ['executionEnabled']) ||
+      typeof result.meta.executionEnabled !== 'boolean') {
+    throw new ApiError(
+      502,
+      '模组恢复状态未通过严格浏览器合同校验；普通模组写入保持锁定。',
+      'MOD_DEPLOYMENT_RECOVERY_BROWSER_RESPONSE_INVALID'
+    )
+  }
+  return { data: status, meta: { executionEnabled: result.meta.executionEnabled } }
+}
+
+function normalizeModDeploymentRecoveryStatus(input: unknown): ModDeploymentRecoveryStatus | null {
+  if (!hasExactKeys(input, ['phase', 'requestId', 'operation', 'allowedDesired']) ||
+      (input.phase !== 'ready' && input.phase !== 'recovery-required') ||
+      !Array.isArray(input.allowedDesired) || input.allowedDesired.length > 2 ||
+      !input.allowedDesired.every((desired) => desired === 'candidate' || desired === 'previous') ||
+      new Set(input.allowedDesired).size !== input.allowedDesired.length) return null
+
+  if (input.phase === 'ready') {
+    return input.requestId === null && input.operation === null && input.allowedDesired.length === 0
+      ? { phase: 'ready', requestId: null, operation: null, allowedDesired: [] }
+      : null
+  }
+  if (typeof input.requestId !== 'string' || !uuidPattern.test(input.requestId) ||
+      !['install', 'update', 'enable', 'disable', 'remove'].includes(String(input.operation)) ||
+      input.allowedDesired.length < 1) return null
+  return {
+    phase: 'recovery-required',
+    requestId: input.requestId.toLowerCase(),
+    operation: input.operation as ModDeploymentRecoveryStatus['operation'],
+    allowedDesired: [...input.allowedDesired] as Array<'candidate' | 'previous'>
+  }
+}
+
 async function acquisitionRequest<T>(path: string, init?: RequestInit): Promise<{ data: T }> {
   const headers = new Headers(init?.headers)
   if (init?.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
@@ -1244,6 +1310,18 @@ function updateActivationErrorMessage(status: number, code: string | null): stri
   if (code === 'UPDATE_ACTIVATION_NOT_CONFIGURED') return '组件激活事务尚未配置；当前只允许官方发现与离线暂存。'
   if (code === 'UPDATE_DSP_MANUAL_STEAM_REQUIRED') return 'DSP 本体必须通过已登录的 Steam 客户端手动更新。'
   if (code === 'UPDATE_RECOVERY_REQUIRED') return '组件状态要求先完成恢复核验，激活继续保持锁定。'
+  if (code === 'UPDATE_ACTIVATION_HTTP_RECOVERY_NOT_REQUIRED' ||
+      code === 'UPDATE_HOST_LEASE_RECOVERY_NOT_REQUIRED') {
+    return '服务端已经没有与该事务匹配的待恢复租约；请刷新恢复状态。'
+  }
+  if (code === 'UPDATE_RECOVERY_REQUEST_MISMATCH' ||
+      code === 'UPDATE_HOST_LEASE_RECOVERY_MISMATCH') {
+    return '该 request ID 与服务端待恢复事务不匹配；未执行任何恢复写入。'
+  }
+  if (code === 'UPDATE_RECOVERY_EVIDENCE_CHANGED' || code === 'UPDATE_RECOVERY_EVIDENCE_INVALID' ||
+      code === 'UPDATE_RECOVERY_TERMINAL_UNPROVEN') {
+    return '恢复证据已变化或无法证明安全终态；全局恢复门禁保持关闭。'
+  }
   if (status === 409) return '组件激活预条件已变化；请刷新 revision 和兼容性证据后重新预演。'
   if (status === 422) return '组件激活请求未通过固定字段或兼容性校验。'
   if (status === 403) return '当前角色没有执行组件激活的服务端权限。'

@@ -27,6 +27,7 @@ describe('mod deployment workspace', () => {
         candidates: [{ id: 'snapshot-fictional-0001', kind: 'snapshot' }]
       }
     })
+    mockRecoveryReady(true)
     const preview = previewFixture()
     vi.spyOn(api, 'previewModDeployment').mockResolvedValue({ data: preview, meta: { executionEnabled: true } })
     vi.spyOn(api, 'executeModDeployment').mockResolvedValue({ data: receiptFixture() })
@@ -73,6 +74,7 @@ describe('mod deployment workspace', () => {
     vi.spyOn(api, 'modDeploymentRecovery').mockResolvedValue({
       data: { dryRun: true, irreversible: true, executeSupported: false, candidates: [] }
     })
+    mockRecoveryReady(false)
     const preview = vi.spyOn(api, 'previewModDeployment')
     render(<ModWorkspace demo={true} />)
     const input = screen.getByLabelText('选择模组部署请求 JSON')
@@ -106,6 +108,7 @@ describe('mod deployment workspace', () => {
     vi.spyOn(api, 'modDeploymentRecovery').mockResolvedValue({
       data: { dryRun: true, irreversible: true, executeSupported: false, candidates: [] }
     })
+    mockRecoveryReady(false)
     const preview = vi.spyOn(api, 'previewModDeployment')
       .mockResolvedValueOnce({ data: previewFixture(), meta: { executionEnabled: false } })
     const view = render(<ModWorkspace demo={false} />)
@@ -127,7 +130,60 @@ describe('mod deployment workspace', () => {
     view.unmount()
     expect(stateSignal?.aborted).toBe(true)
   })
+
+  it('recovers only the exact server-projected interrupted transaction and proves the terminal revision', async () => {
+    const requestId = requestFixture().requestId
+    vi.spyOn(api, 'modDeploymentState').mockResolvedValue({
+      data: stateFixture(), meta: { executionEnabled: true }
+    })
+    vi.spyOn(api, 'modDeploymentRecovery').mockResolvedValue({
+      data: { dryRun: true, irreversible: true, executeSupported: false, candidates: [] }
+    })
+    vi.spyOn(api, 'modDeploymentRecoveryStatus')
+      .mockResolvedValueOnce({
+        data: {
+          phase: 'recovery-required', requestId, operation: 'install',
+          allowedDesired: ['candidate', 'previous']
+        },
+        meta: { executionEnabled: true }
+      })
+      .mockResolvedValue({
+        data: { phase: 'ready', requestId: null, operation: null, allowedDesired: [] },
+        meta: { executionEnabled: true }
+      })
+    const recovered: ModDeploymentReceipt = {
+      ...receiptFixture(),
+      status: 'rolled-back',
+      newRevision: null,
+      rollback: 'succeeded',
+      errorCode: 'MOD_DEPLOYMENT_EXECUTION_FAILED'
+    }
+    const recover = vi.spyOn(api, 'recoverModDeployment').mockResolvedValue({ data: recovered })
+    render(<ModWorkspace demo={false} canRecover />)
+
+    expect(await screen.findByText('RECOVERY REQUIRED')).toBeTruthy()
+    expect((screen.getByLabelText('模组恢复 request ID') as HTMLInputElement).value).toBe(requestId)
+    fireEvent.change(screen.getByLabelText('模组恢复目标'), { target: { value: 'previous' } })
+    const button = screen.getByRole('button', { name: '执行精确恢复' }) as HTMLButtonElement
+    expect(button.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('模组恢复精确确认'), {
+      target: { value: 'RECOVER_MOD_DEPLOYMENT' }
+    })
+    expect(button.disabled).toBe(false)
+    fireEvent.click(button)
+
+    expect(await screen.findByText('发布失败，已自动回滚')).toBeTruthy()
+    expect(recover).toHaveBeenCalledWith(requestId, 'previous')
+    await waitFor(() => expect(screen.getByText('READY')).toBeTruthy())
+  })
 })
+
+function mockRecoveryReady(executionEnabled: boolean) {
+  return vi.spyOn(api, 'modDeploymentRecoveryStatus').mockResolvedValue({
+    data: { phase: 'ready', requestId: null, operation: null, allowedDesired: [] },
+    meta: { executionEnabled }
+  })
+}
 
 function stateFixture(): ModDeploymentStateSummary {
   return {

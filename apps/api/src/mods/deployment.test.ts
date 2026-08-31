@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   ModDeploymentService,
@@ -23,7 +26,9 @@ import {
   type HostMutationOperationCoordinator,
   type HostMutationOperationOutcome,
   type HostMutationOperationRequest,
-  type HostMutationOperationScope
+  type HostMutationOperationScope,
+  type HostMutationRecoveryOperationCoordinator,
+  type HostMutationRecoveryOperationRequest
 } from '../host-mutation/operation-coordinator.js'
 
 type HostMutationOperation<T> = (
@@ -52,6 +57,18 @@ afterEach(async () => {
 })
 
 describe('mod deployment transaction core', () => {
+  it('reports a minimal ready recovery status without creating recovery evidence', async () => {
+    const harness = await createHarness()
+    const before = await treeDigest(harness.root)
+    await expect(harness.service.recoveryStatus()).resolves.toEqual({
+      phase: 'ready',
+      requestId: null,
+      operation: null,
+      allowedDesired: []
+    })
+    expect(await treeDigest(harness.root)).toBe(before)
+  })
+
   it('revalidates a verified platform lock for new execution but replays a terminal receipt immutably', async () => {
     let inventoryRevision = 'c'.repeat(64)
     let inventoryReads = 0
@@ -74,6 +91,9 @@ describe('mod deployment transaction core', () => {
     await expect(harness.service.preview(request)).resolves.toMatchObject({ dryRun: true })
     await expect(harness.service.execute(request)).resolves.toMatchObject({ status: 'succeeded', reused: false })
     expect(inventoryReads).toBe(4)
+    await expect(harness.service.recoveryStatus()).resolves.toEqual({
+      phase: 'ready', requestId: null, operation: null, allowedDesired: []
+    })
 
     inventoryRevision = 'd'.repeat(64)
     await expect(harness.service.execute(request)).resolves.toMatchObject({ status: 'succeeded', reused: true })
@@ -351,10 +371,12 @@ describe('mod deployment transaction core', () => {
 
   it('fails closed without a host coordinator before stopped proof or live publication', async () => {
     let stoppedChecks = 0
+    const recoveryCoordinator = new RecordingHostMutationRecoveryCoordinator()
     const harness = await createHarness()
     const service = new ModDeploymentService({
       stagingRoot: harness.stagingRoot,
       pluginsRoot: harness.pluginsRoot,
+      hostMutationRecoveryCoordinator: recoveryCoordinator,
       verifyStoppedState: async () => {
         stoppedChecks += 1
         return { processStopped: true, portClosed: true }
@@ -370,6 +392,7 @@ describe('mod deployment transaction core', () => {
     await expect(service.preview(request)).resolves.toMatchObject({ dryRun: true })
     await expect(service.execute(request)).rejects.toThrow('MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE')
     expect(stoppedChecks).toBe(0)
+    expect(recoveryCoordinator.requests).toEqual([])
     expect(await treeDigest(harness.pluginsRoot)).toBe(before)
   })
 
@@ -405,6 +428,35 @@ describe('mod deployment transaction core', () => {
     await expect(secondInstance.preview(request)).rejects.toThrow('MOD_DEPLOYMENT_BUSY')
     allowHostLease()
     await expect(execution).resolves.toMatchObject({ status: 'succeeded' })
+  })
+
+  it('preserves an exact-content replacement transaction lock on normal release', async () => {
+    const harness = await createHarness()
+    const lockPath = join(harness.root, '.plugins.dyson-control', 'transaction.lock')
+    const displacedPath = `${lockPath}.displaced`
+    const service = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      hostMutationCoordinator: new RecordingHostMutationCoordinator(),
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true }),
+      faultInjector: async (phase) => {
+        if (phase !== 'after-pending-built') return
+        const exactContent = await readFile(lockPath)
+        await rename(lockPath, displacedPath)
+        await writeFile(lockPath, exactContent)
+        throw new Error('fictional replacement after pending build')
+      }
+    })
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-LockIdentity-1.0.0', {
+      'LockIdentity.dll': Buffer.from('fictional-lock-identity')
+    })
+    const request = makeRequest(
+      'install', staged, manifests([staged], [staged.dependencyId]), (await harness.service.inspect()).revision
+    )
+
+    await expect(service.execute(request)).rejects.toThrow('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    expect(existsSync(lockPath)).toBe(true)
+    expect(existsSync(displacedPath)).toBe(true)
   })
 
   it('abandons the host lease for rollback-failed and unknown write outcomes', async () => {
@@ -443,6 +495,8 @@ describe('mod deployment transaction core', () => {
       rollback: 'failed',
       errorCode: 'MOD_DEPLOYMENT_ROLLBACK_FAILED'
     })
+    await expect(rollbackFailingService.recoveryStatus())
+      .rejects.toThrow('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
     expect(coordinator.outcomes).toEqual([
       expect.objectContaining({ kind: 'return', disposition: 'abandon' })
     ])
@@ -518,7 +572,7 @@ describe('mod deployment transaction core', () => {
       ): Promise<T> {
         const scope = activeHostMutationScope(() => {
           activeAssertions += 1
-          if (activeAssertions === 7) {
+          if (stoppedChecks === 2) {
             throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
           }
         })
@@ -542,8 +596,47 @@ describe('mod deployment transaction core', () => {
 
     await expect(harness.service.execute(request)).rejects.toThrow('MOD_DEPLOYMENT_HOST_LEASE_LOST')
     expect(stoppedChecks).toBe(2)
-    expect(activeAssertions).toBe(7)
+    expect(activeAssertions).toBeGreaterThanOrEqual(7)
     expect(await treeDigest(harness.pluginsRoot)).toBe(before)
+  })
+
+  it('preserves the transaction lock when lease loss leaves an initial journal pending', async () => {
+    let lost = false
+    const coordinator: HostMutationOperationCoordinator = {
+      async runExclusive<T>(
+        _request: HostMutationOperationRequest,
+        operation: HostMutationOperation<T>
+      ): Promise<T> {
+        return unwrapHostMutationOutcome(await operation(activeHostMutationScope(() => {
+          if (lost) throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
+        })))
+      }
+    }
+    const harness = await createHarness({
+      hostMutationCoordinator: coordinator,
+      faultInjector: async (phase) => {
+        if (phase === 'after-journal-pending-synced') lost = true
+      }
+    })
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-InitialJournalLost-1.0.0', {
+      'InitialJournalLost.dll': Buffer.from('initial-journal-lost')
+    })
+    const request = makeRequest(
+      'install', staged, manifests([staged], [staged.dependencyId]), (await harness.service.inspect()).revision
+    )
+    await expect(harness.service.execute(request)).rejects.toThrow('MOD_DEPLOYMENT_HOST_LEASE_LOST')
+
+    const controlRoot = join(harness.root, '.plugins.dyson-control')
+    expect(existsSync(join(controlRoot, 'transaction.lock'))).toBe(true)
+    expect(existsSync(join(controlRoot, 'journals', `${request.requestId}.pending`))).toBe(true)
+    const restarted = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+    await expect(restarted.reconcileInterrupted(
+      request.requestId, 'previous', activeHostMutationScope()
+    )).resolves.toMatchObject({ status: 'rolled-back' })
   })
 
   it('fails closed on missing dependencies, active dependents, and client parity tampering', async () => {
@@ -831,6 +924,443 @@ describe('mod deployment transaction core', () => {
       id: `failed-${request.requestId}`,
       kind: 'failed-publication'
     })
+
+    const recoveryCoordinator = new RecordingHostMutationRecoveryCoordinator()
+    const replayService = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      hostMutationRecoveryCoordinator: recoveryCoordinator,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+    const terminalEvidence = await treeDigest(harness.root)
+    await expect(replayService.recoverInterrupted(request.requestId, 'candidate')).rejects.toMatchObject({
+      code: 'MOD_DEPLOYMENT_RECOVERY_TARGET_NOT_ALLOWED'
+    })
+    expect(recoveryCoordinator.requests).toEqual([])
+    expect(recoveryCoordinator.outcomes).toEqual([])
+    expect(await treeDigest(harness.root)).toBe(terminalEvidence)
+  })
+
+  it.each([
+    ['after-journal-pending-synced', 'previous', 'rolled-back', '1.0.0', ['previous']],
+    ['after-snapshot', 'previous', 'rolled-back', '1.0.0', ['previous']],
+    ['after-publish', 'candidate', 'succeeded', '2.0.0', ['candidate', 'previous']],
+    ['after-receipt-pending-synced', 'candidate', 'succeeded', '2.0.0', ['candidate']],
+    ['after-rollback-receipt-pending-synced', 'previous', 'rolled-back', '1.0.0', ['previous']],
+    ['after-rollback-failed-move', 'previous', 'rolled-back', '1.0.0', ['previous']],
+    ['after-rollback-restore', 'previous', 'rolled-back', '1.0.0', ['previous']]
+  ] as const)(
+    'recovers byte-exactly after a hard process exit at %s',
+    async (crashPhase, desired, expectedStatus, expectedVersion, allowedDesired) => {
+      const harness = await createHarness()
+      const dependencyName = `HardExit_${crashPhase.replaceAll('-', '_')}`
+      const v1 = await stagePackage(harness.stagingRoot, `Fictional-${dependencyName}-1.0.0`, {
+        'HardExit.dll': Buffer.from(`stable-${crashPhase}`),
+        'config.json': Buffer.from('{"version":1}\n')
+      })
+      const v2 = await stagePackage(harness.stagingRoot, `Fictional-${dependencyName}-2.0.0`, {
+        'HardExit.dll': Buffer.from(`candidate-${crashPhase}`),
+        'config.json': Buffer.from('{"version":2}\n')
+      })
+      await harness.service.execute(makeRequest(
+        'install', v1, manifests([v1], [v1.dependencyId]), (await harness.service.inspect()).revision
+      ))
+      const before = await harness.service.inspect()
+      const previousDigest = await treeDigest(harness.pluginsRoot)
+      const request = makeRequest('update', v2, manifests([v2], [v2.dependencyId]), before.revision)
+      const requestPath = join(harness.root, `hard-exit-${request.requestId}.json`)
+      await writeFile(requestPath, `${JSON.stringify(request)}\n`, 'utf8')
+
+      await expect(runHardExitFixture(harness, requestPath, crashPhase)).resolves.toBe(86)
+
+      const restarted = new ModDeploymentService({
+        stagingRoot: harness.stagingRoot,
+        pluginsRoot: harness.pluginsRoot,
+        hostMutationCoordinator: new RecordingHostMutationCoordinator(),
+        verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+      })
+      const evidenceBeforeReplay = await treeDigest(harness.root)
+      const recoveryStatus = await restarted.recoveryStatus()
+      expect(recoveryStatus).toEqual({
+        phase: 'recovery-required',
+        requestId: request.requestId,
+        operation: 'update',
+        allowedDesired
+      })
+      expect(Object.keys(recoveryStatus).sort()).toEqual([
+        'allowedDesired', 'operation', 'phase', 'requestId'
+      ])
+      expect(JSON.stringify(recoveryStatus)).not.toMatch(/fingerprint|manifest|plugins|staging|snapshot/i)
+      expect(await treeDigest(harness.root)).toBe(evidenceBeforeReplay)
+      await expect(restarted.execute(request)).rejects.toThrow('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+      expect(await treeDigest(harness.root)).toBe(evidenceBeforeReplay)
+
+      const candidateDigest = crashPhase === 'after-publish' || crashPhase === 'after-receipt-pending-synced'
+        ? await treeDigest(harness.pluginsRoot)
+        : null
+      if (crashPhase === 'after-snapshot') {
+        const snapshotRoot = join(
+          harness.root,
+          '.plugins.dyson-control',
+          'snapshots',
+          `snapshot-${before.revision.slice(0, 16)}-${request.requestId}`
+        )
+        const lostScope = activeHostMutationScope(() => {
+          if (existsSync(harness.pluginsRoot) && !existsSync(snapshotRoot)) {
+            throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
+          }
+        })
+        await expect(restarted.reconcileInterrupted(request.requestId, desired, lostScope))
+          .rejects.toMatchObject({ code: 'HOST_MUTATION_LEASE_LOST' })
+        expect(await treeDigest(harness.pluginsRoot)).toBe(previousDigest)
+        expect(existsSync(join(harness.root, '.plugins.dyson-control', 'transaction.lock'))).toBe(true)
+        expect(existsSync(join(
+          harness.root, '.plugins.dyson-control', 'journals', `${request.requestId}.json`
+        ))).toBe(true)
+      }
+      const receipt = await restarted.reconcileInterrupted(request.requestId, desired, activeHostMutationScope())
+      expect(receipt).toMatchObject({ status: expectedStatus, previousRevision: before.revision })
+      expect(await treeDigest(harness.pluginsRoot)).toBe(
+        expectedStatus === 'succeeded' ? candidateDigest : previousDigest
+      )
+      expect((await restarted.inspect()).packages).toEqual([
+        expect.objectContaining({ version: expectedVersion, enabled: true })
+      ])
+      const controlRoot = join(harness.root, '.plugins.dyson-control')
+      expect(existsSync(join(controlRoot, 'transaction.lock'))).toBe(false)
+      expect(existsSync(join(controlRoot, 'journals', `${request.requestId}.json`))).toBe(false)
+    },
+    15_000
+  )
+
+  it('rejects an unsupported durable recovery target before acquiring the recovery capability or writing', async () => {
+    const harness = await createHarness()
+    const v1 = await stagePackage(harness.stagingRoot, 'Fictional-WrongRecoveryTarget-1.0.0', {
+      'WrongRecoveryTarget.dll': Buffer.from('stable-wrong-recovery-target')
+    })
+    const v2 = await stagePackage(harness.stagingRoot, 'Fictional-WrongRecoveryTarget-2.0.0', {
+      'WrongRecoveryTarget.dll': Buffer.from('candidate-wrong-recovery-target')
+    })
+    await harness.service.execute(makeRequest(
+      'install', v1, manifests([v1], [v1.dependencyId]), (await harness.service.inspect()).revision
+    ))
+    const before = await harness.service.inspect()
+    const request = makeRequest('update', v2, manifests([v2], [v2.dependencyId]), before.revision)
+    const requestPath = join(harness.root, `wrong-recovery-target-${request.requestId}.json`)
+    await writeFile(requestPath, `${JSON.stringify(request)}\n`, 'utf8')
+    await expect(runHardExitFixture(harness, requestPath, 'after-snapshot')).resolves.toBe(86)
+
+    const recoveryCoordinator = new RecordingHostMutationRecoveryCoordinator()
+    const restarted = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      hostMutationRecoveryCoordinator: recoveryCoordinator,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+    await expect(restarted.recoveryStatus()).resolves.toEqual({
+      phase: 'recovery-required',
+      requestId: request.requestId,
+      operation: 'update',
+      allowedDesired: ['previous']
+    })
+    const durableEvidence = await treeDigest(harness.root)
+
+    await expect(restarted.recoverInterrupted(request.requestId, 'candidate')).rejects.toMatchObject({
+      code: 'MOD_DEPLOYMENT_RECOVERY_TARGET_NOT_ALLOWED'
+    })
+    expect(recoveryCoordinator.requests).toEqual([])
+    expect(recoveryCoordinator.outcomes).toEqual([])
+    expect(await treeDigest(harness.root)).toBe(durableEvidence)
+    await expect(restarted.recoveryStatus()).resolves.toEqual({
+      phase: 'recovery-required',
+      requestId: request.requestId,
+      operation: 'update',
+      allowedDesired: ['previous']
+    })
+  }, 15_000)
+
+  it('resumes a fully written journal pending after lease loss and converges on retry', async () => {
+    const harness = await createHarness()
+    const v1 = await stagePackage(harness.stagingRoot, 'Fictional-JournalPendingLost-1.0.0', {
+      'JournalPendingLost.dll': Buffer.from('stable-journal-pending-lost')
+    })
+    const v2 = await stagePackage(harness.stagingRoot, 'Fictional-JournalPendingLost-2.0.0', {
+      'JournalPendingLost.dll': Buffer.from('candidate-journal-pending-lost')
+    })
+    await harness.service.execute(makeRequest(
+      'install', v1, manifests([v1], [v1.dependencyId]), (await harness.service.inspect()).revision
+    ))
+    const before = await harness.service.inspect()
+    const beforeDigest = await treeDigest(harness.pluginsRoot)
+    const request = makeRequest('update', v2, manifests([v2], [v2.dependencyId]), before.revision)
+    const requestPath = join(harness.root, `journal-pending-lost-${request.requestId}.json`)
+    await writeFile(requestPath, `${JSON.stringify(request)}\n`, 'utf8')
+    await expect(runHardExitFixture(harness, requestPath, 'after-publish')).resolves.toBe(86)
+
+    let loseLease = false
+    const faulting = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true }),
+      faultInjector: async (phase) => {
+        if (phase === 'after-journal-pending-synced') loseLease = true
+      }
+    })
+    const lostScope = activeHostMutationScope(() => {
+      if (loseLease) throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
+    })
+    await expect(faulting.reconcileInterrupted(request.requestId, 'previous', lostScope))
+      .rejects.toMatchObject({ code: 'HOST_MUTATION_LEASE_LOST' })
+    const journalRoot = join(harness.root, '.plugins.dyson-control', 'journals')
+    expect(existsSync(join(journalRoot, `${request.requestId}.json`))).toBe(true)
+    expect(existsSync(join(journalRoot, `${request.requestId}.pending`))).toBe(true)
+
+    const restarted = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+    await expect(restarted.reconcileInterrupted(
+      request.requestId, 'previous', activeHostMutationScope()
+    )).resolves.toMatchObject({ status: 'rolled-back' })
+    expect(await treeDigest(harness.pluginsRoot)).toBe(beforeDigest)
+  })
+
+  it('keeps its transaction lock when lease loss is observed after the final identity read', async () => {
+    const harness = await createHarness()
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-FinalLockLease-1.0.0', {
+      'FinalLockLease.dll': Buffer.from('final-lock-lease')
+    })
+    const request = makeRequest(
+      'install', staged, manifests([staged], [staged.dependencyId]), (await harness.service.inspect()).revision
+    )
+    const requestPath = join(harness.root, `final-lock-lease-${request.requestId}.json`)
+    await writeFile(requestPath, `${JSON.stringify(request)}\n`, 'utf8')
+    await expect(runHardExitFixture(harness, requestPath, 'after-publish')).resolves.toBe(86)
+
+    const controlRoot = join(harness.root, '.plugins.dyson-control')
+    const journalPath = join(controlRoot, 'journals', `${request.requestId}.json`)
+    const lockPath = join(controlRoot, 'transaction.lock')
+    let terminalCleanupAssertions = 0
+    const loseAtFinalLockCheck = activeHostMutationScope(() => {
+      if (!existsSync(journalPath)) {
+        terminalCleanupAssertions += 1
+        if (terminalCleanupAssertions === 3) {
+          throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
+        }
+      }
+    })
+    const restarted = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+    await expect(restarted.reconcileInterrupted(request.requestId, 'candidate', loseAtFinalLockCheck))
+      .rejects.toMatchObject({ code: 'HOST_MUTATION_LEASE_LOST' })
+    expect(terminalCleanupAssertions).toBe(3)
+    expect(existsSync(lockPath)).toBe(true)
+    await expect(restarted.recoveryStatus()).resolves.toEqual({
+      phase: 'recovery-required',
+      requestId: request.requestId,
+      operation: 'install',
+      allowedDesired: ['candidate']
+    })
+
+    await expect(restarted.reconcileInterrupted(
+      request.requestId, 'candidate', activeHostMutationScope()
+    )).resolves.toMatchObject({ status: 'succeeded', reused: true })
+    await expect(restarted.recoveryStatus()).resolves.toEqual({
+      phase: 'ready', requestId: null, operation: null, allowedDesired: []
+    })
+    expect(existsSync(lockPath)).toBe(false)
+    await expect(restarted.reconcileInterrupted(
+      request.requestId, 'candidate', activeHostMutationScope()
+    )).resolves.toMatchObject({ status: 'succeeded', reused: true })
+  })
+
+  it('derives the exact recovery lease binding from durable evidence and releases only after terminal replay', async () => {
+    const harness = await createHarness()
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-RecoveryCoordinator-1.0.0', {
+      'RecoveryCoordinator.dll': Buffer.from('recovery-coordinator')
+    })
+    const request = makeRequest(
+      'install', staged, manifests([staged], [staged.dependencyId]), (await harness.service.inspect()).revision
+    )
+    const requestPath = join(harness.root, `recovery-coordinator-${request.requestId}.json`)
+    await writeFile(requestPath, `${JSON.stringify(request)}\n`, 'utf8')
+    await expect(runHardExitFixture(harness, requestPath, 'after-publish')).resolves.toBe(86)
+
+    const recoveryCoordinator = new RecordingHostMutationRecoveryCoordinator()
+    const restarted = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      hostMutationRecoveryCoordinator: recoveryCoordinator,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+    recoveryCoordinator.assertActive = () => {
+      throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
+    }
+    await expect(restarted.recoverInterrupted(request.requestId, 'candidate'))
+      .rejects.toThrow('MOD_DEPLOYMENT_HOST_LEASE_LOST')
+    recoveryCoordinator.assertActive = () => {}
+    await expect(restarted.recoverInterrupted(request.requestId, 'candidate'))
+      .resolves.toMatchObject({ status: 'succeeded' })
+    expect(recoveryCoordinator.requests).toEqual([
+      {
+        expectedOperation: 'mod-deployment-install',
+        expectedRequestId: request.requestId
+      },
+      {
+        expectedOperation: 'mod-deployment-install',
+        expectedRequestId: request.requestId
+      }
+    ])
+    expect(recoveryCoordinator.outcomes).toEqual([
+      expect.objectContaining({ kind: 'return', disposition: 'release' })
+    ])
+
+    recoveryCoordinator.recoveryNotRequired = true
+    await expect(restarted.recoverInterrupted(request.requestId, 'candidate'))
+      .resolves.toMatchObject({ status: 'succeeded', reused: true })
+  })
+
+  it('does not acquire the recovery capability for a journal pending with a foreign binding', async () => {
+    const harness = await createHarness()
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-ForeignJournalPending-1.0.0', {
+      'ForeignJournalPending.dll': Buffer.from('foreign-journal-pending')
+    })
+    const request = makeRequest(
+      'install', staged, manifests([staged], [staged.dependencyId]), (await harness.service.inspect()).revision
+    )
+    const requestPath = join(harness.root, `foreign-journal-pending-${request.requestId}.json`)
+    await writeFile(requestPath, `${JSON.stringify(request)}\n`, 'utf8')
+    await expect(runHardExitFixture(harness, requestPath, 'after-journal-pending-synced')).resolves.toBe(86)
+
+    const pendingPath = join(
+      harness.root, '.plugins.dyson-control', 'journals', `${request.requestId}.pending`
+    )
+    const pending = JSON.parse(await readFile(pendingPath, 'utf8')) as Record<string, unknown>
+    pending.fingerprint = 'f'.repeat(64)
+    await writeFile(pendingPath, `${JSON.stringify(pending, null, 2)}\n`, 'utf8')
+    const evidence = await treeDigest(harness.root)
+    const recoveryCoordinator = new RecordingHostMutationRecoveryCoordinator()
+    const restarted = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      hostMutationRecoveryCoordinator: recoveryCoordinator,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+
+    await expect(restarted.recoveryStatus()).rejects.toThrow('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    expect(await treeDigest(harness.root)).toBe(evidence)
+    await expect(restarted.recoverInterrupted(request.requestId, 'previous'))
+      .rejects.toThrow('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    expect(recoveryCoordinator.requests).toEqual([])
+    expect(await treeDigest(harness.root)).toBe(evidence)
+  })
+
+  it('preserves a foreign receipt pending instead of publishing it as a terminal result', async () => {
+    const harness = await createHarness()
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-ForeignReceiptPending-1.0.0', {
+      'ForeignReceiptPending.dll': Buffer.from('foreign-receipt-pending')
+    })
+    const request = makeRequest(
+      'install', staged, manifests([staged], [staged.dependencyId]), (await harness.service.inspect()).revision
+    )
+    const requestPath = join(harness.root, `foreign-receipt-pending-${request.requestId}.json`)
+    await writeFile(requestPath, `${JSON.stringify(request)}\n`, 'utf8')
+    await expect(runHardExitFixture(harness, requestPath, 'after-receipt-pending-synced')).resolves.toBe(86)
+
+    const pendingPath = join(
+      harness.root, '.plugins.dyson-control', 'receipts', `${request.requestId}.pending`
+    )
+    const pending = JSON.parse(await readFile(pendingPath, 'utf8')) as Record<string, unknown>
+    pending.fingerprint = 'f'.repeat(64)
+    await writeFile(pendingPath, `${JSON.stringify(pending, null, 2)}\n`, 'utf8')
+    const evidence = await treeDigest(harness.root)
+    const restarted = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+
+    await expect(restarted.reconcileInterrupted(
+      request.requestId, 'candidate', activeHostMutationScope()
+    )).rejects.toThrow('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    expect(await treeDigest(harness.root)).toBe(evidence)
+  })
+
+  it('recovers a committed-state receipt repair interrupted after its pending file was synced', async () => {
+    const harness = await createHarness()
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-ReceiptRepairPending-1.0.0', {
+      'ReceiptRepairPending.dll': Buffer.from('receipt-repair-pending')
+    })
+    const request = makeRequest(
+      'install', staged, manifests([staged], [staged.dependencyId]), (await harness.service.inspect()).revision
+    )
+    await harness.service.execute(request)
+    const controlRoot = join(harness.root, '.plugins.dyson-control')
+    await rm(join(controlRoot, 'receipts', `${request.requestId}.json`))
+
+    const interruptedRepair = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      hostMutationCoordinator: new RecordingHostMutationCoordinator(),
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true }),
+      faultInjector: async (phase) => {
+        if (phase === 'after-receipt-pending-synced') throw new Error('fictional receipt repair interruption')
+      }
+    })
+    await expect(interruptedRepair.execute(request)).rejects.toThrow('fictional receipt repair interruption')
+    expect(existsSync(join(controlRoot, 'transaction.lock'))).toBe(true)
+    expect(existsSync(join(controlRoot, 'receipts', `${request.requestId}.pending`))).toBe(true)
+
+    const restarted = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+    await expect(restarted.reconcileInterrupted(
+      request.requestId, 'candidate', activeHostMutationScope()
+    )).resolves.toMatchObject({ status: 'succeeded', reused: true })
+    expect(existsSync(join(controlRoot, 'transaction.lock'))).toBe(false)
+  })
+
+  it('performs zero writes when interrupted recovery evidence contains foreign bytes', async () => {
+    const harness = await createHarness()
+    const v1 = await stagePackage(harness.stagingRoot, 'Fictional-ForeignRecovery-1.0.0', {
+      'ForeignRecovery.dll': Buffer.from('stable-foreign-recovery')
+    })
+    const v2 = await stagePackage(harness.stagingRoot, 'Fictional-ForeignRecovery-2.0.0', {
+      'ForeignRecovery.dll': Buffer.from('candidate-foreign-recovery')
+    })
+    await harness.service.execute(makeRequest(
+      'install', v1, manifests([v1], [v1.dependencyId]), (await harness.service.inspect()).revision
+    ))
+    const before = await harness.service.inspect()
+    const request = makeRequest('update', v2, manifests([v2], [v2.dependencyId]), before.revision)
+    const requestPath = join(harness.root, `foreign-${request.requestId}.json`)
+    await writeFile(requestPath, `${JSON.stringify(request)}\n`, 'utf8')
+    await expect(runHardExitFixture(harness, requestPath, 'after-snapshot')).resolves.toBe(86)
+
+    const pendingRoot = join(harness.root, '.plugins.dyson-control', 'pending', request.requestId)
+    const payloadDirectory = (await readdir(pendingRoot, { withFileTypes: true }))
+      .find((entry) => entry.isDirectory())
+    expect(payloadDirectory).toBeDefined()
+    await writeFile(join(pendingRoot, payloadDirectory!.name, 'ForeignRecovery.dll'), 'foreign-bytes')
+    const evidence = await treeDigest(harness.root)
+    const restarted = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      hostMutationCoordinator: new RecordingHostMutationCoordinator(),
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+
+    await expect(restarted.reconcileInterrupted(
+      request.requestId, 'previous', activeHostMutationScope()
+    )).rejects.toThrow('MOD_DEPLOYMENT_RECOVERY_REQUIRED')
+    expect(await treeDigest(harness.root)).toBe(evidence)
+    expect(existsSync(join(harness.root, '.plugins.dyson-control', 'transaction.lock'))).toBe(true)
   })
 
   it('keeps preview available at the finite snapshot limit but refuses another publication', async () => {
@@ -880,6 +1410,34 @@ async function createHarness(overrides: Partial<ModDeploymentServiceOptions> = {
     ...overrides
   })
   return { root, stagingRoot, pluginsRoot, service }
+}
+
+async function runHardExitFixture(
+  harness: Harness,
+  requestPath: string,
+  crashPhase: ModDeploymentFaultPhase | 'after-rollback-receipt-pending-synced'
+): Promise<number | null> {
+  const moduleDirectory = dirname(fileURLToPath(import.meta.url))
+  const apiRoot = join(moduleDirectory, '..', '..')
+  const fixturePath = join(moduleDirectory, 'deployment-hard-exit.fixture.ts')
+  return await new Promise<number | null>((resolvePromise, reject) => {
+    const child = spawn(process.execPath, [
+      '--import', 'tsx', fixturePath,
+      harness.stagingRoot, harness.pluginsRoot, requestPath, crashPhase
+    ], {
+      cwd: apiRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    })
+    let stderr = ''
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (chunk: string) => { stderr += chunk })
+    child.once('error', reject)
+    child.once('exit', (code) => {
+      if (code === 86) resolvePromise(code)
+      else reject(new Error(`hard-exit fixture failed with ${String(code)}: ${stderr.slice(0, 2_000)}`))
+    })
+  })
 }
 
 async function stagePackage(
@@ -991,6 +1549,26 @@ class RecordingHostMutationCoordinator implements HostMutationOperationCoordinat
     this.requests.length = 0
     this.outcomes.length = 0
     this.scopes.length = 0
+  }
+}
+
+class RecordingHostMutationRecoveryCoordinator implements HostMutationRecoveryOperationCoordinator {
+  readonly requests: HostMutationRecoveryOperationRequest[] = []
+  readonly outcomes: HostMutationOperationOutcome<unknown>[] = []
+  recoveryNotRequired = false
+  assertActive: () => void = () => {}
+
+  async runRecoveryExclusive<T>(
+    request: HostMutationRecoveryOperationRequest,
+    operation: HostMutationOperation<T>
+  ): Promise<T> {
+    this.requests.push({ ...request })
+    if (this.recoveryNotRequired) {
+      throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED')
+    }
+    const outcome = await operation(activeHostMutationScope(this.assertActive))
+    this.outcomes.push(outcome as HostMutationOperationOutcome<unknown>)
+    return unwrapHostMutationOutcome(outcome)
   }
 }
 

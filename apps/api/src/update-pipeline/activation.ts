@@ -4,6 +4,7 @@ import { constants } from 'node:fs'
 import type { BigIntStats } from 'node:fs'
 import {
   lstat,
+  link,
   mkdir,
   open,
   readFile,
@@ -25,6 +26,7 @@ import {
   hostMutationReturn,
   hostMutationThrow,
   type HostMutationOperationCoordinator,
+  type HostMutationRecoveryOperationCoordinator,
   type HostMutationOperationScope
 } from '../host-mutation/operation-coordinator.js'
 import {
@@ -126,9 +128,28 @@ interface StoredTransaction {
 
 interface ActivationHostMutationContext {
   readonly scope: HostMutationOperationScope
+  readonly recoveryRequestId: string | null
   markPossibleWrite(): void
   resolvePossibleWrite(): void
+  markLiveTerminalVerified(requestId: string, status: 'succeeded' | 'rolled-back'): void
+  liveTerminalIsVerified(requestId: string, status: 'succeeded' | 'rolled-back'): boolean
+  markRecoveryTerminalPersisted(requestId: string): void
+  recoveryTerminalWasPersisted(requestId: string): boolean
 }
+
+type RecoveryEvidence =
+  | Readonly<{
+      kind: 'replay'
+      envelope: StoredReceiptEnvelope
+      requiresBrokerRelease: boolean
+    }>
+  | Readonly<{
+      kind: 'pending'
+      journal: StoredTransactionJournal
+      receipt: StoredReceiptEnvelope | null
+      state: StoredActiveState
+      previousState: StoredActiveState
+    }>
 
 interface StoredActiveState {
   format: 'dyson-control-component-active-state'
@@ -325,6 +346,7 @@ export class ComponentUpdateActivationService {
   readonly #smoke: ComponentUpdateActivationOptions['smoke']
   readonly #compatibilityVerifier: ComponentUpdateActivationOptions['compatibilityVerifier']
   readonly #hostMutationCoordinator: HostMutationOperationCoordinator | null
+  readonly #hostMutationRecoveryCoordinator: HostMutationRecoveryOperationCoordinator | null
   readonly #liveDeployment: FixedLiveComponentDeployment
   #activeHostMutationContext: ActivationHostMutationContext | null = null
   #tail: Promise<void> = Promise.resolve()
@@ -363,6 +385,7 @@ export class ComponentUpdateActivationService {
     }
     this.#compatibilityVerifier = options.compatibilityVerifier
     this.#hostMutationCoordinator = options.hostMutationCoordinator ?? null
+    this.#hostMutationRecoveryCoordinator = options.hostMutationRecoveryCoordinator ?? null
     this.#liveDeployment = new FixedLiveComponentDeployment({
       immutableReleaseRoot: path.join(this.#controlRoot, 'releases'),
       controlRoot: path.join(this.#controlRoot, 'live-deployment'),
@@ -476,9 +499,9 @@ export class ComponentUpdateActivationService {
                 expandedBytes,
                 activatedAt
               }
-              await this.#persistHistory(request.requestId, state)
+              await this.#persistHistory(request.requestId, state, context)
               context.markPossibleWrite()
-              await this.#persistJournal(transaction)
+              await this.#persistJournal(transaction, context)
               journalPersisted = true
               context.scope.assertActive()
               await this.#liveDeployment.publishCandidate(
@@ -515,7 +538,7 @@ export class ComponentUpdateActivationService {
                 expandedBytes,
                 completedAt: this.#timestamp()
               })
-              await this.#persistReceipt(fingerprint, receipt).catch(() => undefined)
+              await this.#persistReceipt(fingerprint, receipt, context).catch(() => undefined)
               throw new ComponentUpdateActivationError(normalized.code, { cause: normalized, receipt })
             }
           }
@@ -531,6 +554,63 @@ export class ComponentUpdateActivationService {
         { operation: 'component-update-reconciliation', requestId: randomUUID() },
         async (context) => await this.#reconcilePendingTransactions(context)
       ))
+    })
+  }
+
+  /**
+   * Explicit administrator recovery entry point. The caller supplies only the
+   * original activation request UUID; the host operation identity is fixed by
+   * this service and low-level lease bindings never cross the domain boundary.
+   */
+  async recoverInterrupted(requestIdInput: unknown): Promise<ComponentUpdateActivationReceipt> {
+    const requestId = requestIdSchema.parse(requestIdInput)
+    return await this.#serialize(async () => {
+      await this.#initialize()
+      await this.#proveRecoveryEvidence(requestId)
+      if (this.#hostMutationRecoveryCoordinator === null) {
+        throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE')
+      }
+      try {
+        return await this.#runRecoveryHostMutation(requestId, async (context) => {
+          return await this.#withCrossInstanceLock(async () => {
+            await this.#convergeRecoveryTemporaryEvidence(requestId, context)
+            // Re-read after the broker has consumed the exact recovery binding.
+            // Recovery temporary evidence is converged only while both the
+            // broker lease and the activation lock are held.
+            const current = await this.#proveRecoveryEvidence(requestId)
+            if (current.kind === 'replay') {
+              const matchingJournal = (await this.#readAllJournals(requestId))
+                .find((journal) => journal.transaction.requestId === requestId) ?? null
+              if (current.envelope.receipt.status === 'failed') {
+                if (matchingJournal !== null) {
+                  throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+                }
+              } else {
+                if (matchingJournal === null) {
+                  throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+                }
+                assertReceiptBoundToTransaction(current.envelope, matchingJournal.transaction)
+                await this.#proveRecoveryTerminalLayout(current.envelope, matchingJournal.transaction)
+              }
+              await this.#assertRecoveryReplayTerminal(current.envelope, requestId, context)
+              context.markRecoveryTerminalPersisted(requestId)
+              return { ...current.envelope.receipt, reused: true }
+            }
+            return await this.#reconcileJournal(current.journal, context, true)
+          }, context)
+        })
+      } catch (error) {
+        if (!(error instanceof ComponentUpdateActivationError) ||
+            (error.code !== 'UPDATE_HOST_LEASE_RECOVERY_NOT_REQUIRED' &&
+             error.code !== 'UPDATE_HOST_LEASE_RECOVERY_MISMATCH')) throw error
+        // A clean broker or an unrelated recovery binding requires no mutation
+        // for this already-proven terminal. Exact matching bindings enter the
+        // recovery callback above and are released only after current layout
+        // evidence has been revalidated while holding the recovery lease.
+        const current = await this.#proveRecoveryEvidence(requestId)
+        if (current.kind !== 'replay') throw error
+        return { ...current.envelope.receipt, reused: true }
+      }
     })
   }
 
@@ -657,7 +737,8 @@ export class ComponentUpdateActivationService {
         expandedBytes: transaction.expandedBytes,
         completedAt: this.#timestamp()
       })
-      await this.#persistReceipt(transaction.requestFingerprint, receipt)
+      context.markLiveTerminalVerified(transaction.requestId, 'succeeded')
+      await this.#persistReceipt(transaction.requestFingerprint, receipt, context)
       return receipt
     }
 
@@ -690,7 +771,7 @@ export class ComponentUpdateActivationService {
         expandedBytes: transaction.expandedBytes,
         completedAt: this.#timestamp()
       })
-      await this.#persistReceipt(transaction.requestFingerprint, receipt)
+      await this.#persistReceipt(transaction.requestFingerprint, receipt, context)
       throw new CandidateHandledError(receipt)
     }
 
@@ -724,7 +805,7 @@ export class ComponentUpdateActivationService {
         expandedBytes: transaction.expandedBytes,
         completedAt: this.#timestamp()
       })
-      await this.#persistReceipt(transaction.requestFingerprint, receipt)
+      await this.#persistReceipt(transaction.requestFingerprint, receipt, context)
       throw new CandidateHandledError(receipt, { cause: error })
     }
 
@@ -758,7 +839,8 @@ export class ComponentUpdateActivationService {
         expandedBytes: transaction.expandedBytes,
         completedAt: this.#timestamp()
       })
-      await this.#persistReceipt(transaction.requestFingerprint, receipt)
+      context.markLiveTerminalVerified(transaction.requestId, 'rolled-back')
+      await this.#persistReceipt(transaction.requestFingerprint, receipt, context)
       return receipt
     }
 
@@ -778,7 +860,7 @@ export class ComponentUpdateActivationService {
       expandedBytes: transaction.expandedBytes,
       completedAt: this.#timestamp()
     })
-    await this.#persistReceipt(transaction.requestFingerprint, receipt)
+    await this.#persistReceipt(transaction.requestFingerprint, receipt, context)
     return receipt
   }
 
@@ -787,13 +869,25 @@ export class ComponentUpdateActivationService {
   ): Promise<ComponentUpdateActivationReceipt | null> {
     const journals = await this.#readPendingJournals()
     if (journals.length === 0) return null
+    if (journals.length > 1) throw new ComponentUpdateActivationError('UPDATE_RECONCILIATION_AMBIGUOUS')
+    return await this.#reconcileJournal(journals[0]!, context, false)
+  }
+
+  async #reconcileJournal(
+    journal: StoredTransactionJournal,
+    context: ActivationHostMutationContext,
+    allowRecoveryReceipt: boolean
+  ): Promise<ComponentUpdateActivationReceipt | null> {
     // Any unresolved durable journal is evidence that a prior host write may
     // already have happened, even before this reconciliation performs I/O.
     context.markPossibleWrite()
-    if (journals.length > 1) throw new ComponentUpdateActivationError('UPDATE_RECONCILIATION_AMBIGUOUS')
-    const journal = journals[0]!
     const existing = await this.#readReceipt(journal.transaction.requestId)
-    if (existing !== null) return null
+    if (existing !== null) {
+      if (existing.requestFingerprint !== journal.transaction.requestFingerprint) {
+        throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+      }
+      if (!allowRecoveryReceipt || !existing.receipt.recoveryRequired) return null
+    }
     const state = await this.#loadState(true)
     const previousState = await this.#loadHistory(journal.transaction.requestId)
     if (previousState.revision !== journal.transaction.previousRevision) {
@@ -802,7 +896,17 @@ export class ComponentUpdateActivationService {
     if (state.lastTransaction?.requestId === journal.transaction.requestId &&
         state.lastTransaction.requestFingerprint === journal.transaction.requestFingerprint) {
       const active = state.components.find((component) => component.component === journal.transaction.component)
-      if (state.recoveryRequired || active?.releaseId !== journal.transaction.releaseId ||
+      let desired: 'candidate' | 'previous' = 'candidate'
+      if (state.recoveryRequired) {
+        if (!allowRecoveryReceipt) {
+          throw new ComponentUpdateActivationError('UPDATE_RECONCILIATION_UNCERTAIN')
+        }
+        const layout = classifyRecoveryStateLayout(state, previousState, journal.transaction)
+        if (layout === 'unknown') {
+          throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+        }
+        desired = layout
+      } else if (active?.releaseId !== journal.transaction.releaseId ||
           active.version !== journal.transaction.targetVersion || active.artifactId !== journal.transaction.artifactId) {
         throw new ComponentUpdateActivationError('UPDATE_RECONCILIATION_UNCERTAIN')
       }
@@ -811,7 +915,7 @@ export class ComponentUpdateActivationService {
         context.scope.assertActive()
         liveResult = await this.#liveDeployment.reconcileCandidate(
           transactionToLiveRequest(journal.transaction),
-          'candidate',
+          desired,
           context.scope
         )
         context.scope.assertActive()
@@ -823,10 +927,17 @@ export class ComponentUpdateActivationService {
         await this.#writeActiveState(previousState, context)
         return await this.#finishInterruptedPrevious(journal.transaction, previousState, context)
       }
+      if (desired === 'previous') {
+        throw new ComponentUpdateActivationError('UPDATE_RECONCILIATION_UNCERTAIN')
+      }
+      const candidateState = state.recoveryRequired
+        ? clearRecoveryState(state, journal.transaction)
+        : state
+      if (candidateState !== state) await this.#writeActiveState(candidateState, context)
       return await this.#finishActivatedTransaction(
         journal.transaction,
         previousState,
-        state,
+        candidateState,
         'reconcile-candidate',
         context
       )
@@ -881,7 +992,7 @@ export class ComponentUpdateActivationService {
         true,
         this.#timestamp()
       )
-      await this.#persistReceipt(transaction.requestFingerprint, failed)
+      await this.#persistReceipt(transaction.requestFingerprint, failed, context)
       return failed
     }
     const rolledBack = journalToReceipt(
@@ -893,7 +1004,8 @@ export class ComponentUpdateActivationService {
       false,
       this.#timestamp()
     )
-    await this.#persistReceipt(transaction.requestFingerprint, rolledBack)
+    context.markLiveTerminalVerified(transaction.requestId, 'rolled-back')
+    await this.#persistReceipt(transaction.requestFingerprint, rolledBack, context)
     return rolledBack
   }
 
@@ -915,7 +1027,7 @@ export class ComponentUpdateActivationService {
       true,
       this.#timestamp()
     )
-    await this.#persistReceipt(transaction.requestFingerprint, failed)
+    await this.#persistReceipt(transaction.requestFingerprint, failed, context)
     return failed
   }
 
@@ -1112,7 +1224,11 @@ export class ComponentUpdateActivationService {
     }
   }
 
-  async #persistHistory(requestId: string, state: StoredActiveState): Promise<void> {
+  async #persistHistory(
+    requestId: string,
+    state: StoredActiveState,
+    context: ActivationHostMutationContext
+  ): Promise<void> {
     const historyPath = managedChild(this.#controlRoot, 'history', `${requestId}.json`)
     const existing = await readJsonIfPresent(historyPath)
     const envelope = { format: 'dyson-control-component-update-history', schemaVersion: 1, requestId, state }
@@ -1120,11 +1236,30 @@ export class ComponentUpdateActivationService {
       if (canonicalJson(existing) !== canonicalJson(envelope)) throw new ComponentUpdateActivationError('UPDATE_HISTORY_CONFLICT')
       return
     }
-    await writeImmutableJson(historyPath, envelope)
+    await writeImmutableJson(historyPath, envelope, context.scope)
   }
 
   async #loadHistory(requestId: string): Promise<StoredActiveState> {
     const historyPath = managedChild(this.#controlRoot, 'history', `${requestId}.json`)
+    return await this.#loadHistoryPath(historyPath, requestId)
+  }
+
+  async #loadRecoveryHistory(requestId: string): Promise<StoredActiveState> {
+    const historyRoot = managedChild(this.#controlRoot, 'history')
+    const finalPath = managedChild(historyRoot, `${requestId}.json`)
+    if (await pathExists(finalPath)) return await this.#loadHistoryPath(finalPath, requestId)
+    const temporary = (await readdir(historyRoot, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && !entry.isSymbolicLink() &&
+        isRecoveryTemporaryName(entry.name, requestId))
+    if (temporary.length !== 1) {
+      throw new ComponentUpdateActivationError(
+        temporary.length === 0 ? 'UPDATE_HISTORY_MISSING' : 'UPDATE_RECOVERY_EVIDENCE_INVALID'
+      )
+    }
+    return await this.#loadHistoryPath(managedChild(historyRoot, temporary[0]!.name), requestId)
+  }
+
+  async #loadHistoryPath(historyPath: string, requestId: string): Promise<StoredActiveState> {
     let value: unknown
     try {
       const info = await lstat(historyPath)
@@ -1152,7 +1287,10 @@ export class ComponentUpdateActivationService {
     return envelope.state
   }
 
-  async #persistJournal(transaction: StoredTransaction): Promise<void> {
+  async #persistJournal(
+    transaction: StoredTransaction,
+    context: ActivationHostMutationContext
+  ): Promise<void> {
     const journalPath = managedChild(this.#controlRoot, 'transactions', `${transaction.requestId}.json`)
     const value = journalSchema.parse({
       format: 'dyson-control-component-update-journal',
@@ -1164,15 +1302,26 @@ export class ComponentUpdateActivationService {
       if (canonicalJson(existing) !== canonicalJson(value)) throw new ComponentUpdateActivationError('UPDATE_JOURNAL_CONFLICT')
       return
     }
-    await writeImmutableJson(journalPath, value)
+    await writeImmutableJson(journalPath, value, context.scope)
   }
 
   async #readPendingJournals(): Promise<StoredTransactionJournal[]> {
+    const pending: StoredTransactionJournal[] = []
+    for (const journal of await this.#readAllJournals()) {
+      if (await this.#readReceipt(journal.transaction.requestId) === null) pending.push(journal)
+    }
+    return pending
+  }
+
+  async #readAllJournals(recoveryTemporaryRequestId?: string): Promise<StoredTransactionJournal[]> {
     const transactionsRoot = managedChild(this.#controlRoot, 'transactions')
     const entries = await readdir(transactionsRoot, { withFileTypes: true })
-    const journals: StoredTransactionJournal[] = []
+    const journals = new Map<string, StoredTransactionJournal>()
     for (const entry of entries.sort((left, right) => compareText(left.name, right.name))) {
-      if (!entry.isFile() || entry.isSymbolicLink() || !/^[0-9a-f-]{36}\.json$/i.test(entry.name)) {
+      const finalName = /^[0-9a-f-]{36}\.json$/i.test(entry.name)
+      const recoveryTemporary = recoveryTemporaryRequestId !== undefined &&
+        isRecoveryTemporaryName(entry.name, recoveryTemporaryRequestId)
+      if (!entry.isFile() || entry.isSymbolicLink() || (!finalName && !recoveryTemporary)) {
         throw new ComponentUpdateActivationError('UPDATE_JOURNAL_DIRECTORY_INVALID')
       }
       let journal: StoredTransactionJournal
@@ -1186,12 +1335,173 @@ export class ComponentUpdateActivationService {
       } catch (error) {
         throw new ComponentUpdateActivationError('UPDATE_JOURNAL_INVALID', { cause: error })
       }
-      if (await this.#readReceipt(journal.transaction.requestId) === null) journals.push(journal)
+      if (finalName && `${journal.transaction.requestId}.json`.toLowerCase() !== entry.name.toLowerCase()) {
+        throw new ComponentUpdateActivationError('UPDATE_JOURNAL_INVALID')
+      }
+      if (recoveryTemporary && journal.transaction.requestId !== recoveryTemporaryRequestId) {
+        throw new ComponentUpdateActivationError('UPDATE_JOURNAL_INVALID')
+      }
+      const existing = journals.get(journal.transaction.requestId)
+      if (existing !== undefined && canonicalJson(existing) !== canonicalJson(journal)) {
+        throw new ComponentUpdateActivationError('UPDATE_JOURNAL_CONFLICT')
+      }
+      journals.set(journal.transaction.requestId, journal)
     }
-    return journals
+    return [...journals.values()]
   }
 
-  async #persistReceipt(requestFingerprintValue: string, receipt: ComponentUpdateActivationReceipt): Promise<void> {
+  async #proveRecoveryEvidence(requestId: string): Promise<RecoveryEvidence> {
+    const requestedReceipt = await this.#readReceipt(requestId)
+    if (requestedReceipt !== null && !requestedReceipt.receipt.recoveryRequired) {
+      if (!isCoherentTerminalReceipt(requestedReceipt.receipt)) {
+        throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+      }
+      const matchingJournal = (await this.#readAllJournals(requestId))
+        .find((journal) => journal.transaction.requestId === requestId) ?? null
+      if (matchingJournal !== null) {
+        assertReceiptBoundToTransaction(requestedReceipt, matchingJournal.transaction)
+      } else if (requestedReceipt.receipt.status !== 'failed') {
+        throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+      }
+      const requiresBrokerRelease = await this.#hasRecoveryReceipt(requestId)
+      if (requiresBrokerRelease) {
+        if (matchingJournal === null) {
+          throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+        }
+        await this.#proveRecoveryTerminalLayout(requestedReceipt, matchingJournal.transaction)
+      }
+      return { kind: 'replay', envelope: requestedReceipt, requiresBrokerRelease }
+    }
+
+    const unresolved: Array<{
+      journal: StoredTransactionJournal
+      receipt: StoredReceiptEnvelope | null
+    }> = []
+    for (const journal of await this.#readAllJournals(requestId)) {
+      const receipt = await this.#readReceipt(journal.transaction.requestId)
+      if (receipt !== null && receipt.requestFingerprint !== journal.transaction.requestFingerprint) {
+        throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+      }
+      if (receipt === null || receipt.receipt.recoveryRequired) {
+        unresolved.push({ journal, receipt })
+      }
+    }
+    if (unresolved.length === 0) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_NOT_PENDING')
+    }
+    if (unresolved.length > 1) {
+      throw new ComponentUpdateActivationError('UPDATE_RECONCILIATION_AMBIGUOUS')
+    }
+    const target = unresolved[0]!
+    if (target.journal.transaction.requestId !== requestId) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_REQUEST_MISMATCH')
+    }
+    if (requestedReceipt !== target.receipt) {
+      // Both reads are within activation.lock. A non-identical object here is
+      // expected because envelopes are reparsed; compare the canonical proof.
+      if (canonicalJson(requestedReceipt) !== canonicalJson(target.receipt)) {
+        throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_CHANGED')
+      }
+    }
+
+    const [state, previousState] = await Promise.all([
+      this.#loadState(true),
+      this.#loadRecoveryHistory(requestId)
+    ])
+    const transaction = target.journal.transaction
+    if (previousState.revision !== transaction.previousRevision ||
+        !stateCanReconcileTransaction(state, previousState, transaction)) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+    }
+    if (target.receipt !== null) {
+      assertReceiptBoundToTransaction(target.receipt, transaction)
+      const receipt = target.receipt.receipt
+      const originalRecoveryState = state.recoveryRequired &&
+        receipt.resultingRevision === state.revision &&
+        sameStoredTransaction(state.lastTransaction, transaction)
+      const interruptedRecoveryTransition = !state.recoveryRequired &&
+        stateCanReconcileTransaction(state, previousState, transaction)
+      if (!isRecoveryRequiredReceipt(receipt) ||
+          (!originalRecoveryState && !interruptedRecoveryTransition)) {
+        throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+      }
+    }
+    return {
+      kind: 'pending',
+      journal: target.journal,
+      receipt: target.receipt,
+      state,
+      previousState
+    }
+  }
+
+  async #hasRecoveryReceipt(requestId: string): Promise<boolean> {
+    return await readJsonIfPresent(managedChild(
+      this.#controlRoot,
+      'recovery-receipts',
+      `${requestId}.json`
+    )) !== null
+  }
+
+  async #proveRecoveryTerminalLayout(
+    envelope: StoredReceiptEnvelope,
+    transaction: StoredTransaction
+  ): Promise<void> {
+    const [state, previousState] = await Promise.all([
+      this.#loadState(true),
+      this.#loadRecoveryHistory(transaction.requestId)
+    ])
+    if (previousState.revision !== transaction.previousRevision || state.recoveryRequired) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+    }
+    const receipt = envelope.receipt
+    if (receipt.status === 'succeeded') {
+      if (!sameStoredTransaction(state.lastTransaction, transaction) ||
+          classifyRecoveryStateLayout(state, previousState, transaction) !== 'candidate' ||
+          receipt.resultingRevision !== state.revision) {
+        throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+      }
+      return
+    }
+    if (receipt.status !== 'rolled-back' || receipt.resultingRevision !== previousState.revision ||
+        canonicalJson(state) !== canonicalJson(previousState)) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+    }
+  }
+
+  async #assertRecoveryReplayTerminal(
+    envelope: StoredReceiptEnvelope,
+    requestId: string,
+    context: ActivationHostMutationContext
+  ): Promise<void> {
+    context.scope.assertActive()
+    if (envelope.receipt.requestId !== requestId || envelope.receipt.recoveryRequired ||
+        !isCoherentTerminalReceipt(envelope.receipt)) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+    }
+    if (envelope.receipt.status === 'failed') {
+      const state = await this.#loadState(true)
+      if (state.recoveryRequired || envelope.receipt.previousRevision !== state.revision ||
+          envelope.receipt.resultingRevision !== state.revision ||
+          state.lastTransaction?.requestId === requestId) {
+        throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+      }
+      context.scope.assertActive()
+      return
+    }
+    if (envelope.receipt.status !== 'succeeded' && envelope.receipt.status !== 'rolled-back') {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+    }
+    context.markLiveTerminalVerified(requestId, envelope.receipt.status)
+    await this.#assertRecoveryTerminalReceipt(envelope.receipt, context)
+    context.scope.assertActive()
+  }
+
+  async #persistReceipt(
+    requestFingerprintValue: string,
+    receipt: ComponentUpdateActivationReceipt,
+    context?: ActivationHostMutationContext
+  ): Promise<void> {
     const envelope = receiptEnvelopeSchema.parse({
       format: 'dyson-control-component-update-receipt-envelope',
       schemaVersion: 1,
@@ -1201,23 +1511,108 @@ export class ComponentUpdateActivationService {
     const receiptPath = managedChild(this.#controlRoot, 'receipts', `${receipt.requestId}.json`)
     const existing = await this.#readReceipt(receipt.requestId)
     if (existing !== null) {
-      if (canonicalJson(existing) !== canonicalJson(envelope)) throw new ComponentUpdateActivationError('UPDATE_IDEMPOTENCY_CONFLICT')
+      if (canonicalJson(existing) === canonicalJson(envelope)) {
+        if (context?.recoveryRequestId === receipt.requestId && !receipt.recoveryRequired) {
+          await this.#assertRecoveryTerminalReceipt(receipt, context)
+          context.markRecoveryTerminalPersisted(receipt.requestId)
+        }
+        return
+      }
+      if (context?.recoveryRequestId !== receipt.requestId ||
+          !isValidRecoveryReceiptTransition(existing, envelope)) {
+        throw new ComponentUpdateActivationError('UPDATE_IDEMPOTENCY_CONFLICT')
+      }
+      await this.#assertRecoveryTerminalReceipt(receipt, context)
+      const recoveryReceiptPath = managedChild(
+        this.#controlRoot,
+        'recovery-receipts',
+        `${receipt.requestId}.json`
+      )
+      await writeImmutableJson(recoveryReceiptPath, envelope, context.scope)
+      context.markRecoveryTerminalPersisted(receipt.requestId)
       return
     }
-    await writeImmutableJson(receiptPath, envelope)
+    if (context?.recoveryRequestId === receipt.requestId && !receipt.recoveryRequired) {
+      await this.#assertRecoveryTerminalReceipt(receipt, context)
+      const recoveryReceiptPath = managedChild(
+        this.#controlRoot,
+        'recovery-receipts',
+        `${receipt.requestId}.json`
+      )
+      await writeImmutableJson(recoveryReceiptPath, envelope, context.scope)
+      context.markRecoveryTerminalPersisted(receipt.requestId)
+      return
+    }
+    await writeImmutableJson(receiptPath, envelope, context?.scope)
+    if (context?.recoveryRequestId === receipt.requestId && !receipt.recoveryRequired) {
+      context.markRecoveryTerminalPersisted(receipt.requestId)
+    }
   }
 
   async #readReceipt(requestId: string): Promise<StoredReceiptEnvelope | null> {
     const receiptPath = managedChild(this.#controlRoot, 'receipts', `${requestId}.json`)
-    const value = await readJsonIfPresent(receiptPath)
-    if (value === null) return null
+    const recoveryReceiptPath = managedChild(
+      this.#controlRoot,
+      'recovery-receipts',
+      `${requestId}.json`
+    )
+    const [value, recoveredValue] = await Promise.all([
+      readJsonIfPresent(receiptPath),
+      readJsonIfPresent(recoveryReceiptPath)
+    ])
+    if (value === null && recoveredValue === null) return null
     try {
-      const envelope = receiptEnvelopeSchema.parse(value)
-      if (envelope.receipt.requestId !== requestId) throw new Error('receipt/request mismatch')
-      return envelope
+      const envelope = value === null ? null : receiptEnvelopeSchema.parse(value)
+      const recovered = recoveredValue === null ? null : receiptEnvelopeSchema.parse(recoveredValue)
+      if (envelope?.receipt.requestId !== requestId && envelope !== null) {
+        throw new Error('receipt/request mismatch')
+      }
+      if (recovered?.receipt.requestId !== requestId && recovered !== null) {
+        throw new Error('recovery receipt/request mismatch')
+      }
+      if (recovered === null) return envelope
+      if (envelope === null) {
+        if (!isCoherentTerminalReceipt(recovered.receipt) ||
+            (recovered.receipt.status !== 'succeeded' && recovered.receipt.status !== 'rolled-back')) {
+          throw new Error('orphan recovery receipt is not terminal')
+        }
+        return recovered
+      }
+      if (!isValidRecoveryReceiptTransition(envelope, recovered)) {
+        throw new Error('invalid recovery receipt transition')
+      }
+      return recovered
     } catch (error) {
       throw new ComponentUpdateActivationError('UPDATE_RECEIPT_INVALID', { cause: error })
     }
+  }
+
+  async #assertRecoveryTerminalReceipt(
+    receipt: ComponentUpdateActivationReceipt,
+    context: ActivationHostMutationContext
+  ): Promise<void> {
+    context.scope.assertActive()
+    if (context.recoveryRequestId !== receipt.requestId || receipt.recoveryRequired ||
+        (receipt.status !== 'succeeded' && receipt.status !== 'rolled-back') ||
+        !context.liveTerminalIsVerified(receipt.requestId, receipt.status)) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+    }
+    const state = await this.#loadState(true)
+    if (state.recoveryRequired || state.revision !== receipt.resultingRevision) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+    }
+    if (receipt.status === 'succeeded') {
+      const active = state.components.find((component) => component.component === receipt.component)
+      if (active?.releaseId !== receipt.releaseId || active.artifactId !== receipt.artifactId ||
+          active.version !== receipt.targetVersion || receipt.failureCode !== null ||
+          receipt.rollbackVerified) {
+        throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+      }
+    } else if (state.revision !== receipt.previousRevision || !receipt.rollbackVerified ||
+        receipt.failureCode === null) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+    }
+    context.scope.assertActive()
   }
 
   async #writeActiveState(
@@ -1229,10 +1624,11 @@ export class ComponentUpdateActivationService {
     const temporary = managedChild(this.#controlRoot, `.active-${randomUUID()}.tmp`)
     context.scope.assertActive()
     context.markPossibleWrite()
-    await writeFile(temporary, `${canonicalJson(state)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
     try {
+      await writeDurableExclusive(temporary, `${canonicalJson(state)}\n`)
       context.scope.assertActive()
       await rename(temporary, activePath)
+      await syncDirectory(path.dirname(activePath))
       context.scope.assertActive()
     } catch (error) {
       if (error instanceof HostMutationLeaseError) throw error
@@ -1337,10 +1733,18 @@ export class ComponentUpdateActivationService {
         request,
         async (scope) => {
           let possibleWrite = false
+          let liveTerminal: { requestId: string; status: 'succeeded' | 'rolled-back' } | null = null
+          let recoveryTerminalRequestId: string | null = null
           const context: ActivationHostMutationContext = {
             scope,
+            recoveryRequestId: null,
             markPossibleWrite: () => { possibleWrite = true },
-            resolvePossibleWrite: () => { possibleWrite = false }
+            resolvePossibleWrite: () => { possibleWrite = false },
+            markLiveTerminalVerified: (requestId, status) => { liveTerminal = { requestId, status } },
+            liveTerminalIsVerified: (requestId, status) =>
+              liveTerminal?.requestId === requestId && liveTerminal.status === status,
+            markRecoveryTerminalPersisted: (requestId) => { recoveryTerminalRequestId = requestId },
+            recoveryTerminalWasPersisted: (requestId) => recoveryTerminalRequestId === requestId
           }
           if (this.#activeHostMutationContext !== null) {
             return hostMutationThrow<T>(
@@ -1384,6 +1788,89 @@ export class ComponentUpdateActivationService {
     }
   }
 
+  async #runRecoveryHostMutation(
+    requestId: string,
+    operation: (context: ActivationHostMutationContext) => Promise<ComponentUpdateActivationReceipt | null>
+  ): Promise<ComponentUpdateActivationReceipt> {
+    if (this.#hostMutationRecoveryCoordinator === null) {
+      throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE')
+    }
+    try {
+      return await this.#hostMutationRecoveryCoordinator.runRecoveryExclusive(
+        {
+          expectedOperation: 'component-update-activation',
+          expectedRequestId: requestId
+        },
+        async (scope) => {
+          let possibleWrite = false
+          let liveTerminal: { requestId: string; status: 'succeeded' | 'rolled-back' } | null = null
+          let recoveryTerminalRequestId: string | null = null
+          const context: ActivationHostMutationContext = {
+            scope,
+            recoveryRequestId: requestId,
+            markPossibleWrite: () => { possibleWrite = true },
+            resolvePossibleWrite: () => { possibleWrite = false },
+            markLiveTerminalVerified: (verifiedRequestId, status) => {
+              liveTerminal = { requestId: verifiedRequestId, status }
+            },
+            liveTerminalIsVerified: (verifiedRequestId, status) =>
+              liveTerminal?.requestId === verifiedRequestId && liveTerminal.status === status,
+            markRecoveryTerminalPersisted: (persistedRequestId) => {
+              recoveryTerminalRequestId = persistedRequestId
+            },
+            recoveryTerminalWasPersisted: (persistedRequestId) =>
+              recoveryTerminalRequestId === persistedRequestId
+          }
+          if (this.#activeHostMutationContext !== null) {
+            return hostMutationThrow<ComponentUpdateActivationReceipt>(
+              new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE'),
+              'abandon'
+            )
+          }
+          this.#activeHostMutationContext = context
+          try {
+            scope.assertActive()
+            let result: ComponentUpdateActivationReceipt | null
+            try {
+              result = await operation(context)
+            } catch (error) {
+              if (error instanceof CandidateHandledError) result = error.receipt
+              else throw error
+            }
+            scope.assertActive()
+            if (result === null || result.requestId !== requestId) {
+              throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+            }
+            if (result.recoveryRequired) {
+              return hostMutationReturn(result, 'abandon')
+            }
+            if (!context.recoveryTerminalWasPersisted(requestId)) {
+              throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+            }
+            context.resolvePossibleWrite()
+            return hostMutationReturn(result, 'release')
+          } catch (error) {
+            // Every failure after explicit recovery acquisition is sticky. A
+            // caller can retry only through another exact broker-bound recovery.
+            if (error instanceof HostMutationLeaseError) throw error
+            return hostMutationThrow<ComponentUpdateActivationReceipt>(error, 'abandon')
+          } finally {
+            this.#activeHostMutationContext = null
+          }
+        }
+      )
+    } catch (error) {
+      if (error instanceof ComponentUpdateActivationError) throw error
+      if (error instanceof HostMutationOperationCoordinatorError) {
+        throw new ComponentUpdateActivationError(mapHostMutationCoordinatorCode(error.code))
+      }
+      if (error instanceof HostMutationLeaseError) {
+        throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_LOST')
+      }
+      throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE')
+    }
+  }
+
   async #mustAbandonHostLease(error: unknown, possibleWrite: boolean): Promise<boolean> {
     if (possibleWrite) return true
     if (error instanceof ComponentUpdateActivationError) {
@@ -1404,17 +1891,22 @@ export class ComponentUpdateActivationService {
       if (!isNodeError(error, 'EEXIST')) throw error
     })
     await assertDirectory(this.#controlRoot, this.#projectRoot)
-    for (const name of ['releases', 'history', 'receipts', 'transactions', '.pending', '.locks']) {
+    for (const name of [
+      'releases', 'history', 'receipts', 'recovery-receipts', 'transactions', '.pending', '.locks'
+    ]) {
       const directory = managedChild(this.#controlRoot, name)
       await mkdir(directory, { recursive: true })
       await assertDirectory(directory, this.#controlRoot)
     }
   }
 
-  async #withCrossInstanceLock<T>(operation: () => Promise<T>): Promise<T> {
+  async #withCrossInstanceLock<T>(
+    operation: () => Promise<T>,
+    recoveryContext?: ActivationHostMutationContext
+  ): Promise<T> {
     const lockPath = managedChild(this.#controlRoot, '.locks', 'activation.lock')
     const instanceId = randomUUID()
-    const handle = await this.#acquireLock(lockPath, instanceId)
+    const handle = await this.#acquireLock(lockPath, instanceId, recoveryContext)
     try {
       return await operation()
     } finally {
@@ -1424,61 +1916,187 @@ export class ComponentUpdateActivationService {
     }
   }
 
-  async #acquireLock(lockPath: string, instanceId: string): Promise<FileHandle> {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      let handle: FileHandle
-      try {
-        handle = await open(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
-      } catch (error) {
-        if (!isNodeError(error, 'EEXIST')) {
-          throw new ComponentUpdateActivationError('UPDATE_ACTIVATION_LOCK_FAILED', { cause: error })
+  async #acquireLock(
+    lockPath: string,
+    instanceId: string,
+    recoveryContext?: ActivationHostMutationContext
+  ): Promise<FileHandle> {
+    const lock = activationLockSchema.parse({
+      format: 'dyson-control-component-update-lock',
+      schemaVersion: 1,
+      host: hostname(),
+      bootId: currentBootId(),
+      pid: process.pid,
+      instanceId,
+      acquiredAt: this.#timestamp()
+    })
+    const candidatePath = managedChild(
+      this.#controlRoot,
+      '.locks',
+      `.activation-${instanceId}.tmp`
+    )
+    try {
+      // Publish a fully written record with one atomic hard link. A hard exit
+      // can therefore leave either no activation.lock or a complete one, never
+      // an O_EXCL-created empty/partial lock pathname.
+      await writeDurableExclusive(candidatePath, `${canonicalJson(lock)}\n`)
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await link(candidatePath, lockPath)
+          await syncDirectory(path.dirname(lockPath))
+          const handle = await open(lockPath, constants.O_RDONLY)
+          await unlink(candidatePath).catch(() => undefined)
+          return handle
+        } catch (error) {
+          if (!isNodeError(error, 'EEXIST')) {
+            const current = await this.#readLock(lockPath).catch(() => null)
+            if (current?.instanceId === instanceId) await unlink(lockPath).catch(() => undefined)
+            throw new ComponentUpdateActivationError('UPDATE_ACTIVATION_LOCK_FAILED', { cause: error })
+          }
+          const removed = attempt === 0 && (
+            await this.#removeProvablyStaleLock(lockPath) ||
+            (recoveryContext !== undefined &&
+              await this.#removeInvalidRecoveryLock(lockPath, recoveryContext))
+          )
+          if (!removed) {
+            throw new ComponentUpdateActivationError('UPDATE_ACTIVATION_LOCK_BUSY', { cause: error })
+          }
         }
-        if (attempt > 0 || !await this.#removeProvablyStaleLock(lockPath)) {
-          throw new ComponentUpdateActivationError('UPDATE_ACTIVATION_LOCK_BUSY', { cause: error })
-        }
-        continue
       }
-      try {
-        const lock = activationLockSchema.parse({
-          format: 'dyson-control-component-update-lock',
-          schemaVersion: 1,
-          host: hostname(),
-          bootId: currentBootId(),
-          pid: process.pid,
-          instanceId,
-          acquiredAt: this.#timestamp()
-        })
-        await handle.writeFile(`${canonicalJson(lock)}\n`, 'utf8')
-        await handle.sync()
-        return handle
-      } catch (error) {
-        await handle.close().catch(() => undefined)
-        await unlink(lockPath).catch(() => undefined)
-        throw new ComponentUpdateActivationError('UPDATE_ACTIVATION_LOCK_FAILED', { cause: error })
-      }
+      throw new ComponentUpdateActivationError('UPDATE_ACTIVATION_LOCK_BUSY')
+    } finally {
+      await unlink(candidatePath).catch(() => undefined)
     }
-    throw new ComponentUpdateActivationError('UPDATE_ACTIVATION_LOCK_BUSY')
   }
 
   async #removeProvablyStaleLock(lockPath: string): Promise<boolean> {
     let lock: z.infer<typeof activationLockSchema>
+    let identity: BigIntStats
     try {
+      identity = await lstat(lockPath, { bigint: true })
       lock = await this.#readLock(lockPath)
     } catch {
       return false
     }
     if (lock.host !== hostname()) return false
     if (lock.bootId !== currentBootId()) {
-      await unlink(lockPath).catch((error: unknown) => {
-        if (!isNodeError(error, 'ENOENT')) throw error
-      })
-      return true
+      return await this.#unlinkLockIdentity(lockPath, identity)
     }
     if (processIsAlive(lock.pid)) return false
-    await unlink(lockPath).catch((error: unknown) => {
-      if (!isNodeError(error, 'ENOENT')) throw error
+    return await this.#unlinkLockIdentity(lockPath, identity)
+  }
+
+  async #unlinkLockIdentity(lockPath: string, expected: BigIntStats): Promise<boolean> {
+    const current = await lstat(lockPath, { bigint: true }).catch((error: unknown) => {
+      if (isNodeError(error, 'ENOENT')) return null
+      throw error
     })
+    if (current === null) return true
+    if (!sameFileIdentity(expected, current)) return false
+    await unlink(lockPath)
+    await syncDirectory(path.dirname(lockPath))
     return true
+  }
+
+  async #removeInvalidRecoveryLock(
+    lockPath: string,
+    context: ActivationHostMutationContext
+  ): Promise<boolean> {
+    // A valid live lock is never stolen. This recovery-only path handles the
+    // O_EXCL-created zero/partial file left when the former process died before
+    // its lock record became durable.
+    try {
+      await this.#readLock(lockPath)
+      return false
+    } catch {
+      // Continue with strict pathname identity checks below.
+    }
+    const before = await lstat(lockPath, { bigint: true }).catch((error: unknown) => {
+      if (isNodeError(error, 'ENOENT')) return null
+      throw error
+    })
+    if (before === null) return true
+    if (!before.isFile() || before.isSymbolicLink() || before.size > 2_048) return false
+    context.scope.assertActive()
+    const current = await lstat(lockPath, { bigint: true }).catch((error: unknown) => {
+      if (isNodeError(error, 'ENOENT')) return null
+      throw error
+    })
+    if (current === null) return true
+    if (!sameFileIdentity(before, current)) return false
+    context.scope.assertActive()
+    await unlink(lockPath)
+    await syncDirectory(path.dirname(lockPath))
+    context.scope.assertActive()
+    return true
+  }
+
+  async #convergeRecoveryTemporaryEvidence(
+    requestId: string,
+    context: ActivationHostMutationContext
+  ): Promise<void> {
+    await this.#convergeRecoveryTemporaryFile(
+      managedChild(this.#controlRoot, 'history'),
+      requestId,
+      (value) => {
+        const schema = z.strictObject({
+          format: z.literal('dyson-control-component-update-history'),
+          schemaVersion: z.literal(1),
+          requestId: requestIdSchema,
+          state: storedStateSchema
+        })
+        const envelope = schema.parse(value)
+        validateStoredStateRevision(envelope.state)
+        if (envelope.requestId !== requestId) throw new Error('history/request mismatch')
+      },
+      context
+    )
+    await this.#convergeRecoveryTemporaryFile(
+      managedChild(this.#controlRoot, 'transactions'),
+      requestId,
+      (value) => {
+        const journal = journalSchema.parse(value)
+        if (journal.transaction.requestId !== requestId) throw new Error('journal/request mismatch')
+      },
+      context
+    )
+  }
+
+  async #convergeRecoveryTemporaryFile(
+    root: string,
+    requestId: string,
+    validate: (value: unknown) => void,
+    context: ActivationHostMutationContext
+  ): Promise<void> {
+    const entries = (await readdir(root, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && !entry.isSymbolicLink() &&
+        isRecoveryTemporaryName(entry.name, requestId))
+    if (entries.length > 1) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+    }
+    if (entries.length === 0) return
+    const temporary = managedChild(root, entries[0]!.name)
+    const finalPath = managedChild(root, `${requestId}.json`)
+    const temporaryValue = await readJsonIfPresent(temporary)
+    if (temporaryValue === null) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+    try {
+      validate(temporaryValue)
+    } catch (error) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID', { cause: error })
+    }
+    const finalValue = await readJsonIfPresent(finalPath)
+    context.scope.assertActive()
+    if (finalValue === null) {
+      await rename(temporary, finalPath)
+    } else {
+      validate(finalValue)
+      if (canonicalJson(finalValue) !== canonicalJson(temporaryValue)) {
+        throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+      }
+      await unlink(temporary)
+    }
+    await syncDirectory(root)
+    context.scope.assertActive()
   }
 
   async #readLock(lockPath: string): Promise<z.infer<typeof activationLockSchema>> {
@@ -1674,6 +2292,127 @@ function buildRecoveryState(state: StoredActiveState, transaction: StoredTransac
     lastTransaction: transaction
   }
   return { ...base, revision: computeStateRevision(base) }
+}
+
+function clearRecoveryState(
+  state: StoredActiveState,
+  transaction: StoredTransaction
+): StoredActiveState {
+  if (!state.recoveryRequired || !sameStoredTransaction(state.lastTransaction, transaction)) {
+    throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+  }
+  const base: Omit<StoredActiveState, 'revision'> = {
+    format: state.format,
+    schemaVersion: state.schemaVersion,
+    recoveryRequired: false,
+    components: state.components,
+    lastTransaction: transaction
+  }
+  return { ...base, revision: computeStateRevision(base) }
+}
+
+function stateCanReconcileTransaction(
+  state: StoredActiveState,
+  previousState: StoredActiveState,
+  transaction: StoredTransaction
+): boolean {
+  if (state.revision === previousState.revision && canonicalJson(state) === canonicalJson(previousState)) {
+    return true
+  }
+  if (!sameStoredTransaction(state.lastTransaction, transaction)) return false
+  if (state.recoveryRequired) {
+    return classifyRecoveryStateLayout(state, previousState, transaction) !== 'unknown'
+  }
+  return classifyRecoveryStateLayout(state, previousState, transaction) === 'candidate'
+}
+
+function classifyRecoveryStateLayout(
+  state: StoredActiveState,
+  previousState: StoredActiveState,
+  transaction: StoredTransaction
+): 'candidate' | 'previous' | 'unknown' {
+  if (canonicalJson(state.components) === canonicalJson(previousState.components)) return 'previous'
+  const active = state.components.find((component) => component.component === transaction.component)
+  if (active?.releaseId !== transaction.releaseId || active.artifactId !== transaction.artifactId ||
+      active.version !== transaction.targetVersion) {
+    return 'unknown'
+  }
+  const currentOthers = state.components.filter((component) => component.component !== transaction.component)
+  const previousOthers = previousState.components.filter((component) => component.component !== transaction.component)
+  return canonicalJson(currentOthers) === canonicalJson(previousOthers) &&
+    state.components.length === previousOthers.length + 1
+    ? 'candidate'
+    : 'unknown'
+}
+
+function sameStoredTransaction(
+  left: StoredTransaction | null,
+  right: StoredTransaction
+): boolean {
+  return left !== null && canonicalJson(left) === canonicalJson(right)
+}
+
+function isRecoveryRequiredReceipt(receipt: ComponentUpdateActivationReceipt): boolean {
+  return receipt.status === 'rollback-failed' && receipt.recoveryRequired &&
+    !receipt.rollbackVerified && receipt.failureCode !== null
+}
+
+function assertReceiptBoundToTransaction(
+  envelope: StoredReceiptEnvelope,
+  transaction: StoredTransaction
+): void {
+  const receipt = envelope.receipt
+  if (envelope.requestFingerprint !== transaction.requestFingerprint) {
+    throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+  }
+  const bindings = [
+    [receipt.requestId, transaction.requestId],
+    [receipt.component, transaction.component],
+    [receipt.artifactId, transaction.artifactId],
+    [receipt.compatibilityReceiptId, transaction.compatibilityReceiptId],
+    [receipt.targetVersion, transaction.targetVersion],
+    [receipt.releaseId, transaction.releaseId],
+    [receipt.previousRevision, transaction.previousRevision],
+    [receipt.protectionBackupId, transaction.protectionBackupId],
+    [receipt.fileCount, transaction.fileCount],
+    [receipt.expandedBytes, transaction.expandedBytes]
+  ] as const
+  if (bindings.some(([actual, expected]) => actual !== expected)) {
+    throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+  }
+}
+
+function isCoherentTerminalReceipt(receipt: ComponentUpdateActivationReceipt): boolean {
+  if (receipt.recoveryRequired) return false
+  if (receipt.status === 'succeeded') {
+    return receipt.failureCode === null && !receipt.rollbackVerified
+  }
+  if (receipt.status === 'rolled-back') {
+    return receipt.failureCode !== null && receipt.rollbackVerified &&
+      receipt.resultingRevision === receipt.previousRevision
+  }
+  return receipt.status === 'failed' && receipt.failureCode !== null && !receipt.rollbackVerified
+}
+
+function isValidRecoveryReceiptTransition(
+  original: StoredReceiptEnvelope,
+  recovered: StoredReceiptEnvelope
+): boolean {
+  if (original.requestFingerprint !== recovered.requestFingerprint ||
+      !isRecoveryRequiredReceipt(original.receipt) || recovered.receipt.recoveryRequired) {
+    return false
+  }
+  const immutableKeys = [
+    'requestId', 'component', 'artifactId', 'compatibilityReceiptId', 'targetVersion',
+    'releaseId', 'previousRevision', 'protectionBackupId', 'fileCount', 'expandedBytes'
+  ] as const
+  if (immutableKeys.some((key) => original.receipt[key] !== recovered.receipt[key])) return false
+  if (recovered.receipt.status === 'succeeded') {
+    return recovered.receipt.failureCode === null && !recovered.receipt.rollbackVerified
+  }
+  return recovered.receipt.status === 'rolled-back' && recovered.receipt.failureCode !== null &&
+    recovered.receipt.rollbackVerified &&
+    recovered.receipt.resultingRevision === recovered.receipt.previousRevision
 }
 
 function initialStoredState(): StoredActiveState {
@@ -1910,6 +2649,26 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+function isRecoveryTemporaryName(name: string, requestId: string): boolean {
+  const prefix = `${requestId}.json.`.toLowerCase()
+  const lower = name.toLowerCase()
+  if (!lower.startsWith(prefix) || !lower.endsWith('.tmp')) return false
+  return requestIdSchema.safeParse(name.slice(prefix.length, -4)).success
+}
+
+function sameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino &&
+    left.birthtimeNs === right.birthtimeNs && left.mtimeNs === right.mtimeNs &&
+    left.size === right.size
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  return await lstat(filePath).then(() => true, (error: unknown) => {
+    if (isNodeError(error, 'ENOENT')) return false
+    throw error
+  })
+}
+
 async function readJsonIfPresent(filePath: string): Promise<unknown | null> {
   try {
     const info = await lstat(filePath)
@@ -1924,15 +2683,50 @@ async function readJsonIfPresent(filePath: string): Promise<unknown | null> {
   }
 }
 
-async function writeImmutableJson(filePath: string, value: unknown): Promise<void> {
+async function writeImmutableJson(
+  filePath: string,
+  value: unknown,
+  scope?: HostMutationOperationScope
+): Promise<void> {
   const temporary = `${filePath}.${randomUUID()}.tmp`
-  await writeFile(temporary, `${canonicalJson(value)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
   try {
+    scope?.assertActive()
+    await writeDurableExclusive(temporary, `${canonicalJson(value)}\n`)
+    scope?.assertActive()
     await rename(temporary, filePath)
+    await syncDirectory(path.dirname(filePath))
+    scope?.assertActive()
   } catch (error) {
+    if (error instanceof HostMutationLeaseError) throw error
     await unlink(temporary).catch(() => undefined)
     throw new ComponentUpdateActivationError('UPDATE_PERSISTENCE_FAILED', { cause: error })
   }
+}
+
+async function writeDurableExclusive(filePath: string, content: string): Promise<void> {
+  const handle = await open(filePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+  try {
+    await handle.writeFile(content, 'utf8')
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  let handle: FileHandle | null = null
+  try {
+    handle = await open(directory, constants.O_RDONLY)
+    await handle.sync()
+  } catch (error) {
+    if (process.platform !== 'win32' || !isDirectorySyncUnsupported(error)) throw error
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+function isDirectorySyncUnsupported(error: unknown): boolean {
+  return ['EINVAL', 'EPERM', 'EACCES', 'EISDIR'].some((code) => isNodeError(error, code))
 }
 
 function canonicalJson(value: unknown): string {
@@ -1984,6 +2778,8 @@ function mapHostMutationCoordinatorCode(code: string): string {
     case 'HOST_MUTATION_LEASE_BUSY': return 'UPDATE_HOST_LEASE_BUSY'
     case 'HOST_MUTATION_LEASE_DIRTY': return 'UPDATE_HOST_LEASE_DIRTY'
     case 'HOST_MUTATION_LEASE_RECOVERY_REQUIRED': return 'UPDATE_HOST_LEASE_RECOVERY_REQUIRED'
+    case 'HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED': return 'UPDATE_HOST_LEASE_RECOVERY_NOT_REQUIRED'
+    case 'HOST_MUTATION_LEASE_RECOVERY_MISMATCH': return 'UPDATE_HOST_LEASE_RECOVERY_MISMATCH'
     case 'HOST_MUTATION_LEASE_LOST': return 'UPDATE_HOST_LEASE_LOST'
     default: return 'UPDATE_HOST_LEASE_UNAVAILABLE'
   }

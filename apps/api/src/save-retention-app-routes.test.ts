@@ -1,6 +1,6 @@
 import os from 'node:os'
 import path from 'node:path'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { buildApplication, type BuiltApplication } from './app.js'
 import { loadConfig } from './config.js'
@@ -87,6 +87,29 @@ describe('application backup-retention wiring', () => {
       meta: { executionEnabled: false }
     })
 
+    const updateTransactions = path.join(projectRoot, '.dyson-control-updates', 'transactions')
+    await mkdir(updateTransactions, { recursive: true })
+    await mkdir(path.join(projectRoot, '.dyson-control-updates', 'receipts'), { recursive: true })
+    await writeFile(path.join(updateTransactions, 'unexpected.tmp'), 'invalid persisted update record')
+    const failClosedPreview = await application.app.inject({
+      method: 'POST', url: '/api/v1/backups/retention/preview',
+      headers: { origin: publicOrigin }, cookies: { dyson_session: cookie },
+      payload: {
+        referenceTime: '2026-08-31T08:00:00.000Z',
+        policy: {
+          keepLastHealthy: 3, keepDailyDays: 14, keepWeeklyWeeks: 8,
+          minimumHealthy: 2, allowUnhealthyDeletion: false
+        }
+      }
+    })
+    expect(failClosedPreview.statusCode).toBe(503)
+    expect(failClosedPreview.json()).toEqual({
+      error: {
+        code: 'SAVE_RETENTION_STORAGE_UNAVAILABLE',
+        message: '备份保留存储暂不可用'
+      }
+    })
+
     const execute = await application.app.inject({
       method: 'POST', url: '/api/v1/backups/retention/execute',
       headers: { origin: publicOrigin }, cookies: { dyson_session: cookie },
@@ -109,6 +132,34 @@ describe('application backup-retention wiring', () => {
       }
     })
   })
+
+  it('keeps an injected workspace read-only when no fixed project root can back the protection source', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'dyson-retention-read-only-'))
+    temporaryRoots.push(root)
+    const workspacePaths = {
+      saveRoot: path.join(root, 'saves'),
+      backupRoot: path.join(root, 'backups'),
+      configRoot: path.join(root, 'config'),
+      serverRoot: path.join(root, 'server')
+    }
+    await Promise.all(Object.values(workspacePaths).map(async (directory) => {
+      await mkdir(directory, { recursive: true })
+    }))
+
+    application = await buildApplication(testConfig(), { workspacePaths })
+    const cookie = await login()
+
+    const backups = await application.app.inject({
+      method: 'GET', url: '/api/v1/backups?pageSize=10', cookies: { dyson_session: cookie }
+    })
+    expect(backups.statusCode).toBe(200)
+    expect(backups.json()).toMatchObject({ data: { kind: 'backups', items: [] } })
+
+    const retention = await application.app.inject({
+      method: 'GET', url: '/api/v1/backups/retention/annotations', cookies: { dyson_session: cookie }
+    })
+    expect(retention.statusCode).toBe(404)
+  })
 })
 
 function createController(): BackupRetentionRoutesController {
@@ -119,7 +170,8 @@ function createController(): BackupRetentionRoutesController {
     execute: vi.fn(async () => ({ statusCode: 423, body: { error: { code: 'DISABLED', message: 'disabled' } } })),
     restore: vi.fn(async () => ({ statusCode: 423, body: { error: { code: 'DISABLED', message: 'disabled' } } })),
     previewPurge: vi.fn(async () => ({ statusCode: 200, body: { data: {} } })),
-    purge: vi.fn(async () => ({ statusCode: 423, body: { error: { code: 'DISABLED', message: 'disabled' } } }))
+    purge: vi.fn(async () => ({ statusCode: 423, body: { error: { code: 'DISABLED', message: 'disabled' } } })),
+    recover: vi.fn(async () => ({ statusCode: 423, body: { error: { code: 'DISABLED', message: 'disabled' } } }))
   }
 }
 

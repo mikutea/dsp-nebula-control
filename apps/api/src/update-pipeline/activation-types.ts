@@ -1,6 +1,7 @@
 import type { CompatibilityDecision } from '../updates/compatibility.js'
 import type {
   HostMutationOperationCoordinator,
+  HostMutationRecoveryOperationCoordinator,
   HostMutationOperationScope
 } from '../host-mutation/operation-coordinator.js'
 import type { TrustedCompatibilityAssertion } from './trusted-compatibility.js'
@@ -97,6 +98,12 @@ export interface ComponentUpdateActivationOptions extends ComponentUpdateActivat
    * it is absent; read-only preview and inspection remain available.
    */
   hostMutationCoordinator?: HostMutationOperationCoordinator
+  /**
+   * Explicit administrator-triggered recovery capability. It is deliberately
+   * separate from the ordinary coordinator so startup reconciliation cannot
+   * acquire a recovery lease implicitly.
+   */
+  hostMutationRecoveryCoordinator?: HostMutationRecoveryOperationCoordinator
   maximumArchiveBytes?: number
   maximumFileBytes?: number
   maximumExpandedBytes?: number

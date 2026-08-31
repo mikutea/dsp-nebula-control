@@ -26,11 +26,13 @@ const environmentSchema = z.object({
   DYSON_UPDATE_ACQUISITION_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_UPDATE_PREPARATION_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_UPDATE_ACTIVATION_ENABLED: z.enum(['true', 'false']).default('false'),
+  DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_UPDATE_INBOX_ROOT: z.string().optional(),
   DYSON_UPDATE_STAGING_ROOT: z.string().optional(),
   DYSON_UPDATE_COMPATIBILITY_POLICY_FILE: z.string().optional(),
   DYSON_MOD_IMPORT_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_MOD_DEPLOYMENT_ENABLED: z.enum(['true', 'false']).default('false'),
+  DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_MOD_STAGING_ROOT: z.string().optional(),
   DYSON_MOD_PLUGINS_ROOT: z.string().optional(),
   DYSON_MOD_SNAPSHOT_LIMIT: z.coerce.number().int().min(1).max(64).default(8),
@@ -92,11 +94,13 @@ export interface AppConfig {
   updateAcquisitionEnabled: boolean
   updatePreparationEnabled: boolean
   updateActivationEnabled: boolean
+  updateActivationRecoveryEnabled: boolean
   updateInboxRoot: string | null
   updateStagingRoot: string | null
   updateCompatibilityPolicyFile: string | null
   modImportEnabled: boolean
   modDeploymentEnabled: boolean
+  modDeploymentRecoveryEnabled: boolean
   modStagingRoot: string | null
   modPluginsRoot: string | null
   modSnapshotLimit: number
@@ -197,6 +201,20 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       throw new Error('DYSON_UPDATE_ACTIVATION_ENABLED requires a trusted compatibility policy file')
     }
   }
+  if (value.DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED === 'true') {
+    if (value.DYSON_PROVIDER !== 'windows') {
+      throw new Error('DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED requires the Windows provider')
+    }
+    if (value.DYSON_LIFECYCLE_ENABLED !== 'true') {
+      throw new Error('DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED requires lifecycle execution')
+    }
+    if (value.DYSON_UPDATE_STAGING_ENABLED !== 'true' || !value.DYSON_UPDATE_STAGING_ROOT) {
+      throw new Error('DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED requires offline update staging')
+    }
+    if (!value.DYSON_UPDATE_COMPATIBILITY_POLICY_FILE) {
+      throw new Error('DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED requires a trusted compatibility policy file')
+    }
+  }
   if ((value.DYSON_MOD_STAGING_ROOT === undefined) !== (value.DYSON_MOD_PLUGINS_ROOT === undefined)) {
     throw new Error('DYSON_MOD_STAGING_ROOT and DYSON_MOD_PLUGINS_ROOT must be configured together')
   }
@@ -236,6 +254,14 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     }
     if (!value.DYSON_MOD_STAGING_ROOT || !value.DYSON_MOD_PLUGINS_ROOT) {
       throw new Error('DYSON_MOD_DEPLOYMENT_ENABLED requires both fixed mod roots')
+    }
+  }
+  if (value.DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED === 'true') {
+    if (value.DYSON_PROVIDER !== 'windows') {
+      throw new Error('DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED requires the Windows provider')
+    }
+    if (!value.DYSON_MOD_STAGING_ROOT || !value.DYSON_MOD_PLUGINS_ROOT) {
+      throw new Error('DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED requires both fixed mod roots')
     }
   }
   if (value.DYSON_SAVE_MUTATIONS_ENABLED === 'true' && value.DYSON_PROVIDER !== 'windows') {
@@ -281,6 +307,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     updateAcquisitionEnabled: value.DYSON_UPDATE_ACQUISITION_ENABLED === 'true',
     updatePreparationEnabled: value.DYSON_UPDATE_PREPARATION_ENABLED === 'true',
     updateActivationEnabled: value.DYSON_UPDATE_ACTIVATION_ENABLED === 'true',
+    updateActivationRecoveryEnabled: value.DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED === 'true',
     updateInboxRoot: value.DYSON_UPDATE_INBOX_ROOT ? path.resolve(value.DYSON_UPDATE_INBOX_ROOT) : null,
     updateStagingRoot: value.DYSON_UPDATE_STAGING_ROOT ? path.resolve(value.DYSON_UPDATE_STAGING_ROOT) : null,
     updateCompatibilityPolicyFile: value.DYSON_UPDATE_COMPATIBILITY_POLICY_FILE
@@ -288,6 +315,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       : null,
     modImportEnabled: value.DYSON_MOD_IMPORT_ENABLED === 'true',
     modDeploymentEnabled: value.DYSON_MOD_DEPLOYMENT_ENABLED === 'true',
+    modDeploymentRecoveryEnabled: value.DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED === 'true',
     modStagingRoot: value.DYSON_MOD_STAGING_ROOT ? path.resolve(value.DYSON_MOD_STAGING_ROOT) : null,
     modPluginsRoot: value.DYSON_MOD_PLUGINS_ROOT ? path.resolve(value.DYSON_MOD_PLUGINS_ROOT) : null,
     modSnapshotLimit: value.DYSON_MOD_SNAPSHOT_LIMIT,

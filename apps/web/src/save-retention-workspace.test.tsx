@@ -192,6 +192,11 @@ function previewFixture(): BackupRetentionPreview {
       delete: [{ backupId: backups()[0]!.backupId, reason: 'outside-policy' }],
       blocked: []
     },
+    executionBatch: {
+      maximumCandidates: 128,
+      selectedBackupIds: [backups()[0]!.backupId],
+      deferredCandidateCount: 0
+    },
     excluded: [],
     inventoryDigest: 'b'.repeat(64),
     previewDigest: 'a'.repeat(64)

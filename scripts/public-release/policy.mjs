@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const POLICY_ID = 'dyson-public-release-hygiene'
-export const POLICY_VERSION = '1.4.0'
+export const POLICY_VERSION = '1.4.1'
 
 export const DEFAULT_LIMITS = Object.freeze({
   maximumWorktreeFiles: 50_000,
@@ -97,12 +97,18 @@ export const EXACT_ALLOWLIST = Object.freeze([
   },
   { scope: 'worktree', ruleId: 'HIGH_ENTROPY_SECRET_ASSIGNMENT', path: 'scripts/public-release/scanner.mjs' },
   { scope: 'worktree', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'apps/api/src/config.test.ts' },
+  // Fictional broker tokens are required to exercise redaction and lease-binding tests.
+  { scope: 'worktree', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'apps/api/src/host-mutation/lease.test.ts' },
+  { scope: 'worktree', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'apps/api/src/host-mutation/operation-coordinator.test.ts' },
   { scope: 'worktree', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'apps/api/src/update-pipeline/http.test.ts' },
   { scope: 'worktree', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'scripts/public-release/scanner.mjs' },
   { scope: 'worktree', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'scripts/public-release/scanner.test.mjs' },
   { scope: 'worktree', ruleId: 'STEAM_IDENTIFIER', path: 'apps/api/src/console/parser.test.ts' },
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'apps/api/src/client-profile/generator.test.ts' },
+  // These sources contain protocol/extended-path syntax, not a deployment endpoint.
+  { scope: 'worktree', ruleId: 'UNC_PATH', path: 'integrations/dyson-control-bridge/BridgeProtocol.cs' },
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/public-release/scanner.mjs' },
+  { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/windows/DysonHostMutationLease.Common.ps1' },
   { scope: 'worktree', ruleId: 'USER_ABSOLUTE_PATH', path: 'apps/api/src/update-pipeline/activation-http.test.ts' },
   {
     scope: 'history',
@@ -121,6 +127,24 @@ export const EXACT_ALLOWLIST = Object.freeze([
     ruleId: 'SECRET_LITERAL_ASSIGNMENT',
     path: 'apps/api/src/config.test.ts',
     blobId: '718d0f9d877e2ce7ecb9c3bbac0c6552312bdb88'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'apps/api/src/host-mutation/lease.test.ts',
+    blobId: 'c3c8cc1b2f28e3eee97a91daedf243c7e9f10043'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'apps/api/src/host-mutation/operation-coordinator.test.ts',
+    blobId: '4f6c8d2e5e1762c27d8731f68ab532edb885fc8c'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'apps/api/src/host-mutation/operation-coordinator.test.ts',
+    blobId: 'e9927a52a82cc77cb1f7b970709851ed1225ae73'
   },
   {
     scope: 'history',
@@ -167,6 +191,12 @@ export const EXACT_ALLOWLIST = Object.freeze([
   {
     scope: 'history',
     ruleId: 'UNC_PATH',
+    path: 'integrations/dyson-control-bridge/BridgeProtocol.cs',
+    blobId: '83819320c349b69730967a5cd4d1e473faf6d53f'
+  },
+  {
+    scope: 'history',
+    ruleId: 'UNC_PATH',
     path: 'scripts/public-release/scanner.mjs',
     blobId: '79caf486091e9f257d3f54cf365d2ed0a1a4e013'
   },
@@ -175,6 +205,18 @@ export const EXACT_ALLOWLIST = Object.freeze([
     ruleId: 'UNC_PATH',
     path: 'scripts/public-release/scanner.mjs',
     blobId: 'f9117ffbcd2c3d8636c35bccbc04d13907e678c0'
+  },
+  {
+    scope: 'history',
+    ruleId: 'UNC_PATH',
+    path: 'scripts/windows/DysonHostMutationLease.Common.ps1',
+    blobId: '21be43203aff9862b83bd2d069d337a963007fb2'
+  },
+  {
+    scope: 'history',
+    ruleId: 'UNC_PATH',
+    path: 'scripts/windows/DysonHostMutationLease.Common.ps1',
+    blobId: 'a0c8e57e1489beba0d2b2e92c7ccbde629314d30'
   }
 ])
 

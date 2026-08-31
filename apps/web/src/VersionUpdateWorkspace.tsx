@@ -14,7 +14,7 @@ import type {
   ManagedUpdateComponent, ServerStatus, SessionUser,
   SupportedComponentCandidatePreparationComponent,
   UpdateActivationConfirmation, UpdateActivationOperation, UpdateActivationPlan,
-  UpdateActivationReceipt, UpdateActivationRequest, UpdateActivationState,
+  UpdateActivationReceipt, UpdateActivationRecoveryStatus, UpdateActivationRequest, UpdateActivationState,
   UpdateCleanupPlan, UpdateCompatibilityPreparationRequest, UpdateCompatibilityReceipt,
   UpdateCompatibilityStatus
 } from './model'
@@ -68,6 +68,7 @@ const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}
 const acquisitionConfirmation = 'ACQUIRE_UPDATE_ARTIFACT'
 const preparationConfirmation = 'PREPARE_COMPONENT_CANDIDATE'
 const compatibilityConfirmation = 'PREPARE_COMPATIBILITY_EVIDENCE'
+const recoveryConfirmation = 'RECOVER_COMPONENT_UPDATE' as const
 
 export function VersionUpdateWorkspace({ status, demo, user }: {
   status: ServerStatus
@@ -75,6 +76,10 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
   user: SessionUser
 }) {
   const [activationState, setActivationState] = useState<UpdateActivationState | null>(null)
+  const [recoveryStatus, setRecoveryStatus] = useState<UpdateActivationRecoveryStatus | null>(null)
+  const [recoveryRequestId, setRecoveryRequestId] = useState('')
+  const [recoveryConfirmationInput, setRecoveryConfirmationInput] = useState('')
+  const [recovering, setRecovering] = useState(false)
   const [cleanupPlan, setCleanupPlan] = useState<UpdateCleanupPlan | null>(null)
   const [compatibilityStatus, setCompatibilityStatus] = useState<UpdateCompatibilityStatus | null>(null)
   const [compatibilityReceipt, setCompatibilityReceipt] = useState<UpdateCompatibilityReceipt | null>(null)
@@ -139,11 +144,18 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
   const canStage = user.role !== 'viewer' && user.permissions.includes('updates.stage')
   const requiredConfirmation = componentConfirmations[draft.component]
   const selectedActive = activationState?.components.find((entry) => entry.component === draft.component) ?? null
+  const activationMutationBlocked = activationState === null ||
+    recoveryStatus === null ||
+    recoveryStatus.phase !== 'ready' ||
+    recoveryStatus.mutationBlocked ||
+    recoveryStatus.recoveryRequired ||
+    activationState.recoveryRequired
 
   const load = useCallback(async (signal?: AbortSignal, showLoading = true) => {
     if (showLoading) setLoading(true)
     if (demo) {
       setActivationState(fictionalActivationState)
+      setRecoveryStatus(fictionalActivationRecoveryStatus)
       setCleanupPlan(fictionalCleanupPlan)
       setCompatibilityStatus(fictionalCompatibilityStatus)
       setDraft((current) => current.expectedRevision
@@ -155,8 +167,9 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
       return
     }
 
-    const [stateResult, cleanupResult, compatibilityResult] = await Promise.allSettled([
+    const [stateResult, recoveryResult, cleanupResult, compatibilityResult] = await Promise.allSettled([
       api.updateActivationState(signal),
+      api.updateActivationRecoveryStatus(signal),
       api.updateActivationCleanupPreview(signal),
       api.updateCompatibilityStatus(signal)
     ])
@@ -170,6 +183,16 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
     } else {
       errors.push(formatActivationError(stateResult.reason, '活动组件状态暂不可用。'))
       if (isClosedGateFailure(stateResult.reason)) setGateSignal('fail-closed')
+    }
+    if (recoveryResult.status === 'fulfilled') {
+      const nextRecovery = recoveryResult.value.data
+      setRecoveryStatus(nextRecovery)
+      if (nextRecovery.reconciledRequestId) {
+        setRecoveryRequestId((current) => current || nextRecovery.reconciledRequestId || '')
+      }
+    } else {
+      setRecoveryStatus(null)
+      errors.push(formatActivationError(recoveryResult.reason, '显式恢复状态暂不可用；更新写入保持锁定。'))
     }
     if (cleanupResult.status === 'fulfilled') setCleanupPlan(cleanupResult.value.data)
     else errors.push(formatActivationError(cleanupResult.reason, '只读清理预演暂不可用。'))
@@ -776,7 +799,7 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
 
   async function executeActivation(): Promise<void> {
     if (!preparedRequest || !plan || !canActivate || demo || gateSignal === 'fail-closed'
-        || confirmation !== requiredConfirmation || activationState?.recoveryRequired) return
+        || confirmation !== requiredConfirmation || activationMutationBlocked) return
     const controller = replaceAbortController(operationAbort)
     const sequence = ++operationSequence.current
     setExecuting(true)
@@ -803,10 +826,44 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
     } catch (reason) {
       if (sequence === operationSequence.current && !controller.signal.aborted) {
         if (isClosedGateFailure(reason)) setGateSignal('fail-closed')
+        setRecoveryRequestId((current) => current || preparedRequest.requestId)
         setWorkflowError(formatActivationError(reason, '组件激活被拒绝；预演与逻辑请求保持不变。'))
+        await load(undefined, false)
       }
     } finally {
       if (sequence === operationSequence.current) setExecuting(false)
+    }
+  }
+
+  async function recoverActivation(): Promise<void> {
+    const requestId = recoveryRequestId.trim().toLowerCase()
+    if (!canActivate || demo || recoveryStatus?.phase !== 'recovery-required' ||
+        !uuidPattern.test(requestId) || recoveryConfirmationInput !== recoveryConfirmation) return
+    const controller = replaceAbortController(operationAbort)
+    const sequence = ++operationSequence.current
+    setRecovering(true)
+    setWorkflowError('')
+    setReceiptVerified(false)
+    try {
+      const result = await api.recoverUpdateActivation(requestId, recoveryConfirmation, controller.signal)
+      if (sequence !== operationSequence.current || controller.signal.aborted) return
+      setReceipt(result.data)
+      const persisted = await api.updateActivationReceipt(requestId, controller.signal)
+      if (sequence !== operationSequence.current || controller.signal.aborted) return
+      setReceipt(persisted.data)
+      setReceiptVerified(true)
+      setRecoveryConfirmationInput('')
+      await load(undefined, false)
+    } catch (reason) {
+      if (sequence === operationSequence.current && !controller.signal.aborted) {
+        setWorkflowError(formatActivationError(
+          reason,
+          '显式恢复没有得到可验证终态；恢复门禁保持关闭，禁止普通激活。'
+        ))
+        await load(undefined, false)
+      }
+    } finally {
+      if (sequence === operationSequence.current) setRecovering(false)
     }
   }
 
@@ -870,11 +927,25 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
 
     <section className="update-state-deck">
       <div><span>ACTIVE REVISION</span><strong>{activationState ? shortHash(activationState.revision, 16) : 'UNAVAILABLE'}</strong><small>{activationState ? `${activationState.components.length} 个托管组件` : '事务未配置或状态不可读'}</small></div>
-      <div><span>RECOVERY FLAG</span><strong className={activationState?.recoveryRequired ? 'danger' : 'green'}>{activationState ? activationState.recoveryRequired ? 'REQUIRED' : 'CLEAR' : 'UNKNOWN'}</strong><small>{activationState?.recoveryRequired ? '必须先离线证明恢复状态' : '没有活动恢复标志'}</small></div>
+      <div><span>RECOVERY FLAG</span><strong className={activationState?.recoveryRequired || recoveryStatus?.recoveryRequired ? 'danger' : 'green'}>{activationState ? activationState.recoveryRequired || recoveryStatus?.recoveryRequired ? 'REQUIRED' : 'CLEAR' : 'UNKNOWN'}</strong><small>{activationState?.recoveryRequired || recoveryStatus?.recoveryRequired ? '必须先执行精确 broker-bound 恢复' : '没有活动恢复标志'}</small></div>
       <div><span>HISTORY</span><strong>{activationState?.historyEntries ?? '—'}</strong><small>有界审计安全回执</small></div>
       <div className={gateSignal === 'fail-closed' ? 'gate-closed' : gateSignal === 'accepted' ? 'gate-open' : ''}><span>EXECUTION GATE</span><strong>{gateLabel}</strong><small>{gateDetail}</small></div>
       <div><span>DSP CHANNEL</span><strong className="amber">STEAM MANUAL</strong><small>不可通过组件激活事务更新</small></div>
     </section>
+
+    {(activationState?.recoveryRequired || recoveryStatus?.phase === 'recovery-required') && <section className="update-execution-confirm update-recovery-confirm">
+      <div><TriangleAlert size={22} /><span><strong>组件事务需要显式恢复</strong><small>输入原始 request ID 和固定确认 <code>{recoveryConfirmation}</code>。服务端只会恢复该 ID 已持久化且与全局租约绑定的事务；浏览器不能选择路径、组件或回滚目标。</small></span></div>
+      <input aria-label="待恢复组件事务 UUID" value={recoveryRequestId}
+        onChange={(event) => setRecoveryRequestId(event.target.value.slice(0, 36))}
+        placeholder="00000000-0000-4000-8000-000000000000" autoComplete="off" spellCheck={false} />
+      <input aria-label="组件恢复精确确认" value={recoveryConfirmationInput}
+        onChange={(event) => setRecoveryConfirmationInput(event.target.value)}
+        placeholder={recoveryConfirmation} autoComplete="off" />
+      <button type="button" className="confirm-execute" onClick={() => void recoverActivation()}
+        disabled={recovering || !canActivate || demo || recoveryStatus?.phase !== 'recovery-required' || !uuidPattern.test(recoveryRequestId.trim()) || recoveryConfirmationInput !== recoveryConfirmation}>
+        {recovering ? '恢复证明执行中…' : !canActivate ? '需要 Administrator' : '执行精确显式恢复'}
+      </button>
+    </section>}
 
     <section className="dsp-manual-channel">
       <span className="dsp-channel-mark"><CloudDownload size={22} /></span>
@@ -954,9 +1025,9 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
 
       <section className="update-execution-confirm">
         <div><TriangleAlert size={22} /><span><strong>组件专属精确确认</strong><small>输入 <code>{requiredConfirmation}</code>。服务端会重新核验 request、artifact、SHA-256、revision、兼容性和停止态；UI 权限不是安全边界。</small></span></div>
-        <input aria-label="组件激活精确确认" value={confirmation} disabled={!canActivate || demo || gateSignal === 'fail-closed'} onChange={(event) => setConfirmation(event.target.value)} placeholder={requiredConfirmation} autoComplete="off" />
-        <button type="button" className="confirm-execute" disabled={executing || !canActivate || demo || gateSignal === 'fail-closed' || confirmation !== requiredConfirmation || activationState?.recoveryRequired}
-          onClick={() => void executeActivation()}>{executing ? '事务执行中…' : !canActivate ? '需要 Administrator' : demo ? '演示环境不执行' : gateSignal === 'fail-closed' ? '服务端门禁已关闭' : '提交服务端激活门禁'}</button>
+        <input aria-label="组件激活精确确认" value={confirmation} disabled={!canActivate || demo || gateSignal === 'fail-closed' || activationMutationBlocked} onChange={(event) => setConfirmation(event.target.value)} placeholder={requiredConfirmation} autoComplete="off" />
+        <button type="button" className="confirm-execute" disabled={executing || !canActivate || demo || gateSignal === 'fail-closed' || activationMutationBlocked || confirmation !== requiredConfirmation}
+          onClick={() => void executeActivation()}>{executing ? '事务执行中…' : !canActivate ? '需要 Administrator' : demo ? '演示环境不执行' : gateSignal === 'fail-closed' ? '服务端门禁已关闭' : activationMutationBlocked ? '恢复状态保持锁定' : '提交服务端激活门禁'}</button>
       </section>
     </>}
 
@@ -1969,6 +2040,15 @@ const fictionalActivationState: UpdateActivationState = {
     { component: 'control', version: '1.2.0', artifactId: 'fictional-control-active-0001', releaseId: `control-${'d'.repeat(32)}` }
   ],
   historyEntries: 4
+}
+
+const fictionalActivationRecoveryStatus: UpdateActivationRecoveryStatus = {
+  schemaVersion: 1,
+  phase: 'ready',
+  mutationBlocked: false,
+  recoveryRequired: false,
+  failureCode: null,
+  reconciledRequestId: null
 }
 
 const fictionalCleanupPlan: UpdateCleanupPlan = {

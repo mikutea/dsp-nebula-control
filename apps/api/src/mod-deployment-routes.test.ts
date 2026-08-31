@@ -5,6 +5,7 @@ import {
   createModPlatformLock,
   generateModManifests,
   ModDeploymentError,
+  type ModDeploymentRecoveryStatus,
   type ModDeploymentRequest
 } from './mods/index.js'
 import { DemoProvider } from './providers/demo.js'
@@ -40,7 +41,8 @@ describe('authenticated mod deployment routes', () => {
     expect(unauthenticated.statusCode).toBe(401)
     for (const url of [
       `/api/v1/mods/deployment/receipts/${deploymentRequest().requestId}`,
-      '/api/v1/mods/deployment/history'
+      '/api/v1/mods/deployment/history',
+      '/api/v1/mods/deployment/recovery/status'
     ]) {
       const protectedResponse = await application.app.inject({ method: 'GET', url })
       expect(protectedResponse.statusCode).toBe(401)
@@ -67,6 +69,15 @@ describe('authenticated mod deployment routes', () => {
         executeSupported: false,
         candidates: [{ id: 'snapshot-fictional-0001', kind: 'snapshot' }]
       }
+    })
+    const recoveryStatus = await application.app.inject({
+      method: 'GET', url: '/api/v1/mods/deployment/recovery/status',
+      cookies: { dyson_session: cookie }
+    })
+    expect(recoveryStatus.statusCode).toBe(200)
+    expect(recoveryStatus.json()).toEqual({
+      data: { phase: 'ready', requestId: null, operation: null, allowedDesired: [] },
+      meta: { executionEnabled: false }
     })
     const history = await application.app.inject({
       method: 'GET', url: '/api/v1/mods/deployment/history', cookies: { dyson_session: cookie }
@@ -167,6 +178,81 @@ describe('authenticated mod deployment routes', () => {
       }
     })
     expect(service.execute).toHaveBeenCalledWith(request)
+  })
+
+  it('keeps explicit recovery behind an independent administrator gate and exact request contract', async () => {
+    const service = deploymentService()
+    const requestId = deploymentRequest().requestId
+    service.recoveryStatus.mockResolvedValueOnce({
+      phase: 'recovery-required', requestId, operation: 'install',
+      allowedDesired: ['candidate', 'previous']
+    })
+    application = await buildApplication(recoveryEnabledConfig(), {
+      statusProvider: new DemoProvider(),
+      modDeploymentService: service
+    })
+    const administrator = await login(application)
+    const operator = await login(application, 'operator', 'fictional-operator-password')
+
+    const status = await application.app.inject({
+      method: 'GET', url: '/api/v1/mods/deployment/recovery/status',
+      cookies: { dyson_session: operator }
+    })
+    expect(status.statusCode).toBe(200)
+    expect(status.json()).toEqual({
+      data: {
+        phase: 'recovery-required', requestId, operation: 'install',
+        allowedDesired: ['candidate', 'previous']
+      },
+      meta: { executionEnabled: true }
+    })
+
+    const forbidden = await post(application, operator, '/api/v1/mods/deployment/recovery/execute', {
+      requestId, desired: 'previous', confirmation: 'RECOVER_MOD_DEPLOYMENT'
+    })
+    expect(forbidden.statusCode).toBe(403)
+    expect(service.recoverInterrupted).not.toHaveBeenCalled()
+
+    const invalid = await post(application, administrator, '/api/v1/mods/deployment/recovery/execute', {
+      requestId, desired: 'previous', confirmation: 'RECOVER_MOD_DEPLOYMENT',
+      path: 'C:\\DO-NOT-REFLECT-FICTIONAL-PATH'
+    })
+    expect(invalid.statusCode).toBe(400)
+    expect(invalid.body).not.toContain('DO-NOT-REFLECT')
+    expect(service.recoverInterrupted).not.toHaveBeenCalled()
+
+    const recovered = await post(application, administrator, '/api/v1/mods/deployment/recovery/execute', {
+      requestId, desired: 'previous', confirmation: 'RECOVER_MOD_DEPLOYMENT'
+    })
+    expect(recovered.statusCode).toBe(202)
+    expect(recovered.json()).toMatchObject({ data: { requestId, status: 'succeeded', reused: false } })
+    expect(service.recoverInterrupted).toHaveBeenCalledWith(requestId, 'previous')
+
+    service.recoverInterrupted.mockRejectedValueOnce(
+      new ModDeploymentError('MOD_DEPLOYMENT_RECOVERY_TARGET_NOT_ALLOWED')
+    )
+    const wrongTarget = await post(application, administrator, '/api/v1/mods/deployment/recovery/execute', {
+      requestId, desired: 'candidate', confirmation: 'RECOVER_MOD_DEPLOYMENT'
+    })
+    expect(wrongTarget.statusCode).toBe(409)
+    expect(wrongTarget.json().error.code).toBe('MOD_DEPLOYMENT_RECOVERY_TARGET_NOT_ALLOWED')
+  })
+
+  it('does not couple explicit recovery to the ordinary mod deployment gate', async () => {
+    const service = deploymentService()
+    application = await buildApplication(enabledConfig(), {
+      statusProvider: new DemoProvider(),
+      modDeploymentService: service
+    })
+    const cookie = await login(application)
+    const requestId = deploymentRequest().requestId
+
+    const disabled = await post(application, cookie, '/api/v1/mods/deployment/recovery/execute', {
+      requestId, desired: 'candidate', confirmation: 'RECOVER_MOD_DEPLOYMENT'
+    })
+    expect(disabled.statusCode).toBe(503)
+    expect(disabled.json().error.code).toBe('MOD_DEPLOYMENT_RECOVERY_MUTATIONS_DISABLED')
+    expect(service.recoverInterrupted).not.toHaveBeenCalled()
   })
 
   it('rejects path or command injection without reflecting input and maps stopped-gate failure', async () => {
@@ -330,6 +416,21 @@ function roleConfig() {
   })
 }
 
+function recoveryEnabledConfig() {
+  return loadConfig({
+    NODE_ENV: 'test',
+    DYSON_PROVIDER: 'windows',
+    DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+    DYSON_MOD_DEPLOYMENT_ENABLED: 'false',
+    DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED: 'true',
+    DYSON_MOD_STAGING_ROOT: 'C:\\Fictional\\Dyson\\staged-mods',
+    DYSON_MOD_PLUGINS_ROOT: 'C:\\Fictional\\Dyson\\server\\BepInEx\\plugins\\dyson-managed-mods',
+    DYSON_DEV_ADMIN_PASSWORD: 'test-password-long-enough',
+    DYSON_OPERATOR_PASSWORD_HASH: operatorPasswordHash,
+    DYSON_PUBLIC_ORIGIN: origin
+  })
+}
+
 function deploymentRequest(): ModDeploymentRequest {
   const dependencyId = 'Fictional-ExampleMod-1.0.0'
   const manifests = generateModManifests({
@@ -381,6 +482,12 @@ function deploymentService() {
       executeSupported: false as const,
       candidates: [{ id: 'snapshot-fictional-0001', kind: 'snapshot' as const }]
     })),
+    recoveryStatus: vi.fn(async (): Promise<ModDeploymentRecoveryStatus> => ({
+      phase: 'ready' as const,
+      requestId: null,
+      operation: null,
+      allowedDesired: [] as Array<'candidate' | 'previous'>
+    })),
     preview: vi.fn(async () => ({
       dryRun: true as const,
       operation: request.operation,
@@ -399,6 +506,7 @@ function deploymentService() {
       recoverablePayloadPreserved: false
     })),
     execute: vi.fn(async () => receipt),
+    recoverInterrupted: vi.fn(async (_requestId?: unknown, _desired?: unknown) => receipt),
     getReceipt: vi.fn(async (_input?: unknown): Promise<typeof receipt | null> => receipt),
     history: vi.fn(async (input?: unknown) => {
       const query = input as { cursor: string | null; pageSize: number }

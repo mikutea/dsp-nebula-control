@@ -9,6 +9,12 @@ import {
 } from '../update-pipeline/acquisition.js'
 import type { DiscoveredModRelease } from '../update-pipeline/discovery.js'
 import { buildVerifiedModManifests } from '../update-pipeline/pipeline.js'
+import type {
+  HostMutationOperationCoordinator,
+  HostMutationOperationOutcome,
+  HostMutationOperationRequest,
+  HostMutationOperationScope
+} from '../host-mutation/operation-coordinator.js'
 import { computeStagedModPayloadDigest, ModDeploymentService } from './deployment.js'
 import { createModPlatformLock } from './platform-lock.js'
 import {
@@ -304,9 +310,11 @@ describe('Thunderstore mod importer', () => {
     expect(locked.sha256).not.toBe(acquisitionReceipt.artifact.sha256)
     expect(locked.dependencies).toEqual(imported.package.dependencies)
 
+    const hostMutationCoordinator = new RecordingPassThroughHostMutationCoordinator()
     const deployment = new ModDeploymentService({
       stagingRoot: fixture.stagingRoot,
       pluginsRoot: fixture.pluginsRoot,
+      hostMutationCoordinator,
       verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
     })
     const initial = await deployment.inspect()
@@ -336,6 +344,14 @@ describe('Thunderstore mod importer', () => {
       rollback: 'not-needed',
       payloadFileCount: 1
     })
+    expect(hostMutationCoordinator.requests).toEqual([{
+      operation: 'mod-deployment-install',
+      requestId: deploymentRequest.requestId
+    }])
+    expect(hostMutationCoordinator.outcomes).toEqual([{
+      kind: 'return',
+      disposition: 'release'
+    }])
     await expect(deployment.inspect()).resolves.toMatchObject({
       enabledCount: 1,
       packages: [{ dependencyId: release.dependencyId, enabled: true }]
@@ -423,6 +439,27 @@ function executeRequest() {
     requestId: randomUUID(),
     acquisitionReceiptId,
     confirmation: 'IMPORT_THUNDERSTORE_MOD' as const
+  }
+}
+
+class RecordingPassThroughHostMutationCoordinator implements HostMutationOperationCoordinator {
+  readonly requests: HostMutationOperationRequest[] = []
+  readonly outcomes: Array<Pick<HostMutationOperationOutcome<unknown>, 'kind' | 'disposition'>> = []
+
+  async runExclusive<T>(
+    request: HostMutationOperationRequest,
+    operation: (scope: HostMutationOperationScope) =>
+      Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>
+  ): Promise<T> {
+    this.requests.push({ ...request })
+    const outcome = await operation({
+      signal: new AbortController().signal,
+      assertActive: () => {},
+      toPowerShellBorrowArguments: () => []
+    })
+    this.outcomes.push({ kind: outcome.kind, disposition: outcome.disposition })
+    if (outcome.kind === 'throw') throw outcome.error
+    return outcome.value
   }
 }
 

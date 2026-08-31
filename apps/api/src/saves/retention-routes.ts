@@ -14,6 +14,7 @@ export interface BackupRetentionRoutesController {
   restore(input: unknown): Promise<BackupRetentionHttpResult<unknown>>
   previewPurge(input: unknown): Promise<BackupRetentionHttpResult<unknown>>
   purge(input: unknown): Promise<BackupRetentionHttpResult<unknown>>
+  recover(input: unknown): Promise<BackupRetentionHttpResult<unknown>>
 }
 
 export interface BackupRetentionRoutesOptions {
@@ -69,6 +70,11 @@ export function registerBackupRetentionRoutes(
     '/api/v1/backups/retention/purge/execute',
     protectedMutationRoute,
     async (request, reply) => sendResult(reply, await options.controller.purge(queryFreeInput(request, request.body)))
+  )
+  app.post(
+    '/api/v1/backups/retention/recover',
+    protectedMutationRoute,
+    async (request, reply) => sendResult(reply, await options.controller.recover(queryFreeInput(request, request.body)))
   )
 }
 

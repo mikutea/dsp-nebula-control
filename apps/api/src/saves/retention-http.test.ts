@@ -113,6 +113,29 @@ describe('BackupRetentionHttpController', () => {
     expect(purge.statusCode).toBe(201)
   })
 
+  it('exposes explicit recovery only through its fixed confirmation and binds the result identity', async () => {
+    const service = createService()
+    const controller = new BackupRetentionHttpController({ service, mutationGate: () => true })
+    const request = {
+      operation: 'retire' as const,
+      requestId,
+      confirmation: backupRetentionHttpConfirmations.recover
+    }
+
+    const result = await controller.recover(request)
+    expect(result).toEqual({
+      statusCode: 200,
+      body: { data: {
+        operation: 'retire', requestId, retirementRequestId: null, outcome: 'rolled-back'
+      } }
+    })
+    expect(service.recoverInterrupted).toHaveBeenCalledWith(request)
+
+    const wrongConfirmation = await controller.recover({ ...request, confirmation: 'RECOVER' })
+    expect(wrongConfirmation.statusCode).toBe(422)
+    expect(service.recoverInterrupted).toHaveBeenCalledTimes(1)
+  })
+
   it('maps core conflicts without exposing thrown error details', async () => {
     const service = createService()
     vi.mocked(service.execute).mockRejectedValueOnce(
@@ -210,6 +233,12 @@ function createService(options: { retirementReused?: boolean } = {}): BackupRete
         recoveryRequired: false
       },
       reused: false
+    })),
+    recoverInterrupted: vi.fn(async () => ({
+      operation: 'retire',
+      requestId,
+      retirementRequestId: null,
+      outcome: 'rolled-back'
     }))
   }
 }
@@ -228,6 +257,11 @@ function previewFixture() {
       keep: [{ backupId: 'backup-one', reasons: ['latest-healthy' as const] }],
       delete: [] as Array<{ backupId: string; reason: 'outside-policy' | 'unhealthy-deletion-enabled' }>,
       blocked: [] as Array<{ backupId: string; reason: 'unhealthy-backup' }>
+    },
+    executionBatch: {
+      maximumCandidates: 128 as const,
+      selectedBackupIds: [] as string[],
+      deferredCandidateCount: 0
     },
     excluded: [] as Array<{ backupId: string; reason: 'created-at-unavailable' | 'redirected-entry' }>,
     inventoryDigest: 'c'.repeat(64),

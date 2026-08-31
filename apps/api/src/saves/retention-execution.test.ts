@@ -3,9 +3,21 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import type {
+  HostMutationOperationCoordinator,
+  HostMutationRecoveryOperationCoordinator,
+  HostMutationOperationOutcome,
+  HostMutationOperationRequest,
+  HostMutationRecoveryOperationRequest,
+  HostMutationOperationScope
+} from '../host-mutation/operation-coordinator.js'
+import { HostMutationOperationCoordinatorError } from '../host-mutation/operation-coordinator.js'
+import { HostMutationLeaseError } from '../host-mutation/lease.js'
 import {
-  BackupRetentionControlService,
-  BackupRetentionError
+  BackupRetentionControlService as ProductionBackupRetentionControlService,
+  BackupRetentionError,
+  MAX_RETIREMENT_EXECUTION_BATCH,
+  type BackupRetentionControlOptions
 } from './retention-execution.js'
 import { BACKUP_MANIFEST_PROTOCOL } from './schemas.js'
 
@@ -19,11 +31,181 @@ const policy = {
 }
 const referenceTime = '2026-08-31T12:00:00.000Z'
 
+class BackupRetentionControlService extends ProductionBackupRetentionControlService {
+  constructor(options: BackupRetentionControlOptions) {
+    super({ ...options, hostMutationCoordinator: new PassThroughHostMutationCoordinator() })
+  }
+}
+
+class PassThroughHostMutationCoordinator implements HostMutationOperationCoordinator {
+  async runExclusive<T>(
+    _request: HostMutationOperationRequest,
+    operation: (scope: HostMutationOperationScope) =>
+      Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>
+  ): Promise<T> {
+    const outcome = await operation({
+      signal: new AbortController().signal,
+      assertActive: () => undefined,
+      toPowerShellBorrowArguments: () => []
+    })
+    if (outcome.kind === 'throw') throw outcome.error
+    return outcome.value
+  }
+}
+
+class RecoveryHarnessCoordinator implements
+  HostMutationOperationCoordinator,
+  HostMutationRecoveryOperationCoordinator {
+  recoveryRequired = false
+  priorOperation: string | null = null
+  priorRequestId: string | null = null
+  currentLeaseLost = false
+
+  loseCurrentLease(): void {
+    this.currentLeaseLost = true
+  }
+
+  async runExclusive<T>(
+    request: HostMutationOperationRequest,
+    operation: (scope: HostMutationOperationScope) =>
+      Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>
+  ): Promise<T> {
+    if (this.recoveryRequired) {
+      throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_RECOVERY_REQUIRED')
+    }
+    this.priorOperation = request.operation
+    this.priorRequestId = request.requestId
+    try {
+      const outcome = await operation({
+        signal: new AbortController().signal,
+        assertActive: () => {
+          if (this.currentLeaseLost) {
+            throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+          }
+        },
+        toPowerShellBorrowArguments: () => []
+      })
+      if (outcome.disposition === 'abandon') this.recoveryRequired = true
+      if (outcome.kind === 'throw') throw outcome.error
+      return outcome.value
+    } catch (error) {
+      if (error instanceof HostMutationLeaseError) this.recoveryRequired = true
+      throw error
+    }
+  }
+
+  async runRecoveryExclusive<T>(
+    request: HostMutationRecoveryOperationRequest,
+    operation: (scope: HostMutationOperationScope) =>
+      Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>
+  ): Promise<T> {
+    if (!this.recoveryRequired || request.expectedOperation !== this.priorOperation ||
+        request.expectedRequestId !== this.priorRequestId) {
+      throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_RECOVERY_MISMATCH')
+    }
+    this.currentLeaseLost = false
+    const outcome = await operation(activeScope())
+    if (outcome.disposition === 'release') this.recoveryRequired = false
+    if (outcome.kind === 'throw') throw outcome.error
+    return outcome.value
+  }
+}
+
+function activeScope(): HostMutationOperationScope {
+  return {
+    signal: new AbortController().signal,
+    assertActive: () => undefined,
+    toPowerShellBorrowArguments: () => []
+  }
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })))
 })
 
 describe('recoverable backup retention execution', () => {
+  it('blocks ordinary mutations after a hard-exit boundary and resumes only through exact explicit recovery', async () => {
+    const fixture = await fixtureRoot()
+    await createBackup(fixture, '2026-08-31T10:00:00.000Z', 'newest')
+    const old = await createBackup(fixture, '2026-07-01T10:00:00.000Z', 'old')
+    const coordinator = new RecoveryHarnessCoordinator()
+    let loseOnce = true
+    const service = new ProductionBackupRetentionControlService({
+      backupRoot: fixture,
+      now: fixedClock(),
+      hostMutationCoordinator: coordinator,
+      hostMutationRecoveryCoordinator: coordinator,
+      phase: (phase) => {
+        if (phase === 'after-retire-move' && loseOnce) {
+          loseOnce = false
+          coordinator.loseCurrentLease()
+          throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+        }
+      }
+    })
+    const preview = await service.preview({ referenceTime, policy })
+    const request = {
+      requestId: randomUUID(),
+      previewDigest: preview.previewDigest,
+      referenceTime,
+      policy,
+      confirmation: 'RETIRE_BACKUPS'
+    } as const
+
+    await expect(service.execute(request)).rejects.toMatchObject({ code: 'SAVE_RETENTION_HOST_LEASE_LOST' })
+    await expect(stat(retiredBackupPath(fixture, request.requestId, old))).resolves.toBeDefined()
+    await expect(stat(path.join(fixture, '.retention-control', 'retention.lock'))).resolves.toBeDefined()
+    await expect(service.execute(request)).rejects.toMatchObject({
+      code: 'SAVE_RETENTION_HOST_LEASE_RECOVERY_REQUIRED'
+    })
+
+    await expect(service.recoverInterrupted({
+      operation: 'retire',
+      requestId: request.requestId,
+      confirmation: 'RECOVER_RETENTION_OPERATION'
+    })).resolves.toMatchObject({ operation: 'retire', outcome: 'rolled-back' })
+    expect(coordinator.recoveryRequired).toBe(false)
+    await expect(stat(path.join(fixture, '.retention-control', 'retention.lock')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(stat(path.join(fixture, old))).resolves.toBeDefined()
+
+    await expect(service.execute(request)).resolves.toMatchObject({
+      reused: false,
+      receipt: { retired: [expect.objectContaining({ backupId: old })] }
+    })
+  })
+  it('binds a large eligible inventory to a bounded oldest-first recoverable batch', async () => {
+    const fixture = await fixtureRoot()
+    const backupIds: string[] = []
+    for (let index = 0; index < MAX_RETIREMENT_EXECUTION_BATCH + 2; index++) {
+      backupIds.push(await createBackup(
+        fixture,
+        new Date(Date.parse(referenceTime) - index * 3_600_000).toISOString(),
+        `batch-${index.toString().padStart(3, '0')}`
+      ))
+    }
+    const service = new BackupRetentionControlService({ backupRoot: fixture, now: fixedClock() })
+    const preview = await service.preview({ referenceTime, policy })
+
+    expect(preview.plan.delete).toHaveLength(MAX_RETIREMENT_EXECUTION_BATCH + 1)
+    expect(preview.executionBatch).toEqual({
+      maximumCandidates: MAX_RETIREMENT_EXECUTION_BATCH,
+      selectedBackupIds: backupIds.slice(2),
+      deferredCandidateCount: 1
+    })
+
+    const executed = await service.execute({
+      requestId: randomUUID(),
+      previewDigest: preview.previewDigest,
+      referenceTime,
+      policy,
+      confirmation: 'RETIRE_BACKUPS'
+    })
+    expect(executed.receipt.retired.map((entry) => entry.backupId))
+      .toEqual(preview.executionBatch.selectedBackupIds)
+    await expect(stat(path.join(fixture, backupIds[1]!))).resolves.toBeDefined()
+  })
+
   it('persists versioned annotations and makes protection part of the executable plan digest', async () => {
     const fixture = await fixtureRoot()
     await createBackup(fixture, '2026-08-31T10:00:00.000Z', 'newest')
@@ -98,6 +280,37 @@ describe('recoverable backup retention execution', () => {
       .toEqual([old])
   })
 
+  it('releases the global lease after an annotation event is durable even when receipt publication is interrupted', async () => {
+    const fixture = await fixtureRoot()
+    const backupId = await createBackup(fixture, '2026-08-31T10:00:00.000Z', 'annotated')
+    const coordinator = new RecoveryHarnessCoordinator()
+    let failOnce = true
+    const service = new ProductionBackupRetentionControlService({
+      backupRoot: fixture,
+      now: fixedClock(),
+      hostMutationCoordinator: coordinator,
+      hostMutationRecoveryCoordinator: coordinator,
+      phase: (phase) => {
+        if (phase === 'after-annotation-event' && failOnce) {
+          failOnce = false
+          throw new Error('receipt publication interrupted')
+        }
+      }
+    })
+    const request = {
+      requestId: randomUUID(), backupId, expectedRevision: null,
+      note: 'durable event', protected: true,
+      confirmation: 'UPDATE_BACKUP_ANNOTATION'
+    } as const
+
+    await expect(service.setAnnotation(request)).rejects.toMatchObject({ code: 'SAVE_RETENTION_FAILED' })
+    expect(coordinator.recoveryRequired).toBe(false)
+    await expect(service.setAnnotation(request)).resolves.toMatchObject({
+      reused: true,
+      receipt: { requestId: request.requestId, annotation: { backupId, protected: true } }
+    })
+  })
+
   it('fails closed when the private annotation ledger contains an unexpected entry', async () => {
     const fixture = await fixtureRoot()
     const backupId = await createBackup(fixture, '2026-08-31T10:00:00.000Z', 'annotated')
@@ -149,6 +362,69 @@ describe('recoverable backup retention execution', () => {
     expect(preview.inventoryDigest).toMatch(/^[a-f0-9]{64}$/)
     expect(preview.previewDigest).toMatch(/^[a-f0-9]{64}$/)
     await expect(stat(path.join(fixture, deletableOld))).resolves.toBeDefined()
+  })
+
+  it('skips a candidate that becomes protected after executable candidate generation', async () => {
+    const fixture = await fixtureRoot()
+    await createBackup(fixture, '2026-08-31T10:00:00.000Z', 'newest')
+    const old = await createBackup(fixture, '2026-07-01T10:00:00.000Z', 'old')
+    let protectionReads = 0
+    const service = new BackupRetentionControlService({
+      backupRoot: fixture,
+      now: fixedClock(),
+      protectionSource: {
+        listProtectedBackupIds: async () => {
+          protectionReads += 1
+          return protectionReads >= 3 ? new Set([old]) : new Set()
+        }
+      }
+    })
+    const preview = await service.preview({ referenceTime, policy })
+    expect(preview.plan.delete.map((entry) => entry.backupId)).toEqual([old])
+
+    const executed = await service.execute({
+      requestId: randomUUID(),
+      previewDigest: preview.previewDigest,
+      referenceTime,
+      policy,
+      confirmation: 'RETIRE_BACKUPS'
+    })
+
+    expect(protectionReads).toBe(3)
+    expect(executed.receipt.retired).toEqual([])
+    await expect(stat(path.join(fixture, old))).resolves.toBeDefined()
+  })
+
+  it('fails the whole retirement batch before moving bytes when the commit-boundary protection refresh fails', async () => {
+    const fixture = await fixtureRoot()
+    await createBackup(fixture, '2026-08-31T10:00:00.000Z', 'newest')
+    const old = await createBackup(fixture, '2026-07-01T10:00:00.000Z', 'old')
+    let protectionReads = 0
+    const service = new BackupRetentionControlService({
+      backupRoot: fixture,
+      now: fixedClock(),
+      protectionSource: {
+        listProtectedBackupIds: async () => {
+          protectionReads += 1
+          if (protectionReads === 3) throw new Error('fictional protection source outage')
+          return new Set()
+        }
+      }
+    })
+    const preview = await service.preview({ referenceTime, policy })
+    const retirementRequestId = randomUUID()
+
+    await expect(service.execute({
+      requestId: retirementRequestId,
+      previewDigest: preview.previewDigest,
+      referenceTime,
+      policy,
+      confirmation: 'RETIRE_BACKUPS'
+    })).rejects.toMatchObject({ code: 'SAVE_RETENTION_STORAGE_UNAVAILABLE' })
+    expect(protectionReads).toBe(3)
+    await expect(stat(path.join(fixture, old))).resolves.toBeDefined()
+    await expect(stat(retiredBackupPath(fixture, retirementRequestId, old)))
+      .rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('retires only the bound plan, persists an idempotent receipt, and restores it separately', async () => {
@@ -217,6 +493,39 @@ describe('recoverable backup retention execution', () => {
       retirementRequestId: requestId,
       confirmation: 'RESTORE_RETIRED_BACKUPS'
     })).toEqual({ receipt: restored.receipt, reused: true })
+  })
+
+  it('never rolls an unrelated active backup into retirement when a schema-valid journal is corrupted', async () => {
+    const fixture = await fixtureRoot()
+    const newest = await createBackup(fixture, '2026-08-31T10:00:00.000Z', 'newest')
+    const old = await createBackup(fixture, '2026-07-01T10:00:00.000Z', 'old')
+    const service = new BackupRetentionControlService({ backupRoot: fixture, now: fixedClock() })
+    const preview = await service.preview({ referenceTime, policy })
+    const retirementRequestId = randomUUID()
+    await service.execute({
+      requestId: retirementRequestId,
+      previewDigest: preview.previewDigest,
+      referenceTime,
+      policy,
+      confirmation: 'RETIRE_BACKUPS'
+    })
+    const operationDirectory = path.join(
+      fixture, '.retention-control', 'retired', `retire-${retirementRequestId.toLowerCase()}`
+    )
+    const latestJournalPath = path.join(operationDirectory, 'journal-000003.json')
+    const journal = JSON.parse(await readFile(latestJournalPath, 'utf8')) as {
+      planned: Array<{ backupId: string }>
+    }
+    journal.planned[0]!.backupId = newest
+    await writeFile(latestJournalPath, JSON.stringify(journal))
+
+    await expect(service.restore({
+      requestId: randomUUID(),
+      retirementRequestId,
+      confirmation: 'RESTORE_RETIRED_BACKUPS'
+    })).rejects.toMatchObject({ code: 'SAVE_RETENTION_RECOVERY_REQUIRED' })
+    await expect(stat(path.join(fixture, newest))).resolves.toBeDefined()
+    await expect(stat(retiredBackupPath(fixture, retirementRequestId, old))).resolves.toBeDefined()
   })
 
   it('binds the preview to manifest content even when replacement bytes remain healthy and equal-sized', async () => {
@@ -412,16 +721,53 @@ describe('recoverable backup retention execution', () => {
     })).rejects.toMatchObject({ code: 'SAVE_RETENTION_OPERATION_NOT_RESTORABLE' })
   })
 
+  it('performs zero irreversible deletion when a retired backup becomes protected before purge', async () => {
+    const fixture = await fixtureRoot()
+    await createBackup(fixture, '2026-08-31T10:00:00.000Z', 'newest')
+    const old = await createBackup(fixture, '2026-07-01T10:00:00.000Z', 'old')
+    let protectedNow = false
+    const service = new BackupRetentionControlService({
+      backupRoot: fixture,
+      now: fixedClock(),
+      minimumPurgeAgeMs: 0,
+      protectionSource: {
+        listProtectedBackupIds: async () => protectedNow ? new Set([old]) : new Set()
+      }
+    })
+    const preview = await service.preview({ referenceTime, policy })
+    const retirementRequestId = randomUUID()
+    await service.execute({
+      requestId: retirementRequestId,
+      previewDigest: preview.previewDigest,
+      referenceTime,
+      policy,
+      confirmation: 'RETIRE_BACKUPS'
+    })
+    const purgePreview = await service.previewPurge({ retirementRequestId })
+    protectedNow = true
+
+    await expect(service.purge({
+      requestId: randomUUID(),
+      retirementRequestId,
+      purgePreviewDigest: purgePreview.purgePreviewDigest,
+      confirmation: 'PURGE_RETIRED_BACKUPS'
+    })).rejects.toMatchObject({ code: 'SAVE_RETENTION_PLAN_CHANGED' })
+    await expect(stat(retiredBackupPath(fixture, retirementRequestId, old))).resolves.toBeDefined()
+  })
+
   it('resumes the same purge after a crash-equivalent failure following irreversible removal', async () => {
     const fixture = await fixtureRoot()
     await createBackup(fixture, '2026-08-31T10:00:00.000Z', 'newest')
     const middle = await createBackup(fixture, '2026-07-01T10:00:00.000Z', 'middle')
     const oldest = await createBackup(fixture, '2026-06-01T10:00:00.000Z', 'oldest')
     let failOnce = true
-    const service = new BackupRetentionControlService({
+    const coordinator = new RecoveryHarnessCoordinator()
+    const service = new ProductionBackupRetentionControlService({
       backupRoot: fixture,
       now: fixedClock(),
       minimumPurgeAgeMs: 0,
+      hostMutationCoordinator: coordinator,
+      hostMutationRecoveryCoordinator: coordinator,
       phase: (phase) => {
         if (phase === 'after-purge' && failOnce) {
           failOnce = false
@@ -448,6 +794,7 @@ describe('recoverable backup retention execution', () => {
     await expect(service.purge(request)).rejects.toMatchObject({
       code: 'SAVE_RETENTION_RECOVERY_REQUIRED'
     })
+    expect(coordinator.recoveryRequired).toBe(false)
     const resumed = await service.purge(request)
     expect(resumed.receipt.purgedBackupIds).toEqual([middle, oldest])
     await expect(stat(retiredBackupPath(fixture, retirementRequestId, middle)))

@@ -48,6 +48,44 @@ describe('component update activation web client', () => {
     }))
   })
 
+  it('reads recovery status and submits only request ID plus the fixed recovery confirmation', async () => {
+    const requestId = requestFixture().requestId
+    const recoveryStatus = {
+      schemaVersion: 1 as const,
+      phase: 'recovery-required' as const,
+      mutationBlocked: true,
+      recoveryRequired: true,
+      failureCode: 'UPDATE_RECOVERY_REQUIRED',
+      reconciledRequestId: requestId
+    }
+    const fetchMock = vi.fn(async (path: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        expect(JSON.parse(String(init.body))).toEqual({
+          requestId,
+          confirmation: 'RECOVER_COMPONENT_UPDATE'
+        })
+        return new Response(JSON.stringify({ ok: true, data: receiptFixture }), {
+          status: 202,
+          headers: { 'Content-Type': 'application/json' }
+        })
+      }
+      expect(path).toBe('/api/v1/updates/activation/recovery')
+      return new Response(JSON.stringify({ ok: true, data: recoveryStatus }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.updateActivationRecoveryStatus()).resolves.toEqual({ data: recoveryStatus })
+    await expect(api.recoverUpdateActivation(requestId, 'RECOVER_COMPONENT_UPDATE')).resolves.toEqual({
+      data: receiptFixture
+    })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/v1/updates/activation/recovery', expect.objectContaining({
+      method: 'POST', credentials: 'same-origin'
+    }))
+  })
+
   it('maps a code-only 423 envelope to an explicit fail-closed error', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       ok: false,

@@ -4,6 +4,7 @@ import {
   ComponentUpdateActivationError,
   ComponentUpdateActivationHttpController,
   componentUpdateActivationConfirmations,
+  componentUpdateActivationRecoveryConfirmation,
   type ComponentUpdateActivationHttpService,
   type ComponentUpdateActivationPlan,
   type ComponentUpdateActivationReceipt,
@@ -178,6 +179,30 @@ describe('component update activation HTTP contract', () => {
     }) })
   })
 
+  it('enters recovery-required immediately when ordinary execution returns rollback-failed', async () => {
+    const rollbackFailed = {
+      ...receiptFixture,
+      status: 'rollback-failed' as const,
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      recoveryRequired: true
+    }
+    const service = createService({ execute: vi.fn(async () => rollbackFailed) })
+    const controller = new ComponentUpdateActivationHttpController({ service, mutationGate: () => true })
+
+    expect(await controller.execute(makeExecuteRequest())).toEqual({
+      statusCode: 503,
+      body: { ok: false, error: { code: 'UPDATE_ROLLBACK_SMOKE_FAILED' } }
+    })
+    expect((await controller.recoveryStatus({})).body).toEqual({
+      ok: true,
+      data: expect.objectContaining({
+        phase: 'recovery-required',
+        mutationBlocked: true,
+        reconciledRequestId: receiptFixture.requestId
+      })
+    })
+  })
+
   it('retains a stable code-only startup recovery failure and never retries it implicitly', async () => {
     const gate = vi.fn(() => true)
     const service = createService({
@@ -204,6 +229,242 @@ describe('component update activation HTTP contract', () => {
     expect(service.reconcile).toHaveBeenCalledOnce()
     expect(gate).not.toHaveBeenCalled()
     expect(service.execute).not.toHaveBeenCalled()
+  })
+
+  it('requires a fixed confirmation and an independent gate for explicit recovery', async () => {
+    const requestId = receiptFixture.requestId
+    const recoveryRequired = {
+      ...receiptFixture,
+      status: 'rollback-failed' as const,
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackVerified: false,
+      recoveryRequired: true
+    }
+    const service = createService({
+      reconcile: vi.fn(async () => recoveryRequired),
+      getState: vi.fn(async () => ({ ...stateFixture, recoveryRequired: true }))
+    })
+    const gate = vi.fn(() => true)
+    const controller = new ComponentUpdateActivationHttpController({
+      service,
+      recoveryMutationGate: gate
+    })
+
+    expect(await controller.recover({
+      requestId,
+      confirmation: 'ACTIVATE_NEBULA_UPDATE'
+    })).toEqual(invalidRequest)
+    expect(gate).not.toHaveBeenCalled()
+    expect(service.recoverInterrupted).not.toHaveBeenCalled()
+
+    const disabled = new ComponentUpdateActivationHttpController({ service })
+    expect(await disabled.recover({
+      requestId,
+      confirmation: componentUpdateActivationRecoveryConfirmation
+    })).toEqual({
+      statusCode: 423,
+      body: { ok: false, error: { code: 'UPDATE_ACTIVATION_HTTP_MUTATION_DISABLED' } }
+    })
+    expect(service.recoverInterrupted).not.toHaveBeenCalled()
+  })
+
+  it('runs one exact explicit recovery and reopens activation only after terminal state proof', async () => {
+    const requestId = receiptFixture.requestId
+    const recoveryRequired = {
+      ...receiptFixture,
+      status: 'rollback-failed' as const,
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackVerified: false,
+      recoveryRequired: true
+    }
+    const rolledBack = {
+      ...receiptFixture,
+      status: 'rolled-back' as const,
+      resultingRevision: receiptFixture.previousRevision,
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackVerified: true,
+      recoveryRequired: false
+    }
+    const getState = vi.fn()
+      .mockResolvedValueOnce({ ...stateFixture, recoveryRequired: true })
+      .mockResolvedValueOnce({ ...stateFixture, revision: rolledBack.resultingRevision, recoveryRequired: false })
+      .mockResolvedValueOnce({ ...stateFixture, revision: rolledBack.resultingRevision, recoveryRequired: false })
+    const service = createService({
+      reconcile: vi.fn(async () => recoveryRequired),
+      recoverInterrupted: vi.fn(async () => rolledBack),
+      getReceipt: vi.fn(async () => ({ ...rolledBack, reused: false })),
+      getState
+    })
+    const gate = vi.fn(() => true)
+    const controller = new ComponentUpdateActivationHttpController({
+      service,
+      recoveryMutationGate: gate
+    })
+
+    expect(await controller.recover({
+      requestId,
+      confirmation: componentUpdateActivationRecoveryConfirmation
+    })).toEqual({ statusCode: 202, body: { ok: true, data: rolledBack } })
+    expect(gate).toHaveBeenCalledWith(requestId)
+    expect(service.recoverInterrupted).toHaveBeenCalledWith(requestId)
+    expect(await controller.recoveryStatus({})).toEqual({
+      statusCode: 200,
+      body: { ok: true, data: expect.objectContaining({
+        phase: 'ready',
+        mutationBlocked: false,
+        recoveryRequired: false,
+        reconciledRequestId: requestId
+      }) }
+    })
+  })
+
+  it('rejects a known recovery request mismatch before either gate or core', async () => {
+    const pendingRequestId = receiptFixture.requestId
+    const otherRequestId = randomUUID()
+    const recoveryRequired = {
+      ...receiptFixture,
+      status: 'rollback-failed' as const,
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackVerified: false,
+      recoveryRequired: true
+    }
+    const gate = vi.fn(() => true)
+    const service = createService({
+      reconcile: vi.fn(async () => recoveryRequired),
+      getState: vi.fn(async () => ({ ...stateFixture, recoveryRequired: true }))
+    })
+    const controller = new ComponentUpdateActivationHttpController({
+      service,
+      recoveryMutationGate: gate
+    })
+
+    expect(await controller.recover({
+      requestId: otherRequestId,
+      confirmation: componentUpdateActivationRecoveryConfirmation
+    })).toEqual({
+      statusCode: 409,
+      body: { ok: false, error: { code: 'UPDATE_RECOVERY_REQUEST_MISMATCH' } }
+    })
+    expect(gate).not.toHaveBeenCalled()
+    expect(service.recoverInterrupted).not.toHaveBeenCalled()
+    expect((await controller.recoveryStatus({})).body).toEqual({
+      ok: true,
+      data: expect.objectContaining({
+        phase: 'recovery-required',
+        reconciledRequestId: pendingRequestId
+      })
+    })
+  })
+
+  it('keeps recovery blocked unless the returned terminal receipt was durably reread exactly', async () => {
+    const recoveryRequired = {
+      ...receiptFixture,
+      status: 'rollback-failed' as const,
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackVerified: false,
+      recoveryRequired: true
+    }
+    const rolledBack = {
+      ...receiptFixture,
+      status: 'rolled-back' as const,
+      resultingRevision: receiptFixture.previousRevision,
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackVerified: true,
+      recoveryRequired: false
+    }
+    const service = createService({
+      reconcile: vi.fn(async () => recoveryRequired),
+      recoverInterrupted: vi.fn(async () => rolledBack),
+      getReceipt: vi.fn(async () => ({ ...rolledBack, completedAt: '2026-08-30T10:00:01.000Z' })),
+      getState: vi.fn()
+        .mockResolvedValueOnce({ ...stateFixture, recoveryRequired: true })
+        .mockResolvedValueOnce({ ...stateFixture, revision: rolledBack.resultingRevision })
+    })
+    const controller = new ComponentUpdateActivationHttpController({
+      service,
+      recoveryMutationGate: () => true
+    })
+
+    expect(await controller.recover({
+      requestId: receiptFixture.requestId,
+      confirmation: componentUpdateActivationRecoveryConfirmation
+    })).toEqual({
+      statusCode: 503,
+      body: { ok: false, error: { code: 'UPDATE_RECOVERY_TERMINAL_UNPROVEN' } }
+    })
+    expect(service.getReceipt).toHaveBeenCalledWith(receiptFixture.requestId)
+    expect((await controller.recoveryStatus({})).body).toEqual({
+      ok: true,
+      data: expect.objectContaining({
+        phase: 'recovery-required',
+        failureCode: 'UPDATE_RECOVERY_TERMINAL_UNPROVEN'
+      })
+    })
+  })
+
+  it.each([
+    ['wrong revision', { ...stateFixture, revision: 'f'.repeat(64) }],
+    ['wrong active component identity', {
+      ...stateFixture,
+      components: [{ ...stateFixture.components[0]!, releaseId: `nebula-${'f'.repeat(32)}` }]
+    }]
+  ])('keeps recovery blocked when durable state has %s', async (_label, terminalState) => {
+    const recoveryRequired = {
+      ...receiptFixture,
+      status: 'rollback-failed' as const,
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackVerified: false,
+      recoveryRequired: true
+    }
+    const service = createService({
+      reconcile: vi.fn(async () => recoveryRequired),
+      recoverInterrupted: vi.fn(async () => receiptFixture),
+      getReceipt: vi.fn(async () => receiptFixture),
+      getState: vi.fn()
+        .mockResolvedValueOnce({ ...stateFixture, recoveryRequired: true })
+        .mockResolvedValueOnce(terminalState)
+    })
+    const controller = new ComponentUpdateActivationHttpController({
+      service,
+      recoveryMutationGate: () => true
+    })
+
+    expect(await controller.recover({
+      requestId: receiptFixture.requestId,
+      confirmation: componentUpdateActivationRecoveryConfirmation
+    })).toEqual({
+      statusCode: 503,
+      body: { ok: false, error: { code: 'UPDATE_RECOVERY_TERMINAL_UNPROVEN' } }
+    })
+  })
+
+  it('keeps recovery blocked when the core cannot prove a safe terminal result', async () => {
+    const requestId = receiptFixture.requestId
+    const recoveryRequired = {
+      ...receiptFixture,
+      status: 'rollback-failed' as const,
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackVerified: false,
+      recoveryRequired: true
+    }
+    const service = createService({
+      reconcile: vi.fn(async () => recoveryRequired),
+      recoverInterrupted: vi.fn(async () => recoveryRequired),
+      getState: vi.fn(async () => ({ ...stateFixture, recoveryRequired: true }))
+    })
+    const controller = new ComponentUpdateActivationHttpController({
+      service,
+      recoveryMutationGate: () => true
+    })
+
+    expect((await controller.recover({
+      requestId,
+      confirmation: componentUpdateActivationRecoveryConfirmation
+    })).statusCode).toBe(503)
+    expect((await controller.recoveryStatus({})).body).toEqual({
+      ok: true,
+      data: expect.objectContaining({ phase: 'recovery-required', mutationBlocked: true })
+    })
   })
 
   it.each([
@@ -244,6 +505,25 @@ describe('component update activation HTTP contract', () => {
     }) })
     expect(JSON.stringify(status)).not.toContain('do-not-reflect')
     expect(service.execute).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['UPDATE_RECOVERY_NOT_PENDING', 409],
+    ['UPDATE_RECOVERY_REQUEST_MISMATCH', 409],
+    ['UPDATE_HOST_LEASE_RECOVERY_NOT_REQUIRED', 409],
+    ['UPDATE_HOST_LEASE_RECOVERY_MISMATCH', 409],
+    ['UPDATE_RECOVERY_EVIDENCE_CHANGED', 503],
+    ['UPDATE_RECOVERY_EVIDENCE_INVALID', 503],
+    ['UPDATE_RECOVERY_TERMINAL_UNPROVEN', 503]
+  ] as const)('preserves recovery core error %s as HTTP %i', async (code, statusCode) => {
+    const service = createService({
+      preview: vi.fn(async () => { throw new ComponentUpdateActivationError(code) })
+    })
+
+    expect(await new ComponentUpdateActivationHttpController({ service }).preview(makeRequest())).toEqual({
+      statusCode,
+      body: { ok: false, error: { code } }
+    })
   })
 
   it('requires an exact component-specific confirmation before checking the gate', async () => {
@@ -454,6 +734,7 @@ function createService(overrides: Partial<ComponentUpdateActivationHttpService> 
     preview: vi.fn(async () => planFixture),
     execute: vi.fn(async () => receiptFixture),
     reconcile: vi.fn(async () => null),
+    recoverInterrupted: vi.fn(async () => receiptFixture),
     getReceipt: vi.fn(async () => receiptFixture),
     getState: vi.fn(async () => stateFixture),
     previewCleanup: vi.fn(async () => cleanupFixture),

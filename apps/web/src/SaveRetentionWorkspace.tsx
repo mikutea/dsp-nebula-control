@@ -61,6 +61,11 @@ export function SaveRetentionWorkspace({ backups, user, onCatalogChanged }: {
     [annotations, selectedBackupId]
   )
   const selectedBackup = backups.find((backup) => backup.backupId === selectedBackupId) ?? null
+  const selectedRetirementDecisions = useMemo(() => {
+    if (!preview) return []
+    const selectedIds = new Set(preview.executionBatch.selectedBackupIds)
+    return preview.plan.delete.filter((entry) => selectedIds.has(entry.backupId))
+  }, [preview])
   const busy = phase !== 'idle' && phase !== 'loading'
 
   useEffect(() => {
@@ -313,9 +318,10 @@ export function SaveRetentionWorkspace({ backups, user, onCatalogChanged }: {
 
     {preview && <section className="retention-plan" aria-label="备份保留预演">
       <header><div><Check size={16} /><span><strong>预演已绑定当前清单</strong><small>{shortDigest(preview.previewDigest)} · 清单变化后执行会被拒绝</small></span></div><b>{executionEnabled ? 'EXECUTION GATE OPEN' : 'SERVER READ-ONLY'}</b></header>
-      <div className="retention-plan-counts"><span><strong>{preview.plan.keep.length}</strong>保留</span><span><strong>{preview.plan.delete.length}</strong>退役</span><span><strong>{preview.plan.blocked.length}</strong>阻止</span><span><strong>{preview.excluded.length}</strong>排除</span></div>
+      <div className="retention-plan-counts"><span><strong>{preview.plan.keep.length}</strong>保留</span><span><strong>{preview.plan.delete.length}</strong>符合退役</span><span><strong>{preview.executionBatch.selectedBackupIds.length}</strong>本批退役</span><span><strong>{preview.plan.blocked.length}</strong>阻止</span><span><strong>{preview.excluded.length}</strong>排除</span></div>
       {preview.excluded.some((entry) => entry.reason === 'redirected-entry') && <div className="retention-warning"><TriangleAlert size={15} />检测到重定向目录；服务端会拒绝执行整个退役事务。</div>}
-      <div className="retention-candidates">{preview.plan.delete.length ? preview.plan.delete.map((entry) => <span key={entry.backupId}><Trash2 size={13} /><code>{shortId(entry.backupId)}</code><small>{entry.reason === 'outside-policy' ? '超出策略' : '不健康删除已显式允许'}</small></span>) : <span className="empty"><ShieldCheck size={14} />当前没有需要退役的保护点</span>}</div>
+      {preview.executionBatch.deferredCandidateCount > 0 && <div className="retention-warning"><Clock3 size={15} />为保证事务日志可恢复，本次只处理最旧的 {preview.executionBatch.selectedBackupIds.length} 个；其余 {preview.executionBatch.deferredCandidateCount} 个会在下一次重新预演后处理。</div>}
+      <div className="retention-candidates">{selectedRetirementDecisions.length ? selectedRetirementDecisions.map((entry) => <span key={entry.backupId}><Trash2 size={13} /><code>{shortId(entry.backupId)}</code><small>{entry.reason === 'outside-policy' ? '超出策略' : '不健康删除已显式允许'}</small></span>) : <span className="empty"><ShieldCheck size={14} />当前没有需要退役的保护点</span>}</div>
       <div className="retention-confirm"><label><span>输入 RETIRE</span><input aria-label="确认退役" value={retireConfirmation} onChange={(event) => setRetireConfirmation(event.target.value)} /></label><button type="button" className="danger" disabled={busy || !executionEnabled || retireConfirmation !== 'RETIRE'} onClick={executeRetirement}>{phase === 'retiring' ? '正在事务式退役…' : '退役选中备份'}</button></div>
     </section>}
 

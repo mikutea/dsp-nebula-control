@@ -265,6 +265,11 @@ export interface BackupRetentionPreview {
   referenceTime: string
   policy: BackupRetentionPolicy
   plan: BackupRetentionPlan
+  executionBatch: {
+    maximumCandidates: 128
+    selectedBackupIds: string[]
+    deferredCandidateCount: number
+  }
   excluded: Array<{
     backupId: string
     reason: 'created-at-unavailable' | 'redirected-entry'
@@ -1143,6 +1148,17 @@ export interface UpdateActivationState {
   historyEntries: number
 }
 
+export interface UpdateActivationRecoveryStatus {
+  schemaVersion: 1
+  phase: 'pending' | 'reconciling' | 'ready' | 'recovery-required' | 'unavailable'
+  mutationBlocked: boolean
+  recoveryRequired: boolean
+  failureCode: string | null
+  reconciledRequestId: string | null
+}
+
+export type UpdateActivationRecoveryConfirmation = 'RECOVER_COMPONENT_UPDATE'
+
 export type UpdateCompatibilityReasonCode =
   | 'dsp-version-mismatch' | 'nebula-version-mismatch' | 'bepinex-version-mismatch'
   | 'plugin-missing' | 'plugin-version-mismatch'
@@ -1396,6 +1412,15 @@ export interface ModDeploymentRecoveryPlan {
     kind: 'snapshot' | 'failed-publication' | 'abandoned-pending'
   }>
 }
+
+export interface ModDeploymentRecoveryStatus {
+  phase: 'ready' | 'recovery-required'
+  requestId: string | null
+  operation: ModDeploymentOperation | null
+  allowedDesired: Array<'candidate' | 'previous'>
+}
+
+export type ModDeploymentRecoveryDesired = 'candidate' | 'previous'
 
 export interface ClientProfileModEntry {
   sourceId: string

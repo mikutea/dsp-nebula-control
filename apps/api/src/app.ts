@@ -36,7 +36,8 @@ import {
 } from './host-mutation/lifecycle-coordinator.js'
 import {
   HostMutationCoordinator,
-  type HostMutationOperationCoordinator
+  type HostMutationOperationCoordinator,
+  type HostMutationRecoveryOperationCoordinator
 } from './host-mutation/operation-coordinator.js'
 import {
   SaveJobService,
@@ -68,6 +69,7 @@ import {
   registerBackupRetentionRoutes,
   verifyBackupPair
 } from './saves/index.js'
+import { ProductionBackupRetentionProtectionSource } from './saves/retention-protection-source.js'
 import { readGameConfigurationFiles } from './game-config/filesystem.js'
 import {
   GameConfigPlanError,
@@ -276,6 +278,11 @@ const modDeploymentExecuteSchema = z.strictObject({
     expectedRevision: z.string().length(64).regex(/^[0-9a-f]{64}$/)
   })
 })
+const modDeploymentRecoveryExecuteSchema = z.strictObject({
+  requestId: z.string().uuid().transform((value) => value.toLowerCase()),
+  desired: z.enum(['candidate', 'previous']),
+  confirmation: z.literal('RECOVER_MOD_DEPLOYMENT')
+})
 const modDeploymentReceiptParamsSchema = z.strictObject({
   requestId: z.string().uuid().transform((value) => value.toLowerCase())
 })
@@ -304,6 +311,7 @@ export interface ApplicationDependencies {
   lifecycleAdapter?: LifecycleMutationAdapter
   lifecycleCoordinator?: LifecycleMutationCoordinator
   hostMutationCoordinator?: HostMutationOperationCoordinator
+  hostMutationRecoveryCoordinator?: HostMutationRecoveryOperationCoordinator
   consoleReader?: StructuredLogReader
   playerSnapshotSource?: { read(signal?: AbortSignal): Promise<PlayerSnapshot> }
   playerPresenceHistory?: PlayerPresenceHistoryStore
@@ -353,11 +361,11 @@ export interface ApplicationDependencies {
   verifiedModLockService?: Pick<VerifiedModLockService, 'preview'>
   componentUpdateActivationController?: Pick<
     ComponentUpdateActivationHttpController,
-    'initialize' | 'recoveryStatus' | 'preview' | 'execute' | 'getReceipt' | 'history' | 'previewCleanup'
+    'initialize' | 'recoveryStatus' | 'recover' | 'preview' | 'execute' | 'getReceipt' | 'history' | 'previewCleanup'
   >
   componentUpdateActivationService?: Pick<
     ComponentUpdateActivationService,
-    'preview' | 'execute' | 'reconcile' | 'getReceipt' | 'getState' | 'previewCleanup'
+    'preview' | 'execute' | 'reconcile' | 'recoverInterrupted' | 'getReceipt' | 'getState' | 'previewCleanup'
   >
   trustedCompatibilityService?: Pick<
     TrustedCompatibilityService,
@@ -369,7 +377,8 @@ export interface ApplicationDependencies {
   >
   modDeploymentService?: Pick<
     ModDeploymentService,
-    'inspect' | 'preview' | 'execute' | 'previewCleanup' | 'getReceipt' | 'history'
+    'inspect' | 'preview' | 'execute' | 'recoveryStatus' | 'recoverInterrupted' |
+    'previewCleanup' | 'getReceipt' | 'history'
   >
   observabilityHistory?: ObservabilityHistoryStore
   observabilityAlerts?: Pick<
@@ -478,11 +487,14 @@ export async function buildApplication(
   const hostMutationLeaseManager = config.provider === 'windows'
     ? new HostMutationLeaseManager({ scriptRoot: config.scriptRoot })
     : null
-  const hostMutationCoordinator = dependencies.hostMutationCoordinator ?? (
+  const defaultHostMutationCoordinator = (
     hostMutationLeaseManager
       ? new HostMutationCoordinator(hostMutationLeaseManager, { dataRoot: config.dataDir })
       : undefined
   )
+  const hostMutationCoordinator = dependencies.hostMutationCoordinator ?? defaultHostMutationCoordinator
+  const hostMutationRecoveryCoordinator = dependencies.hostMutationRecoveryCoordinator ??
+    defaultHostMutationCoordinator
   const lifecycleCoordinator = dependencies.lifecycleCoordinator ?? (
     config.lifecycleEnabled && hostMutationLeaseManager
       ? new HostMutationLifecycleCoordinator(
@@ -584,12 +596,22 @@ export async function buildApplication(
         })
       : null
   )
+  const productionRetentionRoots = workspacePaths !== null && config.projectRoot !== null &&
+      path.isAbsolute(config.projectRoot) && path.isAbsolute(workspacePaths.backupRoot)
+    ? { projectRoot: config.projectRoot, backupRoot: workspacePaths.backupRoot }
+    : null
   const backupRetention = dependencies.backupRetentionController ?? (
-    workspacePaths
+    productionRetentionRoots
       ? new BackupRetentionHttpController({
           service: new BackupRetentionControlService({
-            backupRoot: workspacePaths.backupRoot,
-            minimumPurgeAgeMs: config.saveRetentionPurgeMinimumHours * 60 * 60 * 1_000
+            backupRoot: productionRetentionRoots.backupRoot,
+            minimumPurgeAgeMs: config.saveRetentionPurgeMinimumHours * 60 * 60 * 1_000,
+            hostMutationCoordinator,
+            hostMutationRecoveryCoordinator,
+            protectionSource: new ProductionBackupRetentionProtectionSource({
+              projectRoot: productionRetentionRoots.projectRoot,
+              workflowStore: database
+            })
           }),
           mutationGate: () => config.saveRetentionMutationsEnabled
         })
@@ -714,6 +736,7 @@ export async function buildApplication(
             },
             compatibilityVerifier: trustedCompatibilityService,
             hostMutationCoordinator,
+            hostMutationRecoveryCoordinator,
             verifyStoppedState: (request, hostMutation) =>
               runtimeAdapters.verifyStoppedState(request, hostMutation),
             createSaveProtectionPoint: (request, hostMutation) =>
@@ -727,7 +750,8 @@ export async function buildApplication(
     componentUpdateActivationService
       ? new ComponentUpdateActivationHttpController({
           service: componentUpdateActivationService,
-          mutationGate: () => config.updateActivationEnabled
+          mutationGate: () => config.updateActivationEnabled,
+          recoveryMutationGate: () => config.updateActivationRecoveryEnabled
         })
       : null
   )
@@ -782,6 +806,7 @@ export async function buildApplication(
           pluginsRoot: config.modPluginsRoot,
           maxSnapshots: config.modSnapshotLimit,
           hostMutationCoordinator,
+          hostMutationRecoveryCoordinator,
           ...(trustedCompatibilityService
             ? {
                 readPlatformInventory: async () => {
@@ -1618,6 +1643,34 @@ export async function buildApplication(
     }
   })
 
+  app.get('/api/v1/mods/deployment/recovery/status', protectedRoute('mods.read'), async (request, reply) => {
+    if (!modDeployments) return modDeploymentUnavailable(reply)
+    if (!emptyObjectSchema.safeParse(request.query ?? {}).success) {
+      return invalidModDeploymentRequest(reply)
+    }
+    try {
+      return {
+        data: await modDeployments.recoveryStatus(),
+        meta: { executionEnabled: config.modDeploymentRecoveryEnabled }
+      }
+    } catch (error) {
+      return modDeploymentError(reply, error)
+    }
+  })
+
+  app.post('/api/v1/mods/deployment/recovery/execute', protectedRoute('mods.mutate'), async (request, reply) => {
+    if (!config.modDeploymentRecoveryEnabled) return modDeploymentRecoveryMutationsDisabled(reply)
+    if (!modDeployments) return modDeploymentUnavailable(reply)
+    const parsed = modDeploymentRecoveryExecuteSchema.safeParse(request.body)
+    if (!parsed.success) return invalidModDeploymentRequest(reply)
+    try {
+      const receipt = await modDeployments.recoverInterrupted(parsed.data.requestId, parsed.data.desired)
+      return reply.code(receipt.reused ? 200 : 202).send({ data: receipt })
+    } catch (error) {
+      return modDeploymentError(reply, error)
+    }
+  })
+
   app.get('/api/v1/mods/deployment/receipts/:requestId', protectedRoute('mods.read'), async (request, reply) => {
     if (!modDeployments) return modDeploymentUnavailable(reply)
     const parsed = modDeploymentReceiptParamsSchema.safeParse(request.params)
@@ -1825,6 +1878,12 @@ export async function buildApplication(
   app.get('/api/v1/updates/activation/recovery', protectedRoute('updates.read'), async (_request, reply) => {
     if (!componentUpdateActivation) return updateActivationUnavailable(reply)
     const result = await componentUpdateActivation.recoveryStatus({})
+    return reply.code(result.statusCode).send(result.body)
+  })
+
+  app.post('/api/v1/updates/activation/recovery', protectedRoute('updates.activate'), async (request, reply) => {
+    if (!componentUpdateActivation) return updateActivationUnavailable(reply)
+    const result = await componentUpdateActivation.recover(request.body)
     return reply.code(result.statusCode).send(result.body)
   })
 
@@ -2292,6 +2351,15 @@ function modDeploymentUnavailable(reply: FastifyReply) {
 function modDeploymentMutationsDisabled(reply: FastifyReply) {
   return reply.code(503).send({
     error: { code: 'MOD_DEPLOYMENT_MUTATIONS_DISABLED', message: '模组部署写操作尚未显式启用' }
+  })
+}
+
+function modDeploymentRecoveryMutationsDisabled(reply: FastifyReply) {
+  return reply.code(503).send({
+    error: {
+      code: 'MOD_DEPLOYMENT_RECOVERY_MUTATIONS_DISABLED',
+      message: '模组部署显式恢复尚未通过独立开关启用'
+    }
   })
 }
 

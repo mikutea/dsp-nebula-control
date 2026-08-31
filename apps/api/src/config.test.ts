@@ -105,7 +105,8 @@ describe('production configuration', () => {
       updateStagingEnabled: false,
       updateAcquisitionEnabled: false,
       updatePreparationEnabled: false,
-      updateActivationEnabled: false
+      updateActivationEnabled: false,
+      updateActivationRecoveryEnabled: false
     })
     expect(() => loadConfig({
       NODE_ENV: 'test', DYSON_UPDATE_STAGING_ENABLED: 'true',
@@ -173,10 +174,36 @@ describe('production configuration', () => {
     })).toThrow(/must be an absolute path/)
   })
 
+  it('keeps explicit component recovery independently disabled and validates its complete host chain', () => {
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED: 'true'
+    })).toThrow(/requires the Windows provider/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED: 'true'
+    })).toThrow(/requires lifecycle execution/)
+    const config = loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_UPDATE_ACTIVATION_ENABLED: 'false',
+      DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED: 'true', DYSON_LIFECYCLE_ENABLED: 'true',
+      DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
+      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
+      DYSON_UPDATE_STAGING_ENABLED: 'true',
+      DYSON_UPDATE_INBOX_ROOT: 'C:\\ProgramData\\DysonControl\\update-inbox',
+      DYSON_UPDATE_STAGING_ROOT: 'C:\\ProgramData\\DysonControl\\staging',
+      DYSON_UPDATE_COMPATIBILITY_POLICY_FILE: 'C:\\ProgramData\\DysonControl\\compatibility-policy.json'
+    })
+    expect(config).toMatchObject({
+      updateActivationEnabled: false,
+      updateActivationRecoveryEnabled: true
+    })
+  })
+
   it('keeps mod deployment independently disabled and binds activation to fixed Windows roots', () => {
     expect(loadConfig({ NODE_ENV: 'test' })).toMatchObject({
       modImportEnabled: false,
       modDeploymentEnabled: false,
+      modDeploymentRecoveryEnabled: false,
       modStagingRoot: null,
       modPluginsRoot: null,
       modSnapshotLimit: 8
@@ -217,8 +244,26 @@ describe('production configuration', () => {
     })).toMatchObject({
       modImportEnabled: true,
       modDeploymentEnabled: true,
+      modDeploymentRecoveryEnabled: false,
       modPluginsRoot: 'C:\\Fictional\\Dyson\\server\\BepInEx\\plugins\\dyson-managed-mods',
       modSnapshotLimit: 16
+    })
+  })
+
+  it('keeps explicit mod recovery independently disabled and requires the fixed Windows roots', () => {
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED: 'true'
+    })).toThrow(/requires the Windows provider/)
+    const config = loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_MOD_DEPLOYMENT_ENABLED: 'false',
+      DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED: 'true',
+      DYSON_MOD_STAGING_ROOT: 'C:\\Fictional\\staged-mods',
+      DYSON_MOD_PLUGINS_ROOT: 'C:\\Fictional\\Dyson\\server\\BepInEx\\plugins\\dyson-managed-mods'
+    })
+    expect(config).toMatchObject({
+      modDeploymentEnabled: false,
+      modDeploymentRecoveryEnabled: true
     })
   })
 

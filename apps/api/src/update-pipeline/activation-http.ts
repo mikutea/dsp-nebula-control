@@ -20,6 +20,8 @@ export const componentUpdateActivationConfirmations = Object.freeze({
   control: 'ACTIVATE_CONTROL_UPDATE'
 } satisfies Record<UpdateActivationComponent, string>)
 
+export const componentUpdateActivationRecoveryConfirmation = 'RECOVER_COMPONENT_UPDATE' as const
+
 const confirmationSchema = z.enum([
   'ACTIVATE_DSP_UPDATE',
   'ACTIVATE_NEBULA_UPDATE',
@@ -42,12 +44,17 @@ const executeEnvelopeSchema = z.strictObject({
 })
 
 const requestIdInputSchema = z.strictObject({ requestId: z.string().uuid() })
+const recoveryEnvelopeSchema = z.strictObject({
+  requestId: z.string().uuid().transform((value) => value.toLowerCase()),
+  confirmation: z.literal(componentUpdateActivationRecoveryConfirmation)
+})
 const emptyInputSchema = z.strictObject({})
 
 export interface ComponentUpdateActivationHttpService {
   preview(input: unknown): Promise<ComponentUpdateActivationPlan>
   execute(input: unknown): Promise<ComponentUpdateActivationReceipt>
   reconcile(): Promise<ComponentUpdateActivationReceipt | null>
+  recoverInterrupted(requestId: unknown): Promise<ComponentUpdateActivationReceipt>
   getReceipt(requestId: unknown): Promise<ComponentUpdateActivationReceipt | null>
   getState(): Promise<ComponentUpdateStateSummary>
   previewCleanup(): Promise<ComponentUpdateCleanupPlan>
@@ -73,10 +80,16 @@ export type ComponentUpdateMutationGate = (
   request: Readonly<UpdateActivationRequest>
 ) => boolean | Promise<boolean>
 
+export type ComponentUpdateRecoveryMutationGate = (
+  requestId: string
+) => boolean | Promise<boolean>
+
 export interface ComponentUpdateActivationHttpOptions {
   service: ComponentUpdateActivationHttpService
   /** Mutations are disabled unless an embedding application explicitly opts in. */
   mutationGate?: ComponentUpdateMutationGate
+  /** Explicit recovery is independently fail-closed even when normal activation is enabled. */
+  recoveryMutationGate?: ComponentUpdateRecoveryMutationGate
 }
 
 export interface ComponentUpdateActivationHttpSuccess<T> {
@@ -103,12 +116,14 @@ export interface ComponentUpdateActivationHttpResult<T> {
 export class ComponentUpdateActivationHttpController {
   readonly #service: ComponentUpdateActivationHttpService
   readonly #mutationGate: ComponentUpdateMutationGate
+  readonly #recoveryMutationGate: ComponentUpdateRecoveryMutationGate
   #initialization: Promise<void> | null = null
   #recovery: ComponentUpdateActivationRecoveryStatus = recoveryStatus('pending')
 
   constructor(options: ComponentUpdateActivationHttpOptions) {
     this.#service = options.service
     this.#mutationGate = options.mutationGate ?? (() => false)
+    this.#recoveryMutationGate = options.recoveryMutationGate ?? (() => false)
   }
 
   /**
@@ -181,6 +196,13 @@ export class ComponentUpdateActivationHttpController {
 
       const receipt = await this.#service.execute(request)
       if (receipt.status !== 'succeeded') {
+        if (receipt.recoveryRequired || receipt.status === 'rollback-failed') {
+          this.#recovery = recoveryStatus(
+            'recovery-required',
+            safeReceiptFailureCode(receipt),
+            receipt.requestId
+          )
+        }
         return failure(
           receipt.status === 'rollback-failed' ? 503 : 409,
           safeReceiptFailureCode(receipt)
@@ -191,6 +213,80 @@ export class ComponentUpdateActivationHttpController {
       return success(receipt.reused ? 200 : 202, receipt)
     } catch (error) {
       return failureFrom(error)
+    }
+  }
+
+  /**
+   * Performs one exact, administrator-confirmed recovery. The browser supplies
+   * only the durable request ID and a fixed confirmation; the core reconstructs
+   * all paths, transaction identity, and desired terminal state from trusted
+   * host evidence and the recovery broker binding.
+   */
+  async recover(input: unknown): Promise<ComponentUpdateActivationHttpResult<ComponentUpdateActivationReceipt>> {
+    try {
+      const { requestId } = recoveryEnvelopeSchema.parse(input)
+      await this.initialize()
+      if (this.#recovery.phase === 'pending' || this.#recovery.phase === 'reconciling') {
+        throw new ActivationHttpFault(503, 'UPDATE_ACTIVATION_HTTP_RECOVERY_PENDING')
+      }
+      if (this.#recovery.phase !== 'recovery-required') {
+        throw new ActivationHttpFault(
+          this.#recovery.phase === 'ready' ? 409 : 503,
+          this.#recovery.phase === 'ready'
+            ? 'UPDATE_ACTIVATION_HTTP_RECOVERY_NOT_REQUIRED'
+            : 'UPDATE_ACTIVATION_HTTP_RECOVERY_UNAVAILABLE'
+        )
+      }
+      if (this.#recovery.reconciledRequestId !== null &&
+          this.#recovery.reconciledRequestId !== requestId) {
+        throw new ActivationHttpFault(409, 'UPDATE_RECOVERY_REQUEST_MISMATCH')
+      }
+
+      let mutationAllowed: boolean
+      try {
+        mutationAllowed = await this.#recoveryMutationGate(requestId)
+      } catch {
+        throw new ActivationHttpFault(503, 'UPDATE_ACTIVATION_HTTP_GATE_UNAVAILABLE')
+      }
+      if (mutationAllowed !== true) {
+        throw new ActivationHttpFault(423, 'UPDATE_ACTIVATION_HTTP_MUTATION_DISABLED')
+      }
+
+      const receipt = await this.#service.recoverInterrupted(requestId)
+      if (!isProvenRecoveryTerminalReceipt(receipt, requestId)) {
+        const failureCode = receipt.recoveryRequired
+          ? safeReceiptFailureCode(receipt)
+          : 'UPDATE_RECOVERY_TERMINAL_UNPROVEN'
+        this.#recovery = recoveryStatus(
+          'recovery-required',
+          failureCode,
+          requestId
+        )
+        return failure(503, failureCode)
+      }
+      const [persistedReceipt, state] = await Promise.all([
+        this.#service.getReceipt(requestId),
+        this.#service.getState()
+      ])
+      if (persistedReceipt === null ||
+          !samePersistedTerminalReceipt(receipt, persistedReceipt) ||
+          !stateProvesRecoveryTerminal(state, receipt)) {
+        this.#recovery = recoveryStatus(
+          'recovery-required',
+          'UPDATE_RECOVERY_TERMINAL_UNPROVEN',
+          requestId
+        )
+        return failure(503, 'UPDATE_RECOVERY_TERMINAL_UNPROVEN')
+      }
+      this.#recovery = recoveryStatus('ready', null, requestId)
+      return success(receipt.reused ? 200 : 202, receipt)
+    } catch (error) {
+      const result = failureFrom(error)
+      if (result.statusCode >= 500 && this.#recovery.phase === 'recovery-required') {
+        const code = result.body.ok ? null : result.body.error.code
+        this.#recovery = recoveryStatus('recovery-required', code, this.#recovery.reconciledRequestId)
+      }
+      return result
     }
   }
 
@@ -363,6 +459,52 @@ function safeReceiptFailureCode(receipt: ComponentUpdateActivationReceipt): stri
   return mapped.body.ok ? 'UPDATE_ACTIVATION_FAILED' : mapped.body.error.code
 }
 
+function isProvenRecoveryTerminalReceipt(
+  receipt: ComponentUpdateActivationReceipt,
+  requestId: string
+): boolean {
+  if (receipt.requestId !== requestId || receipt.recoveryRequired) return false
+  if (receipt.status === 'succeeded') return receipt.failureCode === null
+  return receipt.status === 'rolled-back' && receipt.rollbackVerified && receipt.failureCode !== null
+}
+
+function samePersistedTerminalReceipt(
+  recovered: ComponentUpdateActivationReceipt,
+  persisted: ComponentUpdateActivationReceipt
+): boolean {
+  return persisted.reused === false &&
+    recovered.format === persisted.format &&
+    recovered.schemaVersion === persisted.schemaVersion &&
+    recovered.requestId === persisted.requestId &&
+    recovered.component === persisted.component &&
+    recovered.artifactId === persisted.artifactId &&
+    recovered.compatibilityReceiptId === persisted.compatibilityReceiptId &&
+    recovered.targetVersion === persisted.targetVersion &&
+    recovered.releaseId === persisted.releaseId &&
+    recovered.status === persisted.status &&
+    recovered.previousRevision === persisted.previousRevision &&
+    recovered.resultingRevision === persisted.resultingRevision &&
+    recovered.protectionBackupId === persisted.protectionBackupId &&
+    recovered.failureCode === persisted.failureCode &&
+    recovered.rollbackVerified === persisted.rollbackVerified &&
+    recovered.recoveryRequired === persisted.recoveryRequired &&
+    recovered.fileCount === persisted.fileCount &&
+    recovered.expandedBytes === persisted.expandedBytes &&
+    recovered.completedAt === persisted.completedAt
+}
+
+function stateProvesRecoveryTerminal(
+  state: ComponentUpdateStateSummary,
+  receipt: ComponentUpdateActivationReceipt
+): boolean {
+  if (state.recoveryRequired || state.revision !== receipt.resultingRevision) return false
+  if (receipt.status === 'rolled-back') return true
+  const active = state.components.find((entry) => entry.component === receipt.component)
+  return active?.version === receipt.targetVersion &&
+    active.artifactId === receipt.artifactId &&
+    active.releaseId === receipt.releaseId
+}
+
 const conflictCodes = new Set([
   'UPDATE_ARCHIVE_CHANGED',
   'UPDATE_COMPATIBILITY_CONFLICT',
@@ -377,8 +519,12 @@ const conflictCodes = new Set([
   'UPDATE_INTERRUPTED',
   'UPDATE_INVENTORY_DRIFT',
   'UPDATE_JOURNAL_CONFLICT',
+  'UPDATE_HOST_LEASE_RECOVERY_MISMATCH',
+  'UPDATE_HOST_LEASE_RECOVERY_NOT_REQUIRED',
   'UPDATE_RECONCILIATION_AMBIGUOUS',
   'UPDATE_RECONCILIATION_UNCERTAIN',
+  'UPDATE_RECOVERY_NOT_PENDING',
+  'UPDATE_RECOVERY_REQUEST_MISMATCH',
   'UPDATE_RECOVERY_REQUIRED',
   'UPDATE_REVISION_CONFLICT',
   'UPDATE_STAGED_ARTIFACT_CHANGED',
@@ -470,6 +616,9 @@ const unavailableCodes = new Set([
   'UPDATE_COMPATIBILITY_ROOT_UNAVAILABLE',
   'UPDATE_PERSISTED_FILE_INVALID',
   'UPDATE_PERSISTENCE_FAILED',
+  'UPDATE_RECOVERY_EVIDENCE_CHANGED',
+  'UPDATE_RECOVERY_EVIDENCE_INVALID',
+  'UPDATE_RECOVERY_TERMINAL_UNPROVEN',
   'UPDATE_RECEIPT_INVALID',
   'UPDATE_RELEASE_ASSEMBLY_FAILED',
   'UPDATE_RELEASE_DIRECTORY_INVALID',

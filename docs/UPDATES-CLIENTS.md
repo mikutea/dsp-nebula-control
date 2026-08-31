@@ -232,6 +232,7 @@ The authenticated component workspace uses these routes:
 
 - `GET /api/v1/updates/activation/state`;
 - `GET /api/v1/updates/activation/recovery`;
+- `POST /api/v1/updates/activation/recovery`;
 - `GET /api/v1/updates/activation/cleanup/preview`;
 - `GET /api/v1/updates/activation/receipts/:requestId`;
 - `POST /api/v1/updates/activation/preview`;
@@ -260,6 +261,22 @@ uncertain journal or durable `recoveryRequired` state keeps all activation
 mutations blocked while state, receipt, history, and cleanup previews remain
 readable. Restarting the application may retry reconciliation, but requests do
 not implicitly repeat it within one process.
+
+Ordinary activation and explicit recovery have separate, default-off Windows
+gates:
+
+```text
+DYSON_UPDATE_ACTIVATION_ENABLED=false
+DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED=false
+```
+
+Enabling ordinary activation never enables recovery, and enabling recovery
+never authorizes a new update. The recovery request is restricted to an
+Administrator with `updates.activate` and contains exactly the persisted
+transaction UUID plus `RECOVER_COMPONENT_UPDATE`. The server reconstructs the
+component, artifact, paths and terminal action from its durable journal and
+the global host-mutation broker. It re-reads the persisted terminal receipt
+and active revision before reopening the ordinary activation gate.
 
 Nebula, bridge, and control plugin archives are limited to declared
 `plugins/**/*.dll|json` files. BepInEx uses a separate versioned Windows x64
@@ -331,6 +348,22 @@ mutation workspace remains restricted to `mods.mutate` Administrators. Neither
 route accepts or returns a server path, URL, command, credential, storage
 fingerprint, or arbitrary archive. It still lacks a separately verified
 production live-installed-mod drift scan and real Nebula load proof.
+
+Interrupted publication is exposed through a separate bounded contract:
+
+- `GET /api/v1/mods/deployment/recovery/status` returns only `ready` or the
+  exact pending request ID, operation and server-approved terminal choices;
+- `POST /api/v1/mods/deployment/recovery/execute` accepts exactly that UUID,
+  one approved `candidate` or `previous` choice, and
+  `RECOVER_MOD_DEPLOYMENT`.
+
+The independent `DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED=false` gate does not
+inherit from `DYSON_MOD_DEPLOYMENT_ENABLED`. While status is missing, invalid,
+or recovery-required, the Web workspace and server both keep ordinary mod
+publication fail-closed. A successful recovery is accepted by the browser only
+after a fresh state read proves the durable terminal revision and a fresh
+recovery-status read returns `ready`; paths, journal contents and storage
+fingerprints never cross the API boundary.
 
 The Thunderstore browser-to-deployment chain is deliberately receipt-bound:
 

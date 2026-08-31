@@ -24,6 +24,10 @@ import type {
   StoredSaveJobRun
 } from '../saves/job-types.js'
 import type { SaveTransactionErrorCode, SaveTransactionStatus } from '../saves/transactions.js'
+import type {
+  LifecycleBackupProtectionRecord,
+  SaveRestoreBackupProtectionRecord
+} from '../saves/retention-protection-source.js'
 import type { ControlRole } from '../security/authorization.js'
 import type {
   ObservabilityAlertStateStore,
@@ -34,6 +38,9 @@ import {
   validatePlayerPresencePersistenceMetadata,
   validatePlayerPresencePersistenceState
 } from '../players/history.js'
+
+const MAX_RETENTION_PROTECTION_RECORDS = 20_000
+const MAX_LIFECYCLE_PROTECTION_RECEIPTS = 32
 import type {
   PlayerPresenceEventDraft,
   PlayerPresenceHistoryPersistence,
@@ -109,6 +116,30 @@ interface SaveRunRow {
   recovery_required: number
   created_at: string
   updated_at: string
+}
+
+interface LifecycleProtectionRow extends LifecycleRunRow {
+  job_kind: JobKind | null
+  job_state: JobState | null
+  job_started_at: string | null
+  job_finished_at: string | null
+  job_duration_ms: number | null
+  job_error_code: string | null
+  receipt_count: number
+  invalid_receipt_count: number
+  failed_receipt_count: number
+  receipt_min_sequence: number | null
+  receipt_max_sequence: number | null
+  receipt_phase_sequence: string | null
+}
+
+interface SaveProtectionRow extends SaveRunRow {
+  job_kind: JobKind | null
+  job_state: JobState | null
+  job_started_at: string | null
+  job_finished_at: string | null
+  job_duration_ms: number | null
+  job_error_code: string | null
 }
 
 interface PlayerPresenceStateRow {
@@ -189,6 +220,8 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
       );
       CREATE INDEX IF NOT EXISTS lifecycle_receipts_job_idx
         ON lifecycle_receipts(job_id, sequence);
+      CREATE INDEX IF NOT EXISTS lifecycle_runs_created_job_idx
+        ON lifecycle_runs(created_at, job_id);
       CREATE TABLE IF NOT EXISTS lifecycle_locks (
         name TEXT PRIMARY KEY,
         job_id TEXT NOT NULL REFERENCES lifecycle_runs(job_id) ON DELETE CASCADE,
@@ -230,6 +263,8 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
       );
       CREATE INDEX IF NOT EXISTS save_runs_state_created_idx
         ON save_runs(state, created_at);
+      CREATE INDEX IF NOT EXISTS save_runs_operation_created_job_idx
+        ON save_runs(operation, created_at, job_id);
       CREATE TABLE IF NOT EXISTS save_reconciliation_receipts (
         id TEXT PRIMARY KEY,
         job_id TEXT NOT NULL REFERENCES save_runs(job_id) ON DELETE CASCADE,
@@ -618,6 +653,76 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
     return rows.map((row) => this.#toSaveRun(row))
   }
 
+  /**
+   * Internal retention input. The query deliberately returns only fixed
+   * workflow fields; no save path, revision, file content, or actor data is
+   * exposed to the protection source.
+   */
+  listSaveRestoreBackupProtectionRecords(): SaveRestoreBackupProtectionRecord[] {
+    const rows = this.#database.prepare(`
+      WITH bounded_restore_runs AS MATERIALIZED (
+        SELECT job_id
+        FROM save_runs INDEXED BY save_runs_operation_created_job_idx
+        WHERE operation = 'restore'
+        ORDER BY created_at ASC, job_id ASC
+        LIMIT ${MAX_RETENTION_PROTECTION_RECORDS + 1}
+      )
+      SELECT save_runs.*,
+             jobs.kind AS job_kind,
+             jobs.state AS job_state,
+             jobs.started_at AS job_started_at,
+             jobs.finished_at AS job_finished_at,
+             jobs.duration_ms AS job_duration_ms
+             , jobs.error_code AS job_error_code
+      FROM bounded_restore_runs
+      INNER JOIN save_runs ON save_runs.job_id = bounded_restore_runs.job_id
+      LEFT JOIN jobs ON jobs.id = save_runs.job_id
+      ORDER BY save_runs.created_at ASC, save_runs.job_id ASC
+    `).all() as unknown as SaveProtectionRow[]
+    return rows.map((row) => {
+      const run = this.#toSaveRun(row)
+      const result = run.result
+      const jobStateMatches =
+        (run.state === 'queued' && row.job_state === 'queued') ||
+        (run.state === 'running' && row.job_state === 'running') ||
+        (run.state === 'succeeded' && row.job_state === 'succeeded') ||
+        ((run.state === 'failed' || run.state === 'interrupted') && row.job_state === 'failed')
+      const jobTerminalComplete = row.job_finished_at !== null &&
+        row.job_started_at !== null && row.job_duration_ms !== null && row.job_duration_ms >= 0 &&
+        row.job_kind === 'save.restore'
+      const terminalResultMatchesState = result !== null && (
+        (run.state === 'succeeded' && result.status === 'succeeded' && result.rollback === 'not-required') ||
+        (run.state === 'failed' &&
+          ['busy', 'rejected', 'revision-conflict', 'failed', 'rolled-back'].includes(result.status) &&
+          (result.status === 'rolled-back' ? result.rollback === 'succeeded' : result.rollback === 'not-required'))
+      )
+      const auditComplete = result !== null && (
+        !['succeeded', 'rolled-back'].includes(result.status) || result.auditStored
+      )
+      const protectionIdentityMatches = run.protectionRequestId !== null &&
+        row.result_protection_backup_id === `tx-${run.protectionRequestId.toLocaleLowerCase('en-US')}`
+      const resultIdentityMatches = run.backupId !== null && row.result_backup_id === run.backupId &&
+        Number.isSafeInteger(row.result_pair_bytes) && row.result_pair_bytes !== null && row.result_pair_bytes >= 0 &&
+        (row.result_reused === 0 || row.result_reused === 1) &&
+        (row.audit_stored === 0 || row.audit_stored === 1) &&
+        (row.result_cleanup_pending === 0 || row.result_cleanup_pending === 1) &&
+        (row.result_maintenance_required === 0 || row.result_maintenance_required === 1)
+      const terminalErrorMatches = run.state === 'succeeded'
+        ? run.errorCode === null && row.job_error_code === null
+        : run.state === 'failed' && run.errorCode !== null && row.job_error_code === run.errorCode
+      return {
+        state: run.state,
+        protectionRequestId: run.protectionRequestId,
+        resultProtectionBackupId: row.result_protection_backup_id,
+        recoveryRequired: row.recovery_required !== 0,
+        terminalReceiptComplete: (run.state === 'succeeded' || run.state === 'failed') &&
+          jobStateMatches && jobTerminalComplete && row.recovery_required === 0 && terminalResultMatchesState &&
+          auditComplete && row.result_cleanup_pending === 0 && row.result_maintenance_required === 0 &&
+          protectionIdentityMatches && resultIdentityMatches && terminalErrorMatches
+      }
+    })
+  }
+
   claimQueuedSaveRun(
     jobId: string,
     expectedUpdatedAt: string,
@@ -835,6 +940,98 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
       'SELECT * FROM lifecycle_receipts WHERE job_id = ? ORDER BY sequence ASC'
     ).all(jobId) as unknown as LifecycleReceiptRow[]
     return rows.map((row) => this.#toLifecycleReceipt(row))
+  }
+
+  /** Fixed-column lifecycle protection records consumed by backup retention. */
+  listLifecycleBackupProtectionRecords(): LifecycleBackupProtectionRecord[] {
+    const rows = this.#database.prepare(`
+      WITH bounded_lifecycle_runs AS MATERIALIZED (
+        SELECT job_id
+        FROM lifecycle_runs INDEXED BY lifecycle_runs_created_job_idx
+        ORDER BY created_at ASC, job_id ASC
+        LIMIT ${MAX_RETENTION_PROTECTION_RECORDS + 1}
+      )
+      SELECT lifecycle_runs.*,
+             jobs.kind AS job_kind,
+             jobs.state AS job_state,
+             jobs.started_at AS job_started_at,
+             jobs.finished_at AS job_finished_at,
+             jobs.duration_ms AS job_duration_ms,
+             jobs.error_code AS job_error_code,
+             COUNT(lifecycle_receipts.id) AS receipt_count,
+             COALESCE(SUM(CASE
+                WHEN lifecycle_receipts.id IS NOT NULL AND (
+                     lifecycle_receipts.state NOT IN ('succeeded', 'failed') OR
+                     lifecycle_receipts.finished_at IS NULL OR
+                     (lifecycle_receipts.state = 'succeeded' AND lifecycle_receipts.error_code IS NOT NULL) OR
+                     (lifecycle_receipts.state = 'failed' AND lifecycle_receipts.error_code IS NULL)
+                )
+                 THEN 1 ELSE 0 END), 0) AS invalid_receipt_count
+             , COALESCE(SUM(CASE
+                 WHEN lifecycle_receipts.state = 'failed' THEN 1 ELSE 0 END), 0) AS failed_receipt_count
+             , (SELECT sequence
+                  FROM lifecycle_receipts AS first_receipt
+                 WHERE first_receipt.job_id = lifecycle_runs.job_id
+                 ORDER BY sequence ASC LIMIT 1) AS receipt_min_sequence
+             , (SELECT sequence
+                  FROM lifecycle_receipts AS last_receipt
+                 WHERE last_receipt.job_id = lifecycle_runs.job_id
+                 ORDER BY sequence DESC LIMIT 1) AS receipt_max_sequence
+             , (SELECT GROUP_CONCAT(phase, '|')
+                  FROM (
+                    SELECT phase
+                      FROM lifecycle_receipts AS ordered_receipt
+                     WHERE ordered_receipt.job_id = lifecycle_runs.job_id
+                       AND ordered_receipt.sequence BETWEEN 1 AND ${MAX_LIFECYCLE_PROTECTION_RECEIPTS + 1}
+                     ORDER BY sequence ASC
+                  )) AS receipt_phase_sequence
+      FROM bounded_lifecycle_runs
+      INNER JOIN lifecycle_runs ON lifecycle_runs.job_id = bounded_lifecycle_runs.job_id
+      LEFT JOIN jobs ON jobs.id = lifecycle_runs.job_id
+      LEFT JOIN lifecycle_receipts
+        ON lifecycle_receipts.job_id = lifecycle_runs.job_id
+       AND lifecycle_receipts.sequence BETWEEN 1 AND ${MAX_LIFECYCLE_PROTECTION_RECEIPTS + 1}
+      GROUP BY lifecycle_runs.job_id
+      ORDER BY lifecycle_runs.created_at ASC, lifecycle_runs.job_id ASC
+    `).all() as unknown as LifecycleProtectionRow[]
+    return rows.map((row) => {
+      const jobStateMatches =
+        (row.state === 'queued' && row.job_state === 'queued') ||
+        (row.state === 'running' && row.job_state === 'running') ||
+        (row.state === 'succeeded' && row.job_state === 'succeeded') ||
+        ((row.state === 'failed' || row.state === 'interrupted') && row.job_state === 'failed')
+      const receiptSequenceComplete = row.receipt_count > 0 &&
+        row.receipt_count <= MAX_LIFECYCLE_PROTECTION_RECEIPTS &&
+        row.receipt_min_sequence === 1 && row.receipt_max_sequence === row.receipt_count
+      const expectedSuccessfulPhases: Record<LifecycleAction, string> = {
+        start: 'lock|preflight|start|verify-running',
+        save: 'lock|preflight|protection-point|save',
+        'graceful-stop': 'lock|preflight|protection-point|save|stop|verify-stopped',
+        restart: 'lock|preflight|protection-point|save|stop|verify-stopped|start|verify-running'
+      }
+      const expectedJobKinds: Record<LifecycleAction, JobKind> = {
+        start: 'game.start',
+        save: 'game.save',
+        'graceful-stop': 'game.stop',
+        restart: 'game.restart'
+      }
+      return {
+        requestId: row.request_id,
+        action: row.action,
+        state: row.state,
+        protectionPointId: row.protection_point_id,
+        recoveryRequired: row.recovery_required === 1,
+        // Failed lifecycle transactions are retained conservatively. Their
+        // rollback paths are action/phase dependent and cannot be reduced to
+        // a count of terminal rows without losing crash-window evidence.
+        terminalReceiptComplete: row.state === 'succeeded' &&
+          row.recovery_required === 0 && jobStateMatches && row.job_finished_at !== null &&
+          row.job_started_at !== null && row.job_duration_ms !== null && row.job_duration_ms >= 0 &&
+          row.job_kind === expectedJobKinds[row.action] && receiptSequenceComplete &&
+          row.job_error_code === null && row.invalid_receipt_count === 0 && row.failed_receipt_count === 0 &&
+          row.receipt_phase_sequence === expectedSuccessfulPhases[row.action]
+      }
+    })
   }
 
   markLifecycleRunRunning(jobId: string, summary: string): { job: JobRecord; run: LifecycleRunRecord } {
