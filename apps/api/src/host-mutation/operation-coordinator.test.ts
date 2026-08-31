@@ -1,14 +1,24 @@
+import { EventEmitter } from 'node:events'
+import path from 'node:path'
+import { PassThrough } from 'node:stream'
 import { describe, expect, it } from 'vitest'
 import {
   HostMutationLeaseError,
+  HostMutationLeaseManager,
+  type HostMutationBrokerProcess,
+  type HostMutationBrokerSpawner,
   type HostMutationLease,
   type HostMutationLeaseRequest
 } from './lease.js'
+import { HostMutationLifecycleCoordinator } from './lifecycle-coordinator.js'
 import {
   HostMutationCoordinator,
   hostMutationReturn,
   hostMutationThrow
 } from './operation-coordinator.js'
+
+const repositoryRoot = path.resolve(import.meta.dirname, '..', '..', '..', '..')
+const scriptRoot = path.join(repositoryRoot, 'scripts', 'windows')
 
 describe('generic host mutation operation coordinator', () => {
   it('releases a returned value and forwards the active lease signal', async () => {
@@ -108,6 +118,142 @@ describe('generic host mutation operation coordinator', () => {
   })
 })
 
+describe('nested host mutation disposition propagation', () => {
+  it('keeps a direct nested unclassified failure sticky after the outer holder catches it', async () => {
+    const harness = createNestedLeaseHarness('direct-unclassified')
+    const failure = new Error('NESTED_UNCLASSIFIED')
+
+    const result = await harness.manager.runExclusive(
+      leaseRequest(harness.dataRoot, 'direct-outer'),
+      async (outerLease) => {
+        await expect(harness.manager.runExclusive(
+          leaseRequest(harness.dataRoot, 'direct-inner'),
+          async () => { throw failure }
+        )).rejects.toBe(failure)
+        // Poisoning selects the eventual disposition without preventing bounded
+        // compensation while the physical broker lease is still held.
+        expect(() => outerLease.assertActive()).not.toThrow()
+        return 'compensated'
+      }
+    )
+
+    expect(result).toBe('compensated')
+    expect(harness.calls()).toBe(1)
+    expect(harness.commands).toEqual(['ABANDON'])
+  })
+
+  it('propagates generic-to-generic return+abandon through an outer release', async () => {
+    const harness = createNestedLeaseHarness('generic-return-abandon')
+    const coordinator = new HostMutationCoordinator(harness.manager, { dataRoot: harness.dataRoot })
+
+    const result = await coordinator.runExclusive(
+      operationRequest('generic-outer-return'),
+      async (outerScope) => {
+        const nested = await coordinator.runExclusive(
+          operationRequest('generic-inner-return'),
+          async () => hostMutationReturn('recovery-required', 'abandon')
+        )
+        expect(() => outerScope.assertActive()).not.toThrow()
+        return hostMutationReturn(nested, 'release')
+      }
+    )
+
+    expect(result).toBe('recovery-required')
+    expect(harness.calls()).toBe(1)
+    expect(harness.commands).toEqual(['ABANDON'])
+  })
+
+  it('propagates generic-to-generic throw+abandon even when the outer operation catches it', async () => {
+    const harness = createNestedLeaseHarness('generic-throw-abandon')
+    const coordinator = new HostMutationCoordinator(harness.manager, { dataRoot: harness.dataRoot })
+    const failure = new Error('NESTED_RECOVERY_REQUIRED')
+
+    const result = await coordinator.runExclusive(
+      operationRequest('generic-outer-catch'),
+      async () => {
+        await expect(coordinator.runExclusive(
+          operationRequest('generic-inner-throw'),
+          async () => hostMutationThrow(failure, 'abandon')
+        )).rejects.toBe(failure)
+        return hostMutationReturn('caught-and-compensated', 'release')
+      }
+    )
+
+    expect(result).toBe('caught-and-compensated')
+    expect(harness.calls()).toBe(1)
+    expect(harness.commands).toEqual(['ABANDON'])
+  })
+
+  it('propagates generic-to-lifecycle abandon through the shared manager', async () => {
+    const harness = createNestedLeaseHarness('generic-lifecycle-abandon')
+    const generic = new HostMutationCoordinator(harness.manager, { dataRoot: harness.dataRoot })
+    const lifecycle = new HostMutationLifecycleCoordinator(harness.manager, { dataRoot: harness.dataRoot })
+
+    const result = await generic.runExclusive(
+      operationRequest('generic-lifecycle-outer'),
+      async () => {
+        const nested = await lifecycle.runExclusive(
+          { requestId: 'lifecycle-inner-abandon', action: 'restart' },
+          async () => ({ value: 'lifecycle-recovery-required', disposition: 'abandon' })
+        )
+        return hostMutationReturn(nested, 'release')
+      }
+    )
+
+    expect(result).toBe('lifecycle-recovery-required')
+    expect(harness.calls()).toBe(1)
+    expect(harness.commands).toEqual(['ABANDON'])
+  })
+
+  it('propagates lifecycle-to-generic throw+abandon after the lifecycle operation catches it', async () => {
+    const harness = createNestedLeaseHarness('lifecycle-generic-abandon')
+    const generic = new HostMutationCoordinator(harness.manager, { dataRoot: harness.dataRoot })
+    const lifecycle = new HostMutationLifecycleCoordinator(harness.manager, { dataRoot: harness.dataRoot })
+    const failure = new Error('GENERIC_RECOVERY_REQUIRED')
+
+    const result = await lifecycle.runExclusive(
+      { requestId: 'lifecycle-outer-catch', action: 'restart' },
+      async () => {
+        await expect(generic.runExclusive(
+          operationRequest('lifecycle-generic-inner'),
+          async () => hostMutationThrow(failure, 'abandon')
+        )).rejects.toBe(failure)
+        return { value: 'lifecycle-compensated', disposition: 'release' }
+      }
+    )
+
+    expect(result).toBe('lifecycle-compensated')
+    expect(harness.calls()).toBe(1)
+    expect(harness.commands).toEqual(['ABANDON'])
+  })
+
+  it('does not poison the shared scope for nested release results or release-classified exceptions', async () => {
+    const harness = createNestedLeaseHarness('nested-release')
+    const coordinator = new HostMutationCoordinator(harness.manager, { dataRoot: harness.dataRoot })
+    const safeRejection = new Error('SAFE_DOMAIN_REJECTION')
+
+    const result = await coordinator.runExclusive(
+      operationRequest('release-outer'),
+      async (outerScope) => {
+        await expect(coordinator.runExclusive(
+          operationRequest('release-inner-return'),
+          async () => hostMutationReturn('nested-ok', 'release')
+        )).resolves.toBe('nested-ok')
+        await expect(coordinator.runExclusive(
+          operationRequest('release-inner-throw'),
+          async () => hostMutationThrow(safeRejection, 'release')
+        )).rejects.toBe(safeRejection)
+        expect(() => outerScope.assertActive()).not.toThrow()
+        return hostMutationReturn('outer-ok', 'release')
+      }
+    )
+
+    expect(result).toBe('outer-ok')
+    expect(harness.calls()).toBe(1)
+    expect(harness.commands).toEqual(['RELEASE'])
+  })
+})
+
 class FakeLeaseRunner {
   readonly requests: HostMutationLeaseRequest[] = []
   acquireError: unknown = null
@@ -139,5 +285,79 @@ class FakeLeaseRunner {
     } finally {
       controller.abort()
     }
+  }
+}
+
+function operationRequest(suffix: string) {
+  return { operation: 'nested-test', requestId: suffix }
+}
+
+function leaseRequest(dataRoot: string, suffix: string): HostMutationLeaseRequest {
+  return {
+    dataRoot,
+    owner: 'nested-test',
+    operation: 'nested-test',
+    requestId: suffix,
+    acquireTimeoutMs: 100
+  }
+}
+
+function createNestedLeaseHarness(label: string): {
+  manager: HostMutationLeaseManager
+  dataRoot: string
+  commands: Array<'RELEASE' | 'ABANDON'>
+  calls: () => number
+} {
+  const commands: Array<'RELEASE' | 'ABANDON'> = []
+  let callCount = 0
+  const spawnBroker: HostMutationBrokerSpawner = () => {
+    callCount += 1
+    return new RecordingBrokerProcess((command) => commands.push(command))
+  }
+  return {
+    manager: new HostMutationLeaseManager({ scriptRoot, spawnBroker }),
+    dataRoot: path.join(repositoryRoot, 'fictional-host-mutation-data', label),
+    commands,
+    calls: () => callCount
+  }
+}
+
+class RecordingBrokerProcess extends EventEmitter implements HostMutationBrokerProcess {
+  readonly stdin = new PassThrough()
+  readonly stdout = new PassThrough()
+  readonly stderr = new PassThrough()
+  #exited = false
+
+  constructor(onCommand: (command: 'RELEASE' | 'ABANDON') => void) {
+    super()
+    this.stdin.on('data', (chunk: Buffer | string) => {
+      const command = String(chunk).trim()
+      if (command !== 'RELEASE' && command !== 'ABANDON') return
+      onCommand(command)
+      queueMicrotask(() => this.#exit(command === 'RELEASE' ? 0 : 22, null))
+    })
+    queueMicrotask(() => {
+      this.stdout.write(JSON.stringify({
+        protocol: 'DYSON_HOST_MUTATION_BROKER_V1',
+        type: 'ready',
+        dataRootIdentity: `sha256:${'b'.repeat(64)}`,
+        instanceId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        token: 'A'.repeat(43)
+      }) + '\n')
+    })
+  }
+
+  kill(): boolean {
+    this.#exit(null, 'SIGTERM')
+    return true
+  }
+
+  #exit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.#exited) return
+    this.#exited = true
+    this.stdin.destroy()
+    this.stdout.end()
+    this.stderr.end()
+    queueMicrotask(() => this.emit('exit', code, signal))
   }
 }

@@ -113,6 +113,14 @@ interface BrokerExit {
 
 interface LeaseScope {
   active: boolean
+  /**
+   * A nested holder can be caught by its caller so action failure alone is not
+   * sufficient to select the broker disposition at the outermost boundary.
+   * Once set, this flag is deliberately irreversible for the lifetime of the
+   * shared ALS scope. The physical lease remains active so callers can perform
+   * bounded compensation before the broker is abandoned.
+   */
+  abandonRequired: boolean
   readonly abortController: AbortController
   readonly dataRoot: string
   readonly dataRootKey: string
@@ -439,7 +447,16 @@ export class HostMutationLeaseManager {
       if (validated.recovery) {
         throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_NESTED_RECOVERY_INVALID')
       }
-      return action(new HostMutationLease(current, true))
+      try {
+        const nestedResult = await action(new HostMutationLease(current, true))
+        return nestedResult
+      } catch (error) {
+        // Throwing from a borrowed holder means its disposition is uncertain or
+        // explicitly abandoned. The caller may catch the domain error to finish
+        // compensation, but it must never be able to cleanly release this scope.
+        current.abandonRequired = true
+        throw error
+      }
     }
 
     if (activeDataRoots.has(validated.dataRootKey)) {
@@ -470,6 +487,7 @@ export class HostMutationLeaseManager {
       const ready = await broker.start(this.#startupTimeoutMs)
       scope = {
         active: true,
+        abandonRequired: false,
         abortController: new AbortController(),
         dataRoot: validated.dataRoot,
         dataRootKey: validated.dataRootKey,
@@ -504,10 +522,11 @@ export class HostMutationLeaseManager {
         ))
       }
       expectedBrokerExit = true
-      if (actionFailed) {
+      if (actionFailed || acquiredScope.abandonRequired) {
         try { await broker.finish('abandon', this.#releaseTimeoutMs) }
         catch { broker.abort() }
-        throw actionError
+        if (actionFailed) throw actionError
+        return result
       }
       await broker.finish('release', this.#releaseTimeoutMs)
       return result
