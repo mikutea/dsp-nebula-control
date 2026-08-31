@@ -29,6 +29,11 @@ import { ControlDatabase } from './storage/database.js'
 import { EventHub } from './services/event-hub.js'
 import { JobService } from './services/job-service.js'
 import { LifecycleExecutionError, LifecycleService } from './services/lifecycle-service.js'
+import { HostMutationLeaseManager } from './host-mutation/lease.js'
+import {
+  HostMutationLifecycleCoordinator,
+  type LifecycleMutationCoordinator
+} from './host-mutation/lifecycle-coordinator.js'
 import {
   SaveJobService,
   SaveJobServiceError,
@@ -293,6 +298,7 @@ export interface BuiltApplication {
 export interface ApplicationDependencies {
   statusProvider?: StatusProvider
   lifecycleAdapter?: LifecycleMutationAdapter
+  lifecycleCoordinator?: LifecycleMutationCoordinator
   consoleReader?: StructuredLogReader
   playerSnapshotSource?: { read(signal?: AbortSignal): Promise<PlayerSnapshot> }
   playerPresenceHistory?: PlayerPresenceHistoryStore
@@ -464,11 +470,20 @@ export async function buildApplication(
       })
     : new DisabledLifecycleAdapter(provider)
   const activeLifecycleAdapter = dependencies.lifecycleAdapter ?? configuredLifecycleAdapter
+  const lifecycleCoordinator = dependencies.lifecycleCoordinator ?? (
+    config.lifecycleEnabled
+      ? new HostMutationLifecycleCoordinator(
+          new HostMutationLeaseManager({ scriptRoot: config.scriptRoot }),
+          { dataRoot: config.dataDir }
+        )
+      : undefined
+  )
   const lifecycle = new LifecycleService(
     database,
     activeLifecycleAdapter,
     events,
-    config.lifecycleTimeoutMs
+    config.lifecycleTimeoutMs,
+    lifecycleCoordinator
   )
   const auth = new AuthService(config, database)
   const protectedRoute = (permission: ControlPermission) => ({

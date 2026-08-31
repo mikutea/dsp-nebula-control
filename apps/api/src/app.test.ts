@@ -9,6 +9,12 @@ import type {
   LifecyclePreview,
   StatusProvider
 } from './domain.js'
+import type {
+  LifecycleCoordinatorOutcome,
+  LifecycleCoordinatorRequest,
+  LifecycleCoordinatorScope,
+  LifecycleMutationCoordinator
+} from './host-mutation/lifecycle-coordinator.js'
 
 let application: BuiltApplication | null = null
 afterEach(async () => { if (application) await application.close(); application = null })
@@ -179,7 +185,11 @@ describe('control API', () => {
       DYSON_PUBLIC_ORIGIN: 'http://127.0.0.1:13010'
     })
     const adapter = new ApiLifecycleAdapter()
-    application = await buildApplication(config, { lifecycleAdapter: adapter })
+    const coordinator = new ApiLifecycleCoordinator()
+    application = await buildApplication(config, {
+      lifecycleAdapter: adapter,
+      lifecycleCoordinator: coordinator
+    })
 
     const login = await application.app.inject({
       method: 'POST', url: '/api/v1/auth/login',
@@ -219,6 +229,10 @@ describe('control API', () => {
       'lock', 'preflight', 'protection-point', 'save'
     ])
     expect(adapter.calls).toEqual(['preflight:save', 'preflight:save', 'protection-point', 'save'])
+    expect(coordinator.requests).toEqual([
+      expect.objectContaining({ action: 'save' })
+    ])
+    expect(coordinator.dispositions).toEqual(['release'])
 
     const duplicate = await application.app.inject({
       method: 'POST', url: '/api/v1/actions/lifecycle/execute',
@@ -281,6 +295,11 @@ describe('control API', () => {
     expect(completedStart.receipts.map((receipt: { phase: string }) => receipt.phase)).toEqual([
       'lock', 'preflight', 'start', 'verify-running'
     ])
+    expect(coordinator.requests).toEqual([
+      expect.objectContaining({ action: 'save' }),
+      expect.objectContaining({ action: 'start' })
+    ])
+    expect(coordinator.dispositions).toEqual(['release', 'release'])
 
     const arbitraryStartTarget = await application.app.inject({
       method: 'POST', url: '/api/v1/actions/lifecycle/execute',
@@ -294,6 +313,24 @@ describe('control API', () => {
     expect(arbitraryStartTarget.json().error.code).toBe('INVALID_LIFECYCLE_EXECUTION')
   })
 })
+
+class ApiLifecycleCoordinator implements LifecycleMutationCoordinator {
+  readonly requests: LifecycleCoordinatorRequest[] = []
+  readonly dispositions: Array<'release' | 'abandon'> = []
+  readonly #controller = new AbortController()
+
+  async runExclusive<T>(
+    request: LifecycleCoordinatorRequest,
+    operation: (
+      scope: LifecycleCoordinatorScope
+    ) => Promise<LifecycleCoordinatorOutcome<T>> | LifecycleCoordinatorOutcome<T>
+  ): Promise<T> {
+    this.requests.push(request)
+    const outcome = await operation({ signal: this.#controller.signal })
+    this.dispositions.push(outcome.disposition)
+    return outcome.value
+  }
+}
 
 class ApiLifecycleAdapter implements LifecycleMutationAdapter {
   readonly mutationEnabled = true
