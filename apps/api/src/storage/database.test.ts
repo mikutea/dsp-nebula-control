@@ -21,6 +21,14 @@ function temporaryDirectory(): string {
   return directory
 }
 
+function claimSaveFixtureRunning(database: ControlDatabase, jobId: string): void {
+  const queued = database.getSaveRun(jobId)
+  if (!queued) throw new Error(`fixture save run missing: ${jobId}`)
+  if (!database.claimQueuedSaveRun(jobId, queued.updatedAt, 'running fixture')) {
+    throw new Error(`fixture save run claim failed: ${jobId}`)
+  }
+}
+
 describe('control database session roles', () => {
   it('persists alert state with compare-and-swap revisions across reopen', () => {
     const directory = temporaryDirectory()
@@ -188,5 +196,172 @@ describe('control database session roles', () => {
     expect((verify.prepare('SELECT COUNT(*) AS count FROM sessions').get() as { count: number }).count)
       .toBe(1)
     verify.close()
+  })
+})
+
+describe('durable save reconciliation storage', () => {
+  it('adds cleanup and maintenance result columns to an existing save-run table', () => {
+    const directory = temporaryDirectory()
+    const database = new ControlDatabase(directory)
+    const created = database.createSaveJob({
+      operation: 'restore',
+      idempotencyKey: '33333333-3333-4333-8333-333333333333',
+      saveName: null,
+      backupId: 'tx-55555555-5555-4555-8555-555555555555',
+      expectedRevision: `pair-v1:${'a'.repeat(64)}`,
+      protectionRequestId: '44444444-4444-4444-8444-444444444444'
+    }, 'Administrator', 'legacy migration fixture')
+    claimSaveFixtureRunning(database, created.job.id)
+    database.completeSaveRun(created.job.id, 'interrupted', 'cleanup pending fixture',
+      'SAVE_COMMIT_CLEANUP_PENDING', true, {
+        status: 'succeeded',
+        backupId: 'tx-55555555-5555-4555-8555-555555555555',
+        protectionBackupId: 'tx-44444444-4444-4444-8444-444444444444',
+        pairBytes: 2048,
+        rollback: 'not-required',
+        reused: false,
+        auditStored: true,
+        cleanupPending: true,
+        maintenanceRequired: true
+      })
+    database.close()
+
+    const legacy = new DatabaseSync(join(directory, 'control.db'))
+    legacy.exec(`
+      ALTER TABLE save_runs DROP COLUMN result_cleanup_pending;
+      ALTER TABLE save_runs DROP COLUMN result_maintenance_required;
+    `)
+    legacy.close()
+
+    const migrated = new ControlDatabase(directory)
+    expect(migrated.getSaveRun(created.job.id)).toMatchObject({
+      result: { cleanupPending: true, maintenanceRequired: true }
+    })
+    migrated.close()
+    const inspected = new DatabaseSync(join(directory, 'control.db'), { readOnly: true })
+    const columns = inspected.prepare('PRAGMA table_info(save_runs)').all() as unknown as Array<{ name: string }>
+    inspected.close()
+    expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining([
+      'result_cleanup_pending', 'result_maintenance_required'
+    ]))
+  })
+
+  it('atomically records authorization and requeues only the expected interrupted revision', () => {
+    const directory = temporaryDirectory()
+    const database = new ControlDatabase(directory)
+    const created = database.createSaveJob({
+      operation: 'restore',
+      idempotencyKey: '33333333-3333-4333-8333-333333333333',
+      saveName: null,
+      backupId: 'tx-55555555-5555-4555-8555-555555555555',
+      expectedRevision: `pair-v1:${'a'.repeat(64)}`,
+      protectionRequestId: '44444444-4444-4444-8444-444444444444'
+    }, 'Administrator', 'queued fixture')
+    claimSaveFixtureRunning(database, created.job.id)
+    const completed = database.completeSaveRun(
+      created.job.id,
+      'interrupted',
+      'cleanup pending fixture',
+      'SAVE_COMMIT_CLEANUP_PENDING',
+      true,
+      {
+        status: 'succeeded',
+        backupId: 'tx-55555555-5555-4555-8555-555555555555',
+        protectionBackupId: 'tx-44444444-4444-4444-8444-444444444444',
+        pairBytes: 2048,
+        rollback: 'not-required',
+        reused: false,
+        auditStored: true,
+        cleanupPending: true,
+        maintenanceRequired: true
+      }
+    )
+
+    expect(() => database.requeueSaveRunForReconciliation(
+      created.job.id, 'stale-revision', 'Administrator', 'committed-cleanup', 'reconcile fixture'
+    )).toThrow(/conflict/i)
+    const requeued = database.requeueSaveRunForReconciliation(
+      created.job.id,
+      completed.run.updatedAt,
+      'Administrator',
+      'committed-cleanup',
+      'reconcile fixture'
+    )
+    expect(requeued).toMatchObject({
+      reused: false,
+      job: { state: 'queued', errorCode: null },
+      run: {
+        state: 'queued', recoveryRequired: true, attemptCount: 1,
+        result: { cleanupPending: true, maintenanceRequired: true }
+      }
+    })
+    expect(database.getLatestSaveReconciliationReason(created.job.id)).toBe('committed-cleanup')
+    expect(database.requeueSaveRunForReconciliation(
+      created.job.id,
+      completed.run.updatedAt,
+      'Administrator',
+      'committed-cleanup',
+      'reconcile fixture'
+    ).reused).toBe(true)
+    expect(() => database.requeueSaveRunForReconciliation(
+      created.job.id,
+      completed.run.updatedAt,
+      'bad\nactor',
+      'committed-cleanup',
+      'reconcile fixture'
+    )).toThrow(/audit input is invalid/)
+    database.close()
+
+    const raw = new DatabaseSync(join(directory, 'control.db'), { readOnly: true })
+    const receipts = raw.prepare(`
+      SELECT actor, reason, sequence FROM save_reconciliation_receipts WHERE job_id = ?
+    `).all(created.job.id)
+    raw.close()
+    expect(receipts).toEqual([{ actor: 'Administrator', reason: 'committed-cleanup', sequence: 1 }])
+  })
+
+  it('grants a queued save execution claim to only one database connection', () => {
+    const directory = temporaryDirectory()
+    const first = new ControlDatabase(directory)
+    const created = first.createSaveJob({
+      operation: 'backup',
+      idempotencyKey: '11111111-1111-4111-8111-111111111111',
+      saveName: '_lastexit_',
+      backupId: null,
+      expectedRevision: null,
+      protectionRequestId: null
+    }, 'Administrator', 'queued fixture')
+    const second = new ControlDatabase(directory)
+    const observedBySecond = second.getSaveRun(created.job.id)
+    if (!observedBySecond) throw new Error('fixture save run missing')
+
+    expect(first.claimQueuedSaveRun(
+      created.job.id, created.run.updatedAt, 'claimed by first'
+    )).toMatchObject({ run: { state: 'running', attemptCount: 1 } })
+    expect(second.claimQueuedSaveRun(
+      created.job.id, observedBySecond.updatedAt, 'claimed by second'
+    )).toBeNull()
+    expect(second.getSaveRun(created.job.id)).toMatchObject({
+      state: 'running', attemptCount: 1
+    })
+    first.close()
+    second.close()
+  })
+
+  it('fails closed when a trigger is attached to reconciliation authorization receipts', () => {
+    const directory = temporaryDirectory()
+    const database = new ControlDatabase(directory)
+    database.close()
+    const tampered = new DatabaseSync(join(directory, 'control.db'))
+    tampered.exec(`
+      CREATE TRIGGER fixture_save_reconciliation_trigger
+      AFTER INSERT ON save_reconciliation_receipts
+      BEGIN
+        UPDATE save_runs SET recovery_required = 0 WHERE job_id = NEW.job_id;
+      END;
+    `)
+    tampered.close()
+
+    expect(() => new ControlDatabase(directory)).toThrow('Save reconciliation schema is invalid')
   })
 })

@@ -230,6 +230,9 @@ const restoreSaveRequestSchema = z.strictObject({
 const executeRestoreSaveRequestSchema = restoreSaveRequestSchema.extend({
   confirmation: z.literal('RESTORE_SAVE_PAIR')
 }).strict()
+const reconcileSaveJobRequestSchema = z.strictObject({
+  confirmation: z.literal('RECONCILE_SAVE_JOB')
+})
 const observabilityHistoryQuerySchema = z.strictObject({
   points: z.coerce.number().int().min(1).max(120).optional()
 })
@@ -1136,6 +1139,19 @@ export async function buildApplication(
     return result
       ? { data: result }
       : reply.code(404).send({ error: { code: 'SAVE_JOB_NOT_FOUND', message: '存档事务任务不存在' } })
+  })
+
+  app.post('/api/v1/saves/jobs/:jobId/reconcile', protectedRoute('saves.restore'), async (request, reply) => {
+    if (!saveJobs) return saveTransactionsUnavailable(reply)
+    if (!config.saveMutationsEnabled) return saveMutationsDisabled(reply)
+    const jobId = z.string().uuid().safeParse((request.params as { jobId: string }).jobId)
+    const body = reconcileSaveJobRequestSchema.safeParse(request.body)
+    if (!jobId.success || !body.success) return invalidSaveTransactionRequest(reply)
+    try {
+      return saveJobReply(reply, saveJobs.reconcile(jobId.data, request.actor ?? 'authenticated-user'))
+    } catch (error) {
+      return saveJobError(reply, error)
+    }
   })
 
   app.post('/api/v1/saves/transfers/exports', protectedRoute('saves.transfer'), async (request, reply) => {
@@ -2127,6 +2143,17 @@ function saveJobError(reply: FastifyReply, error: unknown) {
     if (error.code === 'SAVE_JOB_IDEMPOTENCY_CONFLICT') {
       return reply.code(409).send({
         error: { code: error.code, message: '该幂等请求标识已经用于不同的存档事务' }
+      })
+    }
+    if (error.code === 'SAVE_JOB_RECONCILE_NOT_ALLOWED' ||
+        error.code === 'SAVE_JOB_RECONCILE_CONFLICT') {
+      return reply.code(409).send({
+        error: {
+          code: error.code,
+          message: error.code === 'SAVE_JOB_RECONCILE_NOT_ALLOWED'
+            ? '该存档任务没有可安全重放的维护终态'
+            : '存档任务状态已变化，请刷新后重试'
+        }
       })
     }
     if (error.code === 'SAVE_JOB_SERVICE_CLOSED') {

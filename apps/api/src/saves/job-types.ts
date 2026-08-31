@@ -40,7 +40,14 @@ export interface SaveJobResultSummary {
   rollback: 'not-required' | 'succeeded' | 'failed'
   reused: boolean
   auditStored: boolean
+  cleanupPending: boolean
+  maintenanceRequired: boolean
 }
+
+export type SaveJobReconciliationReason =
+  | 'committed-cleanup'
+  | 'audit-repair'
+  | 'rolled-back-cleanup'
 
 /** Internal database record. Do not return its request fields from an HTTP route. */
 export interface StoredSaveJobRun extends PersistedSaveJobRequest {
@@ -75,3 +82,6 @@ export type SaveJobErrorCode =
   | 'SAVE_JOB_EXECUTOR_FAILED'
   | 'SAVE_JOB_AUDIT_MISSING'
   | 'SAVE_JOB_RECONCILIATION_UNCERTAIN'
+  | 'SAVE_JOB_RECONCILE_NOT_ALLOWED'
+  | 'SAVE_JOB_RECONCILE_CONFLICT'
+  | 'SAVE_ROLLBACK_CLEANUP_PENDING'

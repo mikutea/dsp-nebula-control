@@ -5,7 +5,13 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { buildApplication, type BuiltApplication } from './app.js'
 import { loadConfig } from './config.js'
-import { SaveTransactionService } from './saves/transactions.js'
+import {
+  SaveTransactionService,
+  type BackupSavePairRequest,
+  type RestoreSavePairRequest,
+  type SavePairRevision,
+  type SaveTransactionResult
+} from './saves/transactions.js'
 
 let application: BuiltApplication | null = null
 const temporaryRoots: string[] = []
@@ -153,7 +159,151 @@ describe('authenticated save transaction routes', () => {
     expect(response.statusCode).toBe(409)
     expect(response.json().error.code).toBe('SAVE_SERVICE_NOT_STOPPED')
   })
+
+  it('exposes an explicit, gated reconcile route without making duplicate execute retry a mutation', async () => {
+    const fixture = await createFixture()
+    const service = new ScriptedRouteSaveService()
+    application = await buildApplication(config(true), {
+      saveTransactionService: service,
+      workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
+    })
+    const cookie = await login(application)
+    const input = {
+      requestId: randomUUID(),
+      backupId: 'tx-55555555-5555-4555-8555-555555555555',
+      expectedRevision: `pair-v1:${'a'.repeat(64)}`,
+      protectionRequestId: randomUUID()
+    }
+    const execute = await injectMutation('/api/v1/saves/restore/execute', cookie, {
+      ...input, confirmation: 'RESTORE_SAVE_PAIR'
+    })
+    expect(execute.statusCode).toBe(202)
+    const jobId = execute.json().data.job.id as string
+    const interrupted = await waitForSaveJob(jobId, cookie)
+    expect(interrupted.data).toMatchObject({
+      job: { state: 'failed', errorCode: 'SAVE_COMMIT_CLEANUP_PENDING' },
+      run: {
+        state: 'interrupted', attemptCount: 1, recoveryRequired: true,
+        result: { cleanupPending: true, maintenanceRequired: true }
+      }
+    })
+
+    const duplicate = await injectMutation('/api/v1/saves/restore/execute', cookie, {
+      ...input, confirmation: 'RESTORE_SAVE_PAIR'
+    })
+    expect(duplicate.statusCode).toBe(200)
+    expect(duplicate.json().data).toMatchObject({ reused: true, run: { state: 'interrupted' } })
+    expect(service.restoreCalls).toHaveLength(1)
+
+    const invalid = await injectMutation(`/api/v1/saves/jobs/${jobId}/reconcile`, cookie, {
+      confirmation: 'RECONCILE_SAVE_JOB', backupId: input.backupId
+    })
+    expect(invalid.statusCode).toBe(400)
+    const reconcile = await injectMutation(`/api/v1/saves/jobs/${jobId}/reconcile`, cookie, {
+      confirmation: 'RECONCILE_SAVE_JOB'
+    })
+    expect(reconcile.statusCode).toBe(202)
+    expect(reconcile.json().data).toMatchObject({
+      reused: false, job: { id: jobId }, run: { state: 'queued', recoveryRequired: true }
+    })
+    const completed = await waitForSaveJob(jobId, cookie)
+    expect(completed.data).toMatchObject({
+      job: { state: 'succeeded', errorCode: null },
+      run: { state: 'succeeded', attemptCount: 2, recoveryRequired: false }
+    })
+    expect(service.restoreCalls).toHaveLength(2)
+    expect(service.restoreCalls[1]).toEqual(service.restoreCalls[0])
+  })
+
+  it('keeps the explicit reconcile route closed when save mutations are disabled', async () => {
+    const fixture = await createFixture()
+    application = await buildApplication(config(false), {
+      saveTransactionService: new ScriptedRouteSaveService(),
+      workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
+    })
+    const cookie = await login(application)
+    const response = await injectMutation(
+      `/api/v1/saves/jobs/${randomUUID()}/reconcile`,
+      cookie,
+      { confirmation: 'RECONCILE_SAVE_JOB' }
+    )
+    expect(response.statusCode).toBe(503)
+    expect(response.json().error.code).toBe('SAVE_MUTATIONS_DISABLED')
+  })
 })
+
+class ScriptedRouteSaveService {
+  readonly restoreCalls: RestoreSavePairRequest[] = []
+
+  async inspect(saveName: string): Promise<SavePairRevision> {
+    return {
+      schemaVersion: 1,
+      saveName,
+      revision: `pair-v1:${'b'.repeat(64)}`,
+      dsvBytes: 1024,
+      serverBytes: 256,
+      totalBytes: 1280
+    }
+  }
+
+  async backup(input: BackupSavePairRequest): Promise<SaveTransactionResult> {
+    return scriptedResult('backup', input.requestId, `tx-${input.requestId}`)
+  }
+
+  async restore(input: RestoreSavePairRequest): Promise<SaveTransactionResult> {
+    this.restoreCalls.push({ ...input })
+    return scriptedResult(
+      'restore',
+      input.requestId,
+      input.backupId,
+      input.protectionRequestId,
+      this.restoreCalls.length === 1
+    )
+  }
+}
+
+function scriptedResult(
+  operation: 'backup' | 'restore',
+  requestId: string,
+  backupId: string,
+  protectionRequestId?: string,
+  cleanupPending = false
+): SaveTransactionResult {
+  const protectionBackupId = protectionRequestId ? `tx-${protectionRequestId}` : undefined
+  const errorCode = cleanupPending ? 'SAVE_COMMIT_CLEANUP_PENDING' as const : undefined
+  return {
+    schemaVersion: 1,
+    requestId,
+    operation,
+    status: 'succeeded',
+    dryRun: false,
+    backupId,
+    ...(protectionBackupId ? { protectionBackupId } : {}),
+    reused: !cleanupPending,
+    rollback: 'not-required',
+    pairBytes: 2048,
+    cleanupPending,
+    maintenanceRequired: cleanupPending,
+    ...(errorCode ? { errorCode } : {}),
+    auditStored: true,
+    audit: {
+      schemaVersion: 1,
+      requestId,
+      action: operation === 'backup' ? 'save.backup' : 'save.restore',
+      status: 'succeeded',
+      dryRun: false,
+      backupId,
+      ...(protectionBackupId ? { protectionBackupId } : {}),
+      reused: !cleanupPending,
+      rollback: 'not-required',
+      cleanupPending,
+      maintenanceRequired: cleanupPending,
+      startedAt: '2026-08-30T00:00:00.000Z',
+      finishedAt: '2026-08-30T00:00:01.000Z',
+      ...(errorCode ? { errorCode } : {})
+    }
+  }
+}
 
 interface Fixture {
   root: string

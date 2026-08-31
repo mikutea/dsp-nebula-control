@@ -18,6 +18,7 @@ import type {
   PersistedSaveJobRequest,
   SaveJobErrorCode,
   SaveJobOperation,
+  SaveJobReconciliationReason,
   SaveJobResultSummary,
   SaveJobRunState,
   StoredSaveJobRun
@@ -102,6 +103,8 @@ interface SaveRunRow {
   result_rollback: SaveJobResultSummary['rollback'] | null
   result_reused: number | null
   audit_stored: number | null
+  result_cleanup_pending: number | null
+  result_maintenance_required: number | null
   error_code: SaveTransactionErrorCode | SaveJobErrorCode | null
   recovery_required: number
   created_at: string
@@ -211,6 +214,8 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
         result_rollback TEXT CHECK(result_rollback IS NULL OR result_rollback IN ('not-required', 'succeeded', 'failed')),
         result_reused INTEGER CHECK(result_reused IS NULL OR result_reused IN (0, 1)),
         audit_stored INTEGER CHECK(audit_stored IS NULL OR audit_stored IN (0, 1)),
+        result_cleanup_pending INTEGER CHECK(result_cleanup_pending IS NULL OR result_cleanup_pending IN (0, 1)),
+        result_maintenance_required INTEGER CHECK(result_maintenance_required IS NULL OR result_maintenance_required IN (0, 1)),
         error_code TEXT,
         recovery_required INTEGER NOT NULL DEFAULT 0 CHECK(recovery_required IN (0, 1)),
         created_at TEXT NOT NULL,
@@ -225,6 +230,19 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
       );
       CREATE INDEX IF NOT EXISTS save_runs_state_created_idx
         ON save_runs(state, created_at);
+      CREATE TABLE IF NOT EXISTS save_reconciliation_receipts (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES save_runs(job_id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL CHECK(sequence >= 1),
+        actor TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 128),
+        reason TEXT NOT NULL CHECK(reason IN (
+          'committed-cleanup', 'audit-repair', 'rolled-back-cleanup'
+        )),
+        requested_at TEXT NOT NULL,
+        UNIQUE(job_id, sequence)
+      );
+      CREATE INDEX IF NOT EXISTS save_reconciliation_receipts_job_idx
+        ON save_reconciliation_receipts(job_id, sequence);
       CREATE TABLE IF NOT EXISTS observability_samples (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         observed_at TEXT NOT NULL,
@@ -247,6 +265,38 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
         "ALTER TABLE sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'administrator' " +
         "CHECK(role IN ('viewer', 'operator', 'administrator'))"
       )
+    }
+    const saveRunColumns = this.#database.prepare(
+      'PRAGMA table_info(save_runs)'
+    ).all() as unknown as Array<{ name: string }>
+    if (!saveRunColumns.some((column) => column.name === 'result_cleanup_pending')) {
+      this.#database.exec(
+        'ALTER TABLE save_runs ADD COLUMN result_cleanup_pending INTEGER ' +
+        'CHECK(result_cleanup_pending IS NULL OR result_cleanup_pending IN (0, 1))'
+      )
+    }
+    if (!saveRunColumns.some((column) => column.name === 'result_maintenance_required')) {
+      this.#database.exec(
+        'ALTER TABLE save_runs ADD COLUMN result_maintenance_required INTEGER ' +
+        'CHECK(result_maintenance_required IS NULL OR result_maintenance_required IN (0, 1))'
+      )
+    }
+    this.#database.exec(`
+      UPDATE save_runs
+      SET result_cleanup_pending = CASE
+        WHEN error_code IN ('SAVE_COMMIT_CLEANUP_PENDING', 'SAVE_ROLLBACK_CLEANUP_PENDING')
+          THEN 1 ELSE 0 END
+      WHERE result_status IS NOT NULL AND result_cleanup_pending IS NULL;
+      UPDATE save_runs
+      SET result_maintenance_required = CASE
+        WHEN recovery_required = 1 OR result_status = 'rollback-failed' THEN 1 ELSE 0 END
+      WHERE result_status IS NOT NULL AND result_maintenance_required IS NULL;
+    `)
+    try {
+      this.#assertSaveReconciliationSchema()
+    } catch (error) {
+      this.#database.close()
+      throw error
     }
     try {
       this.#assertObservabilityAlertSchema()
@@ -568,15 +618,25 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
     return rows.map((row) => this.#toSaveRun(row))
   }
 
-  markSaveRunRunning(jobId: string, summary: string): { job: JobRecord; run: StoredSaveJobRun } {
+  claimQueuedSaveRun(
+    jobId: string,
+    expectedUpdatedAt: string,
+    summary: string,
+    reconciling = false
+  ): { job: JobRecord; run: StoredSaveJobRun } | null {
     return this.#transaction(() => {
       const currentRun = this.getSaveRun(jobId)
       const currentJob = this.getJob(jobId)
       if (!currentRun || !currentJob) throw new Error(`Save job is missing: ${jobId}`)
-      if (!['queued', 'running'].includes(currentRun.state)) {
-        throw new Error(`Save job is already terminal: ${jobId}`)
-      }
+      if (currentRun.state !== 'queued' || currentRun.updatedAt !== expectedUpdatedAt) return null
       const now = new Date().toISOString()
+      const update = this.#database.prepare(`
+        UPDATE save_runs
+        SET state = 'running', attempt_count = attempt_count + 1,
+            error_code = NULL, recovery_required = ?, updated_at = ?
+        WHERE job_id = ? AND state = 'queued' AND updated_at = ?
+      `).run(reconciling ? 1 : 0, now, jobId, expectedUpdatedAt)
+      if (Number(update.changes) !== 1) return null
       const job = this.updateJob(jobId, {
         state: 'running',
         startedAt: currentJob.startedAt ?? now,
@@ -585,15 +645,97 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
         summary,
         errorCode: null
       })
-      this.#database.prepare(`
-        UPDATE save_runs
-        SET state = 'running', attempt_count = attempt_count + 1,
-            error_code = NULL, recovery_required = 0, updated_at = ?
-        WHERE job_id = ?
-      `).run(now, jobId)
       const run = this.getSaveRun(jobId)
       if (!run) throw new Error(`Save run is missing: ${jobId}`)
       return { job, run }
+    })
+  }
+
+  interruptRunningSaveRun(
+    jobId: string,
+    expectedUpdatedAt: string,
+    summary: string
+  ): { job: JobRecord; run: StoredSaveJobRun } | null {
+    return this.#transaction(() => {
+      const currentRun = this.getSaveRun(jobId)
+      const currentJob = this.getJob(jobId)
+      if (!currentRun || !currentJob) throw new Error(`Save job is missing: ${jobId}`)
+      if (currentRun.state !== 'running' || currentRun.updatedAt !== expectedUpdatedAt) return null
+      const finishedAt = new Date()
+      const startedAt = currentJob.startedAt ? new Date(currentJob.startedAt) : new Date(currentJob.createdAt)
+      const update = this.#database.prepare(`
+        UPDATE save_runs
+        SET state = 'interrupted', error_code = 'SAVE_JOB_RECONCILIATION_UNCERTAIN',
+            recovery_required = 1, updated_at = ?
+        WHERE job_id = ? AND state = 'running' AND updated_at = ?
+      `).run(finishedAt.toISOString(), jobId, expectedUpdatedAt)
+      if (Number(update.changes) !== 1) return null
+      const job = this.updateJob(jobId, {
+        state: 'failed',
+        finishedAt: finishedAt.toISOString(),
+        durationMs: Math.max(0, finishedAt.getTime() - startedAt.getTime()),
+        summary,
+        errorCode: 'SAVE_JOB_RECONCILIATION_UNCERTAIN'
+      })
+      const run = this.getSaveRun(jobId)
+      if (!run) throw new Error(`Save run is missing: ${jobId}`)
+      return { job, run }
+    })
+  }
+
+  getLatestSaveReconciliationReason(jobId: string): SaveJobReconciliationReason | null {
+    const row = this.#database.prepare(`
+      SELECT reason FROM save_reconciliation_receipts
+      WHERE job_id = ? ORDER BY sequence DESC LIMIT 1
+    `).get(jobId) as { reason: SaveJobReconciliationReason } | undefined
+    return row?.reason ?? null
+  }
+
+  requeueSaveRunForReconciliation(
+    jobId: string,
+    expectedUpdatedAt: string,
+    actor: string,
+    reason: SaveJobReconciliationReason,
+    summary: string
+  ): { job: JobRecord; run: StoredSaveJobRun; reused: boolean } {
+    if (typeof actor !== 'string' || actor.length < 1 || actor.length > 128 || /[\r\n\0]/.test(actor) ||
+        typeof summary !== 'string' || summary.length < 1 || summary.length > 256 || /[\r\n\0]/.test(summary)) {
+      throw new Error('Save reconciliation audit input is invalid')
+    }
+    return this.#transaction(() => {
+      const currentRun = this.getSaveRun(jobId)
+      const currentJob = this.getJob(jobId)
+      if (!currentRun || !currentJob) throw new Error(`Save job is missing: ${jobId}`)
+      if (currentRun.state === 'queued' || currentRun.state === 'running') {
+        if (this.getLatestSaveReconciliationReason(jobId) === null) {
+          throw new Error(`Save reconciliation conflict: ${jobId}`)
+        }
+        return { job: currentJob, run: currentRun, reused: true }
+      }
+      if (currentRun.state !== 'interrupted' || currentRun.updatedAt !== expectedUpdatedAt) {
+        throw new Error(`Save reconciliation conflict: ${jobId}`)
+      }
+      const requestedAt = new Date().toISOString()
+      const sequenceRow = this.#database.prepare(`
+        SELECT COALESCE(MAX(sequence), 0) AS sequence
+        FROM save_reconciliation_receipts WHERE job_id = ?
+      `).get(jobId) as { sequence: number }
+      this.#database.prepare(`
+        INSERT INTO save_reconciliation_receipts(
+          id, job_id, sequence, actor, reason, requested_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(randomUUID(), jobId, sequenceRow.sequence + 1, actor, reason, requestedAt)
+      const job = this.updateJob(jobId, {
+        state: 'queued', startedAt: null, finishedAt: null, durationMs: null,
+        summary, errorCode: null
+      })
+      this.#database.prepare(`
+        UPDATE save_runs SET state = 'queued', error_code = NULL,
+          recovery_required = 1, updated_at = ? WHERE job_id = ?
+      `).run(requestedAt, jobId)
+      const run = this.getSaveRun(jobId)
+      if (!run) throw new Error(`Save run is missing: ${jobId}`)
+      return { job, run, reused: false }
     })
   }
 
@@ -626,6 +768,7 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
           state = ?, result_status = ?, result_backup_id = ?,
           result_protection_backup_id = ?, result_pair_bytes = ?,
           result_rollback = ?, result_reused = ?, audit_stored = ?,
+          result_cleanup_pending = ?, result_maintenance_required = ?,
           error_code = ?, recovery_required = ?, updated_at = ?
         WHERE job_id = ?
       `).run(
@@ -637,6 +780,8 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
         result?.rollback ?? null,
         result === null ? null : result.reused ? 1 : 0,
         result === null ? null : result.auditStored ? 1 : 0,
+        result === null ? null : result.cleanupPending ? 1 : 0,
+        result === null ? null : result.maintenanceRequired ? 1 : 0,
         errorCode,
         recoveryRequired ? 1 : 0,
         finishedAt.toISOString(),
@@ -945,7 +1090,9 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
           pairBytes: row.result_pair_bytes,
           rollback: row.result_rollback,
           reused: row.result_reused === 1,
-          auditStored: row.audit_stored === 1
+          auditStored: row.audit_stored === 1,
+          cleanupPending: row.result_cleanup_pending === 1,
+          maintenanceRequired: row.result_maintenance_required === 1
         }
     return {
       jobId: row.job_id,
@@ -1227,6 +1374,65 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
       LIMIT 1
     `).get() as unknown as { name: string } | undefined
     if (trigger) throw new Error('Observability alert schema is invalid')
+  }
+
+  #assertSaveReconciliationSchema(): void {
+    const table = this.#database.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'save_reconciliation_receipts'
+    `).get() as unknown as { sql: string } | undefined
+    if (!table || typeof table.sql !== 'string') {
+      throw new Error('Save reconciliation schema is invalid')
+    }
+    const columns = this.#database.prepare(
+      'PRAGMA table_info(save_reconciliation_receipts)'
+    ).all() as unknown as SqliteTableColumn[]
+    const expected: Array<[string, string, number, number]> = [
+      ['id', 'TEXT', 0, 1],
+      ['job_id', 'TEXT', 1, 0],
+      ['sequence', 'INTEGER', 1, 0],
+      ['actor', 'TEXT', 1, 0],
+      ['reason', 'TEXT', 1, 0],
+      ['requested_at', 'TEXT', 1, 0]
+    ]
+    if (columns.length !== expected.length || expected.some(([name, type, notnull, pk], index) => {
+      const column = columns[index]
+      return !column || column.name !== name || column.type.toUpperCase() !== type ||
+        column.notnull !== notnull || column.pk !== pk
+    })) {
+      throw new Error('Save reconciliation schema is invalid')
+    }
+    const normalized = normalizeSql(table.sql)
+    for (const fragment of [
+      'idtextprimarykey',
+      'job_idtextnotnullreferencessave_runs(job_id)ondeletecascade',
+      'sequenceintegernotnullcheck(sequence>=1)',
+      'actortextnotnullcheck(length(actor)between1and128)',
+      "reasontextnotnullcheck(reasonin('committed-cleanup','audit-repair','rolled-back-cleanup'))",
+      'requested_attextnotnull',
+      'unique(job_id,sequence)'
+    ]) {
+      if (!normalized.includes(fragment)) throw new Error('Save reconciliation schema is invalid')
+    }
+    const foreignKeys = this.#database.prepare(
+      'PRAGMA foreign_key_list(save_reconciliation_receipts)'
+    ).all() as unknown as Array<{
+      table: string
+      from: string
+      to: string
+      on_delete: string
+    }>
+    if (foreignKeys.length !== 1 || foreignKeys[0]?.table !== 'save_runs' ||
+        foreignKeys[0].from !== 'job_id' || foreignKeys[0].to !== 'job_id' ||
+        foreignKeys[0].on_delete.toUpperCase() !== 'CASCADE') {
+      throw new Error('Save reconciliation schema is invalid')
+    }
+    const trigger = this.#database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'trigger' AND tbl_name = 'save_reconciliation_receipts'
+      LIMIT 1
+    `).get() as unknown as { name: string } | undefined
+    if (trigger) throw new Error('Save reconciliation schema is invalid')
   }
 
   #assertPlayerPresenceRetention(capacity: number, cutoffUnixMs: number): void {
