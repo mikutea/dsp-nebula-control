@@ -16,6 +16,7 @@ import { hostname, tmpdir } from 'node:os'
 import path from 'node:path'
 import { verifyBackupPair } from './backups.js'
 import {
+  SaveRestoreMutationScopeLostError,
   SaveTransactionService,
   previewBackupRetention,
   type RuntimeStoppedEvidence,
@@ -181,6 +182,68 @@ describe('save pair backup transactions', () => {
 })
 
 describe('save pair restore transactions', () => {
+  it('threads the lease signal through both stopped proofs and checks scope around every live rename', async () => {
+    const fixture = await seedPair(
+      'Restore_Lease_Scope',
+      Buffer.from('scope-source-dsv'),
+      Buffer.from('scope-source-server')
+    )
+    const setup = makeService(fixture)
+    const source = await setup.backup({ requestId: randomUUID(), saveName: fixture.saveName })
+    await writePair(fixture, Buffer.from('scope-live-dsv'), Buffer.from('scope-live-server'))
+    const before = await setup.inspect(fixture.saveName)
+    const controller = new AbortController()
+    const observedSignals: Array<AbortSignal | undefined> = []
+    let activeChecks = 0
+    const service = makeService(fixture, {
+      gate: async (signal) => {
+        observedSignals.push(signal)
+        return stoppedEvidence
+      }
+    })
+
+    const result = await service.restore({
+      requestId: randomUUID(),
+      backupId: source.backupId,
+      expectedRevision: before.revision,
+      protectionRequestId: randomUUID()
+    }, {
+      signal: controller.signal,
+      assertActive: () => { activeChecks += 1 }
+    })
+
+    expect(result.status).toBe('succeeded')
+    expect(observedSignals).toEqual([controller.signal, controller.signal])
+    expect(activeChecks).toBe(10)
+  })
+
+  it('propagates lease loss immediately after a live rename instead of classifying it as rollback failure', async () => {
+    const fixture = await seedPair(
+      'Restore_Lease_Lost',
+      Buffer.from('lost-source-dsv'),
+      Buffer.from('lost-source-server')
+    )
+    const setup = makeService(fixture)
+    const source = await setup.backup({ requestId: randomUUID(), saveName: fixture.saveName })
+    await writePair(fixture, Buffer.from('lost-live-dsv'), Buffer.from('lost-live-server'))
+    const before = await setup.inspect(fixture.saveName)
+    let activeChecks = 0
+
+    await expect(makeService(fixture).restore({
+      requestId: randomUUID(),
+      backupId: source.backupId,
+      expectedRevision: before.revision,
+      protectionRequestId: randomUUID()
+    }, {
+      signal: new AbortController().signal,
+      assertActive: () => {
+        activeChecks += 1
+        if (activeChecks === 4) throw new Error('private lease detail')
+      }
+    })).rejects.toBeInstanceOf(SaveRestoreMutationScopeLostError)
+    expect(activeChecks).toBe(4)
+  })
+
   it('restores both bytes only after a stopped gate and protects the current pair first', async () => {
     const originalDsv = Buffer.from('backup-dsv-bytes')
     const originalServer = Buffer.from('backup-server-bytes')
@@ -1883,7 +1946,7 @@ interface Fixture {
 }
 
 interface ServiceOverrides {
-  gate?: () => Promise<unknown>
+  gate?: (signal?: AbortSignal) => Promise<unknown>
   hooks?: (phase: SaveTransactionHookPhase) => void | Promise<void>
   snapshotAttempts?: number
   wait?: (milliseconds: number) => Promise<void>

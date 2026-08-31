@@ -215,7 +215,7 @@ export interface SaveTransactionServiceOptions {
   /** Trusted server-side protection-point directory; never populate this from an HTTP request. */
   backupRoot: string
   /** Required fixed-adapter gate. Every restore invokes it before protection and again before commit. */
-  verifyServiceStopped: () => Promise<unknown>
+  verifyServiceStopped: (signal?: AbortSignal) => Promise<unknown>
   /** @internal Deterministic fault injection for tests only. */
   testHooks?: SaveTransactionTestHooks
   /** @internal Deterministic clock for tests only. */
@@ -240,6 +240,20 @@ export interface RestoreSavePairRequest {
   expectedRevision: string
   protectionRequestId: string
   dryRun?: boolean
+}
+
+/** Trusted per-attempt host-mutation scope supplied by SaveJobService. */
+export interface SaveRestoreMutationScope {
+  readonly signal: AbortSignal
+  assertActive(): void
+}
+
+/** Stable boundary marker used to keep lease loss distinct from domain failures. */
+export class SaveRestoreMutationScopeLostError extends Error {
+  constructor() {
+    super('SAVE_RESTORE_MUTATION_SCOPE_LOST')
+    this.name = 'SaveRestoreMutationScopeLostError'
+  }
 }
 
 export interface SaveTransactionAuditRecord {
@@ -350,7 +364,7 @@ export class SaveTransactionError extends Error {
 export class SaveTransactionService {
   readonly #configuredSaveRoot: string
   readonly #configuredBackupRoot: string
-  readonly #verifyServiceStopped: () => Promise<unknown>
+  readonly #verifyServiceStopped: (signal?: AbortSignal) => Promise<unknown>
   readonly #hooks: SaveTransactionTestHooks | undefined
   readonly #now: () => Date
   readonly #stableWindowMs: number
@@ -543,7 +557,10 @@ export class SaveTransactionService {
     }
   }
 
-  async restore(input: RestoreSavePairRequest): Promise<SaveTransactionResult> {
+  async restore(
+    input: RestoreSavePairRequest,
+    mutationScope?: SaveRestoreMutationScope
+  ): Promise<SaveTransactionResult> {
     const request = parseRestoreRequest(input)
     const protectionBackupId = `tx-${request.protectionRequestId}`
     const startedAt = this.#now().toISOString()
@@ -701,7 +718,9 @@ export class SaveTransactionService {
       }
       if (receipt !== null) {
         if (interruptedJournal !== null) {
-          return await this.#reconcileRestoreJournal(roots, request, interruptedJournal, startedAt, receipt)
+          return await this.#reconcileRestoreJournal(
+            roots, request, interruptedJournal, startedAt, receipt, mutationScope
+          )
         }
         return await this.#finish(roots, {
           requestId: request.requestId,
@@ -720,12 +739,14 @@ export class SaveTransactionService {
       }
       if (interruptedJournal !== null) {
         if (request.dryRun) throw new SaveTransactionError('SAVE_IDEMPOTENCY_CONFLICT')
-        return await this.#reconcileRestoreJournal(roots, request, interruptedJournal, startedAt, null)
+        return await this.#reconcileRestoreJournal(
+          roots, request, interruptedJournal, startedAt, null, mutationScope
+        )
       }
 
       const backup = await readTrustedBackup(roots.backupRoot, request.backupId, this.#readStablePair.bind(this))
       pairBytes = backup.pair.totalBytes
-      await this.#assertServiceStopped()
+      await this.#assertServiceStopped(mutationScope)
 
       const current = await this.#readStablePair(roots.saveRoot, backup.manifest.saveName)
       beforeRevision = current.revision
@@ -833,7 +854,7 @@ export class SaveTransactionService {
         stageCreated = true
         await copyBackupIntoRestoreStage(backup, stage)
         await this.#phase('restore-staged')
-        await this.#assertServiceStopped()
+        await this.#assertServiceStopped(mutationScope)
         const immediatelyBeforeCommit = await this.#readStablePair(roots.saveRoot, backup.manifest.saveName)
         if (immediatelyBeforeCommit.revision !== request.expectedRevision) {
           throw new SaveTransactionError('SAVE_REVISION_CONFLICT')
@@ -849,19 +870,27 @@ export class SaveTransactionService {
 
         mutationMayHaveOccurred = true
         journal = await advanceRestoreJournal(roots, journal, 'original-dsv-move-intent', this.#now())
+        assertRestoreMutationScopeActive(mutationScope)
         await rename(targetPaths.dsv, rollbackPaths.dsv)
+        assertRestoreMutationScopeActive(mutationScope)
         journal = await advanceRestoreJournal(roots, journal, 'original-dsv-moved', this.#now())
         await this.#phase('after-original-dsv-moved')
         journal = await advanceRestoreJournal(roots, journal, 'original-server-move-intent', this.#now())
+        assertRestoreMutationScopeActive(mutationScope)
         await rename(targetPaths.server, rollbackPaths.server)
+        assertRestoreMutationScopeActive(mutationScope)
         journal = await advanceRestoreJournal(roots, journal, 'original-server-moved', this.#now())
         await this.#phase('after-original-server-moved')
         journal = await advanceRestoreJournal(roots, journal, 'restored-dsv-install-intent', this.#now())
+        assertRestoreMutationScopeActive(mutationScope)
         await rename(stage.dsv, targetPaths.dsv)
+        assertRestoreMutationScopeActive(mutationScope)
         journal = await advanceRestoreJournal(roots, journal, 'restored-dsv-installed', this.#now())
         await this.#phase('after-restored-dsv-installed')
         journal = await advanceRestoreJournal(roots, journal, 'restored-server-install-intent', this.#now())
+        assertRestoreMutationScopeActive(mutationScope)
         await rename(stage.server, targetPaths.server)
+        assertRestoreMutationScopeActive(mutationScope)
         journal = await advanceRestoreJournal(roots, journal, 'restored-server-installed', this.#now())
         await this.#phase('after-restored-server-installed')
         await this.#phase('before-restore-verify')
@@ -887,6 +916,7 @@ export class SaveTransactionService {
         // and must never re-enter business rollback.
         durableCommitReached = true
       } catch (error) {
+        if (error instanceof SaveRestoreMutationScopeLostError) throw error
         if (durableCommitReached) throw error
         if (journal === null) {
           // The journal is published before any request-owned restore artifact.
@@ -933,7 +963,8 @@ export class SaveTransactionService {
               journal,
               trustedProtection,
               backup.pair,
-              targetPaths
+              targetPaths,
+              mutationScope
             )
             journal = recovered.journal
             rolledBack = recovered.recovered
@@ -970,7 +1001,8 @@ export class SaveTransactionService {
             afterRevision: rolledBack.revision,
             errorCode: restoreFailureCode(error)
           }, cleanup)
-        } catch {
+        } catch (rollbackError) {
+          if (rollbackError instanceof SaveRestoreMutationScopeLostError) throw rollbackError
           rollback = 'failed'
           const durableJournal = await readRestoreJournal(roots, request.requestId).catch(() => null)
           const remainsRecoverable = durableJournal !== null && durableJournal.phase !== 'recovery-required' &&
@@ -1032,6 +1064,7 @@ export class SaveTransactionService {
         afterRevision: backup.pair.revision
       }, cleanup)
     } catch (error) {
+      if (error instanceof SaveRestoreMutationScopeLostError) throw error
       const code = safeErrorCode(error)
       const recoveryRequired = code === 'SAVE_ROLLBACK_FAILED'
       const maintenanceRequired = code === 'SAVE_JOURNAL_MAINTENANCE_REQUIRED'
@@ -1160,12 +1193,22 @@ export class SaveTransactionService {
     return makePairEvidence(saveName, dsv, server)
   }
 
-  async #assertServiceStopped(): Promise<RuntimeStoppedEvidence> {
+  async #assertServiceStopped(
+    mutationScope?: SaveRestoreMutationScope
+  ): Promise<RuntimeStoppedEvidence> {
+    let evidence: RuntimeStoppedEvidence
     try {
-      return runtimeStoppedEvidenceSchema.parse(await this.#verifyServiceStopped())
-    } catch {
+      evidence = runtimeStoppedEvidenceSchema.parse(
+        await this.#verifyServiceStopped(mutationScope?.signal)
+      )
+    } catch (error) {
+      if (error instanceof SaveRestoreMutationScopeLostError || mutationScope?.signal.aborted) {
+        throw new SaveRestoreMutationScopeLostError()
+      }
       throw new SaveTransactionError('SAVE_SERVICE_NOT_STOPPED')
     }
+    assertRestoreMutationScopeActive(mutationScope)
+    return evidence
   }
 
   async #phase(phase: SaveTransactionHookPhase): Promise<void> {
@@ -1238,7 +1281,8 @@ export class SaveTransactionService {
     journal: RestoreJournal,
     protection: TrustedBackup,
     after: PairEvidence,
-    targets: { dsv: string; server: string }
+    targets: { dsv: string; server: string },
+    mutationScope?: SaveRestoreMutationScope
   ): Promise<{ journal: RestoreJournal; recovered: PairEvidence }> {
     journal = await forceRestoreJournalPhase(roots, journal, 'recovery-dsv-install-intent', this.#now())
     const recoveryStage = restoreStagePaths(roots.saveRoot, requestId)
@@ -1247,18 +1291,26 @@ export class SaveTransactionService {
     await copyBackupIntoRestoreStage(protection, recoveryStage)
     await this.#phase('after-recovery-staged')
     await this.#phase('before-recovery-dsv-target-remove')
+    assertRestoreMutationScopeActive(mutationScope)
     await removeKnownRecoveryTarget(targets.dsv, [protection.pair.dsv, after.dsv])
+    assertRestoreMutationScopeActive(mutationScope)
     await this.#phase('after-recovery-dsv-target-removed')
     await this.#phase('before-recovery-dsv-install')
+    assertRestoreMutationScopeActive(mutationScope)
     await rename(recoveryStage.dsv, targets.dsv)
+    assertRestoreMutationScopeActive(mutationScope)
     await this.#phase('after-recovery-dsv-installed')
     journal = await forceRestoreJournalPhase(roots, journal, 'recovery-dsv-installed', this.#now())
     journal = await forceRestoreJournalPhase(roots, journal, 'recovery-server-install-intent', this.#now())
     await this.#phase('before-recovery-server-target-remove')
+    assertRestoreMutationScopeActive(mutationScope)
     await removeKnownRecoveryTarget(targets.server, [protection.pair.server, after.server])
+    assertRestoreMutationScopeActive(mutationScope)
     await this.#phase('after-recovery-server-target-removed')
     await this.#phase('before-recovery-server-install')
+    assertRestoreMutationScopeActive(mutationScope)
     await rename(recoveryStage.server, targets.server)
+    assertRestoreMutationScopeActive(mutationScope)
     await this.#phase('after-recovery-server-installed')
     journal = await forceRestoreJournalPhase(roots, journal, 'recovery-server-installed', this.#now())
     const recovered = await this.#readStablePair(roots.saveRoot, journal.saveName)
@@ -1273,7 +1325,8 @@ export class SaveTransactionService {
     request: z.infer<typeof restoreRequestSchema>,
     journal: RestoreJournal,
     startedAt: string,
-    receipt: z.infer<typeof restoreReceiptSchema> | null
+    receipt: z.infer<typeof restoreReceiptSchema> | null,
+    mutationScope?: SaveRestoreMutationScope
   ): Promise<SaveTransactionResult> {
     const protectionBackupId = `tx-${request.protectionRequestId}`
     if (journal.requestId !== request.requestId || journal.backupId !== request.backupId ||
@@ -1334,7 +1387,7 @@ export class SaveTransactionService {
         afterRevision: receipt.afterRevision
       }, cleanup)
     }
-    await this.#assertServiceStopped()
+    await this.#assertServiceStopped(mutationScope)
     if (journal.phase === 'gc-pending') {
       await forceRestoreJournalPhase(roots, journal, 'recovery-required', this.#now()).catch(() => undefined)
       throw new SaveTransactionError('SAVE_ROLLBACK_FAILED')
@@ -1421,11 +1474,13 @@ export class SaveTransactionService {
         journal,
         protection,
         source.pair,
-        targets
+        targets,
+        mutationScope
       )
       journal = recovery.journal
       recovered = recovery.recovered
-    } catch {
+    } catch (error) {
+      if (error instanceof SaveRestoreMutationScopeLostError) throw error
       const durableJournal = await readRestoreJournal(roots, request.requestId).catch(() => null)
       if (durableJournal === null || durableJournal.phase === 'recovery-required' ||
           !await restoreLayoutAllowsProtectionRecovery(
@@ -1510,6 +1565,17 @@ export class SaveTransactionService {
 /** Existing retention logic is deliberately exposed as preview-only; it never deletes backups. */
 export function previewBackupRetention(input: unknown): RetentionPlan {
   return planBackupRetention(input)
+}
+
+function assertRestoreMutationScopeActive(scope?: SaveRestoreMutationScope): void {
+  if (scope === undefined) return
+  try {
+    scope.assertActive()
+  } catch (error) {
+    if (error instanceof SaveRestoreMutationScopeLostError) throw error
+    throw new SaveRestoreMutationScopeLostError()
+  }
+  if (scope.signal.aborted) throw new SaveRestoreMutationScopeLostError()
 }
 
 function parseBackupRequest(input: BackupSavePairRequest): z.infer<typeof backupRequestSchema> {

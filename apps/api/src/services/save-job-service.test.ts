@@ -2,16 +2,25 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
+import {
+  HostMutationOperationCoordinatorError,
+  type HostMutationOperationCoordinator,
+  type HostMutationOperationOutcome,
+  type HostMutationOperationRequest,
+  type HostMutationOperationScope
+} from '../host-mutation/operation-coordinator.js'
 import type { PersistedSaveJobRequest } from '../saves/job-types.js'
 import type {
   BackupSavePairRequest,
   RestoreSavePairRequest,
+  SaveRestoreMutationScope,
   SaveTransactionResult
 } from '../saves/transactions.js'
 import { ControlDatabase } from '../storage/database.js'
 import { EventHub } from './event-hub.js'
 import {
-  SaveJobService,
+  SaveJobService as CoreSaveJobService,
+  type SaveJobServiceOptions,
   type SaveTransactionExecutor
 } from './save-job-service.js'
 
@@ -21,6 +30,20 @@ const restoreKey = '33333333-3333-4333-8333-333333333333'
 const protectionKey = '44444444-4444-4444-8444-444444444444'
 const sourceBackupId = 'tx-55555555-5555-4555-8555-555555555555'
 const expectedRevision = `pair-v1:${'a'.repeat(64)}`
+
+class SaveJobService extends CoreSaveJobService {
+  constructor(
+    database: ControlDatabase,
+    executor: SaveTransactionExecutor,
+    events: EventHub,
+    options: SaveJobServiceOptions = {}
+  ) {
+    super(database, executor, events, {
+      hostMutationCoordinator: new RecordingHostMutationCoordinator(),
+      ...options
+    })
+  }
+}
 
 describe('durable paired-save job service', () => {
   it('returns queued immediately, serializes concurrent jobs, and reuses the same UUID exactly once', async () => {
@@ -716,6 +739,261 @@ describe('durable paired-save job service', () => {
     database.close()
   })
 
+  it('fails a restore closed before claim when the host mutation coordinator is missing', async () => {
+    const database = new ControlDatabase('unused', true)
+    const executor = new ScriptedExecutor(async (operation, input) => transactionResult(operation, input))
+    const service = new CoreSaveJobService(database, executor, new EventHub())
+    const queued = service.enqueue({
+      operation: 'restore', idempotencyKey: restoreKey, backupId: sourceBackupId,
+      expectedRevision, protectionRequestId: protectionKey
+    }, 'Administrator')
+
+    await service.close()
+
+    expect(executor.calls).toHaveLength(0)
+    expect(service.get(queued.job.id)).toMatchObject({
+      job: { state: 'failed', errorCode: 'SAVE_JOB_HOST_LEASE_UNAVAILABLE' },
+      run: {
+        state: 'failed', attemptCount: 0,
+        errorCode: 'SAVE_JOB_HOST_LEASE_UNAVAILABLE', recoveryRequired: false, result: null
+      }
+    })
+    database.close()
+  })
+
+  it('leases only restore execution and forwards the active signal/assertion scope', async () => {
+    const database = new ControlDatabase('unused', true)
+    const coordinator = new RecordingHostMutationCoordinator()
+    const executor = new ScriptedExecutor(async (operation, input, scope) => {
+      if (operation === 'restore') {
+        expect(scope?.signal).toBe(coordinator.signal)
+        scope?.assertActive()
+      } else {
+        expect(scope).toBeUndefined()
+      }
+      return transactionResult(operation, input)
+    })
+    const service = new SaveJobService(database, executor, new EventHub(), {
+      hostMutationCoordinator: coordinator
+    })
+
+    service.enqueue({
+      operation: 'backup', idempotencyKey: backupKey, saveName: '_lastexit_'
+    }, 'Administrator')
+    const restore = service.enqueue({
+      operation: 'restore', idempotencyKey: restoreKey, backupId: sourceBackupId,
+      expectedRevision, protectionRequestId: protectionKey
+    }, 'Administrator')
+    await service.close()
+
+    expect(coordinator.requests).toEqual([{
+      operation: 'save-restore', requestId: restoreKey
+    }])
+    expect(coordinator.dispositions).toEqual(['release'])
+    expect(coordinator.activeChecks).toBeGreaterThanOrEqual(1)
+    expect(executor.calls.map((call) => call.operation)).toEqual(['backup', 'restore'])
+    expect(service.get(restore.job.id)).toMatchObject({
+      run: { state: 'succeeded', attemptCount: 1, recoveryRequired: false }
+    })
+    database.close()
+  })
+
+  it('keeps a host-lease-busy restore queued without claiming or executing and drains bounded retries on close', async () => {
+    const database = new ControlDatabase('unused', true)
+    const coordinator = new RecordingHostMutationCoordinator()
+    coordinator.acquireFailures.push(
+      'HOST_MUTATION_LEASE_BUSY',
+      'HOST_MUTATION_LEASE_BUSY',
+      'HOST_MUTATION_LEASE_BUSY'
+    )
+    const executor = new ScriptedExecutor(async (operation, input) => transactionResult(operation, input))
+    const waits: number[] = []
+    const service = new SaveJobService(database, executor, new EventHub(), {
+      hostMutationCoordinator: coordinator,
+      hostLeaseBusyRetryLimit: 2,
+      hostLeaseBusyRetryDelayMs: 7,
+      wait: async (milliseconds) => { waits.push(milliseconds) }
+    })
+    const queued = service.enqueue({
+      operation: 'restore', idempotencyKey: restoreKey, backupId: sourceBackupId,
+      expectedRevision, protectionRequestId: protectionKey
+    }, 'Administrator')
+
+    await service.close()
+
+    expect(coordinator.requests).toHaveLength(3)
+    expect(waits).toEqual([7, 7])
+    expect(executor.calls).toHaveLength(0)
+    expect(service.get(queued.job.id)).toMatchObject({
+      job: { state: 'queued', errorCode: null },
+      run: { state: 'queued', attemptCount: 0, errorCode: null, recoveryRequired: false }
+    })
+    database.close()
+  })
+
+  it('protects startup queued replay and explicit cleanup reconciliation with fresh ordinary leases', async () => {
+    const startupDatabase = new ControlDatabase('unused', true)
+    const startupJob = startupDatabase.createSaveJob(
+      persistedRestore(), 'Administrator', 'queued startup fixture'
+    )
+    const startupCoordinator = new RecordingHostMutationCoordinator()
+    const startupExecutor = new ScriptedExecutor(async (operation, input) => transactionResult(operation, input))
+    const startupService = new SaveJobService(startupDatabase, startupExecutor, new EventHub(), {
+      hostMutationCoordinator: startupCoordinator
+    })
+    expect(startupService.initialize()).toBe(1)
+    await startupService.close()
+    expect(startupCoordinator.requests).toEqual([{
+      operation: 'save-restore', requestId: restoreKey
+    }])
+    expect(startupCoordinator.requests[0]).not.toHaveProperty('recovery')
+    expect(startupService.get(startupJob.job.id)).toMatchObject({
+      run: { state: 'succeeded', attemptCount: 1 }
+    })
+    startupDatabase.close()
+
+    const reconcileDatabase = new ControlDatabase('unused', true)
+    const reconcileCoordinator = new RecordingHostMutationCoordinator()
+    let attempt = 0
+    const reconcileExecutor = new ScriptedExecutor(async (operation, input) => {
+      attempt += 1
+      return transactionResult(operation, input, attempt === 1
+        ? {
+            status: 'succeeded', rollback: 'not-required', auditStored: true,
+            cleanupPending: true, maintenanceRequired: true,
+            errorCode: 'SAVE_COMMIT_CLEANUP_PENDING'
+          }
+        : { reused: true })
+    })
+    const reconcileService = new SaveJobService(
+      reconcileDatabase, reconcileExecutor, new EventHub(),
+      { hostMutationCoordinator: reconcileCoordinator }
+    )
+    const initial = reconcileService.enqueue({
+      operation: 'restore', idempotencyKey: restoreKey, backupId: sourceBackupId,
+      expectedRevision, protectionRequestId: protectionKey
+    }, 'Administrator')
+    await waitForTerminal(reconcileService, initial.job.id)
+    reconcileService.reconcile(initial.job.id, 'Administrator')
+    await reconcileService.close()
+
+    expect(reconcileCoordinator.requests).toHaveLength(2)
+    expect(reconcileCoordinator.requests.every((request) => request.recovery === undefined)).toBe(true)
+    expect(reconcileCoordinator.dispositions).toEqual(['release', 'release'])
+    expect(reconcileService.get(initial.job.id)).toMatchObject({
+      run: { state: 'succeeded', attemptCount: 2, recoveryRequired: false }
+    })
+    reconcileDatabase.close()
+  })
+
+  it('abandons rollback-failed, invalid, and thrown restore outcomes but releases proven cleanup terminals', async () => {
+    const cases = [
+      {
+        name: 'cleanup',
+        handler: async (operation: 'backup' | 'restore', input: ExecutorInput) => transactionResult(operation, input, {
+          status: 'succeeded', rollback: 'not-required', auditStored: true,
+          cleanupPending: true, maintenanceRequired: true,
+          errorCode: 'SAVE_COMMIT_CLEANUP_PENDING'
+        }),
+        disposition: 'release'
+      },
+      {
+        name: 'rollback-failed',
+        handler: async (operation: 'backup' | 'restore', input: ExecutorInput) => transactionResult(operation, input, {
+          status: 'rollback-failed', rollback: 'failed', auditStored: true,
+          maintenanceRequired: true, errorCode: 'SAVE_ROLLBACK_FAILED'
+        }),
+        disposition: 'abandon'
+      },
+      {
+        name: 'invalid-result',
+        handler: async (operation: 'backup' | 'restore', input: ExecutorInput) => transactionResult(operation, input, {
+          backupId: 'tx-66666666-6666-4666-8666-666666666666'
+        }),
+        disposition: 'abandon'
+      },
+      {
+        name: 'throw',
+        handler: async (): Promise<SaveTransactionResult> => { throw new Error('fixture executor error') },
+        disposition: 'abandon'
+      }
+    ] as const
+
+    for (const fixture of cases) {
+      const database = new ControlDatabase('unused', true)
+      const coordinator = new RecordingHostMutationCoordinator()
+      const service = new SaveJobService(
+        database,
+        new ScriptedExecutor(fixture.handler),
+        new EventHub(),
+        { hostMutationCoordinator: coordinator }
+      )
+      service.enqueue({
+        operation: 'restore', idempotencyKey: restoreKey, backupId: sourceBackupId,
+        expectedRevision, protectionRequestId: protectionKey
+      }, 'Administrator')
+      await service.close()
+      expect(coordinator.dispositions, fixture.name).toEqual([fixture.disposition])
+      database.close()
+    }
+  })
+
+  it('records a sanitized interrupted terminal when the lease is lost after executor completion', async () => {
+    const database = new ControlDatabase('unused', true)
+    const coordinator = new RecordingHostMutationCoordinator()
+    coordinator.failAfterOperation = true
+    const executor = new ScriptedExecutor(async (operation, input) => transactionResult(operation, input))
+    const service = new SaveJobService(database, executor, new EventHub(), {
+      hostMutationCoordinator: coordinator
+    })
+    const queued = service.enqueue({
+      operation: 'restore', idempotencyKey: restoreKey, backupId: sourceBackupId,
+      expectedRevision, protectionRequestId: protectionKey
+    }, 'Administrator')
+    await service.close()
+
+    expect(executor.calls).toHaveLength(1)
+    expect(service.get(queued.job.id)).toMatchObject({
+      job: { state: 'failed', errorCode: 'SAVE_JOB_HOST_LEASE_LOST' },
+      run: {
+        state: 'interrupted', attemptCount: 1,
+        errorCode: 'SAVE_JOB_HOST_LEASE_LOST', recoveryRequired: true, result: null
+      }
+    })
+    expect(JSON.stringify(service.get(queued.job.id))).not.toMatch(/digest|token|instanceId|prior|path/i)
+    database.close()
+  })
+
+  it('preserves mutation-scope loss as a host-lease-lost terminal instead of executor failure', async () => {
+    const database = new ControlDatabase('unused', true)
+    const coordinator = new RecordingHostMutationCoordinator()
+    coordinator.loseOnActiveCheck = 1
+    const executor = new ScriptedExecutor(async (operation, input, scope) => {
+      scope?.assertActive()
+      return transactionResult(operation, input)
+    })
+    const service = new SaveJobService(database, executor, new EventHub(), {
+      hostMutationCoordinator: coordinator
+    })
+    const queued = service.enqueue({
+      operation: 'restore', idempotencyKey: restoreKey, backupId: sourceBackupId,
+      expectedRevision, protectionRequestId: protectionKey
+    }, 'Administrator')
+
+    await service.close()
+
+    expect(executor.calls).toHaveLength(1)
+    expect(coordinator.dispositions).toHaveLength(0)
+    expect(service.get(queued.job.id)).toMatchObject({
+      job: { state: 'failed', errorCode: 'SAVE_JOB_HOST_LEASE_LOST' },
+      run: {
+        state: 'interrupted', attemptCount: 1,
+        errorCode: 'SAVE_JOB_HOST_LEASE_LOST', recoveryRequired: true, result: null
+      }
+    })
+    database.close()
+  })
+
   it('drains an in-flight mutation on close instead of cancelling it', async () => {
     const database = new ControlDatabase('unused', true)
     const started = deferred<void>()
@@ -746,10 +1024,11 @@ type ExecutorInput = BackupSavePairRequest | RestoreSavePairRequest
 
 class ScriptedExecutor implements SaveTransactionExecutor {
   readonly calls: Array<{ operation: 'backup' | 'restore'; input: ExecutorInput }> = []
+  readonly restoreScopes: SaveRestoreMutationScope[] = []
 
   constructor(
     private readonly handler: (
-      operation: 'backup' | 'restore', input: ExecutorInput
+      operation: 'backup' | 'restore', input: ExecutorInput, scope?: SaveRestoreMutationScope
     ) => Promise<SaveTransactionResult>
   ) {}
 
@@ -757,13 +1036,60 @@ class ScriptedExecutor implements SaveTransactionExecutor {
     return this.run('backup', input)
   }
 
-  restore(input: RestoreSavePairRequest): Promise<SaveTransactionResult> {
-    return this.run('restore', input)
+  restore(input: RestoreSavePairRequest, mutationScope?: SaveRestoreMutationScope): Promise<SaveTransactionResult> {
+    if (mutationScope) this.restoreScopes.push(mutationScope)
+    return this.run('restore', input, mutationScope)
   }
 
-  private run(operation: 'backup' | 'restore', input: ExecutorInput): Promise<SaveTransactionResult> {
+  private run(
+    operation: 'backup' | 'restore',
+    input: ExecutorInput,
+    mutationScope?: SaveRestoreMutationScope
+  ): Promise<SaveTransactionResult> {
     this.calls.push({ operation, input })
-    return this.handler(operation, input)
+    return this.handler(operation, input, mutationScope)
+  }
+}
+
+class RecordingHostMutationCoordinator implements HostMutationOperationCoordinator {
+  readonly requests: HostMutationOperationRequest[] = []
+  readonly dispositions: Array<HostMutationOperationOutcome<unknown>['disposition']> = []
+  readonly acquireFailures: HostMutationOperationCoordinatorError['code'][] = []
+  readonly controller = new AbortController()
+  failAfterOperation = false
+  loseOnActiveCheck: number | null = null
+  activeChecks = 0
+
+  get signal(): AbortSignal {
+    return this.controller.signal
+  }
+
+  async runExclusive<T>(
+    request: HostMutationOperationRequest,
+    operation: (
+      scope: HostMutationOperationScope
+    ) => Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>
+  ): Promise<T> {
+    this.requests.push(request)
+    const failure = this.acquireFailures.shift()
+    if (failure) throw new HostMutationOperationCoordinatorError(failure)
+    const outcome = await operation({
+      signal: this.controller.signal,
+      assertActive: () => {
+        this.activeChecks += 1
+        if (this.controller.signal.aborted ||
+            (this.loseOnActiveCheck !== null && this.activeChecks >= this.loseOnActiveCheck)) {
+          throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
+        }
+      },
+      toPowerShellBorrowArguments: () => []
+    })
+    this.dispositions.push(outcome.disposition)
+    if (this.failAfterOperation) {
+      throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
+    }
+    if (outcome.kind === 'throw') throw outcome.error
+    return outcome.value
   }
 }
 
