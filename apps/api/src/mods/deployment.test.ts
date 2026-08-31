@@ -52,7 +52,7 @@ afterEach(async () => {
 })
 
 describe('mod deployment transaction core', () => {
-  it('revalidates a verified platform lock for preview, execution, and idempotent replay', async () => {
+  it('revalidates a verified platform lock for new execution but replays a terminal receipt immutably', async () => {
     let inventoryRevision = 'c'.repeat(64)
     let inventoryReads = 0
     const harness = await createHarness({
@@ -73,11 +73,43 @@ describe('mod deployment transaction core', () => {
 
     await expect(harness.service.preview(request)).resolves.toMatchObject({ dryRun: true })
     await expect(harness.service.execute(request)).resolves.toMatchObject({ status: 'succeeded', reused: false })
-    expect(inventoryReads).toBe(2)
+    expect(inventoryReads).toBe(4)
 
     inventoryRevision = 'd'.repeat(64)
-    await expect(harness.service.execute(request)).rejects.toThrow('MOD_DEPLOYMENT_PLATFORM_INVENTORY_DRIFT')
-    expect(inventoryReads).toBe(3)
+    await expect(harness.service.execute(request)).resolves.toMatchObject({ status: 'succeeded', reused: true })
+    expect(inventoryReads).toBe(4)
+  })
+
+  it('rejects platform drift that occurs while a new execution waits for the host lease', async () => {
+    let inventoryRevision = 'c'.repeat(64)
+    let inventoryReads = 0
+    const coordinator = new RecordingHostMutationCoordinator(() => {
+      inventoryRevision = 'd'.repeat(64)
+    })
+    const harness = await createHarness({
+      hostMutationCoordinator: coordinator,
+      readPlatformInventory: async () => {
+        inventoryReads += 1
+        return {
+          inventoryRevision,
+          inventory: { nebula: '0.9.22', bepInEx: '5.4.17' }
+        }
+      }
+    })
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-LeaseDriftMod-1.0.0', {
+      'LeaseDriftMod.dll': Buffer.from('fictional-lease-drift-mod')
+    })
+    const generated = manifests([staged], [staged.dependencyId])
+    const request = makeRequest('install', staged, generated, (await harness.service.inspect()).revision)
+    request.manifest.platformLock = platformLockFor(generated, inventoryRevision)
+    const before = await treeDigest(harness.pluginsRoot)
+
+    await expect(harness.service.execute(request))
+      .rejects.toThrow('MOD_DEPLOYMENT_PLATFORM_INVENTORY_DRIFT')
+
+    expect(inventoryReads).toBe(2)
+    expect(await treeDigest(harness.pluginsRoot)).toBe(before)
+    expect(coordinator.outcomes).toMatchObject([{ kind: 'throw', disposition: 'release' }])
   })
 
   it('fails closed for unavailable, drifted, or exact-version-mismatched trusted platform inventory', async () => {
@@ -486,7 +518,7 @@ describe('mod deployment transaction core', () => {
       ): Promise<T> {
         const scope = activeHostMutationScope(() => {
           activeAssertions += 1
-          if (activeAssertions === 4) {
+          if (activeAssertions === 7) {
             throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
           }
         })
@@ -510,7 +542,7 @@ describe('mod deployment transaction core', () => {
 
     await expect(harness.service.execute(request)).rejects.toThrow('MOD_DEPLOYMENT_HOST_LEASE_LOST')
     expect(stoppedChecks).toBe(2)
-    expect(activeAssertions).toBe(4)
+    expect(activeAssertions).toBe(7)
     expect(await treeDigest(harness.pluginsRoot)).toBe(before)
   })
 
@@ -940,11 +972,14 @@ class RecordingHostMutationCoordinator implements HostMutationOperationCoordinat
   readonly outcomes: HostMutationOperationOutcome<unknown>[] = []
   readonly scopes: HostMutationOperationScope[] = []
 
+  constructor(private readonly beforeEnter: (() => void | Promise<void>) | null = null) {}
+
   async runExclusive<T>(
     request: HostMutationOperationRequest,
     operation: HostMutationOperation<T>
   ): Promise<T> {
     this.requests.push({ ...request })
+    await this.beforeEnter?.()
     const scope = activeHostMutationScope()
     this.scopes.push(scope)
     const outcome = await operation(scope)

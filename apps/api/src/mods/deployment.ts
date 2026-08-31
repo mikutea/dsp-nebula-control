@@ -299,7 +299,6 @@ export class ModDeploymentService {
 
   async execute(input: ModDeploymentRequest): Promise<ModDeploymentReceipt> {
     const request = parseRequest(input)
-    await this.#assertPlatformLockCurrent(request)
     const fingerprint = requestFingerprint(request)
     return this.#exclusive(async () => this.#withFileLock(request.requestId, async () => {
       const stored = await this.#readReceipt(request.requestId)
@@ -318,6 +317,7 @@ export class ModDeploymentService {
         return { ...reconstructed, reused: true }
       }
 
+      await this.#assertPlatformLockCurrent(request)
       const prepared = await this.#prepare(request, current)
       return this.#executePreparedWithHostMutation(prepared)
     }))
@@ -514,6 +514,7 @@ export class ModDeploymentService {
     await this.#buildPendingTree(prepared, pendingRoot)
     await this.#injectFault('after-pending-built')
     await this.#assertStopped(hostMutationScope)
+    await this.#assertPlatformLockWithinHostMutation(prepared.request, hostMutationScope)
 
     const snapshotsRoot = await this.#ensureControlDirectory('snapshots')
     const snapshotId = `snapshot-${prepared.current.revision.slice(0, 16)}-${prepared.request.requestId}`
@@ -572,6 +573,7 @@ export class ModDeploymentService {
         },
         async (scope) => {
           try {
+            await this.#assertPlatformLockWithinHostMutation(prepared.request, scope)
             const receipt = await this.#executePrepared(prepared, scope)
             return hostMutationReturn(
               receipt,
@@ -598,6 +600,15 @@ export class ModDeploymentService {
       }
       throw error
     }
+  }
+
+  async #assertPlatformLockWithinHostMutation(
+    request: ModDeploymentRequest,
+    scope: HostMutationOperationScope | null
+  ): Promise<void> {
+    this.#assertHostMutationActive(scope)
+    await this.#assertPlatformLockCurrent(request)
+    this.#assertHostMutationActive(scope)
   }
 
   async #buildPendingTree(prepared: PreparedDeployment, pendingRoot: string): Promise<void> {
