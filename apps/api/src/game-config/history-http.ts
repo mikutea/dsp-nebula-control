@@ -97,7 +97,12 @@ const historyErrorCodeSchema = z.enum([
   'CONFIG_HISTORY_RECONCILIATION_REQUIRED',
   'CONFIG_HISTORY_COMMIT_FAILED',
   'CONFIG_HISTORY_ROLLBACK_FAILED',
-  'CONFIG_HISTORY_INTERRUPTED_RECOVERED'
+  'CONFIG_HISTORY_INTERRUPTED_RECOVERED',
+  'CONFIG_HISTORY_HOST_LEASE_BUSY',
+  'CONFIG_HISTORY_HOST_LEASE_DIRTY',
+  'CONFIG_HISTORY_HOST_LEASE_RECOVERY_REQUIRED',
+  'CONFIG_HISTORY_HOST_LEASE_LOST',
+  'CONFIG_HISTORY_HOST_LEASE_UNAVAILABLE'
 ])
 const receiptSchema = z.strictObject({
   format: z.literal('dyson-control-game-config-restore-receipt'),
@@ -403,7 +408,8 @@ function failureFrom(
 }
 
 function statusForCoreCode(code: GameConfigHistoryErrorCode | 'NONE'): number {
-  if (code === 'CONFIG_HISTORY_BUSY' || code === 'CONFIG_HISTORY_STOP_PROOF_REJECTED') return 423
+  if (code === 'CONFIG_HISTORY_BUSY' || code === 'CONFIG_HISTORY_STOP_PROOF_REJECTED' ||
+      code === 'CONFIG_HISTORY_HOST_LEASE_BUSY') return 423
   if (code === 'CONFIG_HISTORY_REQUEST_CONFLICT' || code === 'CONFIG_HISTORY_REVISION_CONFLICT') return 409
   if (code === 'CONFIG_HISTORY_REQUEST_INVALID' || code === 'CONFIG_HISTORY_SNAPSHOT_INVALID') return 422
   return 503

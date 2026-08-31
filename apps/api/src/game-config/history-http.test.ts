@@ -244,7 +244,12 @@ describe('game configuration history HTTP contract', () => {
     ['CONFIG_HISTORY_RECONCILIATION_REQUIRED', 503],
     ['CONFIG_HISTORY_COMMIT_FAILED', 503],
     ['CONFIG_HISTORY_ROLLBACK_FAILED', 503],
-    ['CONFIG_HISTORY_INTERRUPTED_RECOVERED', 503]
+    ['CONFIG_HISTORY_INTERRUPTED_RECOVERED', 503],
+    ['CONFIG_HISTORY_HOST_LEASE_BUSY', 423],
+    ['CONFIG_HISTORY_HOST_LEASE_DIRTY', 503],
+    ['CONFIG_HISTORY_HOST_LEASE_RECOVERY_REQUIRED', 503],
+    ['CONFIG_HISTORY_HOST_LEASE_LOST', 503],
+    ['CONFIG_HISTORY_HOST_LEASE_UNAVAILABLE', 503]
   ] satisfies Array<[GameConfigHistoryErrorCode, number]>) (
     'maps core error %s to fixed status %i',
     async (code, statusCode) => {
