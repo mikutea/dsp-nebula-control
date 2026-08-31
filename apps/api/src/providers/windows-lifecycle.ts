@@ -1,6 +1,12 @@
 import { z } from 'zod'
 import type { FileBridgeClient } from '../bridge/file-client.js'
-import { BridgeProtocolError, type BridgeHeartbeat, type BridgeReceipt } from '../bridge/protocol.js'
+import {
+  BridgeProtocolError,
+  assertBridgeReceiptV2,
+  computeBridgeSaveGenerationId,
+  type BridgeHeartbeat,
+  type BridgeReceipt
+} from '../bridge/protocol.js'
 import {
   LifecycleExecutionError,
   type LifecycleAction,
@@ -160,11 +166,13 @@ export class WindowsLifecycleAdapter implements LifecycleMutationAdapter {
   async requestSave(context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
     try {
       const receipt = await this.#options.bridgeClient.requestSave(context.requestId, context.signal)
+      assertBridgeReceiptV2(receipt)
       this.#assertRequestId(receipt.requestId, context.requestId)
       if (receipt.state !== 'succeeded') throw new LifecycleExecutionError(receipt.errorCode)
       return {
         summary: '游戏内保存已完成，配对存档回执有效',
         evidence: {
+          generationId: computeBridgeSaveGenerationId(receipt),
           dsvBytes: receipt.dsvBytes,
           serverBytes: receipt.serverBytes,
           saveAdvanced: receipt.saveTimeAfter > receipt.saveTimeBefore,

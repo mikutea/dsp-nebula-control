@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { FileBridgeClient } from '../bridge/file-client.js'
 import {
   buildBridgeHeartbeat,
   buildBridgeReceipt,
+  computeBridgeSaveGenerationId,
   parseBridgeRequest
 } from '../bridge/protocol.js'
 import { ControlDatabase } from '../storage/database.js'
@@ -44,7 +45,7 @@ describe('Windows save lifecycle integration', () => {
     const simulatedPlugin = completeNextSave(fixture)
 
     const result = await service.execute('save', 'save:windows-integration:0001', 'Administrator')
-    await simulatedPlugin
+    const expectedGenerationId = await simulatedPlugin
     expect(result.job).toMatchObject({ state: 'succeeded', errorCode: null })
     expect(result.run).toMatchObject({
       state: 'succeeded', recoveryRequired: false,
@@ -55,7 +56,10 @@ describe('Windows save lifecycle integration', () => {
       ['protection-point', 'succeeded'], ['save', 'succeeded']
     ])
     expect(result.receipts.at(-1)?.evidence).toMatchObject({
-      saveAdvanced: true, dsvBytes: 20, serverBytes: 23
+      generationId: expectedGenerationId,
+      saveAdvanced: true,
+      dsvBytes: 20,
+      serverBytes: 23
     })
 
     const protectionRoot = path.join(
@@ -66,6 +70,7 @@ describe('Windows save lifecycle integration', () => {
 
     const duplicate = await service.execute('save', 'save:windows-integration:0001', 'Administrator')
     expect(duplicate).toMatchObject({ reused: true, job: { id: result.job.id, state: 'succeeded' } })
+    expect(duplicate.receipts.at(-1)?.evidence).toMatchObject({ generationId: expectedGenerationId })
     expect((await readdir(path.join(fixture.controlRoot, 'requests')))).toEqual([])
     database.close()
   }, 30_000)
@@ -105,7 +110,7 @@ async function createFixture(): Promise<Fixture> {
   return { projectRoot, saveRoot, controlRoot, secretFile }
 }
 
-async function completeNextSave(fixture: Fixture): Promise<void> {
+async function completeNextSave(fixture: Fixture): Promise<string> {
   const requestFile = await waitForRequest(fixture.controlRoot)
   const request = parseBridgeRequest(
     await readFile(path.join(fixture.controlRoot, 'requests', requestFile), 'utf8'), secret
@@ -116,6 +121,11 @@ async function completeNextSave(fixture: Fixture): Promise<void> {
     writeFile(path.join(fixture.saveRoot, '_lastexit_.dsv'), dsv, 'utf8'),
     writeFile(path.join(fixture.saveRoot, '_lastexit_.server'), sidecar, 'utf8')
   ])
+  const [dsvStats, serverStats] = await Promise.all([
+    stat(path.join(fixture.saveRoot, '_lastexit_.dsv'), { bigint: true }),
+    stat(path.join(fixture.saveRoot, '_lastexit_.server'), { bigint: true })
+  ])
+  const dotNetUnixEpochTicks = 621355968000000000n
   const startedAtUnixMs = Date.now()
   const receipt = buildBridgeReceipt({
     requestId: request.requestId,
@@ -123,16 +133,22 @@ async function completeNextSave(fixture: Fixture): Promise<void> {
     state: 'succeeded',
     startedAtUnixMs,
     finishedAtUnixMs: startedAtUnixMs + 30,
+    saveName: '_lastexit_',
     saveTimeBefore: 100,
     saveTimeAfter: 101,
     dsvBytes: Buffer.byteLength(dsv),
+    dsvWriteTimeUtcTicks: dotNetUnixEpochTicks + dsvStats.mtimeNs / 100n,
     serverBytes: Buffer.byteLength(sidecar),
+    serverWriteTimeUtcTicks: dotNetUnixEpochTicks + serverStats.mtimeNs / 100n,
+    dsvChanged: true,
+    serverChanged: true,
     errorCode: 'NONE'
   }, secret)
   const temporary = path.join(fixture.controlRoot, 'receipts', `.partial-${request.requestId}`)
   await writeFile(temporary, receipt.payload, 'utf8')
   await rename(temporary, path.join(fixture.controlRoot, 'receipts', `${request.requestId}.receipt`))
   await rm(path.join(fixture.controlRoot, 'requests', requestFile), { force: true })
+  return computeBridgeSaveGenerationId(receipt.receipt)
 }
 
 async function waitForRequest(controlRoot: string): Promise<string> {

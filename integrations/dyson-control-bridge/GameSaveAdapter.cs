@@ -130,7 +130,8 @@ namespace DysonControl.Bridge
                 var saveFolder = gameSaveFolderField.GetValue(null) as string;
                 var saveName = lastExitField.GetValue(null) as string;
                 var saveExtension = saveExtensionField.GetValue(null) as string;
-                if (string.IsNullOrWhiteSpace(saveFolder) || string.IsNullOrWhiteSpace(saveName) ||
+                if (string.IsNullOrWhiteSpace(saveFolder) ||
+                    !string.Equals(saveName, BridgeProtocol.LastExitSaveName, StringComparison.Ordinal) ||
                     string.IsNullOrWhiteSpace(saveExtension) || !saveExtension.StartsWith(".", StringComparison.Ordinal))
                 {
                     errorCode = "BRIDGE_INCOMPATIBLE";
@@ -146,13 +147,21 @@ namespace DysonControl.Bridge
                     return false;
                 }
 
-                context = new SaveContext
+                var prepared = new SaveContext
                 {
                     SaveName = saveName,
                     DsvPath = dsvPath,
-                    ServerPath = serverPath,
-                    SaveTimeBefore = GetLastSaveTime()
+                    ServerPath = serverPath
                 };
+                var before = Observe(prepared);
+                if (before.SaveTime < 0)
+                {
+                    errorCode = "SAVE_TIME_UNAVAILABLE";
+                    return false;
+                }
+                prepared.BeforeObservation = before;
+                prepared.SaveTimeBefore = before.SaveTime;
+                context = prepared;
                 errorCode = "NONE";
                 return true;
             }
@@ -164,23 +173,62 @@ namespace DysonControl.Bridge
             }
         }
 
-        internal bool TryInvokeSave(SaveContext context, out string errorCode)
+        internal bool TryInvokeSave(
+            SaveContext context,
+            out SaveObservation immediateObservation,
+            out string errorCode)
         {
+            immediateObservation = null;
             errorCode = "SAVE_CALL_FAILED";
+            object result;
             try
             {
-                var result = saveCurrentGameMethod.Invoke(null, new object[] { context.SaveName });
-                if (result is bool succeeded && succeeded)
-                {
-                    errorCode = "NONE";
-                    return true;
-                }
-                return false;
+                result = saveCurrentGameMethod.Invoke(null, new object[] { context.SaveName });
             }
             catch
             {
                 return false;
             }
+            try
+            {
+                immediateObservation = Observe(context);
+            }
+            catch
+            {
+                immediateObservation = null;
+                errorCode = "SAVE_OBSERVATION_FAILED";
+                return false;
+            }
+            if (!(result is bool succeeded) || !succeeded)
+            {
+                return false;
+            }
+            if (!immediateObservation.PairPresent || immediateObservation.DsvBytes <= 0 ||
+                immediateObservation.DsvWriteTimeUtcTicks <= 0 || immediateObservation.ServerBytes <= 0 ||
+                immediateObservation.ServerWriteTimeUtcTicks <= 0)
+            {
+                errorCode = "SAVE_PAIR_MISSING";
+                return false;
+            }
+            if (immediateObservation.SaveTime <= context.SaveTimeBefore)
+            {
+                errorCode = "SAVE_TIME_UNCHANGED";
+                return false;
+            }
+            var dsvChanged = immediateObservation.DsvChangedFrom(context.BeforeObservation);
+            var serverChanged = immediateObservation.ServerChangedFrom(context.BeforeObservation);
+            if (!dsvChanged && !serverChanged)
+            {
+                errorCode = "SAVE_PAIR_UNCHANGED";
+                return false;
+            }
+            if (!dsvChanged || !serverChanged)
+            {
+                errorCode = "SAVE_PAIR_PARTIAL";
+                return false;
+            }
+            errorCode = "NONE";
+            return true;
         }
 
         internal SaveObservation Observe(SaveContext context)
@@ -194,9 +242,9 @@ namespace DysonControl.Bridge
                 PairPresent = dsv.Exists && server.Exists && dsv.Length > 0 && server.Length > 0,
                 DsvBytes = dsv.Exists ? dsv.Length : -1,
                 ServerBytes = server.Exists ? server.Length : -1,
-                DsvWriteTicks = dsv.Exists ? dsv.LastWriteTimeUtc.Ticks : -1,
-                ServerWriteTicks = server.Exists ? server.LastWriteTimeUtc.Ticks : -1,
-                SaveTimeAfter = GetLastSaveTime()
+                DsvWriteTimeUtcTicks = dsv.Exists ? dsv.LastWriteTimeUtc.Ticks : -1,
+                ServerWriteTimeUtcTicks = server.Exists ? server.LastWriteTimeUtc.Ticks : -1,
+                SaveTime = GetLastSaveTime()
             };
         }
 
@@ -230,41 +278,6 @@ namespace DysonControl.Bridge
         internal string DsvPath { get; set; }
         internal string ServerPath { get; set; }
         internal long SaveTimeBefore { get; set; }
-    }
-
-    internal sealed class SaveObservation : IEquatable<SaveObservation>
-    {
-        internal bool PairPresent { get; set; }
-        internal long DsvBytes { get; set; }
-        internal long ServerBytes { get; set; }
-        internal long DsvWriteTicks { get; set; }
-        internal long ServerWriteTicks { get; set; }
-        internal long SaveTimeAfter { get; set; }
-
-        public bool Equals(SaveObservation other)
-        {
-            return other != null && PairPresent == other.PairPresent && DsvBytes == other.DsvBytes &&
-                   ServerBytes == other.ServerBytes && DsvWriteTicks == other.DsvWriteTicks &&
-                   ServerWriteTicks == other.ServerWriteTicks && SaveTimeAfter == other.SaveTimeAfter;
-        }
-
-        public override bool Equals(object obj)
-        {
-            return Equals(obj as SaveObservation);
-        }
-
-        public override int GetHashCode()
-        {
-            unchecked
-            {
-                var hash = PairPresent ? 17 : 31;
-                hash = hash * 31 + DsvBytes.GetHashCode();
-                hash = hash * 31 + ServerBytes.GetHashCode();
-                hash = hash * 31 + DsvWriteTicks.GetHashCode();
-                hash = hash * 31 + ServerWriteTicks.GetHashCode();
-                hash = hash * 31 + SaveTimeAfter.GetHashCode();
-                return hash;
-            }
-        }
+        internal SaveObservation BeforeObservation { get; set; }
     }
 }

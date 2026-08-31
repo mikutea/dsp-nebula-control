@@ -38,7 +38,12 @@ describe('Windows lifecycle adapter', () => {
       evidence: { manifestVerified: true, dsvBytes: 1024, serverBytes: 256 }
     })
     await expect(adapter.requestSave(context)).resolves.toMatchObject({
-      evidence: { saveAdvanced: true, dsvBytes: 2048, serverBytes: 512 }
+      evidence: {
+        generationId: 'generation-v1:6899cf8e7a311b70bbb961477ea9e650c852dcf19ae760488a9183d9518172bd',
+        saveAdvanced: true,
+        dsvBytes: 2048,
+        serverBytes: 512
+      }
     })
     await expect(adapter.requestGracefulStop(context)).resolves.toMatchObject({
       evidence: { outcome: 'stopped', processVerified: true }
@@ -112,6 +117,34 @@ describe('Windows lifecycle adapter', () => {
     )
   })
 
+  it('rejects legacy and wrong-slot success receipts from injected bridge adapters', async () => {
+    const legacy = createAdapter()
+    legacy.bridge.receiptMode = 'legacy-v1'
+    await expect(legacy.adapter.requestSave(operationContext('save'))).rejects.toEqual(
+      expect.objectContaining<Partial<LifecycleExecutionError>>({ code: 'BRIDGE_RECEIPT_V2_REQUIRED' })
+    )
+
+    const wrongSlot = createAdapter()
+    wrongSlot.bridge.receiptMode = 'wrong-slot'
+    await expect(wrongSlot.adapter.requestSave(operationContext('save'))).rejects.toEqual(
+      expect.objectContaining<Partial<LifecycleExecutionError>>({ code: 'BRIDGE_RECEIPT_INCONSISTENT' })
+    )
+  })
+
+  it('rejects missing V2 evidence and false changed semantics from injected adapters', async () => {
+    const incomplete = createAdapter()
+    incomplete.bridge.receiptMode = 'missing-evidence'
+    await expect(incomplete.adapter.requestSave(operationContext('save'))).rejects.toEqual(
+      expect.objectContaining<Partial<LifecycleExecutionError>>({ code: 'BRIDGE_RECEIPT_V2_REQUIRED' })
+    )
+
+    const unchanged = createAdapter()
+    unchanged.bridge.receiptMode = 'unchanged'
+    await expect(unchanged.adapter.requestSave(operationContext('save'))).rejects.toEqual(
+      expect.objectContaining<Partial<LifecycleExecutionError>>({ code: 'BRIDGE_RECEIPT_INCONSISTENT' })
+    )
+  })
+
   it('rejects malformed host receipts with one stable adapter error', async () => {
     const fixture = createAdapter()
     fixture.runner.malformedProtection = true
@@ -126,6 +159,7 @@ class FakeBridgeClient implements LifecycleBridgeClient {
   probeFailure = false
   probeCalls = 0
   failedSaveCode: string | null = null
+  receiptMode: 'valid-v2' | 'legacy-v1' | 'wrong-slot' | 'missing-evidence' | 'unchanged' = 'valid-v2'
   readonly saveRequestIds: string[] = []
 
   async probe(): Promise<BridgeHeartbeat> {
@@ -144,18 +178,35 @@ class FakeBridgeClient implements LifecycleBridgeClient {
     const now = Date.now()
     if (this.failedSaveCode) {
       return {
-        protocol: 'DYSON_CONTROL_RECEIPT_V1', requestId: id, action: 'save', state: 'failed',
+        protocol: 'DYSON_CONTROL_RECEIPT_V2', requestId: id, action: 'save', state: 'failed',
         startedAtUnixMs: now, finishedAtUnixMs: now + 1,
-        saveTimeBefore: -1, saveTimeAfter: -1, dsvBytes: -1, serverBytes: -1,
+        saveName: '_unavailable_', saveTimeBefore: -1n, saveTimeAfter: -1n,
+        dsvBytes: -1, dsvWriteTimeUtcTicks: -1n,
+        serverBytes: -1, serverWriteTimeUtcTicks: -1n,
+        dsvChanged: false, serverChanged: false,
         errorCode: this.failedSaveCode, hmac: '0'.repeat(64)
       }
     }
-    return {
-      protocol: 'DYSON_CONTROL_RECEIPT_V1', requestId: id, action: 'save', state: 'succeeded',
+    if (this.receiptMode === 'legacy-v1') {
+      return {
+        protocol: 'DYSON_CONTROL_RECEIPT_V1', requestId: id, action: 'save', state: 'succeeded',
+        startedAtUnixMs: now, finishedAtUnixMs: now + 25,
+        saveTimeBefore: 100, saveTimeAfter: 101, dsvBytes: 2048, serverBytes: 512,
+        errorCode: 'NONE', hmac: '0'.repeat(64)
+      }
+    }
+    const receipt: BridgeReceipt = {
+      protocol: 'DYSON_CONTROL_RECEIPT_V2', requestId: id, action: 'save', state: 'succeeded',
       startedAtUnixMs: now, finishedAtUnixMs: now + 25,
-      saveTimeBefore: 100, saveTimeAfter: 101, dsvBytes: 2048, serverBytes: 512,
+      saveName: this.receiptMode === 'wrong-slot' ? '_autosave_' : '_lastexit_',
+      saveTimeBefore: 100n, saveTimeAfter: 101n,
+      dsvBytes: 2048, dsvWriteTimeUtcTicks: 638817408010000001n,
+      serverBytes: 512, serverWriteTimeUtcTicks: 638817408010000002n,
+      dsvChanged: this.receiptMode !== 'unchanged', serverChanged: true,
       errorCode: 'NONE', hmac: '0'.repeat(64)
     }
+    if (this.receiptMode === 'missing-evidence') delete receipt.serverWriteTimeUtcTicks
+    return receipt
   }
 }
 

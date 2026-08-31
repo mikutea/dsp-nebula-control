@@ -27,10 +27,10 @@ namespace DysonControl.Bridge
         private PlayerRosterPublisher playerRoster;
         private PendingSave pending;
         private bool operational;
-        private long nextPollUnixMs;
-        private long lastSaveStartedUnixMs;
+        private long nextPollMonotonicTicks;
+        private long lastSaveStartedMonotonicTicks = -1;
         private long startedAtUnixMs;
-        private long nextHeartbeatUnixMs;
+        private long nextHeartbeatMonotonicTicks;
 
         private void Awake()
         {
@@ -65,7 +65,7 @@ namespace DysonControl.Bridge
                 }
                 operational = true;
                 startedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                WriteHeartbeat(startedAtUnixMs);
+                WriteHeartbeat(startedAtUnixMs, BridgeMonotonicTime.NowTicks());
                 try
                 {
                     playerRoster = new PlayerRosterPublisher(store);
@@ -77,7 +77,7 @@ namespace DysonControl.Bridge
                     playerRoster = null;
                     Logger.LogWarning("Player roster bridge is unavailable: " + exception.GetType().Name);
                 }
-                Logger.LogInfo("Dyson Control Bridge V1 is enabled for signed local save requests and read-only player snapshots.");
+                Logger.LogInfo("Dyson Control Bridge receipt V2 is enabled for signed local save requests and read-only player snapshots.");
             }
             catch (Exception exception)
             {
@@ -92,18 +92,19 @@ namespace DysonControl.Bridge
                 return;
             }
 
-            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var nowUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var nowMonotonicTicks = BridgeMonotonicTime.NowTicks();
             try
             {
-                if (now >= nextHeartbeatUnixMs)
+                if (nowMonotonicTicks >= nextHeartbeatMonotonicTicks)
                 {
-                    WriteHeartbeat(now);
+                    WriteHeartbeat(nowUnixMs, nowMonotonicTicks);
                 }
                 if (playerRoster != null)
                 {
                     try
                     {
-                        playerRoster.Tick(now);
+                        playerRoster.Tick(nowUnixMs);
                     }
                     catch (Exception exception)
                     {
@@ -112,18 +113,20 @@ namespace DysonControl.Bridge
                 }
                 if (pending != null)
                 {
-                    ObservePendingSave(now);
+                    ObservePendingSave(nowUnixMs, nowMonotonicTicks);
                     return;
                 }
-                if (now < nextPollUnixMs)
+                if (nowMonotonicTicks < nextPollMonotonicTicks)
                 {
                     return;
                 }
-                nextPollUnixMs = now + Clamp(pollMilliseconds.Value, 100, 2000);
+                nextPollMonotonicTicks = BridgeMonotonicTime.DeadlineAfter(
+                    nowMonotonicTicks,
+                    BridgeMonotonicTime.DurationTicks(Clamp(pollMilliseconds.Value, 100, 2000)));
                 var claim = store.TryClaimNext();
                 if (claim != null)
                 {
-                    ProcessClaim(claim, now);
+                    ProcessClaim(claim, nowUnixMs, nowMonotonicTicks);
                 }
             }
             catch (Exception exception)
@@ -131,7 +134,7 @@ namespace DysonControl.Bridge
                 Logger.LogError("Dyson Control Bridge update failed safely: " + exception.GetType().Name);
                 if (pending != null)
                 {
-                    FailPending("BRIDGE_IO_ERROR", now);
+                    FailPending("BRIDGE_IO_ERROR", nowUnixMs);
                 }
             }
         }
@@ -142,13 +145,19 @@ namespace DysonControl.Bridge
             playerRoster = null;
         }
 
-        private void WriteHeartbeat(long now)
+        private void WriteHeartbeat(long nowUnixMs, long nowMonotonicTicks)
         {
-            store.WriteHeartbeat(PluginVersion, Process.GetCurrentProcess().Id, startedAtUnixMs, now);
-            nextHeartbeatUnixMs = now + 2000;
+            store.WriteHeartbeat(
+                PluginVersion,
+                Process.GetCurrentProcess().Id,
+                startedAtUnixMs,
+                Math.Max(startedAtUnixMs, nowUnixMs));
+            nextHeartbeatMonotonicTicks = BridgeMonotonicTime.DeadlineAfter(
+                nowMonotonicTicks,
+                BridgeMonotonicTime.DurationTicks(2000));
         }
 
-        private void ProcessClaim(BridgeClaim claim, long now)
+        private void ProcessClaim(BridgeClaim claim, long nowUnixMs, long nowMonotonicTicks)
         {
             if (!store.TryReadRequest(claim, out var request, out var parseError))
             {
@@ -163,47 +172,69 @@ namespace DysonControl.Bridge
             }
             if (claim.Recovered)
             {
-                CompleteFailure(claim, request, "INTERRUPTED_UNCERTAIN", now, now);
+                CompleteFailure(claim, request, "INTERRUPTED_UNCERTAIN", nowUnixMs, nowUnixMs);
                 return;
             }
-            if (now < request.CreatedAtUnixMs - 5000 || now > request.ExpiresAtUnixMs)
+            // Signed request timestamps are absolute UTC protocol data. Local
+            // elapsed windows below deliberately use Stopwatch ticks instead.
+            if (nowUnixMs < request.CreatedAtUnixMs - 5000 || nowUnixMs > request.ExpiresAtUnixMs)
             {
-                CompleteFailure(claim, request, "REQUEST_EXPIRED", now, now);
+                CompleteFailure(claim, request, "REQUEST_EXPIRED", nowUnixMs, nowUnixMs);
                 return;
             }
-            var cooldown = Clamp(saveCooldownSeconds.Value, 30, 600) * 1000L;
-            if (lastSaveStartedUnixMs > 0 && now - lastSaveStartedUnixMs < cooldown)
+            var cooldownTicks = BridgeMonotonicTime.DurationTicks(
+                Clamp(saveCooldownSeconds.Value, 30, 600) * 1000L);
+            if (lastSaveStartedMonotonicTicks >= 0 &&
+                !BridgeMonotonicTime.HasElapsed(
+                    lastSaveStartedMonotonicTicks,
+                    nowMonotonicTicks,
+                    cooldownTicks))
             {
-                CompleteFailure(claim, request, "SAVE_COOLDOWN", now, now);
+                CompleteFailure(claim, request, "SAVE_COOLDOWN", nowUnixMs, nowUnixMs);
                 return;
             }
             if (!adapter.TryPrepare(out var context, out var prepareError))
             {
-                CompleteFailure(claim, request, prepareError, now, now);
+                CompleteFailure(claim, request, prepareError, nowUnixMs, nowUnixMs);
                 return;
             }
 
-            lastSaveStartedUnixMs = now;
-            if (!adapter.TryInvokeSave(context, out var saveError))
+            lastSaveStartedMonotonicTicks = nowMonotonicTicks;
+            if (!adapter.TryInvokeSave(context, out var immediateObservation, out var saveError))
             {
-                CompleteFailure(claim, request, saveError, now, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                    context.SaveTimeBefore);
+                CompleteFailure(
+                    claim,
+                    request,
+                    saveError,
+                    nowUnixMs,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    context,
+                    immediateObservation ?? context.BeforeObservation);
                 return;
             }
 
-            var afterCall = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            // The adapter captured and validated this exact tuple before
+            // returning. The monotonic timestamp is taken afterwards so the
+            // stability window can never be shorter than configured.
+            var capturedAtMonotonicTicks = BridgeMonotonicTime.NowTicks();
             pending = new PendingSave
             {
                 Claim = claim,
                 Request = request,
                 Context = context,
-                StartedAtUnixMs = now,
-                DeadlineUnixMs = afterCall + Clamp(saveTimeoutSeconds.Value, 10, 180) * 1000L
+                StartedAtUnixMs = nowUnixMs,
+                DeadlineMonotonicTicks = BridgeMonotonicTime.DeadlineAfter(
+                    capturedAtMonotonicTicks,
+                    BridgeMonotonicTime.DurationTicks(Clamp(saveTimeoutSeconds.Value, 10, 180) * 1000L)),
+                Tracker = new SaveObservationStabilityTracker(
+                    context.BeforeObservation,
+                    immediateObservation,
+                    capturedAtMonotonicTicks)
             };
             Logger.LogInfo("Accepted signed save request " + request.RequestId + ".");
         }
 
-        private void ObservePendingSave(long now)
+        private void ObservePendingSave(long nowUnixMs, long nowMonotonicTicks)
         {
             SaveObservation observation;
             try
@@ -212,45 +243,46 @@ namespace DysonControl.Bridge
             }
             catch
             {
-                FailPending("SAVE_OBSERVATION_FAILED", now);
+                FailPending("SAVE_OBSERVATION_FAILED", nowUnixMs);
                 return;
             }
 
-            if (observation.PairPresent && observation.SaveTimeAfter > pending.Context.SaveTimeBefore)
+            var stable = pending.Tracker.Observe(
+                observation,
+                nowMonotonicTicks,
+                BridgeMonotonicTime.DurationTicks(Clamp(stabilityMilliseconds.Value, 500, 15000)));
+            if (pending.Tracker.IsUnstable)
             {
-                if (pending.LastObservation == null || !pending.LastObservation.Equals(observation))
-                {
-                    pending.LastObservation = observation;
-                    pending.StableSinceUnixMs = now;
-                }
-                else if (now - pending.StableSinceUnixMs >= Clamp(stabilityMilliseconds.Value, 500, 15000))
-                {
-                    store.Complete(pending.Claim, new BridgeReceipt
-                    {
-                        RequestId = pending.Request.RequestId,
-                        State = "succeeded",
-                        StartedAtUnixMs = pending.StartedAtUnixMs,
-                        FinishedAtUnixMs = now,
-                        SaveTimeBefore = pending.Context.SaveTimeBefore,
-                        SaveTimeAfter = observation.SaveTimeAfter,
-                        DsvBytes = observation.DsvBytes,
-                        ServerBytes = observation.ServerBytes,
-                        ErrorCode = "NONE"
-                    });
-                    Logger.LogInfo("Save request " + pending.Request.RequestId + " completed with paired evidence.");
-                    pending = null;
-                    return;
-                }
+                FailPending("SAVE_PAIR_UNSTABLE", nowUnixMs, observation);
+                return;
             }
-
-            if (now >= pending.DeadlineUnixMs)
+            if (nowMonotonicTicks >= pending.DeadlineMonotonicTicks)
             {
-                var error = !observation.PairPresent
-                    ? "SAVE_PAIR_MISSING"
-                    : observation.SaveTimeAfter <= pending.Context.SaveTimeBefore
-                        ? "SAVE_TIME_UNCHANGED"
-                        : "SAVE_PAIR_UNSTABLE";
-                FailPending(error, now, observation);
+                FailPending("SAVE_PAIR_UNSTABLE", nowUnixMs, observation);
+                return;
+            }
+            if (stable)
+            {
+                var target = pending.Tracker.Target;
+                store.Complete(pending.Claim, new BridgeReceipt
+                {
+                    RequestId = pending.Request.RequestId,
+                    State = "succeeded",
+                    StartedAtUnixMs = pending.StartedAtUnixMs,
+                    FinishedAtUnixMs = NormalizeFinishedAt(pending.StartedAtUnixMs, nowUnixMs),
+                    SaveName = BridgeProtocol.LastExitSaveName,
+                    SaveTimeBefore = pending.Context.SaveTimeBefore,
+                    SaveTimeAfter = target.SaveTime,
+                    DsvBytes = target.DsvBytes,
+                    DsvWriteTimeUtcTicks = target.DsvWriteTimeUtcTicks,
+                    ServerBytes = target.ServerBytes,
+                    ServerWriteTimeUtcTicks = target.ServerWriteTimeUtcTicks,
+                    DsvChanged = pending.Tracker.DsvChanged,
+                    ServerChanged = pending.Tracker.ServerChanged,
+                    ErrorCode = "NONE"
+                });
+                Logger.LogInfo("Save request " + pending.Request.RequestId + " completed with paired V2 generation evidence.");
+                pending = null;
             }
         }
 
@@ -258,16 +290,24 @@ namespace DysonControl.Bridge
         {
             var current = pending;
             pending = null;
+            var effective = observation ?? current.Context.BeforeObservation;
+            var dsvChanged = effective != null && effective.DsvChangedFrom(current.Context.BeforeObservation);
+            var serverChanged = effective != null && effective.ServerChangedFrom(current.Context.BeforeObservation);
             store.Complete(current.Claim, new BridgeReceipt
             {
                 RequestId = current.Request.RequestId,
                 State = "failed",
                 StartedAtUnixMs = current.StartedAtUnixMs,
-                FinishedAtUnixMs = finishedAtUnixMs,
+                FinishedAtUnixMs = NormalizeFinishedAt(current.StartedAtUnixMs, finishedAtUnixMs),
+                SaveName = BridgeProtocol.LastExitSaveName,
                 SaveTimeBefore = current.Context.SaveTimeBefore,
-                SaveTimeAfter = observation?.SaveTimeAfter ?? -1,
-                DsvBytes = observation?.DsvBytes ?? -1,
-                ServerBytes = observation?.ServerBytes ?? -1,
+                SaveTimeAfter = effective?.SaveTime ?? -1,
+                DsvBytes = effective?.DsvBytes ?? -1,
+                DsvWriteTimeUtcTicks = effective?.DsvWriteTimeUtcTicks ?? -1,
+                ServerBytes = effective?.ServerBytes ?? -1,
+                ServerWriteTimeUtcTicks = effective?.ServerWriteTimeUtcTicks ?? -1,
+                DsvChanged = dsvChanged,
+                ServerChanged = serverChanged,
                 ErrorCode = errorCode
             });
             Logger.LogWarning("Save request " + current.Request.RequestId + " failed safely: " + errorCode);
@@ -279,18 +319,30 @@ namespace DysonControl.Bridge
             string errorCode,
             long startedAtUnixMs,
             long finishedAtUnixMs,
-            long saveTimeBefore = -1)
+            SaveContext context = null,
+            SaveObservation observation = null)
         {
+            var dsvChanged = context != null && observation != null &&
+                             observation.DsvChangedFrom(context.BeforeObservation);
+            var serverChanged = context != null && observation != null &&
+                                observation.ServerChangedFrom(context.BeforeObservation);
             store.Complete(claim, new BridgeReceipt
             {
                 RequestId = request.RequestId,
                 State = "failed",
                 StartedAtUnixMs = startedAtUnixMs,
-                FinishedAtUnixMs = finishedAtUnixMs,
-                SaveTimeBefore = saveTimeBefore,
-                SaveTimeAfter = -1,
-                DsvBytes = -1,
-                ServerBytes = -1,
+                FinishedAtUnixMs = NormalizeFinishedAt(startedAtUnixMs, finishedAtUnixMs),
+                SaveName = context == null
+                    ? BridgeProtocol.UnavailableSaveName
+                    : BridgeProtocol.LastExitSaveName,
+                SaveTimeBefore = context?.SaveTimeBefore ?? -1,
+                SaveTimeAfter = observation?.SaveTime ?? -1,
+                DsvBytes = observation?.DsvBytes ?? -1,
+                DsvWriteTimeUtcTicks = observation?.DsvWriteTimeUtcTicks ?? -1,
+                ServerBytes = observation?.ServerBytes ?? -1,
+                ServerWriteTimeUtcTicks = observation?.ServerWriteTimeUtcTicks ?? -1,
+                DsvChanged = dsvChanged,
+                ServerChanged = serverChanged,
                 ErrorCode = errorCode
             });
         }
@@ -300,15 +352,19 @@ namespace DysonControl.Bridge
             return Math.Max(minimum, Math.Min(maximum, value));
         }
 
+        private static long NormalizeFinishedAt(long startedAtUnixMs, long finishedAtUnixMs)
+        {
+            return Math.Max(startedAtUnixMs, finishedAtUnixMs);
+        }
+
         private sealed class PendingSave
         {
             internal BridgeClaim Claim { get; set; }
             internal BridgeRequest Request { get; set; }
             internal SaveContext Context { get; set; }
             internal long StartedAtUnixMs { get; set; }
-            internal long DeadlineUnixMs { get; set; }
-            internal long StableSinceUnixMs { get; set; }
-            internal SaveObservation LastObservation { get; set; }
+            internal long DeadlineMonotonicTicks { get; set; }
+            internal SaveObservationStabilityTracker Tracker { get; set; }
         }
     }
 }

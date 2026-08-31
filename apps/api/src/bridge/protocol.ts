@@ -1,8 +1,11 @@
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 
 export const bridgeRequestProtocol = 'DYSON_CONTROL_REQUEST_V1' as const
-export const bridgeReceiptProtocol = 'DYSON_CONTROL_RECEIPT_V1' as const
+export const bridgeReceiptProtocol = 'DYSON_CONTROL_RECEIPT_V2' as const
 export const bridgeHeartbeatProtocol = 'DYSON_CONTROL_HEARTBEAT_V1' as const
+export const bridgeLastExitSaveName = '_lastexit_' as const
+export const bridgeUnavailableSaveName = '_unavailable_' as const
+const legacyBridgeReceiptProtocol = 'DYSON_CONTROL_RECEIPT_V1' as const
 
 export type BridgeAction = 'save'
 export type BridgeReceiptState = 'succeeded' | 'failed'
@@ -17,19 +20,57 @@ export interface BridgeRequest {
   hmac: string
 }
 
+/**
+ * Compatibility shape for injected adapters that predate receipt V2. The
+ * production FileBridgeClient returns BridgeReceiptV2 and never parses V1.
+ */
 export interface BridgeReceipt {
-  protocol: typeof bridgeReceiptProtocol
+  protocol: typeof bridgeReceiptProtocol | typeof legacyBridgeReceiptProtocol
   requestId: string
   action: BridgeAction
   state: BridgeReceiptState
   startedAtUnixMs: number
   finishedAtUnixMs: number
-  saveTimeBefore: number
-  saveTimeAfter: number
+  saveTimeBefore: number | bigint
+  saveTimeAfter: number | bigint
   dsvBytes: number
   serverBytes: number
   errorCode: string
   hmac: string
+  saveName?: string
+  dsvWriteTimeUtcTicks?: bigint
+  serverWriteTimeUtcTicks?: bigint
+  dsvChanged?: boolean
+  serverChanged?: boolean
+}
+
+export interface BridgeReceiptV2 extends BridgeReceipt {
+  protocol: typeof bridgeReceiptProtocol
+  saveName: string
+  saveTimeBefore: bigint
+  saveTimeAfter: bigint
+  dsvWriteTimeUtcTicks: bigint
+  serverWriteTimeUtcTicks: bigint
+  dsvChanged: boolean
+  serverChanged: boolean
+}
+
+export interface BridgeReceiptV2Input {
+  requestId: string
+  action: BridgeAction
+  state: BridgeReceiptState
+  startedAtUnixMs: number
+  finishedAtUnixMs: number
+  saveName: string
+  saveTimeBefore: string | number | bigint
+  saveTimeAfter: string | number | bigint
+  dsvBytes: number
+  dsvWriteTimeUtcTicks: string | number | bigint
+  serverBytes: number
+  serverWriteTimeUtcTicks: string | number | bigint
+  dsvChanged: boolean
+  serverChanged: boolean
+  errorCode: string
 }
 
 export interface BridgeHeartbeat {
@@ -57,16 +98,21 @@ const requestKeys = [
 ] as const
 const receiptKeys = [
   'protocol', 'requestId', 'action', 'state', 'startedAtUnixMs', 'finishedAtUnixMs',
-  'saveTimeBefore', 'saveTimeAfter', 'dsvBytes', 'serverBytes', 'errorCode', 'hmac'
+  'saveName', 'saveTimeBefore', 'saveTimeAfter',
+  'dsvBytes', 'dsvWriteTimeUtcTicks', 'serverBytes', 'serverWriteTimeUtcTicks',
+  'dsvChanged', 'serverChanged', 'errorCode', 'hmac'
 ] as const
 const heartbeatKeys = [
   'protocol', 'pluginVersion', 'processId', 'startedAtUnixMs', 'writtenAtUnixMs', 'state', 'hmac'
 ] as const
-const guidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const guidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const noncePattern = /^[A-Za-z0-9_-]{22,64}$/
 const hmacPattern = /^[0-9a-f]{64}$/i
 const errorCodePattern = /^(?:NONE|[A-Z][A-Z0-9_]{2,47})$/
 const pluginVersionPattern = /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,32})?$/
+const canonicalInt64Pattern = /^(?:-1|0|[1-9]\d{0,18})$/
+const maximumInt64 = 9_223_372_036_854_775_807n
+const generationIdPrefix = 'generation-v1:'
 
 export function validateBridgeSecret(secret: string): string {
   const normalized = secret.trim()
@@ -122,20 +168,25 @@ export function parseBridgeRequest(payload: string, secret: string): BridgeReque
 }
 
 export function buildBridgeReceipt(
-  values: Omit<BridgeReceipt, 'protocol' | 'hmac'>,
+  values: BridgeReceiptV2Input,
   secret: string
-): { receipt: BridgeReceipt; payload: string } {
-  const receipt: BridgeReceipt = {
+): { receipt: BridgeReceiptV2; payload: string } {
+  const receipt: BridgeReceiptV2 = {
     protocol: bridgeReceiptProtocol,
     requestId: normalizeRequestId(values.requestId),
     action: requireLiteral(values.action, 'save'),
     state: requireReceiptState(values.state),
     startedAtUnixMs: requireSafeInteger(values.startedAtUnixMs),
     finishedAtUnixMs: requireSafeInteger(values.finishedAtUnixMs),
-    saveTimeBefore: requireSignedSafeInteger(values.saveTimeBefore),
-    saveTimeAfter: requireSignedSafeInteger(values.saveTimeAfter),
+    saveName: requireSaveName(values.saveName),
+    saveTimeBefore: requireInt64(values.saveTimeBefore),
+    saveTimeAfter: requireInt64(values.saveTimeAfter),
     dsvBytes: requireSignedSafeInteger(values.dsvBytes),
+    dsvWriteTimeUtcTicks: requireInt64(values.dsvWriteTimeUtcTicks),
     serverBytes: requireSignedSafeInteger(values.serverBytes),
+    serverWriteTimeUtcTicks: requireInt64(values.serverWriteTimeUtcTicks),
+    dsvChanged: requireBoolean(values.dsvChanged),
+    serverChanged: requireBoolean(values.serverChanged),
     errorCode: requirePattern(values.errorCode, errorCodePattern, 'BRIDGE_ERROR_CODE_INVALID'),
     hmac: ''
   }
@@ -144,25 +195,80 @@ export function buildBridgeReceipt(
   return { receipt, payload: serialize(receiptKeys, receipt) }
 }
 
-export function parseBridgeReceipt(payload: string, secret: string): BridgeReceipt {
+export function parseBridgeReceipt(payload: string, secret: string): BridgeReceiptV2 {
   const values = parse(payload, receiptKeys)
-  const receipt: BridgeReceipt = {
+  const receipt: BridgeReceiptV2 = {
     protocol: requireLiteral(values.protocol, bridgeReceiptProtocol),
     requestId: normalizeRequestId(values.requestId),
     action: requireLiteral(values.action, 'save'),
     state: requireReceiptState(values.state),
     startedAtUnixMs: parseSafeInteger(values.startedAtUnixMs, 1, Number.MAX_SAFE_INTEGER),
     finishedAtUnixMs: parseSafeInteger(values.finishedAtUnixMs, 1, Number.MAX_SAFE_INTEGER),
-    saveTimeBefore: parseSafeInteger(values.saveTimeBefore, -1, Number.MAX_SAFE_INTEGER),
-    saveTimeAfter: parseSafeInteger(values.saveTimeAfter, -1, Number.MAX_SAFE_INTEGER),
+    saveName: requireSaveName(values.saveName),
+    saveTimeBefore: parseInt64(values.saveTimeBefore),
+    saveTimeAfter: parseInt64(values.saveTimeAfter),
     dsvBytes: parseSafeInteger(values.dsvBytes, -1, Number.MAX_SAFE_INTEGER),
+    dsvWriteTimeUtcTicks: parseInt64(values.dsvWriteTimeUtcTicks),
     serverBytes: parseSafeInteger(values.serverBytes, -1, Number.MAX_SAFE_INTEGER),
+    serverWriteTimeUtcTicks: parseInt64(values.serverWriteTimeUtcTicks),
+    dsvChanged: parseBoolean(values.dsvChanged),
+    serverChanged: parseBoolean(values.serverChanged),
     errorCode: requirePattern(values.errorCode, errorCodePattern, 'BRIDGE_ERROR_CODE_INVALID'),
     hmac: requirePattern(values.hmac, hmacPattern, 'BRIDGE_HMAC_INVALID').toLowerCase()
   }
   validateReceiptSemantics(receipt)
   assertSignature(receipt.hmac, signReceipt(receipt, validateBridgeSecret(secret)))
   return receipt
+}
+
+export function computeBridgeSaveGenerationId(receipt: BridgeReceipt): string {
+  assertBridgeReceiptV2(receipt)
+  if (receipt.state !== 'succeeded') {
+    throw new BridgeProtocolError('BRIDGE_GENERATION_UNAVAILABLE')
+  }
+  const digest = createHash('sha256')
+    .update('dyson-control-save-generation-v1\n', 'utf8')
+    .update(receipt.saveName, 'utf8')
+    .update('\n', 'utf8')
+    .update(receipt.saveTimeAfter.toString(), 'ascii')
+    .update('\n', 'utf8')
+    .update(String(receipt.dsvBytes), 'ascii')
+    .update('\n', 'utf8')
+    .update(receipt.dsvWriteTimeUtcTicks.toString(), 'ascii')
+    .update('\n', 'utf8')
+    .update(String(receipt.serverBytes), 'ascii')
+    .update('\n', 'utf8')
+    .update(receipt.serverWriteTimeUtcTicks.toString(), 'ascii')
+    .digest('hex')
+  return `${generationIdPrefix}${digest}`
+}
+
+/**
+ * Runtime boundary for injected bridge adapters. Production file receipts are
+ * already parsed and signed as V2, but lifecycle callers must reject an
+ * injected legacy or structurally incomplete object just as strictly.
+ */
+export function assertBridgeReceiptV2(receipt: BridgeReceipt): asserts receipt is BridgeReceiptV2 {
+  if (receipt === null || typeof receipt !== 'object' || !isBridgeReceiptV2(receipt)) {
+    throw new BridgeProtocolError('BRIDGE_RECEIPT_V2_REQUIRED')
+  }
+  normalizeRequestId(receipt.requestId)
+  requireLiteral(receipt.action, 'save')
+  requireReceiptState(receipt.state)
+  requireSafeInteger(receipt.startedAtUnixMs)
+  requireSafeInteger(receipt.finishedAtUnixMs)
+  requireSaveName(receipt.saveName)
+  requireInt64(receipt.saveTimeBefore)
+  requireInt64(receipt.saveTimeAfter)
+  requireSignedSafeInteger(receipt.dsvBytes)
+  requireInt64(receipt.dsvWriteTimeUtcTicks)
+  requireSignedSafeInteger(receipt.serverBytes)
+  requireInt64(receipt.serverWriteTimeUtcTicks)
+  requireBoolean(receipt.dsvChanged)
+  requireBoolean(receipt.serverChanged)
+  requirePattern(receipt.errorCode, errorCodePattern, 'BRIDGE_ERROR_CODE_INVALID')
+  requirePattern(receipt.hmac, hmacPattern, 'BRIDGE_HMAC_INVALID')
+  validateReceiptSemantics(receipt)
 }
 
 export function buildBridgeHeartbeat(
@@ -199,17 +305,27 @@ export function parseBridgeHeartbeat(payload: string, secret: string): BridgeHea
   return heartbeat
 }
 
-function validateReceiptSemantics(receipt: BridgeReceipt): void {
+function validateReceiptSemantics(receipt: BridgeReceiptV2): void {
   if (receipt.finishedAtUnixMs < receipt.startedAtUnixMs) {
     throw new BridgeProtocolError('BRIDGE_TIME_INVALID')
   }
   if (receipt.state === 'succeeded') {
-    if (receipt.errorCode !== 'NONE' || receipt.dsvBytes < 0 || receipt.serverBytes < 0 ||
-        receipt.saveTimeBefore < 0 || receipt.saveTimeAfter <= receipt.saveTimeBefore) {
+    // Pinned Nebula v0.9.22 writes .server unconditionally before the game
+    // writes .dsv. Accepting a one-sided change could bind two generations.
+    if (receipt.saveName !== bridgeLastExitSaveName || receipt.errorCode !== 'NONE' ||
+        receipt.dsvBytes <= 0 || receipt.serverBytes <= 0 ||
+        receipt.dsvWriteTimeUtcTicks <= 0n || receipt.serverWriteTimeUtcTicks <= 0n ||
+        receipt.saveTimeBefore < 0n || receipt.saveTimeAfter <= receipt.saveTimeBefore ||
+        (!receipt.dsvChanged || !receipt.serverChanged)) {
       throw new BridgeProtocolError('BRIDGE_RECEIPT_INCONSISTENT')
     }
-  } else if (receipt.errorCode === 'NONE') {
-    throw new BridgeProtocolError('BRIDGE_RECEIPT_INCONSISTENT')
+    // A failed receipt may report changed=true with -1 metadata: the signed
+    // assertion then means the pre-call file identity changed by disappearing.
+  } else {
+    if ((receipt.saveName !== bridgeLastExitSaveName && receipt.saveName !== bridgeUnavailableSaveName) ||
+        receipt.errorCode === 'NONE') {
+      throw new BridgeProtocolError('BRIDGE_RECEIPT_INCONSISTENT')
+    }
   }
 }
 
@@ -224,7 +340,7 @@ function signRequest(request: Omit<BridgeRequest, 'hmac'> | BridgeRequest, secre
   ], secret)
 }
 
-function signReceipt(receipt: Omit<BridgeReceipt, 'hmac'> | BridgeReceipt, secret: string): string {
+function signReceipt(receipt: Omit<BridgeReceiptV2, 'hmac'> | BridgeReceiptV2, secret: string): string {
   return hmac([
     bridgeReceiptProtocol,
     receipt.requestId,
@@ -232,10 +348,15 @@ function signReceipt(receipt: Omit<BridgeReceipt, 'hmac'> | BridgeReceipt, secre
     receipt.state,
     String(receipt.startedAtUnixMs),
     String(receipt.finishedAtUnixMs),
+    receipt.saveName,
     String(receipt.saveTimeBefore),
     String(receipt.saveTimeAfter),
     String(receipt.dsvBytes),
+    String(receipt.dsvWriteTimeUtcTicks),
     String(receipt.serverBytes),
+    String(receipt.serverWriteTimeUtcTicks),
+    String(receipt.dsvChanged),
+    String(receipt.serverChanged),
     receipt.errorCode
   ], secret)
 }
@@ -273,10 +394,10 @@ function assertSignature(actualHex: string, expectedHex: string): void {
 }
 
 function parse<K extends readonly string[]>(payload: string, keys: K): Record<K[number], string> {
-  if (Buffer.byteLength(payload, 'utf8') > 4096 || payload.includes('\0')) {
+  if (Buffer.byteLength(payload, 'utf8') > 4096 || payload.includes('\0') || payload.includes('\uFEFF')) {
     throw new BridgeProtocolError('BRIDGE_PAYLOAD_INVALID')
   }
-  const lines = payload.replace(/^\uFEFF/, '').split(/\r?\n/)
+  const lines = payload.split(/\r?\n/)
   if (lines.at(-1) === '') lines.pop()
   if (lines.length !== keys.length) throw new BridgeProtocolError('BRIDGE_PAYLOAD_INVALID')
   const values: Partial<Record<K[number], string>> = {}
@@ -301,7 +422,7 @@ function normalizeRequestId(value: string): string {
 }
 
 function parseSafeInteger(value: string, minimum: number, maximum: number): number {
-  if (!/^-?\d+$/.test(value)) throw new BridgeProtocolError('BRIDGE_NUMBER_INVALID')
+  if (!/^(?:-1|0|[1-9]\d*)$/.test(value)) throw new BridgeProtocolError('BRIDGE_NUMBER_INVALID')
   const parsed = Number(value)
   if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
     throw new BridgeProtocolError('BRIDGE_NUMBER_INVALID')
@@ -317,6 +438,53 @@ function requireSafeInteger(value: number): number {
 function requireSignedSafeInteger(value: number): number {
   if (!Number.isSafeInteger(value) || value < -1) throw new BridgeProtocolError('BRIDGE_NUMBER_INVALID')
   return value
+}
+
+function parseInt64(value: string): bigint {
+  if (!canonicalInt64Pattern.test(value)) throw new BridgeProtocolError('BRIDGE_INT64_INVALID')
+  const parsed = BigInt(value)
+  if (parsed < -1n || parsed > maximumInt64) throw new BridgeProtocolError('BRIDGE_INT64_INVALID')
+  return parsed
+}
+
+function requireInt64(value: string | number | bigint): bigint {
+  if (typeof value === 'string') return parseInt64(value)
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value)) throw new BridgeProtocolError('BRIDGE_INT64_INVALID')
+    return parseInt64(String(value))
+  }
+  if (typeof value !== 'bigint' || value < -1n || value > maximumInt64) {
+    throw new BridgeProtocolError('BRIDGE_INT64_INVALID')
+  }
+  return value
+}
+
+function requireBoolean(value: boolean): boolean {
+  if (typeof value !== 'boolean') throw new BridgeProtocolError('BRIDGE_BOOLEAN_INVALID')
+  return value
+}
+
+function parseBoolean(value: string): boolean {
+  if (value === 'true') return true
+  if (value === 'false') return false
+  throw new BridgeProtocolError('BRIDGE_BOOLEAN_INVALID')
+}
+
+function requireSaveName(value: string): string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 120 ||
+      value === '.' || value === '..' || /[\\/:*?"<>|\u0000-\u001f]/u.test(value) ||
+      Buffer.byteLength(value, 'utf8') > 360) {
+    throw new BridgeProtocolError('BRIDGE_SAVE_NAME_INVALID')
+  }
+  return value
+}
+
+function isBridgeReceiptV2(receipt: BridgeReceipt): receipt is BridgeReceiptV2 {
+  return receipt.protocol === bridgeReceiptProtocol && typeof receipt.saveName === 'string' &&
+    typeof receipt.saveTimeBefore === 'bigint' && typeof receipt.saveTimeAfter === 'bigint' &&
+    typeof receipt.dsvWriteTimeUtcTicks === 'bigint' &&
+    typeof receipt.serverWriteTimeUtcTicks === 'bigint' &&
+    typeof receipt.dsvChanged === 'boolean' && typeof receipt.serverChanged === 'boolean'
 }
 
 function requireLiteral<T extends string>(value: string, literal: T): T {

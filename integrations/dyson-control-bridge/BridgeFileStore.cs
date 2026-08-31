@@ -7,7 +7,7 @@ namespace DysonControl.Bridge
 {
     internal sealed class BridgeFileStore
     {
-        private static readonly UTF8Encoding Utf8WithoutBom = new UTF8Encoding(false);
+        private static readonly UTF8Encoding Utf8WithoutBom = new UTF8Encoding(false, true);
         private readonly string requestsRoot;
         private readonly string processingRoot;
         private readonly string receiptsRoot;
@@ -115,7 +115,20 @@ namespace DysonControl.Bridge
                 {
                     return false;
                 }
-                var payload = File.ReadAllText(claim.Path, Encoding.UTF8);
+                var payloadBytes = File.ReadAllBytes(claim.Path);
+                if (payloadBytes.Length == 0 || payloadBytes.Length > 4096 || HasUtf8Bom(payloadBytes))
+                {
+                    return false;
+                }
+                string payload;
+                try
+                {
+                    payload = Utf8WithoutBom.GetString(payloadBytes);
+                }
+                catch (DecoderFallbackException)
+                {
+                    return false;
+                }
                 if (!BridgeProtocol.TryParseRequest(payload, Secret, out request, out errorCode))
                 {
                     return false;
@@ -135,6 +148,11 @@ namespace DysonControl.Bridge
                 errorCode = "REQUEST_IO_ERROR";
                 return false;
             }
+        }
+
+        private static bool HasUtf8Bom(byte[] value)
+        {
+            return value.Length >= 3 && value[0] == 0xEF && value[1] == 0xBB && value[2] == 0xBF;
         }
 
         internal bool ReceiptExists(string requestId)

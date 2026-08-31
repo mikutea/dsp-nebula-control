@@ -1,14 +1,16 @@
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { performance } from 'node:perf_hooks'
 import {
   BridgeProtocolError,
+  assertBridgeReceiptV2,
   buildBridgeRequest,
   parseBridgeHeartbeat,
   parseBridgeReceipt,
   validateBridgeSecret,
   type BridgeHeartbeat,
-  type BridgeReceipt
+  type BridgeReceiptV2
 } from './protocol.js'
 
 export interface FileBridgeClientOptions {
@@ -76,7 +78,7 @@ export class FileBridgeClient {
     return heartbeat
   }
 
-  async requestSave(requestId: string = randomUUID(), signal?: AbortSignal): Promise<BridgeReceipt> {
+  async requestSave(requestId: string = randomUUID(), signal?: AbortSignal): Promise<BridgeReceiptV2> {
     signal?.throwIfAborted()
     const root = path.resolve(this.#options.controlRoot)
     const requestsRoot = path.join(root, 'requests')
@@ -106,8 +108,8 @@ export class FileBridgeClient {
       }
     }
 
-    const deadline = Date.now() + this.#options.timeoutMs
-    while (Date.now() < deadline) {
+    const startedAtMonotonicMs = performance.now()
+    while (performance.now() - startedAtMonotonicMs < this.#options.timeoutMs) {
       if (signal?.aborted) throw new BridgeProtocolError('BRIDGE_REQUEST_ABORTED')
       const receipt = await this.#readReceipt(receiptPath, secret, built.request.requestId)
       if (receipt) return receipt
@@ -116,7 +118,7 @@ export class FileBridgeClient {
     throw new BridgeProtocolError('BRIDGE_RECEIPT_TIMEOUT')
   }
 
-  async #readReceipt(receiptPath: string, secret: string, requestId: string): Promise<BridgeReceipt | null> {
+  async #readReceipt(receiptPath: string, secret: string, requestId: string): Promise<BridgeReceiptV2 | null> {
     let stats
     try {
       stats = await fs.lstat(receiptPath)
@@ -134,6 +136,7 @@ export class FileBridgeClient {
       throw new BridgeProtocolError('BRIDGE_RECEIPT_READ_FAILED')
     }
     const receipt = parseBridgeReceipt(payload, secret)
+    assertBridgeReceiptV2(receipt)
     if (receipt.requestId !== requestId || receipt.action !== 'save') {
       throw new BridgeProtocolError('BRIDGE_RECEIPT_MISMATCH')
     }

@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 
 namespace DysonControl.Bridge
 {
@@ -16,18 +17,64 @@ namespace DysonControl.Bridge
             "hmac=b1259d0dfd035395c0e797d91d1e76fda3531c264c391d4bdc0fb3aa3d43d54a\n";
 
         private const string ReceiptPayload =
-            "protocol=DYSON_CONTROL_RECEIPT_V1\n" +
+            "protocol=DYSON_CONTROL_RECEIPT_V2\n" +
             "requestId=11111111-2222-4333-8444-555555555555\n" +
             "action=save\n" +
             "state=succeeded\n" +
             "startedAtUnixMs=1788081001000\n" +
             "finishedAtUnixMs=1788081003500\n" +
+            "saveName=_lastexit_\n" +
             "saveTimeBefore=1788080000\n" +
             "saveTimeAfter=1788081003\n" +
             "dsvBytes=5242880\n" +
+            "dsvWriteTimeUtcTicks=638817408010000001\n" +
             "serverBytes=22016\n" +
+            "serverWriteTimeUtcTicks=638817408010000777\n" +
+            "dsvChanged=true\n" +
+            "serverChanged=true\n" +
             "errorCode=NONE\n" +
-            "hmac=ae20a2ab9be050ab4ebabf48dae7aaeee85d4ff6baf41c219e95d384a61bd0d3\n";
+            "hmac=614136ceb2a204b2b9e25b969b33bf931e89f7d792e06f15bbcf9208f6be8da4\n";
+
+        private const string GenerationId =
+            "generation-v1:25776f27535c4eb66e45c074cfaa700ed15bce62281f65220483a5659f8d5e8d";
+
+        private const string OneFileMissingReceiptPayload =
+            "protocol=DYSON_CONTROL_RECEIPT_V2\n" +
+            "requestId=22222222-3333-4444-8555-666666666666\n" +
+            "action=save\n" +
+            "state=failed\n" +
+            "startedAtUnixMs=1788081004000\n" +
+            "finishedAtUnixMs=1788081005000\n" +
+            "saveName=_lastexit_\n" +
+            "saveTimeBefore=1788081003\n" +
+            "saveTimeAfter=1788081004\n" +
+            "dsvBytes=-1\n" +
+            "dsvWriteTimeUtcTicks=-1\n" +
+            "serverBytes=22032\n" +
+            "serverWriteTimeUtcTicks=638817408020000777\n" +
+            "dsvChanged=true\n" +
+            "serverChanged=true\n" +
+            "errorCode=SAVE_PAIR_MISSING\n" +
+            "hmac=3eeda6e09a8b4fa36e480ce4b246bf8f17875e979934acb3ce205ecee4daa5ac\n";
+
+        private const string BothFilesMissingReceiptPayload =
+            "protocol=DYSON_CONTROL_RECEIPT_V2\n" +
+            "requestId=33333333-4444-4555-8666-777777777777\n" +
+            "action=save\n" +
+            "state=failed\n" +
+            "startedAtUnixMs=1788081006000\n" +
+            "finishedAtUnixMs=1788081007000\n" +
+            "saveName=_lastexit_\n" +
+            "saveTimeBefore=1788081003\n" +
+            "saveTimeAfter=1788081004\n" +
+            "dsvBytes=-1\n" +
+            "dsvWriteTimeUtcTicks=-1\n" +
+            "serverBytes=-1\n" +
+            "serverWriteTimeUtcTicks=-1\n" +
+            "dsvChanged=true\n" +
+            "serverChanged=true\n" +
+            "errorCode=SAVE_PAIR_MISSING\n" +
+            "hmac=64413d6d559dc5b987d775ca988802eff61c8526443f4842cd62c8f8720464cb\n";
 
         private const string HeartbeatPayload =
             "protocol=DYSON_CONTROL_HEARTBEAT_V1\n" +
@@ -72,19 +119,39 @@ namespace DysonControl.Bridge
             Assert(request.CreatedAtUnixMs == 1788081000000, "request created time");
             Assert(request.ExpiresAtUnixMs == 1788081015000, "request expiry");
 
-            var receipt = BridgeProtocol.SerializeReceipt(new BridgeReceipt
+            var receiptEvidence = new BridgeReceipt
             {
                 RequestId = request.RequestId,
                 State = "succeeded",
                 StartedAtUnixMs = 1788081001000,
                 FinishedAtUnixMs = 1788081003500,
+                SaveName = BridgeProtocol.LastExitSaveName,
                 SaveTimeBefore = 1788080000,
                 SaveTimeAfter = 1788081003,
                 DsvBytes = 5242880,
+                DsvWriteTimeUtcTicks = 638817408010000001,
                 ServerBytes = 22016,
+                ServerWriteTimeUtcTicks = 638817408010000777,
+                DsvChanged = true,
+                ServerChanged = true,
                 ErrorCode = "NONE"
-            }, Secret);
+            };
+            var receipt = BridgeProtocol.SerializeReceipt(receiptEvidence, Secret);
             Assert(receipt == ReceiptPayload, "receipt serialization");
+            Assert(BridgeProtocol.ComputeSaveGenerationId(receiptEvidence) == GenerationId,
+                "generation-v1 canonical identity");
+            receiptEvidence.RequestId = "99999999-8888-4777-8666-555555555555";
+            Assert(BridgeProtocol.ComputeSaveGenerationId(receiptEvidence) == GenerationId,
+                "generation identity excludes request ID");
+            receiptEvidence.RequestId = request.RequestId;
+            receiptEvidence.ServerChanged = false;
+            AssertThrows(() => BridgeProtocol.SerializeReceipt(receiptEvidence, Secret),
+                "one-sided save generation rejection");
+            receiptEvidence.ServerChanged = true;
+            TestImmediateTupleStability();
+            TestMonotonicElapsedWindows();
+            TestReceiptSaveSlotSemantics(receiptEvidence);
+            TestFailedMissingPairVectors();
 
             var heartbeat = BridgeProtocol.SerializeHeartbeat(new BridgeHeartbeat
             {
@@ -139,9 +206,311 @@ namespace DysonControl.Bridge
                    tamperError == "INVALID_SIGNATURE", "tamper rejection");
             Assert(!BridgeProtocol.TryParseRequest(RequestPayload + "extra=value\n", Secret, out _, out _),
                 "extra-field rejection");
+            TestStrictWireGrammar();
+            TestBridgeFileStoreStrictUtf8();
 
-            Console.WriteLine("Dyson Control Bridge protocol V1 self-test passed.");
+            Console.WriteLine("Dyson Control Bridge request V1 / receipt V2 self-test passed.");
             return 0;
+        }
+
+        private static void TestImmediateTupleStability()
+        {
+            var before = new SaveObservation
+            {
+                PairPresent = true,
+                SaveTime = 1000,
+                DsvBytes = 100,
+                DsvWriteTimeUtcTicks = 638817408000000001,
+                ServerBytes = 50,
+                ServerWriteTimeUtcTicks = 638817408000000002
+            };
+            var oneSided = new SaveObservation
+            {
+                PairPresent = true,
+                SaveTime = 1001,
+                DsvBytes = 101,
+                DsvWriteTimeUtcTicks = 638817408010000001,
+                ServerBytes = 50,
+                ServerWriteTimeUtcTicks = 638817408000000002
+            };
+            AssertArgumentThrows(() => new SaveObservationStabilityTracker(before, oneSided, 10000),
+                "immediate one-sided generation rejected");
+
+            var targetA = new SaveObservation
+            {
+                PairPresent = true,
+                SaveTime = 1001,
+                DsvBytes = 101,
+                DsvWriteTimeUtcTicks = 638817408010000001,
+                ServerBytes = 51,
+                ServerWriteTimeUtcTicks = 638817408010000002
+            };
+            var capturedAt = BridgeMonotonicTime.DurationTicks(1000);
+            var stabilityTicks = BridgeMonotonicTime.DurationTicks(500);
+            var tracker = new SaveObservationStabilityTracker(before, targetA, capturedAt);
+            Assert(!tracker.Observe(targetA, capturedAt + stabilityTicks - 1, stabilityTicks),
+                "immutable target stability window not elapsed");
+            Assert(tracker.Observe(targetA, capturedAt + stabilityTicks, stabilityTicks) &&
+                   tracker.DsvChanged && tracker.ServerChanged && !tracker.IsUnstable,
+                "immutable target accepted after monotonic stability window");
+
+            var targetB = new SaveObservation
+            {
+                PairPresent = true,
+                SaveTime = 1001,
+                DsvBytes = 101,
+                DsvWriteTimeUtcTicks = 638817408010000003,
+                ServerBytes = 51,
+                ServerWriteTimeUtcTicks = 638817408010000002
+            };
+            var driftToB = new SaveObservationStabilityTracker(before, targetA, capturedAt);
+            Assert(!driftToB.Observe(targetB, capturedAt + 1, stabilityTicks) && driftToB.IsUnstable,
+                "A-to-B drift permanently latches unstable");
+            Assert(!driftToB.Observe(targetB, capturedAt + stabilityTicks * 3, stabilityTicks),
+                "A-to-B stable candidate cannot replace immediate target");
+
+            var driftBackToA = new SaveObservationStabilityTracker(before, targetA, capturedAt);
+            Assert(!driftBackToA.Observe(targetB, capturedAt + 1, stabilityTicks) &&
+                   !driftBackToA.Observe(targetA, capturedAt + stabilityTicks * 3, stabilityTicks) &&
+                   driftBackToA.IsUnstable,
+                "A-to-B-to-A cannot recover after target drift");
+
+            var clockRegression = new SaveObservationStabilityTracker(before, targetA, capturedAt);
+            Assert(!clockRegression.Observe(targetA, capturedAt - 1, stabilityTicks) &&
+                   clockRegression.IsUnstable,
+                "monotonic clock regression fails closed");
+
+            var frozenSource = new SaveObservation
+            {
+                PairPresent = targetA.PairPresent,
+                SaveTime = targetA.SaveTime,
+                DsvBytes = targetA.DsvBytes,
+                DsvWriteTimeUtcTicks = targetA.DsvWriteTimeUtcTicks,
+                ServerBytes = targetA.ServerBytes,
+                ServerWriteTimeUtcTicks = targetA.ServerWriteTimeUtcTicks
+            };
+            var frozenTracker = new SaveObservationStabilityTracker(before, frozenSource, capturedAt);
+            frozenSource.DsvBytes++;
+            Assert(frozenTracker.Observe(targetA, capturedAt + stabilityTicks, stabilityTicks),
+                "tracker copies the immediate tuple instead of retaining mutable input");
+
+            var saveTimeDidNotAdvance = new SaveObservation
+            {
+                PairPresent = true,
+                SaveTime = 1000,
+                DsvBytes = 102,
+                DsvWriteTimeUtcTicks = 638817408020000001,
+                ServerBytes = 52,
+                ServerWriteTimeUtcTicks = 638817408020000002
+            };
+            AssertArgumentThrows(() => new SaveObservationStabilityTracker(before, saveTimeDidNotAdvance, capturedAt),
+                "non-advancing LastSaveTime rejected immediately");
+
+            var missingBefore = new SaveObservation { PairPresent = false, SaveTime = 0 };
+            var createdPair = new SaveObservation
+            {
+                PairPresent = true,
+                SaveTime = 1,
+                DsvBytes = 100,
+                DsvWriteTimeUtcTicks = 638817408030000001,
+                ServerBytes = 50,
+                ServerWriteTimeUtcTicks = 638817408030000002
+            };
+            var firstGenerationTracker = new SaveObservationStabilityTracker(
+                missingBefore,
+                createdPair,
+                capturedAt);
+            Assert(firstGenerationTracker.Observe(createdPair, capturedAt + stabilityTicks, stabilityTicks),
+                "first complete paired generation from an exact absent baseline");
+        }
+
+        private static void TestReceiptSaveSlotSemantics(BridgeReceipt receiptEvidence)
+        {
+            receiptEvidence.SaveName = "_autosave_";
+            AssertThrows(() => BridgeProtocol.SerializeReceipt(receiptEvidence, Secret),
+                "successful receipt requires exact last-exit slot");
+            receiptEvidence.SaveName = BridgeProtocol.UnavailableSaveName;
+            AssertThrows(() => BridgeProtocol.SerializeReceipt(receiptEvidence, Secret),
+                "unavailable slot cannot report success");
+            receiptEvidence.SaveName = BridgeProtocol.LastExitSaveName;
+
+            var unavailableFailure = new BridgeReceipt
+            {
+                RequestId = "44444444-5555-4666-8777-888888888888",
+                State = "failed",
+                StartedAtUnixMs = 1788081008000,
+                FinishedAtUnixMs = 1788081008001,
+                SaveName = BridgeProtocol.UnavailableSaveName,
+                SaveTimeBefore = -1,
+                SaveTimeAfter = -1,
+                DsvBytes = -1,
+                DsvWriteTimeUtcTicks = -1,
+                ServerBytes = -1,
+                ServerWriteTimeUtcTicks = -1,
+                DsvChanged = false,
+                ServerChanged = false,
+                ErrorCode = "GAME_NOT_READY"
+            };
+            Assert(BridgeProtocol.SerializeReceipt(unavailableFailure, Secret)
+                    .Contains("saveName=_unavailable_\n"),
+                "failed unavailable receipt remains signable");
+            unavailableFailure.SaveName = "_autosave_";
+            AssertThrows(() => BridgeProtocol.SerializeReceipt(unavailableFailure, Secret),
+                "failed receipt rejects an arbitrary save slot");
+        }
+
+        private static void TestMonotonicElapsedWindows()
+        {
+            var startedAtMonotonicTicks = BridgeMonotonicTime.DurationTicks(1000);
+            var durationTicks = BridgeMonotonicTime.DurationTicks(500);
+            var startedAtUnixMs = 1788081000000L;
+            var wallClockJumpedForward = startedAtUnixMs + 86400000L;
+            Assert(wallClockJumpedForward - startedAtUnixMs > 500 &&
+                   !BridgeMonotonicTime.HasElapsed(
+                       startedAtMonotonicTicks,
+                       startedAtMonotonicTicks + durationTicks - 1,
+                       durationTicks),
+                "forward UTC correction cannot expire a monotonic window");
+
+            var wallClockJumpedBackward = startedAtUnixMs - 86400000L;
+            Assert(wallClockJumpedBackward - startedAtUnixMs < 0 &&
+                   BridgeMonotonicTime.HasElapsed(
+                       startedAtMonotonicTicks,
+                       startedAtMonotonicTicks + durationTicks,
+                       durationTicks),
+                "backward UTC correction cannot extend a monotonic window");
+        }
+
+        private static void TestFailedMissingPairVectors()
+        {
+            var oneMissing = BridgeProtocol.SerializeReceipt(new BridgeReceipt
+            {
+                RequestId = "22222222-3333-4444-8555-666666666666",
+                State = "failed",
+                StartedAtUnixMs = 1788081004000,
+                FinishedAtUnixMs = 1788081005000,
+                SaveName = BridgeProtocol.LastExitSaveName,
+                SaveTimeBefore = 1788081003,
+                SaveTimeAfter = 1788081004,
+                DsvBytes = -1,
+                DsvWriteTimeUtcTicks = -1,
+                ServerBytes = 22032,
+                ServerWriteTimeUtcTicks = 638817408020000777,
+                DsvChanged = true,
+                ServerChanged = true,
+                ErrorCode = "SAVE_PAIR_MISSING"
+            }, Secret);
+            Assert(oneMissing == OneFileMissingReceiptPayload,
+                "failed receipt with one missing post-save file");
+
+            var bothMissing = BridgeProtocol.SerializeReceipt(new BridgeReceipt
+            {
+                RequestId = "33333333-4444-4555-8666-777777777777",
+                State = "failed",
+                StartedAtUnixMs = 1788081006000,
+                FinishedAtUnixMs = 1788081007000,
+                SaveName = BridgeProtocol.LastExitSaveName,
+                SaveTimeBefore = 1788081003,
+                SaveTimeAfter = 1788081004,
+                DsvBytes = -1,
+                DsvWriteTimeUtcTicks = -1,
+                ServerBytes = -1,
+                ServerWriteTimeUtcTicks = -1,
+                DsvChanged = true,
+                ServerChanged = true,
+                ErrorCode = "SAVE_PAIR_MISSING"
+            }, Secret);
+            Assert(bothMissing == BothFilesMissingReceiptPayload,
+                "failed receipt with both post-save files missing");
+        }
+
+        private static void TestStrictWireGrammar()
+        {
+            var versionEightRequest = RequestPayload
+                .Replace("11111111-2222-4333-8444-555555555555",
+                    "11111111-2222-8333-8444-555555555555")
+                .Replace("b1259d0dfd035395c0e797d91d1e76fda3531c264c391d4bdc0fb3aa3d43d54a",
+                    "46e9b2e9d3ee93db8070ce1a055442aec7fc81123e2d0063049c6cd5470527e2");
+            Assert(BridgeProtocol.TryParseRequest(versionEightRequest, Secret, out _, out _),
+                "RFC GUID version 8 accepted");
+            Assert(!BridgeProtocol.TryParseRequest(
+                    RequestPayload.Replace("2222-4333", "2222-0333"), Secret, out _, out _),
+                "non-RFC GUID version rejected");
+            Assert(!BridgeProtocol.TryParseRequest(
+                    RequestPayload.Replace("4333-8444", "4333-7444"), Secret, out _, out _),
+                "non-RFC GUID variant rejected");
+            Assert(!BridgeProtocol.TryParseRequest(
+                    RequestPayload.Replace("createdAtUnixMs=1788081000000",
+                        "createdAtUnixMs=01788081000000"), Secret, out _, out _),
+                "leading-zero request time rejected");
+            Assert(!BridgeProtocol.TryParseRequest("\uFEFF" + RequestPayload, Secret, out _, out _),
+                "leading BOM rejected");
+            Assert(!BridgeProtocol.TryParseRequest(
+                    RequestPayload.Replace("action=save", "action=sa\uFEFFve"), Secret, out _, out _),
+                "embedded BOM rejected");
+            AssertThrows(() => BridgeProtocol.SerializeHeartbeat(new BridgeHeartbeat
+                {
+                    PluginVersion = "0.1.0\n",
+                    ProcessId = 4242,
+                    StartedAtUnixMs = 1788080000000,
+                    WrittenAtUnixMs = 1788081004000
+                }, Secret),
+                "C# plugin-version regex is fully anchored");
+        }
+
+        private static void TestBridgeFileStoreStrictUtf8()
+        {
+            var payloadBytes = Encoding.UTF8.GetBytes(RequestPayload);
+            AssertBridgeFileStoreRequest(payloadBytes, true, "UTF-8 request without BOM");
+
+            var bomPayload = new byte[payloadBytes.Length + 3];
+            bomPayload[0] = 0xEF;
+            bomPayload[1] = 0xBB;
+            bomPayload[2] = 0xBF;
+            Buffer.BlockCopy(payloadBytes, 0, bomPayload, 3, payloadBytes.Length);
+            AssertBridgeFileStoreRequest(bomPayload, false, "UTF-8 request with BOM");
+
+            var invalidUtf8Payload = new byte[payloadBytes.Length + 1];
+            Buffer.BlockCopy(payloadBytes, 0, invalidUtf8Payload, 0, payloadBytes.Length);
+            invalidUtf8Payload[invalidUtf8Payload.Length - 1] = 0xFF;
+            AssertBridgeFileStoreRequest(invalidUtf8Payload, false, "request with invalid UTF-8");
+        }
+
+        private static void AssertBridgeFileStoreRequest(byte[] payload, bool expectedSuccess, string name)
+        {
+            var fixtureRoot = Path.Combine(Path.GetTempPath(), "dyson-request-protocol-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(fixtureRoot);
+                var secretPath = Path.Combine(fixtureRoot, "secret.txt");
+                File.WriteAllText(secretPath, Secret, new UTF8Encoding(false, true));
+                var controlRoot = Path.Combine(fixtureRoot, "control");
+                var store = new BridgeFileStore(controlRoot, secretPath);
+                var requestPath = Path.Combine(
+                    controlRoot,
+                    "requests",
+                    "11111111-2222-4333-8444-555555555555.request");
+                File.WriteAllBytes(requestPath, payload);
+                var claim = store.TryClaimNext();
+                Assert(claim != null, name + " was claimed");
+                var succeeded = store.TryReadRequest(claim, out var request, out var errorCode);
+                if (expectedSuccess)
+                {
+                    Assert(succeeded && request != null && errorCode == "NONE", name + " was accepted");
+                }
+                else
+                {
+                    Assert(!succeeded && request == null && errorCode == "INVALID_REQUEST",
+                        name + " was rejected without decoder detail leakage");
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(fixtureRoot))
+                {
+                    Directory.Delete(fixtureRoot, true);
+                }
+            }
         }
 
         private static void TestAtomicPlayerFiles(string expectedPlayersPayload, string expectedCapabilitiesPayload)
@@ -213,6 +582,32 @@ namespace DysonControl.Bridge
             {
                 throw new InvalidOperationException("Protocol self-test failed: " + name);
             }
+        }
+
+        private static void AssertThrows(Action action, string name)
+        {
+            try
+            {
+                action();
+            }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+            throw new InvalidOperationException("Protocol self-test failed: " + name);
+        }
+
+        private static void AssertArgumentThrows(Action action, string name)
+        {
+            try
+            {
+                action();
+            }
+            catch (ArgumentException)
+            {
+                return;
+            }
+            throw new InvalidOperationException("Protocol self-test failed: " + name);
         }
     }
 }
