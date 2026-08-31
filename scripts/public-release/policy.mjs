@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const POLICY_ID = 'dyson-public-release-hygiene'
-export const POLICY_VERSION = '1.4.1'
+export const POLICY_VERSION = '1.4.2'
 
 export const DEFAULT_LIMITS = Object.freeze({
   maximumWorktreeFiles: 50_000,
@@ -127,6 +127,13 @@ export const EXACT_ALLOWLIST = Object.freeze([
     ruleId: 'SECRET_LITERAL_ASSIGNMENT',
     path: 'apps/api/src/config.test.ts',
     blobId: '718d0f9d877e2ce7ecb9c3bbac0c6552312bdb88'
+  },
+  {
+    // Reviewed fictional authentication fixtures used only by configuration validation tests.
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'apps/api/src/config.test.ts',
+    blobId: '843ccfa417ab96c0e81a8e22babeff0fc3cb6570'
   },
   {
     scope: 'history',
