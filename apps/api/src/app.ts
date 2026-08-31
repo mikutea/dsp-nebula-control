@@ -35,6 +35,10 @@ import {
   type LifecycleMutationCoordinator
 } from './host-mutation/lifecycle-coordinator.js'
 import {
+  HostMutationCoordinator,
+  type HostMutationOperationCoordinator
+} from './host-mutation/operation-coordinator.js'
+import {
   SaveJobService,
   SaveJobServiceError,
   type SaveJobExecutionResult
@@ -299,6 +303,7 @@ export interface ApplicationDependencies {
   statusProvider?: StatusProvider
   lifecycleAdapter?: LifecycleMutationAdapter
   lifecycleCoordinator?: LifecycleMutationCoordinator
+  hostMutationCoordinator?: HostMutationOperationCoordinator
   consoleReader?: StructuredLogReader
   playerSnapshotSource?: { read(signal?: AbortSignal): Promise<PlayerSnapshot> }
   playerPresenceHistory?: PlayerPresenceHistoryStore
@@ -470,10 +475,18 @@ export async function buildApplication(
       })
     : new DisabledLifecycleAdapter(provider)
   const activeLifecycleAdapter = dependencies.lifecycleAdapter ?? configuredLifecycleAdapter
+  const hostMutationLeaseManager = config.provider === 'windows'
+    ? new HostMutationLeaseManager({ scriptRoot: config.scriptRoot })
+    : null
+  const hostMutationCoordinator = dependencies.hostMutationCoordinator ?? (
+    hostMutationLeaseManager
+      ? new HostMutationCoordinator(hostMutationLeaseManager, { dataRoot: config.dataDir })
+      : undefined
+  )
   const lifecycleCoordinator = dependencies.lifecycleCoordinator ?? (
-    config.lifecycleEnabled
+    config.lifecycleEnabled && hostMutationLeaseManager
       ? new HostMutationLifecycleCoordinator(
-          new HostMutationLeaseManager({ scriptRoot: config.scriptRoot }),
+          hostMutationLeaseManager,
           { dataRoot: config.dataDir }
         )
       : undefined
@@ -764,6 +777,7 @@ export async function buildApplication(
           stagingRoot: config.modStagingRoot,
           pluginsRoot: config.modPluginsRoot,
           maxSnapshots: config.modSnapshotLimit,
+          hostMutationCoordinator,
           ...(trustedCompatibilityService
             ? {
                 readPlatformInventory: async () => {
@@ -778,7 +792,7 @@ export async function buildApplication(
                 }
               }
             : {}),
-          verifyStoppedState: async () => {
+          verifyStoppedState: async (signal) => {
             if (!windowsScriptRunner || !config.projectRoot) {
               return { processStopped: false, portClosed: false }
             }
@@ -789,7 +803,7 @@ export async function buildApplication(
                 '-Expected', 'stopped',
                 '-GamePort', String(config.gamePort)
               ],
-              new AbortController().signal
+              signal ?? new AbortController().signal
             )
             const proof = runtimeStoppedResultSchema.parse(JSON.parse(output) as unknown)
             return { processStopped: proof.processVerified, portClosed: !proof.gamePortListening }
@@ -2291,6 +2305,17 @@ function modDeploymentError(reply: FastifyReply, error: unknown) {
   }
   if (error.code === 'MOD_DEPLOYMENT_BUSY') {
     return reply.code(423).send({ error: { code: error.code, message: '已有模组部署事务正在执行' } })
+  }
+  if (error.code === 'MOD_DEPLOYMENT_HOST_LEASE_BUSY') {
+    return reply.code(423).send({
+      error: { code: error.code, message: '已有服务器主机变更事务正在执行' }
+    })
+  }
+  if (['MOD_DEPLOYMENT_HOST_LEASE_DIRTY', 'MOD_DEPLOYMENT_HOST_LEASE_RECOVERY_REQUIRED',
+    'MOD_DEPLOYMENT_HOST_LEASE_LOST', 'MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE'].includes(error.code)) {
+    return reply.code(503).send({
+      error: { code: error.code, message: '主机变更互斥状态需要核验，模组部署已关闭放行' }
+    })
   }
   if (error.code === 'MOD_DEPLOYMENT_RECOVERY_REQUIRED') {
     return reply.code(503).send({

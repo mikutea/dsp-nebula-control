@@ -18,6 +18,17 @@ import { createModPlatformLock } from './platform-lock.js'
 import { parseThunderstoreDependency } from './dependency.js'
 import { generateModManifests, type GeneratedModManifests } from './manifest.js'
 import { partitionThunderstorePluginDependencies } from '../update-pipeline/thunderstore-dependency-routing.js'
+import {
+  HostMutationOperationCoordinatorError,
+  type HostMutationOperationCoordinator,
+  type HostMutationOperationOutcome,
+  type HostMutationOperationRequest,
+  type HostMutationOperationScope
+} from '../host-mutation/operation-coordinator.js'
+
+type HostMutationOperation<T> = (
+  scope: HostMutationOperationScope
+) => Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>
 
 interface StagedFixturePackage {
   dependencyId: string
@@ -238,6 +249,269 @@ describe('mod deployment transaction core', () => {
     await expect(harness.service.execute(request)).rejects.toThrow('MOD_DEPLOYMENT_STOP_GATE_REJECTED')
     expect(checks).toBe(1)
     expect((await harness.service.inspect()).revision).toBe(state.revision)
+  })
+
+  it('coordinates only new executions and releases the host lease for success and safe rejection', async () => {
+    const coordinator = new RecordingHostMutationCoordinator()
+    let stoppedChecks = 0
+    const stoppedSignals: Array<AbortSignal | undefined> = []
+    const harness = await createHarness({
+      hostMutationCoordinator: coordinator,
+      verifyStoppedState: async (signal) => {
+        stoppedChecks += 1
+        stoppedSignals.push(signal)
+        return { processStopped: true, portClosed: true }
+      }
+    })
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-HostLeaseMod-1.0.0', {
+      'HostLeaseMod.dll': Buffer.from('fictional-host-lease-mod')
+    })
+    const generated = manifests([staged], [staged.dependencyId])
+    const request = makeRequest('install', staged, generated, (await harness.service.inspect()).revision)
+
+    await expect(harness.service.preview(request)).resolves.toMatchObject({ dryRun: true })
+    expect(coordinator.requests).toEqual([])
+    const receipt = await harness.service.execute(request)
+    expect(receipt).toMatchObject({ status: 'succeeded', reused: false })
+    expect(stoppedChecks).toBe(2)
+    expect(stoppedSignals).toEqual([
+      coordinator.scopes[0]!.signal,
+      coordinator.scopes[0]!.signal
+    ])
+    expect(coordinator.requests).toEqual([{
+      operation: 'mod-deployment-install',
+      requestId: request.requestId
+    }])
+    expect(coordinator.outcomes).toEqual([
+      expect.objectContaining({ kind: 'return', disposition: 'release' })
+    ])
+
+    await expect(harness.service.execute(structuredClone(request)))
+      .resolves.toMatchObject({ status: 'succeeded', reused: true })
+    expect(coordinator.requests).toHaveLength(1)
+
+    const rejectedCoordinator = new RecordingHostMutationCoordinator()
+    const rejectedHarness = await createHarness({
+      hostMutationCoordinator: rejectedCoordinator,
+      verifyStoppedState: async () => ({ processStopped: false, portClosed: true })
+    })
+    const rejectedPackage = await stagePackage(
+      rejectedHarness.stagingRoot,
+      'Fictional-HostLeaseRejectedMod-1.0.0',
+      { 'HostLeaseRejectedMod.dll': Buffer.from('fictional-host-lease-rejected-mod') }
+    )
+    const rejectedManifests = manifests([rejectedPackage], [rejectedPackage.dependencyId])
+    const rejectedRequest = makeRequest(
+      'install',
+      rejectedPackage,
+      rejectedManifests,
+      (await rejectedHarness.service.inspect()).revision
+    )
+    const beforeRejected = await treeDigest(rejectedHarness.pluginsRoot)
+
+    await expect(rejectedHarness.service.execute(rejectedRequest))
+      .rejects.toThrow('MOD_DEPLOYMENT_STOP_GATE_REJECTED')
+    expect(rejectedCoordinator.outcomes).toEqual([
+      expect.objectContaining({ kind: 'throw', disposition: 'release' })
+    ])
+    expect(await treeDigest(rejectedHarness.pluginsRoot)).toBe(beforeRejected)
+  })
+
+  it('fails closed without a host coordinator before stopped proof or live publication', async () => {
+    let stoppedChecks = 0
+    const harness = await createHarness()
+    const service = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      verifyStoppedState: async () => {
+        stoppedChecks += 1
+        return { processStopped: true, portClosed: true }
+      }
+    })
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-HostLeaseMissingMod-1.0.0', {
+      'HostLeaseMissingMod.dll': Buffer.from('fictional-host-lease-missing-mod')
+    })
+    const generated = manifests([staged], [staged.dependencyId])
+    const request = makeRequest('install', staged, generated, (await service.inspect()).revision)
+    const before = await treeDigest(harness.pluginsRoot)
+
+    await expect(service.preview(request)).resolves.toMatchObject({ dryRun: true })
+    await expect(service.execute(request)).rejects.toThrow('MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE')
+    expect(stoppedChecks).toBe(0)
+    expect(await treeDigest(harness.pluginsRoot)).toBe(before)
+  })
+
+  it('holds the local filesystem lock while host lease acquisition is pending', async () => {
+    let hostLeaseEntered!: () => void
+    let allowHostLease!: () => void
+    const entered = new Promise<void>((resolvePromise) => { hostLeaseEntered = resolvePromise })
+    const allowed = new Promise<void>((resolvePromise) => { allowHostLease = resolvePromise })
+    const coordinator: HostMutationOperationCoordinator = {
+      async runExclusive<T>(
+        _request: HostMutationOperationRequest,
+        operation: HostMutationOperation<T>
+      ): Promise<T> {
+        hostLeaseEntered()
+        await allowed
+        return unwrapHostMutationOutcome(await operation(activeHostMutationScope()))
+      }
+    }
+    const harness = await createHarness({ hostMutationCoordinator: coordinator })
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-HostLeaseOrderMod-1.0.0', {
+      'HostLeaseOrderMod.dll': Buffer.from('fictional-host-lease-order-mod')
+    })
+    const generated = manifests([staged], [staged.dependencyId])
+    const request = makeRequest('install', staged, generated, (await harness.service.inspect()).revision)
+    const execution = harness.service.execute(request)
+    await entered
+
+    const secondInstance = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true })
+    })
+    await expect(secondInstance.preview(request)).rejects.toThrow('MOD_DEPLOYMENT_BUSY')
+    allowHostLease()
+    await expect(execution).resolves.toMatchObject({ status: 'succeeded' })
+  })
+
+  it('abandons the host lease for rollback-failed and unknown write outcomes', async () => {
+    const coordinator = new RecordingHostMutationCoordinator()
+    const harness = await createHarness({ hostMutationCoordinator: coordinator })
+    const v1 = await stagePackage(harness.stagingRoot, 'Fictional-HostAbandonMod-1.0.0', {
+      'HostAbandonMod.dll': Buffer.from('fictional-host-abandon-v1')
+    })
+    const v2 = await stagePackage(harness.stagingRoot, 'Fictional-HostAbandonMod-2.0.0', {
+      'HostAbandonMod.dll': Buffer.from('fictional-host-abandon-v2')
+    })
+    const initial = await harness.service.inspect()
+    await harness.service.execute(makeRequest('install', v1, manifests([v1], [v1.dependencyId]), initial.revision))
+    coordinator.reset()
+
+    const before = await harness.service.inspect()
+    const request = makeRequest('update', v2, manifests([v2], [v2.dependencyId]), before.revision)
+    const rollbackFailingService = new ModDeploymentService({
+      stagingRoot: harness.stagingRoot,
+      pluginsRoot: harness.pluginsRoot,
+      hostMutationCoordinator: coordinator,
+      verifyStoppedState: async () => ({ processStopped: true, portClosed: true }),
+      faultInjector: async (phase) => {
+        if (phase !== 'after-publish') return
+        const snapshotId = `snapshot-${before.revision.slice(0, 16)}-${request.requestId}`
+        await rm(join(harness.root, '.plugins.dyson-control', 'snapshots', snapshotId), {
+          recursive: true,
+          force: true
+        })
+        throw new Error('fictional rollback failure')
+      }
+    })
+
+    await expect(rollbackFailingService.execute(request)).resolves.toMatchObject({
+      status: 'rollback-failed',
+      rollback: 'failed',
+      errorCode: 'MOD_DEPLOYMENT_ROLLBACK_FAILED'
+    })
+    expect(coordinator.outcomes).toEqual([
+      expect.objectContaining({ kind: 'return', disposition: 'abandon' })
+    ])
+
+    const unknownCoordinator = new RecordingHostMutationCoordinator()
+    const unknownHarness = await createHarness({
+      hostMutationCoordinator: unknownCoordinator,
+      faultInjector: async (phase) => {
+        if (phase === 'after-pending-built') throw new Error('fictional unknown write failure')
+      }
+    })
+    const unknownPackage = await stagePackage(
+      unknownHarness.stagingRoot,
+      'Fictional-UnknownWriteMod-1.0.0',
+      { 'UnknownWriteMod.dll': Buffer.from('fictional-unknown-write-mod') }
+    )
+    const unknownManifests = manifests([unknownPackage], [unknownPackage.dependencyId])
+    const unknownRequest = makeRequest(
+      'install',
+      unknownPackage,
+      unknownManifests,
+      (await unknownHarness.service.inspect()).revision
+    )
+    const beforeUnknown = await treeDigest(unknownHarness.pluginsRoot)
+
+    await expect(unknownHarness.service.execute(unknownRequest))
+      .rejects.toThrow('MOD_DEPLOYMENT_EXECUTION_FAILED')
+    expect(unknownCoordinator.outcomes).toEqual([
+      expect.objectContaining({ kind: 'throw', disposition: 'abandon' })
+    ])
+    expect(await treeDigest(unknownHarness.pluginsRoot)).toBe(beforeUnknown)
+  })
+
+  it.each([
+    ['HOST_MUTATION_LEASE_BUSY', 'MOD_DEPLOYMENT_HOST_LEASE_BUSY'],
+    ['HOST_MUTATION_LEASE_DIRTY', 'MOD_DEPLOYMENT_HOST_LEASE_DIRTY'],
+    ['HOST_MUTATION_LEASE_RECOVERY_REQUIRED', 'MOD_DEPLOYMENT_HOST_LEASE_RECOVERY_REQUIRED'],
+    ['HOST_MUTATION_LEASE_LOST', 'MOD_DEPLOYMENT_HOST_LEASE_LOST'],
+    ['HOST_MUTATION_LEASE_UNAVAILABLE', 'MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE']
+  ] as const)('maps %s before stopped proof or live publication', async (coordinatorCode, deploymentCode) => {
+    let stoppedChecks = 0
+    const coordinator: HostMutationOperationCoordinator = {
+      async runExclusive(): Promise<never> {
+        throw new HostMutationOperationCoordinatorError(coordinatorCode)
+      }
+    }
+    const harness = await createHarness({
+      hostMutationCoordinator: coordinator,
+      verifyStoppedState: async () => {
+        stoppedChecks += 1
+        return { processStopped: true, portClosed: true }
+      }
+    })
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-HostLeaseFailureMod-1.0.0', {
+      'HostLeaseFailureMod.dll': Buffer.from('fictional-host-lease-failure-mod')
+    })
+    const generated = manifests([staged], [staged.dependencyId])
+    const request = makeRequest('install', staged, generated, (await harness.service.inspect()).revision)
+    const before = await treeDigest(harness.pluginsRoot)
+
+    await expect(harness.service.execute(request)).rejects.toThrow(deploymentCode)
+    expect(stoppedChecks).toBe(0)
+    expect(await treeDigest(harness.pluginsRoot)).toBe(before)
+  })
+
+  it('maps lease loss after the second stopped proof and before live publication', async () => {
+    let activeAssertions = 0
+    let stoppedChecks = 0
+    const coordinator: HostMutationOperationCoordinator = {
+      async runExclusive<T>(
+        _request: HostMutationOperationRequest,
+        operation: HostMutationOperation<T>
+      ): Promise<T> {
+        const scope = activeHostMutationScope(() => {
+          activeAssertions += 1
+          if (activeAssertions === 4) {
+            throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
+          }
+        })
+        return unwrapHostMutationOutcome(await operation(scope))
+      }
+    }
+    const harness = await createHarness({
+      hostMutationCoordinator: coordinator,
+      verifyStoppedState: async (signal) => {
+        expect(signal).toBeInstanceOf(AbortSignal)
+        stoppedChecks += 1
+        return { processStopped: true, portClosed: true }
+      }
+    })
+    const staged = await stagePackage(harness.stagingRoot, 'Fictional-HostLeaseLostMod-1.0.0', {
+      'HostLeaseLostMod.dll': Buffer.from('fictional-host-lease-lost-mod')
+    })
+    const generated = manifests([staged], [staged.dependencyId])
+    const request = makeRequest('install', staged, generated, (await harness.service.inspect()).revision)
+    const before = await treeDigest(harness.pluginsRoot)
+
+    await expect(harness.service.execute(request)).rejects.toThrow('MOD_DEPLOYMENT_HOST_LEASE_LOST')
+    expect(stoppedChecks).toBe(2)
+    expect(activeAssertions).toBe(4)
+    expect(await treeDigest(harness.pluginsRoot)).toBe(before)
   })
 
   it('fails closed on missing dependencies, active dependents, and client parity tampering', async () => {
@@ -502,6 +776,7 @@ describe('mod deployment transaction core', () => {
     const faultingService = new ModDeploymentService({
       stagingRoot: harness.stagingRoot,
       pluginsRoot: harness.pluginsRoot,
+      hostMutationCoordinator: new RecordingHostMutationCoordinator(),
       verifyStoppedState: async () => ({ processStopped: true, portClosed: true }),
       faultInjector: async (phase) => {
         if (phase === fault) throw new Error('fictional injected publication failure')
@@ -568,6 +843,7 @@ async function createHarness(overrides: Partial<ModDeploymentServiceOptions> = {
   const service = new ModDeploymentService({
     stagingRoot,
     pluginsRoot,
+    hostMutationCoordinator: new RecordingHostMutationCoordinator(),
     verifyStoppedState: async () => ({ processStopped: true, portClosed: true }),
     ...overrides
   })
@@ -657,6 +933,43 @@ function makeRequest(
     },
     expectedRevision
   }
+}
+
+class RecordingHostMutationCoordinator implements HostMutationOperationCoordinator {
+  readonly requests: HostMutationOperationRequest[] = []
+  readonly outcomes: HostMutationOperationOutcome<unknown>[] = []
+  readonly scopes: HostMutationOperationScope[] = []
+
+  async runExclusive<T>(
+    request: HostMutationOperationRequest,
+    operation: HostMutationOperation<T>
+  ): Promise<T> {
+    this.requests.push({ ...request })
+    const scope = activeHostMutationScope()
+    this.scopes.push(scope)
+    const outcome = await operation(scope)
+    this.outcomes.push(outcome as HostMutationOperationOutcome<unknown>)
+    return unwrapHostMutationOutcome(outcome)
+  }
+
+  reset(): void {
+    this.requests.length = 0
+    this.outcomes.length = 0
+    this.scopes.length = 0
+  }
+}
+
+function activeHostMutationScope(assertActive: () => void = () => {}): HostMutationOperationScope {
+  return {
+    signal: new AbortController().signal,
+    assertActive,
+    toPowerShellBorrowArguments: () => []
+  }
+}
+
+function unwrapHostMutationOutcome<T>(outcome: HostMutationOperationOutcome<T>): T {
+  if (outcome.kind === 'return') return outcome.value
+  throw outcome.error
 }
 
 function isSymlinkPrivilegeError(error: unknown): boolean {

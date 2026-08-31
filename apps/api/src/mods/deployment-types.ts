@@ -1,5 +1,6 @@
 import type { ClientParityManifest, ServerModLock } from './manifest.js'
 import type { ModPlatformLock } from './platform-lock.js'
+import type { HostMutationOperationCoordinator } from '../host-mutation/operation-coordinator.js'
 
 export const MAX_STAGED_MOD_FILES = 128
 export const MAX_STAGED_MOD_FILE_BYTES = 512 * 1024 * 1024
@@ -142,7 +143,8 @@ export type ModDeploymentFaultPhase = 'after-pending-built' | 'after-snapshot' |
 export interface ModDeploymentServiceOptions {
   stagingRoot: string
   pluginsRoot: string
-  verifyStoppedState: () => Promise<ModStoppedStateProof>
+  verifyStoppedState: (signal?: AbortSignal) => Promise<ModStoppedStateProof>
+  hostMutationCoordinator?: HostMutationOperationCoordinator
   readPlatformInventory?: () => Promise<{
     inventoryRevision: string
     inventory: { nebula: string; bepInEx: string }
@@ -190,6 +192,11 @@ export type ModDeploymentErrorCode =
   | 'MOD_DEPLOYMENT_PAYLOAD_TOO_LARGE'
   | 'MOD_DEPLOYMENT_PAYLOAD_TAMPERED'
   | 'MOD_DEPLOYMENT_STOP_GATE_REJECTED'
+  | 'MOD_DEPLOYMENT_HOST_LEASE_BUSY'
+  | 'MOD_DEPLOYMENT_HOST_LEASE_DIRTY'
+  | 'MOD_DEPLOYMENT_HOST_LEASE_RECOVERY_REQUIRED'
+  | 'MOD_DEPLOYMENT_HOST_LEASE_LOST'
+  | 'MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE'
   | 'MOD_DEPLOYMENT_SNAPSHOT_LIMIT'
   | 'MOD_DEPLOYMENT_EXECUTION_FAILED'
   | 'MOD_DEPLOYMENT_ROLLBACK_FAILED'

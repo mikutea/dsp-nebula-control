@@ -203,6 +203,32 @@ describe('authenticated mod deployment routes', () => {
     })
   })
 
+  it.each([
+    ['MOD_DEPLOYMENT_HOST_LEASE_BUSY', 423],
+    ['MOD_DEPLOYMENT_HOST_LEASE_DIRTY', 503],
+    ['MOD_DEPLOYMENT_HOST_LEASE_RECOVERY_REQUIRED', 503],
+    ['MOD_DEPLOYMENT_HOST_LEASE_LOST', 503],
+    ['MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE', 503]
+  ] as const)('maps host mutation gate %s without leaking broker detail', async (code, statusCode) => {
+    const service = deploymentService()
+    service.execute.mockRejectedValueOnce(new ModDeploymentError(code))
+    application = await buildApplication(enabledConfig(), {
+      statusProvider: new DemoProvider(),
+      modDeploymentService: service
+    })
+    const cookie = await login(application)
+    const request = deploymentRequest()
+
+    const response = await post(application, cookie, '/api/v1/mods/deployment/execute', {
+      request,
+      confirmation: confirmationFor(request)
+    })
+
+    expect(response.statusCode).toBe(statusCode)
+    expect(response.json().error.code).toBe(code)
+    expect(response.body).not.toMatch(/(?:instanceId|recordDigest|leaseToken|C:\\|\\\\)/i)
+  })
+
   it('strictly validates receipt queries and maps missing or recovery-required receipts without leakage', async () => {
     const service = deploymentService()
     application = await buildApplication(testConfig(), { modDeploymentService: service })

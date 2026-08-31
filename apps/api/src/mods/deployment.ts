@@ -15,6 +15,13 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { pipeline } from 'node:stream/promises'
 import { Transform } from 'node:stream'
 import { z } from 'zod'
+import {
+  HostMutationOperationCoordinatorError,
+  hostMutationReturn,
+  hostMutationThrow,
+  type HostMutationOperationCoordinator,
+  type HostMutationOperationScope
+} from '../host-mutation/operation-coordinator.js'
 import { sha256Schema } from '../updates/version.js'
 import { parseThunderstoreDependency, thunderstoreDependencyIdSchema } from './dependency.js'
 import {
@@ -149,6 +156,13 @@ interface ReceiptHistoryCursor {
   requestId: string
 }
 
+class UnknownModDeploymentWriteError extends ModDeploymentError {
+  constructor() {
+    super('MOD_DEPLOYMENT_EXECUTION_FAILED')
+    this.name = 'UnknownModDeploymentWriteError'
+  }
+}
+
 const managedPackageSchema: z.ZodType<ManagedModPackage> = z.strictObject({
   dependencyId: thunderstoreDependencyIdSchema,
   sourceId: z.string().min(3).max(160),
@@ -233,6 +247,7 @@ export class ModDeploymentService {
   readonly #pluginsRoot: string
   readonly #controlRoot: string
   readonly #verifyStoppedState: ModDeploymentServiceOptions['verifyStoppedState']
+  readonly #hostMutationCoordinator: HostMutationOperationCoordinator | null
   readonly #readPlatformInventory: NonNullable<ModDeploymentServiceOptions['readPlatformInventory']> | null
   readonly #faultInjector: ModDeploymentServiceOptions['faultInjector']
   readonly #now: () => Date
@@ -241,7 +256,9 @@ export class ModDeploymentService {
 
   constructor(options: ModDeploymentServiceOptions) {
     if (!isAbsolute(options.stagingRoot) || !isAbsolute(options.pluginsRoot) ||
-        typeof options.verifyStoppedState !== 'function') {
+        typeof options.verifyStoppedState !== 'function' ||
+        (options.hostMutationCoordinator !== undefined &&
+          typeof options.hostMutationCoordinator.runExclusive !== 'function')) {
       throw new ModDeploymentError('MOD_DEPLOYMENT_ROOT_INVALID')
     }
     this.#stagingRoot = resolve(options.stagingRoot)
@@ -253,6 +270,7 @@ export class ModDeploymentService {
       throw new ModDeploymentError('MOD_DEPLOYMENT_ROOT_INVALID')
     }
     this.#verifyStoppedState = options.verifyStoppedState
+    this.#hostMutationCoordinator = options.hostMutationCoordinator ?? null
     this.#readPlatformInventory = options.readPlatformInventory ?? null
     this.#faultInjector = options.faultInjector
     this.#now = options.now ?? (() => new Date())
@@ -301,7 +319,7 @@ export class ModDeploymentService {
       }
 
       const prepared = await this.#prepare(request, current)
-      return this.#executePrepared(prepared)
+      return this.#executePreparedWithHostMutation(prepared)
     }))
   }
 
@@ -484,15 +502,18 @@ export class ModDeploymentService {
     }
   }
 
-  async #executePrepared(prepared: PreparedDeployment): Promise<ModDeploymentReceipt> {
+  async #executePrepared(
+    prepared: PreparedDeployment,
+    hostMutationScope: HostMutationOperationScope | null = null
+  ): Promise<ModDeploymentReceipt> {
     if (prepared.snapshotCount >= this.#maxSnapshots) {
       throw new ModDeploymentError('MOD_DEPLOYMENT_SNAPSHOT_LIMIT')
     }
-    await this.#assertStopped()
+    await this.#assertStopped(hostMutationScope)
     const pendingRoot = await this.#pendingPath(prepared.request.requestId)
     await this.#buildPendingTree(prepared, pendingRoot)
     await this.#injectFault('after-pending-built')
-    await this.#assertStopped()
+    await this.#assertStopped(hostMutationScope)
 
     const snapshotsRoot = await this.#ensureControlDirectory('snapshots')
     const snapshotId = `snapshot-${prepared.current.revision.slice(0, 16)}-${prepared.request.requestId}`
@@ -501,28 +522,81 @@ export class ModDeploymentService {
     let snapshotCreated = false
     let published = false
     try {
+      this.#assertHostMutationActive(hostMutationScope)
       await rename(this.#pluginsRoot, snapshotRoot)
       snapshotCreated = true
       await this.#injectFault('after-snapshot')
+      this.#assertHostMutationActive(hostMutationScope)
       await rename(pendingRoot, this.#pluginsRoot)
       published = true
       await this.#injectFault('after-publish')
       const receipt = successReceipt(prepared)
       await this.#writeReceipt(prepared.fingerprint, receipt)
+      this.#assertHostMutationActive(hostMutationScope)
       return receipt
     } catch (error) {
+      if (error instanceof HostMutationOperationCoordinatorError) throw error
       if (!snapshotCreated) {
         if (error instanceof ModDeploymentError) throw error
-        throw new ModDeploymentError('MOD_DEPLOYMENT_EXECUTION_FAILED')
+        throw new UnknownModDeploymentWriteError()
       }
-      const rollbackSucceeded = await this.#rollbackPublication(prepared.request.requestId, snapshotRoot, published)
+      const rollbackSucceeded = await this.#rollbackPublication(
+        prepared.request.requestId,
+        snapshotRoot,
+        published,
+        hostMutationScope
+      )
       const receipt = rollbackReceipt(prepared, rollbackSucceeded)
       try {
         await this.#writeReceipt(prepared.fingerprint, receipt)
       } catch {
-        // The audit-safe receipt is still returned; stale receipt state will fail closed on reuse.
+        if (rollbackSucceeded) throw new UnknownModDeploymentWriteError()
+        // The unresolved publication already requires an abandoned lease; preserve that result.
       }
+      if (rollbackSucceeded) this.#assertHostMutationActive(hostMutationScope)
       return receipt
+    }
+  }
+
+  async #executePreparedWithHostMutation(prepared: PreparedDeployment): Promise<ModDeploymentReceipt> {
+    const coordinator = this.#hostMutationCoordinator
+    if (coordinator === null) {
+      throw new ModDeploymentError('MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE')
+    }
+
+    try {
+      return await coordinator.runExclusive(
+        {
+          operation: `mod-deployment-${prepared.request.operation}`,
+          requestId: prepared.request.requestId
+        },
+        async (scope) => {
+          try {
+            const receipt = await this.#executePrepared(prepared, scope)
+            return hostMutationReturn(
+              receipt,
+              receipt.status === 'rollback-failed' ? 'abandon' : 'release'
+            )
+          } catch (error) {
+            if (error instanceof HostMutationOperationCoordinatorError) throw error
+            if (error instanceof UnknownModDeploymentWriteError) {
+              return hostMutationThrow(error, 'abandon')
+            }
+            if (error instanceof ModDeploymentError) {
+              return hostMutationThrow(error, 'release')
+            }
+            return hostMutationThrow(
+              new ModDeploymentError('MOD_DEPLOYMENT_EXECUTION_FAILED'),
+              'abandon'
+            )
+          }
+        }
+      )
+    } catch (error) {
+      if (error instanceof HostMutationOperationCoordinatorError) {
+        throw new ModDeploymentError(mapHostMutationCoordinatorError(error.code))
+      }
+      throw error
     }
   }
 
@@ -550,18 +624,26 @@ export class ModDeploymentService {
     await this.#verifyManagedTree(pendingRoot, prepared.next)
   }
 
-  async #rollbackPublication(requestId: string, snapshotRoot: string, published: boolean): Promise<boolean> {
+  async #rollbackPublication(
+    requestId: string,
+    snapshotRoot: string,
+    published: boolean,
+    hostMutationScope: HostMutationOperationScope | null
+  ): Promise<boolean> {
     try {
       if (published) {
         const recoveryRoot = await this.#ensureControlDirectory('recovery')
         const failedRoot = join(recoveryRoot, `failed-${requestId}`)
         await assertPathDoesNotExist(failedRoot)
+        this.#assertHostMutationActive(hostMutationScope)
         await rename(this.#pluginsRoot, failedRoot)
       }
+      this.#assertHostMutationActive(hostMutationScope)
       await rename(snapshotRoot, this.#pluginsRoot)
       await assertDirectoryBoundary(this.#pluginsRoot, dirname(this.#pluginsRoot))
       return true
-    } catch {
+    } catch (error) {
+      if (error instanceof HostMutationOperationCoordinatorError) throw error
       return false
     }
   }
@@ -645,15 +727,27 @@ export class ModDeploymentService {
     if (actual.length !== expectedNames.size) throw new ModDeploymentError('MOD_DEPLOYMENT_UNMANAGED_CONTENT')
   }
 
-  async #assertStopped(): Promise<void> {
+  async #assertStopped(hostMutationScope: HostMutationOperationScope | null): Promise<void> {
     try {
-      const proof = await this.#verifyStoppedState()
+      this.#assertHostMutationActive(hostMutationScope)
+      const proof = await this.#verifyStoppedState(hostMutationScope?.signal)
+      this.#assertHostMutationActive(hostMutationScope)
       if (proof.processStopped !== true || proof.portClosed !== true) {
         throw new ModDeploymentError('MOD_DEPLOYMENT_STOP_GATE_REJECTED')
       }
     } catch (error) {
+      if (error instanceof HostMutationOperationCoordinatorError) throw error
       if (error instanceof ModDeploymentError) throw error
       throw new ModDeploymentError('MOD_DEPLOYMENT_STOP_GATE_REJECTED')
+    }
+  }
+
+  #assertHostMutationActive(scope: HostMutationOperationScope | null): void {
+    if (scope === null) return
+    try {
+      scope.assertActive()
+    } catch {
+      throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
     }
   }
 
@@ -1386,4 +1480,16 @@ function isMissingError(error: unknown): boolean {
 
 function isAlreadyExistsError(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'EEXIST'
+}
+
+function mapHostMutationCoordinatorError(
+  code: HostMutationOperationCoordinatorError['code']
+): ModDeploymentError['code'] {
+  if (code === 'HOST_MUTATION_LEASE_BUSY') return 'MOD_DEPLOYMENT_HOST_LEASE_BUSY'
+  if (code === 'HOST_MUTATION_LEASE_DIRTY') return 'MOD_DEPLOYMENT_HOST_LEASE_DIRTY'
+  if (code === 'HOST_MUTATION_LEASE_RECOVERY_REQUIRED') {
+    return 'MOD_DEPLOYMENT_HOST_LEASE_RECOVERY_REQUIRED'
+  }
+  if (code === 'HOST_MUTATION_LEASE_LOST') return 'MOD_DEPLOYMENT_HOST_LEASE_LOST'
+  return 'MOD_DEPLOYMENT_HOST_LEASE_UNAVAILABLE'
 }
