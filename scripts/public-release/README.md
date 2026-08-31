@@ -36,11 +36,13 @@ historical exception may additionally require one exact Git blob ID, so a
 future blob at the same path is scanned again. Globs and prefix suppressions
 are intentionally unsupported.
 
-The two blob-scoped metadata exceptions in the current policy cover previously
-published OpenAI/Trufo C2PA provenance for the accepted concept images. Their
-containers were reviewed for host paths, UNC paths, private addresses, and
-non-certificate identities before the exception was added. Current worktree
-images remain metadata-free; the exception does not apply to new blobs.
+Blob-scoped metadata exceptions cover previously published OpenAI/Trufo C2PA
+provenance for the accepted concept images. Additional blob-scoped exceptions
+cover only the exact reviewed source/test blobs that implement or exercise the
+scanner's own credential, Steam-ID, and UNC-path detectors. Their contents were
+reviewed as fictional fixtures or detector expressions before the exceptions
+were added. The exceptions do not apply to any future blob at the same path.
+Current worktree images remain metadata-free.
 
 The automated image check validates common containers and rejects embedded
 PNG/JPEG/WebP/SVG metadata. It cannot determine whether compressed pixels show

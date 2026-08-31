@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const POLICY_ID = 'dyson-public-release-hygiene'
-export const POLICY_VERSION = '1.2.0'
+export const POLICY_VERSION = '1.3.0'
 
 export const DEFAULT_LIMITS = Object.freeze({
   maximumWorktreeFiles: 50_000,
@@ -103,7 +103,55 @@ export const EXACT_ALLOWLIST = Object.freeze([
   { scope: 'worktree', ruleId: 'STEAM_IDENTIFIER', path: 'apps/api/src/console/parser.test.ts' },
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'apps/api/src/client-profile/generator.test.ts' },
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/public-release/scanner.mjs' },
-  { scope: 'worktree', ruleId: 'USER_ABSOLUTE_PATH', path: 'apps/api/src/update-pipeline/activation-http.test.ts' }
+  { scope: 'worktree', ruleId: 'USER_ABSOLUTE_PATH', path: 'apps/api/src/update-pipeline/activation-http.test.ts' },
+  {
+    scope: 'history',
+    ruleId: 'HIGH_ENTROPY_SECRET_ASSIGNMENT',
+    path: 'scripts/public-release/scanner.mjs',
+    blobId: '79caf486091e9f257d3f54cf365d2ed0a1a4e013'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'apps/api/src/config.test.ts',
+    blobId: '718d0f9d877e2ce7ecb9c3bbac0c6552312bdb88'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'apps/api/src/update-pipeline/http.test.ts',
+    blobId: 'e6b0aff8a2499cc42fbce7bef0c77cc3bab6b4b4'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'scripts/public-release/scanner.mjs',
+    blobId: '79caf486091e9f257d3f54cf365d2ed0a1a4e013'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'scripts/public-release/scanner.test.mjs',
+    blobId: '7dd287661db2099d9ea50d04e37f7c7a89246337'
+  },
+  {
+    scope: 'history',
+    ruleId: 'STEAM_IDENTIFIER',
+    path: 'apps/api/src/console/parser.test.ts',
+    blobId: '87fb3d72fb77b44635f36aea8c659a1142891b55'
+  },
+  {
+    scope: 'history',
+    ruleId: 'UNC_PATH',
+    path: 'apps/api/src/client-profile/generator.test.ts',
+    blobId: '8b766b3ac84035a27cd15c403acad9dab9824af3'
+  },
+  {
+    scope: 'history',
+    ruleId: 'UNC_PATH',
+    path: 'scripts/public-release/scanner.mjs',
+    blobId: '79caf486091e9f257d3f54cf365d2ed0a1a4e013'
+  }
 ])
 
 // These are public package registries, source forges, standards bodies, and
