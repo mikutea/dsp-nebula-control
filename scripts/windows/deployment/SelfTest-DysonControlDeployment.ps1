@@ -77,6 +77,7 @@ console.log('fictional-dyson-control-$ContentMarker');
         $script:DysonArtifactRequiredBridgeScripts +
         $script:DysonArtifactRequiredMigrationScripts +
         $script:DysonArtifactRequiredMigrationDocs +
+        $script:DysonArtifactRequiredHostMutationScripts +
         $requiredEvidenceScripts
     )) {
         $source = Join-Path $repositoryRoot $relative.Replace('/', '\')
