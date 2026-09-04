@@ -177,7 +177,8 @@ public static class BridgeProcessFixture {
     $publicSource = Join-Path $PSScriptRoot '..\..\..\integrations\dyson-control-bridge'
     foreach ($name in @(
         'BridgeFileStore.cs', 'BridgeProtocol.cs', 'DysonControlBridgePlugin.cs',
-        'GameSaveAdapter.cs', 'LoadedSaveEvidencePublisher.cs', 'PlayerRosterPublisher.cs',
+        'GameSaveAdapter.cs', 'LoadedSaveEvidencePublisher.cs',
+        'NebulaNoticeRuntimeCompatibility.cs', 'PlayerNoticeProtocol.cs', 'PlayerRosterPublisher.cs',
         'SimulationTelemetrySampler.cs', 'DysonControlBridge.csproj',
         'dyson-control-bridge.cfg.example', 'README.md'
     )) {
@@ -196,6 +197,17 @@ public static class BridgeProcessFixture {
     [System.IO.File]::Delete((Join-Path $sourceMissing 'LoadedSaveEvidencePublisher.cs'))
     Assert-BridgeRejected -Action { Get-DysonBridgeSourceContract -SourceRoot $sourceMissing } `
         -Message 'a real artifact layout missing LoadedSaveEvidencePublisher.cs was accepted'
+    foreach ($requiredNoticeSource in @(
+        'NebulaNoticeRuntimeCompatibility.cs',
+        'PlayerNoticeProtocol.cs'
+    )) {
+        $missingNoticeSourceRoot = $sourceMissing + '-' + [System.IO.Path]::GetFileNameWithoutExtension($requiredNoticeSource)
+        Copy-BridgeTree -Source $sourceRoot -Destination $missingNoticeSourceRoot
+        [System.IO.File]::Delete((Join-Path $missingNoticeSourceRoot $requiredNoticeSource))
+        Assert-BridgeRejected -Action {
+            Get-DysonBridgeSourceContract -SourceRoot $missingNoticeSourceRoot
+        } -Message "a real artifact layout missing $requiredNoticeSource was accepted"
+    }
     Copy-BridgeTree -Source $sourceRoot -Destination $sourceExtra
     [System.IO.File]::WriteAllText(
         (Join-Path $sourceExtra 'UnexpectedBridgeSource.cs'),

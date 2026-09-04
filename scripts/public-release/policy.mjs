@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const POLICY_ID = 'dyson-public-release-hygiene'
-export const POLICY_VERSION = '1.4.14'
+export const POLICY_VERSION = '1.4.15'
 
 export const DEFAULT_LIMITS = Object.freeze({
   maximumWorktreeFiles: 50_000,
@@ -237,6 +237,12 @@ export const EXACT_ALLOWLIST = Object.freeze([
   },
   {
     scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'scripts/public-release/scanner.test.mjs',
+    blobId: 'e783fe35d22b5ea6d61b98c8c643078c7fa5260c'
+  },
+  {
+    scope: 'history',
     ruleId: 'STEAM_IDENTIFIER',
     path: 'apps/api/src/console/parser.test.ts',
     blobId: '87fb3d72fb77b44635f36aea8c659a1142891b55'
@@ -294,6 +300,7 @@ export const ARTIFACT_EXACT_ALLOWED_PATHS = Object.freeze([
   'docs/GSM-EVALUATION.md',
   'docs/MIGRATION-GSMANAGER.md',
   'docs/NETWORK-CONNECTIVITY.md',
+  'docs/PRODUCTION-QUALIFICATION.md',
   'docs/WINDOWS-DEPLOYMENT-DRAFT.md',
   'integrations/dyson-control-bridge/BridgeFileStore.cs',
   'integrations/dyson-control-bridge/BridgeProtocol.cs',
@@ -301,6 +308,8 @@ export const ARTIFACT_EXACT_ALLOWED_PATHS = Object.freeze([
   'integrations/dyson-control-bridge/DysonControlBridgePlugin.cs',
   'integrations/dyson-control-bridge/GameSaveAdapter.cs',
   'integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.cs',
+  'integrations/dyson-control-bridge/NebulaNoticeRuntimeCompatibility.cs',
+  'integrations/dyson-control-bridge/PlayerNoticeProtocol.cs',
   'integrations/dyson-control-bridge/PlayerRosterPublisher.cs',
   'integrations/dyson-control-bridge/SimulationTelemetrySampler.cs',
   'integrations/dyson-control-bridge/README.md',

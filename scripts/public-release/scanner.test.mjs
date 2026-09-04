@@ -354,6 +354,7 @@ describe('public release hygiene gate', () => {
       { path: 'docs/GSM-EVALUATION.md', bytes: Buffer.from('# Fictional GSM evaluation\n') },
       { path: 'docs/MIGRATION-GSMANAGER.md', bytes: Buffer.from('# Fictional GSManager removal\n') },
       { path: 'docs/NETWORK-CONNECTIVITY.md', bytes: Buffer.from('# Fictional network contract\n') },
+      { path: 'docs/PRODUCTION-QUALIFICATION.md', bytes: Buffer.from('# Fictional production qualification\n') },
       { path: 'docs/WINDOWS-DEPLOYMENT-DRAFT.md', bytes: Buffer.from('# Fictional deployment draft\n') },
       { path: 'scripts/windows/network/dyson-nebula-network-assessment-v1.schema.json', bytes: Buffer.from('{"title":"Fictional schema"}\n') },
       { path: 'scripts/windows/network/DysonNetwork.Common.ps1', bytes: Buffer.from("$script:Fixture = 'fictional'\n") },
@@ -396,6 +397,8 @@ describe('public release hygiene gate', () => {
       { path: 'integrations/dyson-control-bridge/DysonControlBridgePlugin.cs', bytes: Buffer.from('namespace Fictional;\n') },
       { path: 'integrations/dyson-control-bridge/GameSaveAdapter.cs', bytes: Buffer.from('namespace Fictional;\n') },
       { path: 'integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      { path: 'integrations/dyson-control-bridge/NebulaNoticeRuntimeCompatibility.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      { path: 'integrations/dyson-control-bridge/PlayerNoticeProtocol.cs', bytes: Buffer.from('namespace Fictional;\n') },
       { path: 'integrations/dyson-control-bridge/PlayerRosterPublisher.cs', bytes: Buffer.from('namespace Fictional;\n') },
       { path: 'integrations/dyson-control-bridge/SimulationTelemetrySampler.cs', bytes: Buffer.from('namespace Fictional;\n') },
       { path: 'integrations/dyson-control-bridge/README.md', bytes: Buffer.from('# Fictional Bridge\n') },
@@ -426,6 +429,14 @@ describe('public release hygiene gate', () => {
       },
       {
         path: 'integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.Copy.cs',
+        bytes: Buffer.from('namespace Fictional;\n')
+      },
+      {
+        path: 'integrations/dyson-control-bridge/NebulaNoticeRuntimeCompatibility.Copy.cs',
+        bytes: Buffer.from('namespace Fictional;\n')
+      },
+      {
+        path: 'integrations/dyson-control-bridge/PlayerNoticeProtocol.Copy.cs',
         bytes: Buffer.from('namespace Fictional;\n')
       },
       {
@@ -467,6 +478,8 @@ describe('public release hygiene gate', () => {
         'docs/UNREVIEWED.md',
         'integrations/dyson-control-bridge/BridgeProtocol.Copy.cs',
         'integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.Copy.cs',
+        'integrations/dyson-control-bridge/NebulaNoticeRuntimeCompatibility.Copy.cs',
+        'integrations/dyson-control-bridge/PlayerNoticeProtocol.Copy.cs',
         'integrations/dyson-control-bridge/Unreviewed.cs',
         'integrations/nebula-hostname-wss/README.md'
       ]

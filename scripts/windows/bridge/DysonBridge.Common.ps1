@@ -237,7 +237,8 @@ function Get-DysonBridgeSourceContract {
     $root = Assert-DysonBridgePlainDirectory -Path $SourceRoot
     $required = @(
         'BridgeFileStore.cs', 'BridgeProtocol.cs', 'DysonControlBridgePlugin.cs',
-        'GameSaveAdapter.cs', 'LoadedSaveEvidencePublisher.cs', 'PlayerRosterPublisher.cs',
+        'GameSaveAdapter.cs', 'LoadedSaveEvidencePublisher.cs',
+        'NebulaNoticeRuntimeCompatibility.cs', 'PlayerNoticeProtocol.cs', 'PlayerRosterPublisher.cs',
         'SimulationTelemetrySampler.cs', 'DysonControlBridge.csproj',
         'dyson-control-bridge.cfg.example', 'README.md'
     )
@@ -529,7 +530,8 @@ function Test-DysonBridgeCandidateCore {
     $sources = @($manifest.sources)
     $expectedSourceNames = @(
         'BridgeFileStore.cs', 'BridgeProtocol.cs', 'DysonControlBridge.csproj',
-        'DysonControlBridgePlugin.cs', 'GameSaveAdapter.cs', 'LoadedSaveEvidencePublisher.cs', 'PlayerRosterPublisher.cs',
+        'DysonControlBridgePlugin.cs', 'GameSaveAdapter.cs', 'LoadedSaveEvidencePublisher.cs',
+        'NebulaNoticeRuntimeCompatibility.cs', 'PlayerNoticeProtocol.cs', 'PlayerRosterPublisher.cs',
         'SimulationTelemetrySampler.cs',
         'README.md', 'dyson-control-bridge.cfg.example'
     ) | Sort-Object -CaseSensitive

@@ -130,6 +130,8 @@ $script:DysonArtifactRequiredBridgeSources = @(
     'integrations/dyson-control-bridge/DysonControlBridgePlugin.cs',
     'integrations/dyson-control-bridge/GameSaveAdapter.cs',
     'integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.cs',
+    'integrations/dyson-control-bridge/NebulaNoticeRuntimeCompatibility.cs',
+    'integrations/dyson-control-bridge/PlayerNoticeProtocol.cs',
     'integrations/dyson-control-bridge/PlayerRosterPublisher.cs',
     'integrations/dyson-control-bridge/SimulationTelemetrySampler.cs',
     'integrations/dyson-control-bridge/README.md',

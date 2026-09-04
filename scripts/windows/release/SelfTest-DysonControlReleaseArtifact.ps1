@@ -275,6 +275,7 @@ export { allowedScriptPaths };
     $bridgeSourceFiles = @(
         'BridgeFileStore.cs', 'BridgeProtocol.cs', 'DysonControlBridge.csproj',
         'DysonControlBridgePlugin.cs', 'GameSaveAdapter.cs', 'LoadedSaveEvidencePublisher.cs',
+        'NebulaNoticeRuntimeCompatibility.cs', 'PlayerNoticeProtocol.cs',
         'PlayerRosterPublisher.cs',
         'SimulationTelemetrySampler.cs',
         'README.md', 'dyson-control-bridge.cfg.example',
