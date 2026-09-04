@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   canonicalManifestBytes,
   SavePairTransferService,
+  verifyBackupPair,
   verifySavePairTransportArchive,
   type SavePairTransportManifest
 } from './index.js'
@@ -121,6 +122,113 @@ describe('save-pair transfer archive and quarantine', () => {
 
     await expect(service.importArchive({ ...request, sha256: 'f'.repeat(64) }, chunks(archive, 13)))
       .rejects.toMatchObject({ code: 'SAVE_TRANSFER_IDEMPOTENCY_CONFLICT' })
+  })
+
+  it('previews and atomically promotes quarantine into a verified backup without restoring live saves', async () => {
+    const fixture = await seedBackup('Promoted_Save', Buffer.from('promoted-dsv'), Buffer.from('promoted-server'))
+    const service = makeService(fixture)
+    const exportId = randomUUID()
+    const exported = await service.exportBackup({ requestId: exportId, backupId: fixture.backupId })
+    const archive = await collect((await service.openExport({ requestId: exportId })).source)
+    const importId = randomUUID()
+    await service.importArchive({
+      requestId: importId, declaredBytes: archive.length, sha256: exported.archiveSha256
+    }, chunks(archive, 9))
+
+    const activeSentinel = path.join(fixture.root, 'active-save-must-remain.dsv')
+    await writeFile(activeSentinel, 'active-original', 'utf8')
+    const requestId = randomUUID()
+    const backupId = `tx-${requestId}`
+    const receiptPath = path.join(fixture.transportRoot, 'receipts', `promotion-${requestId}.json`)
+    const preview = await service.previewImportPromotion({ requestId, importRequestId: importId })
+    expect(preview).toMatchObject({
+      mode: 'dry-run', allowed: true, reused: false, backupId,
+      requiredConfirmation: 'PROMOTE_IMPORTED_SAVE_PAIR',
+      effects: {
+        quarantinePreserved: true,
+        verifiedBackupCreated: true,
+        liveSaveChanged: false,
+        restoreExecuted: false
+      }
+    })
+    await expect(lstat(path.join(fixture.backupRoot, backupId))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(lstat(receiptPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(service.promoteImport({
+      requestId, importRequestId: importId, confirmation: 'PROMOTE'
+    })).rejects.toMatchObject({ code: 'SAVE_TRANSFER_REQUEST_INVALID' })
+
+    const interruptedStage = path.join(fixture.backupRoot, `.promotion-${requestId}.partial`)
+    await mkdir(interruptedStage)
+    await writeFile(path.join(interruptedStage, `${fixture.saveName}.dsv`), 'partial')
+    const receipt = await service.promoteImport({
+      requestId, importRequestId: importId, confirmation: 'PROMOTE_IMPORTED_SAVE_PAIR'
+    })
+    expect(receipt).toMatchObject({
+      operation: 'promote-import', requestId, importRequestId: importId,
+      backupId, saveName: fixture.saveName, reused: false, restoreExecuted: false
+    })
+    expect(receipt.sourceArchiveSha256).toBe(exported.archiveSha256)
+    await expect(lstat(interruptedStage)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(verifyBackupPair({ backupRoot: fixture.backupRoot, backupId })).resolves.toMatchObject({
+      health: 'healthy', manifestValid: true, pairPresent: true, saveName: fixture.saveName
+    })
+    await expect(readFile(activeSentinel, 'utf8')).resolves.toBe('active-original')
+    await expect(readFile(
+      path.join(fixture.transportRoot, 'inbox', `import-${importId}`, `${fixture.saveName}.dsv`),
+      'utf8'
+    )).resolves.toBe('promoted-dsv')
+
+    const replay = await service.promoteImport({
+      requestId, importRequestId: importId, confirmation: 'PROMOTE_IMPORTED_SAVE_PAIR'
+    })
+    expect(replay).toMatchObject({ manifestSha256: receipt.manifestSha256, reused: true })
+    const replayPreview = await service.previewImportPromotion({ requestId, importRequestId: importId })
+    expect(replayPreview).toMatchObject({ allowed: true, reused: true })
+
+    await rm(receiptPath)
+    const recovered = await makeService(fixture).promoteImport({
+      requestId, importRequestId: importId, confirmation: 'PROMOTE_IMPORTED_SAVE_PAIR'
+    })
+    expect(recovered).toMatchObject({ manifestSha256: receipt.manifestSha256, reused: true })
+    await expect(lstat(receiptPath)).resolves.toMatchObject({ isFile: expect.any(Function) })
+  })
+
+  it('fails promotion closed on quarantine tampering, destination conflict, and insufficient space', async () => {
+    const fixture = await seedBackup('Promotion_Guards', Buffer.from('guard-dsv'), Buffer.from('guard-server'))
+    const service = makeService(fixture)
+    const exportId = randomUUID()
+    const exported = await service.exportBackup({ requestId: exportId, backupId: fixture.backupId })
+    const archive = await collect((await service.openExport({ requestId: exportId })).source)
+    const importId = randomUUID()
+    await service.importArchive({
+      requestId: importId, declaredBytes: archive.length, sha256: exported.archiveSha256
+    }, chunks(archive, 13))
+    const inboxDsv = path.join(
+      fixture.transportRoot, 'inbox', `import-${importId}`, `${fixture.saveName}.dsv`
+    )
+    await writeFile(inboxDsv, 'tampered-dsv')
+    await expect(service.previewImportPromotion({ requestId: randomUUID(), importRequestId: importId }))
+      .rejects.toMatchObject({ code: 'SAVE_TRANSFER_STATE_INVALID' })
+    await writeFile(inboxDsv, 'guard-dsv')
+
+    const conflictRequestId = randomUUID()
+    await writeConflictingPromotionBackup(fixture, conflictRequestId)
+    await expect(service.previewImportPromotion({
+      requestId: conflictRequestId, importRequestId: importId
+    })).rejects.toMatchObject({ code: 'SAVE_TRANSFER_IDEMPOTENCY_CONFLICT' })
+
+    const noSpace = makeService(fixture, { availableBytes: async () => 0 })
+    const noSpaceRequestId = randomUUID()
+    await expect(noSpace.previewImportPromotion({
+      requestId: noSpaceRequestId, importRequestId: importId
+    })).resolves.toMatchObject({ allowed: false, blockers: ['space-insufficient'] })
+    await expect(noSpace.promoteImport({
+      requestId: noSpaceRequestId,
+      importRequestId: importId,
+      confirmation: 'PROMOTE_IMPORTED_SAVE_PAIR'
+    })).rejects.toMatchObject({ code: 'SAVE_TRANSFER_SPACE_INSUFFICIENT' })
+    await expect(lstat(path.join(fixture.backupRoot, `tx-${noSpaceRequestId}`)))
+      .rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('rejects tampering, CRC corruption, truncation, and trailing data even with a matching outer digest', async () => {
@@ -325,6 +433,25 @@ async function addBackup(fixture: Fixture, saveName: string, dsv: Buffer, server
     ]
   }))
   return backupId
+}
+
+async function writeConflictingPromotionBackup(fixture: Fixture, requestId: string): Promise<void> {
+  const directory = path.join(fixture.backupRoot, `tx-${requestId}`)
+  const dsv = Buffer.from('foreign-dsv')
+  const server = Buffer.from('foreign-server')
+  await mkdir(directory)
+  await Promise.all([
+    writeFile(path.join(directory, `${fixture.saveName}.dsv`), dsv),
+    writeFile(path.join(directory, `${fixture.saveName}.server`), server)
+  ])
+  await writeFile(path.join(directory, 'manifest.json'), JSON.stringify({
+    protocol: 'DYSON_CONTROL_PROTECTION_V1', schemaVersion: 1, requestId,
+    createdAt: fixture.createdAt, saveName: fixture.saveName,
+    files: [
+      { name: `${fixture.saveName}.dsv`, bytes: dsv.length, sha256: hash(dsv) },
+      { name: `${fixture.saveName}.server`, bytes: server.length, sha256: hash(server) }
+    ]
+  }))
 }
 
 function makeService(

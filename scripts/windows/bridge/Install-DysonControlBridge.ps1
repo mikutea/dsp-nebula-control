@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory)][string]$CandidatePath,
     [Parameter(Mandatory)][string]$DysonServerRoot,
     [string]$ConfigurationTemplate,
-    [ValidateCount(0, 8)][string[]]$SecretReaderSid = @(),
+    [Parameter(Mandatory)][string]$ControlServiceSid,
+    [Parameter(Mandatory)][string]$GameServiceSid,
     [Parameter(DontShow)][switch]$SelfTestFailureAfterPluginPublish
 )
 
@@ -11,6 +12,8 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 . (Join-Path $PSScriptRoot 'DysonBridge.Common.ps1')
 
+$installerSid = Get-DysonBridgeCurrentInstallerSid
+Assert-DysonBridgeSeparatedServiceSids -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid
 $serverRoot = Assert-DysonBridgePlainDirectory -Path $DysonServerRoot
 $candidate = Test-DysonBridgeCandidateCore -CandidateRoot $CandidatePath -DysonServerRoot $serverRoot
 [void](Assert-DysonBridgeGameStopped -DysonServerRoot $serverRoot)
@@ -33,6 +36,7 @@ $configPath = Join-Path $configRoot $script:DysonBridgeConfigName
 $statePath = Join-Path $configRoot $script:DysonBridgeStateName
 $secretPath = Join-Path $configRoot $script:DysonBridgeSecretName
 $controlRoot = Get-DysonBridgeFullPath -Path (Join-Path $serverRoot 'BepInEx\dyson-control-bridge')
+$controlTreePaths = Get-DysonBridgeControlTreePaths -ControlRoot $controlRoot
 $snapshotParent = Get-DysonBridgeFullPath -Path (Join-Path $configRoot 'dyson-control-bridge-snapshots')
 $auditPath = Join-Path $configRoot 'dyson-control-bridge.audit.jsonl'
 foreach ($fixed in @($pluginRoot, $pluginPath, $configPath, $statePath, $secretPath, $controlRoot, $snapshotParent, $auditPath)) {
@@ -66,13 +70,29 @@ $configExisted = Test-Path -LiteralPath $configPath -PathType Leaf
 $stateExisted = Test-Path -LiteralPath $statePath -PathType Leaf
 $secretExisted = Test-Path -LiteralPath $secretPath -PathType Leaf
 $originalSecretSddl = $null
+$controlTreeAclSnapshots = @()
 $mutationStarted = $false
 try {
     foreach ($existing in @($pluginPath, $configPath, $statePath, $secretPath)) {
         if (Test-Path -LiteralPath $existing) { [void](Assert-DysonBridgePlainFile -Path $existing -MaximumBytes 64MB) }
     }
     if ($secretExisted) {
-        $originalSecretSddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $secretPath -ErrorAction Stop).Sddl
+        $originalSecretSddl = Get-DysonBridgeAccessSddl -Path $secretPath
+    }
+    foreach ($name in @('root', 'requests', 'processing', 'receipts', 'processed', 'rejected')) {
+        $path = [string]$controlTreePaths[$name]
+        $existed = Test-Path -LiteralPath $path -PathType Container
+        if ((Test-Path -LiteralPath $path) -and -not $existed) { throw 'A fixed Bridge control path is not a directory.' }
+        $controlTreeAclSnapshots += [ordered]@{
+            name = $name
+            path = $path
+            existed = $existed
+            sddl = if ($existed) {
+                [void](Assert-DysonBridgePlainDirectory -Path $path)
+                Get-DysonBridgeAccessSddl -Path $path
+            }
+            else { $null }
+        }
     }
     [System.IO.Directory]::CreateDirectory($pluginRoot) | Out-Null
     [void](Assert-DysonBridgePlainDirectory -Path $pluginRoot)
@@ -102,7 +122,10 @@ try {
     $decoded = $null
     try { $decoded = [Convert]::FromBase64String($secretText) } catch { throw 'The existing Bridge secret is not canonical base64.' }
     if ($decoded.Length -lt 32) { throw 'The Bridge secret must contain at least 32 random bytes.' }
-    Protect-DysonBridgeSecretAcl -SecretPath $secretPath -ReaderSids $SecretReaderSid
+    Protect-DysonBridgeSecretAcl -SecretPath $secretPath -InstallerSid $installerSid `
+        -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid
+    [void](Initialize-DysonBridgeControlTreeAcl -ControlRoot $controlRoot -InstallerSid $installerSid `
+        -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid)
 
     $renderedConfig = $templateText.Replace('{{CONTROL_ROOT}}', $controlRoot).Replace('{{SECRET_FILE}}', $secretPath)
     if ($renderedConfig -notmatch '(?m)^Enabled = false$') { throw 'The rendered Bridge configuration is not disabled.' }
@@ -114,7 +137,7 @@ try {
     Write-DysonBridgeAtomicText -Path $configPath -Value $renderedConfig
     $state = [ordered]@{
         protocol = $script:DysonBridgeInstallProtocol
-        schemaVersion = 1
+        schemaVersion = 2
         guid = $script:DysonBridgeGuid
         version = $candidate.version
         dllSha256 = $candidate.dllSha256
@@ -123,6 +146,10 @@ try {
         installedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
         snapshotId = $snapshotId
         enabledDefault = $false
+        aclContract = $script:DysonBridgeAclContract
+        installerSid = $installerSid
+        controlServiceSid = $ControlServiceSid
+        gameServiceSid = $GameServiceSid
     }
     Write-DysonBridgeAtomicText -Path $statePath -Value (($state | ConvertTo-Json -Depth 8 -Compress) + "`r`n")
     [void](Read-DysonBridgeInstallState -Path $statePath)
@@ -156,9 +183,24 @@ catch {
         }
         if (-not $secretExisted -and (Test-Path -LiteralPath $secretPath -PathType Leaf)) { Remove-Item -LiteralPath $secretPath -Force }
         elseif ($secretExisted -and $originalSecretSddl -and (Test-Path -LiteralPath $secretPath -PathType Leaf)) {
-            $secretAcl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $secretPath -ErrorAction Stop
-            $secretAcl.SetSecurityDescriptorSddlForm($originalSecretSddl)
-            Microsoft.PowerShell.Security\Set-Acl -LiteralPath $secretPath -AclObject $secretAcl -ErrorAction Stop
+            Restore-DysonBridgeAccessSddl -Path $secretPath -Sddl $originalSecretSddl
+        }
+        foreach ($snapshot in @($controlTreeAclSnapshots | Where-Object { [bool]$_.existed })) {
+            if (Test-Path -LiteralPath ([string]$snapshot.path) -PathType Container) {
+                Restore-DysonBridgeAccessSddl -Path ([string]$snapshot.path) -Sddl ([string]$snapshot.sddl) -Directory
+            }
+        }
+        foreach ($name in @('rejected', 'processed', 'receipts', 'processing', 'requests', 'root')) {
+            $snapshot = @($controlTreeAclSnapshots | Where-Object { [string]$_.name -ceq $name })[0]
+            if ($null -ne $snapshot -and -not [bool]$snapshot.existed) {
+                $path = [string]$snapshot.path
+                if (Test-Path -LiteralPath $path -PathType Container) {
+                    [void](Assert-DysonBridgePlainDirectory -Path $path)
+                    if (@(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop).Count -eq 0) {
+                        [System.IO.Directory]::Delete($path, $false)
+                    }
+                }
+            }
         }
     }
     throw $installError

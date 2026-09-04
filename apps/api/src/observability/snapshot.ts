@@ -5,6 +5,8 @@ import {
   OBSERVABILITY_HINT_CODES,
   OBSERVABILITY_METRIC_PATHS,
   OBSERVABILITY_RUNTIME_STATES,
+  OBSERVABILITY_STORAGE_DEPENDENCY_KINDS,
+  OBSERVABILITY_TASK_STATES,
   OBSERVABILITY_UNAVAILABLE_REASONS,
   type CoreCpuUsage,
   type ObservabilityMetric,
@@ -47,6 +49,8 @@ const optionalNetworkUnavailableReasonSchema = z.enum([
   'no-eligible-network-interface',
   'inconsistent-sample'
 ]).nullable().optional()
+
+const optionalTaskStateSchema = z.enum(OBSERVABILITY_TASK_STATES).nullable().optional()
 
 const coreCpuSampleSchema = z.strictObject({
   index: z.number().int().min(0).max(maximumLogicalProcessors - 1),
@@ -92,7 +96,8 @@ export const trustedServerObservabilitySampleSchema = z.strictObject({
   source: z.string().min(1).max(maximumSourceLength).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/),
   runtime: z.strictObject({
     state: z.enum(OBSERVABILITY_RUNTIME_STATES),
-    processId: z.number().int().min(1).max(4_294_967_295).nullable().optional()
+    processId: z.number().int().min(1).max(4_294_967_295).nullable().optional(),
+    startedAt: z.string().max(64).datetime({ offset: true }).nullable().optional()
   }),
   host: z.strictObject({
     cpu: z.strictObject({
@@ -133,7 +138,25 @@ export const trustedServerObservabilitySampleSchema = z.strictObject({
     ups: z.number().finite().min(0).max(maximumSimulationRate).nullable().optional(),
     tps: z.number().finite().min(0).max(maximumSimulationRate).nullable().optional(),
     targetUps: z.number().finite().min(Number.EPSILON).max(maximumSimulationRate).nullable().optional()
-  }).nullable().optional()
+  }).nullable().optional(),
+  automation: z.strictObject({
+    storageDependencyKind: z.enum(OBSERVABILITY_STORAGE_DEPENDENCY_KINDS),
+    projectRootAvailable: z.boolean().nullable().optional(),
+    globalMappingAvailable: z.boolean().nullable().optional(),
+    storageTask: z.strictObject({
+      state: optionalTaskStateSchema,
+      lastResult: z.number().int().safe().nullable().optional()
+    }).nullable().optional()
+  })
+}).superRefine((sample, context) => {
+  if (sample.runtime.startedAt !== undefined && sample.runtime.startedAt !== null
+      && Date.parse(sample.runtime.startedAt) > Date.parse(sample.observedAt)) {
+    context.addIssue({
+      code: 'custom',
+      message: 'runtime start time cannot follow the observation time',
+      path: ['runtime', 'startedAt']
+    })
+  }
 })
 
 export type TrustedServerObservabilitySample = z.infer<typeof trustedServerObservabilitySampleSchema>
@@ -170,6 +193,10 @@ export const serverObservabilitySnapshotSchema = z.strictObject({
   runtime: z.strictObject({
     state: z.enum(OBSERVABILITY_RUNTIME_STATES),
     processId: metricSchema(z.number().int().min(1).max(4_294_967_295)),
+    // Optional only for persisted v1 snapshots written before process
+    // generation binding was introduced. parseServerObservabilitySnapshot
+    // normalizes absence to an unavailable metric and recomputes health.
+    startedAt: metricSchema(z.string().max(64).datetime({ offset: true })).optional(),
     gamePort: z.strictObject({
       port: metricSchema(z.number().int().min(1).max(65_535)),
       listening: metricSchema(z.boolean())
@@ -209,6 +236,15 @@ export const serverObservabilitySnapshotSchema = z.strictObject({
     tps: metricSchema(z.number().finite().min(0).max(maximumSimulationRate)),
     targetUps: metricSchema(z.number().finite().min(Number.EPSILON).max(maximumSimulationRate))
   }),
+  automation: z.strictObject({
+    storageDependencyKind: z.enum(OBSERVABILITY_STORAGE_DEPENDENCY_KINDS),
+    projectRootAvailable: metricSchema(z.boolean()),
+    globalMappingAvailable: metricSchema(z.boolean()),
+    storageTask: z.strictObject({
+      state: metricSchema(z.enum(OBSERVABILITY_TASK_STATES)),
+      lastResult: metricSchema(z.number().int().safe())
+    })
+  }).optional(),
   health: z.strictObject({
     status: z.enum(['healthy', 'unknown', 'warning', 'critical']),
     hints: z.array(z.strictObject({
@@ -220,6 +256,14 @@ export const serverObservabilitySnapshotSchema = z.strictObject({
     unavailableMetrics: z.array(z.enum(OBSERVABILITY_METRIC_PATHS)).max(OBSERVABILITY_METRIC_PATHS.length)
   })
 }).superRefine((snapshot, context) => {
+  if (snapshot.runtime.startedAt?.status === 'available'
+      && Date.parse(snapshot.runtime.startedAt.value) > Date.parse(snapshot.observedAt)) {
+    context.addIssue({
+      code: 'custom',
+      message: 'runtime start time cannot follow the observation time',
+      path: ['runtime', 'startedAt']
+    })
+  }
   if (snapshot.host.cpu.perCorePercent.status === 'available') {
     addDuplicateIssue(
       snapshot.host.cpu.perCorePercent.value.map((core) => core.index),
@@ -249,8 +293,10 @@ export const serverObservabilitySnapshotSchema = z.strictObject({
   validateVolumeReadings(snapshot.host.storage.saveVolume, context, ['host', 'storage', 'saveVolume'])
   addDuplicateIssue(snapshot.health.hints.map((hint) => hint.code), context, ['health', 'hints'])
   addDuplicateIssue(snapshot.health.unavailableMetrics, context, ['health', 'unavailableMetrics'])
-  const expectedHealth = evaluateObservabilityHealth(snapshot as ServerObservabilityReadings)
-  if (JSON.stringify(snapshot.health) !== JSON.stringify(expectedHealth)) {
+  const expectedHealth = snapshot.automation === undefined || snapshot.runtime.startedAt === undefined
+    ? null
+    : evaluateObservabilityHealth(snapshot as ServerObservabilityReadings)
+  if (expectedHealth !== null && JSON.stringify(snapshot.health) !== JSON.stringify(expectedHealth)) {
     context.addIssue({ code: 'custom', message: 'health summary does not match snapshot readings', path: ['health'] })
   }
 })
@@ -291,6 +337,7 @@ export function buildServerObservabilitySnapshot(input: unknown): ServerObservab
     runtime: {
       state: sample.runtime.state,
       processId: processMetric(sample.runtime.processId, sample.runtime.state, undefined),
+      startedAt: processTimeMetric(sample.runtime.startedAt, sample.runtime.state, sample.runtime),
       gamePort: {
         port: numberMetric(gamePort?.port, gamePort),
         listening: booleanMetric(gamePort?.listening, gamePort)
@@ -333,6 +380,21 @@ export function buildServerObservabilitySnapshot(input: unknown): ServerObservab
       ups: numberMetric(sample.simulation?.ups, sample.simulation),
       tps: numberMetric(sample.simulation?.tps, sample.simulation),
       targetUps: numberMetric(sample.simulation?.targetUps, sample.simulation)
+    },
+    automation: {
+      storageDependencyKind: sample.automation.storageDependencyKind,
+      projectRootAvailable: booleanMetric(
+        sample.automation.projectRootAvailable,
+        sample.automation
+      ),
+      globalMappingAvailable: booleanMetric(
+        sample.automation.globalMappingAvailable,
+        sample.automation
+      ),
+      storageTask: {
+        state: enumMetric(sample.automation.storageTask?.state, sample.automation.storageTask),
+        lastResult: numberMetric(sample.automation.storageTask?.lastResult, sample.automation.storageTask)
+      }
     }
   }
 
@@ -342,7 +404,19 @@ export function buildServerObservabilitySnapshot(input: unknown): ServerObservab
 export function parseServerObservabilitySnapshot(input: unknown): ServerObservabilitySnapshot {
   const parsed = serverObservabilitySnapshotSchema.safeParse(input)
   if (!parsed.success) throw new ObservabilityError('OBSERVABILITY_SNAPSHOT_INVALID', parsed.error)
-  return parsed.data as ServerObservabilitySnapshot
+  if (parsed.data.automation !== undefined && parsed.data.runtime.startedAt !== undefined) {
+    return parsed.data as ServerObservabilitySnapshot
+  }
+
+  const normalized: ServerObservabilityReadings = {
+    ...parsed.data,
+    runtime: {
+      ...parsed.data.runtime,
+      startedAt: parsed.data.runtime.startedAt ?? unavailable('not-provided')
+    },
+    automation: parsed.data.automation ?? unavailableAutomation()
+  }
+  return { ...normalized, health: evaluateObservabilityHealth(normalized) }
 }
 
 function parseTrustedSample(input: unknown): TrustedServerObservabilitySample {
@@ -409,11 +483,42 @@ function booleanMetric(
     : available(value)
 }
 
+function enumMetric<T extends string>(
+  value: T | null | undefined,
+  parent: object | null | undefined
+): ObservabilityMetric<T> {
+  return value === undefined || value === null
+    ? unavailable(value === null || parent === null ? 'source-reported-unavailable' : 'not-provided')
+    : available(value)
+}
+
+function unavailableAutomation(): ServerObservabilityReadings['automation'] {
+  return {
+    storageDependencyKind: 'unknown',
+    projectRootAvailable: unavailable('not-provided'),
+    globalMappingAvailable: unavailable('not-provided'),
+    storageTask: {
+      state: unavailable('not-provided'),
+      lastResult: unavailable('not-provided')
+    }
+  }
+}
+
 function processMetric(
   value: number | null | undefined,
   state: TrustedServerObservabilitySample['runtime']['state'],
   parent: object | null | undefined
 ): ObservabilityMetric<number> {
+  if (value !== undefined && value !== null) return available(value)
+  if (state === 'stopped') return unavailable('process-not-running')
+  return unavailable(value === null || parent === null ? 'source-reported-unavailable' : 'not-provided')
+}
+
+function processTimeMetric(
+  value: string | null | undefined,
+  state: TrustedServerObservabilitySample['runtime']['state'],
+  parent: object | null | undefined
+): ObservabilityMetric<string> {
   if (value !== undefined && value !== null) return available(value)
   if (state === 'stopped') return unavailable('process-not-running')
   return unavailable(value === null || parent === null ? 'source-reported-unavailable' : 'not-provided')

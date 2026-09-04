@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { buildApplication, type BuiltApplication } from './app.js'
 import { loadConfig } from './config.js'
+import type { WindowsLifecycleBrokerClient } from './providers/windows-lifecycle-broker.js'
 import type {
   HostMutationOperationCoordinator,
   HostMutationOperationOutcome
@@ -32,6 +33,7 @@ describe('authenticated save transaction routes', () => {
     const service = makeService(fixture)
     application = await buildApplication(config(false), {
       hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       saveTransactionService: service,
       workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
     })
@@ -59,6 +61,7 @@ describe('authenticated save transaction routes', () => {
     const service = makeService(fixture)
     application = await buildApplication(config(true), {
       hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       saveTransactionService: service,
       workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
     })
@@ -155,6 +158,7 @@ describe('authenticated save transaction routes', () => {
     })
     application = await buildApplication(config(true), {
       hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       saveTransactionService: running,
       workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
     })
@@ -167,11 +171,53 @@ describe('authenticated save transaction routes', () => {
     expect(response.json().error.code).toBe('SAVE_SERVICE_NOT_STOPPED')
   })
 
+  it('binds the default fresh stopped proof to the configured game port', async () => {
+    const fixture = await createFixture()
+    const preparationService = makeService(fixture)
+    const source = await preparationService.backup({ requestId: randomUUID(), saveName: fixture.saveName })
+    const revision = await preparationService.inspect(fixture.saveName)
+    const configured = config(true)
+    const broker = {
+      preflight: async () => { throw new Error('unused lifecycle broker preflight') },
+      dispatch: async () => { throw new Error('unused lifecycle broker dispatch') },
+      verify: vi.fn(async () => ({
+        expected: 'stopped' as const,
+        matched: true,
+        blockers: [],
+        runtime: {
+          lifecycleState: 'stopped_verified' as const,
+          session: { status: 'verified' as const, id: 7, count: 1 },
+          steam: { status: 'verified' as const, pid: 1101, sessionId: 7 },
+          process: { status: 'absent' as const, pid: null, owner: null, sessionId: null },
+          port: { port: configured.gamePort + 1, listenerCount: 0 },
+          pidFile: { present: false, valid: false }
+        }
+      })),
+      status: async () => { throw new Error('unused lifecycle broker status') }
+    } satisfies WindowsLifecycleBrokerClient
+    application = await buildApplication(configured, {
+      hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
+      lifecycleBrokerClient: broker,
+      workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
+    })
+    const cookie = await login(application)
+
+    const response = await injectMutation('/api/v1/saves/restore/preview', cookie, {
+      requestId: randomUUID(), backupId: source.backupId,
+      expectedRevision: revision.revision, protectionRequestId: randomUUID()
+    })
+
+    expect(response.statusCode).toBe(409)
+    expect(response.json().error.code).toBe('SAVE_SERVICE_NOT_STOPPED')
+    expect(broker.verify).toHaveBeenCalledOnce()
+  })
+
   it('exposes an explicit, gated reconcile route without making duplicate execute retry a mutation', async () => {
     const fixture = await createFixture()
     const service = new ScriptedRouteSaveService()
     application = await buildApplication(config(true), {
       hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       saveTransactionService: service,
       workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
     })
@@ -227,6 +273,7 @@ describe('authenticated save transaction routes', () => {
     const fixture = await createFixture()
     application = await buildApplication(config(false), {
       hostMutationCoordinator: new PassThroughHostMutationCoordinator(),
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       saveTransactionService: new ScriptedRouteSaveService(),
       workspacePaths: { ...fixture, configRoot: fixture.saveRoot }
     })
@@ -370,11 +417,27 @@ function config(enableMutations: boolean) {
   return loadConfig({
     NODE_ENV: 'test', DYSON_PROVIDER: 'windows',
     DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+    ...(enableMutations ? {
+      DYSON_LIFECYCLE_ENABLED: 'true',
+      DYSON_LIFECYCLE_BROKER_PROFILE_FILE:
+        'C:\\ProgramData\\DysonControl\\data\\lifecycle-broker\\broker-profile.json',
+      DYSON_RUNTIME_SERVICE_USER: '.\\FictionalDyson',
+      DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+      DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
+      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret'
+    } : {}),
     DYSON_SAVE_MUTATIONS_ENABLED: enableMutations ? 'true' : 'false',
     DYSON_DEV_ADMIN_PASSWORD: 'test-password-long-enough',
     DYSON_PUBLIC_ORIGIN: 'http://127.0.0.1:13010'
   })
 }
+
+const unusedLifecycleBrokerClient = {
+  preflight: async () => { throw new Error('unused lifecycle broker preflight') },
+  dispatch: async () => { throw new Error('unused lifecycle broker dispatch') },
+  verify: async () => { throw new Error('unused lifecycle broker verify') },
+  status: async () => { throw new Error('unused lifecycle broker status') }
+} satisfies WindowsLifecycleBrokerClient
 
 async function login(target: BuiltApplication): Promise<string> {
   const response = await target.app.inject({
@@ -397,7 +460,8 @@ function injectMutation(url: string, cookie: string, payload: object) {
 
 async function waitForSaveJob(jobId: string, cookie: string) {
   if (!application) throw new Error('test application unavailable')
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
     const response = await application.app.inject({
       method: 'GET', url: `/api/v1/saves/jobs/${encodeURIComponent(jobId)}`,
       cookies: { dyson_session: cookie }
@@ -405,7 +469,7 @@ async function waitForSaveJob(jobId: string, cookie: string) {
     expect(response.statusCode).toBe(200)
     const body = response.json()
     if (!['queued', 'running'].includes(body.data.run.state as string)) return body
-    await new Promise((resolve) => setTimeout(resolve, 5))
+    await new Promise((resolve) => setTimeout(resolve, 25))
   }
   throw new Error(`save job did not reach a terminal state: ${jobId}`)
 }

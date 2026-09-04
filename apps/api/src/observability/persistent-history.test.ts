@@ -5,6 +5,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ControlDatabase } from '../storage/database.js'
 import { ObservabilityError } from './errors.js'
+import { buildObservabilityLongWindowSample } from './long-window.js'
 import { PersistentObservabilityHistory } from './persistent-history.js'
 import { buildServerObservabilitySnapshot } from './snapshot.js'
 
@@ -74,6 +75,78 @@ describe('persistent observability history', () => {
       reopened.close()
     }
   })
+
+  it('retains a complete 17,281-sample 72-hour slim chain across restart without enlarging the raw ring', () => {
+    const directory = temporaryDirectory()
+    const database = new ControlDatabase(directory)
+    database.close()
+
+    // Seed the already-validated chain in one transaction. The smaller tests
+    // above exercise the production atomic append path; batching here keeps the
+    // exact 17,281-record restart proof practical even on an SMB checkout.
+    const raw = new DatabaseSync(path.join(directory, 'control.db'))
+    const appendLong = raw.prepare(
+      'INSERT INTO observability_long_samples(observed_at, payload_json) VALUES (?, ?)'
+    )
+    const appendRaw = raw.prepare(
+      'INSERT INTO observability_samples(observed_at, payload_json) VALUES (?, ?)'
+    )
+    let predecessor: string | null = null
+    raw.exec('BEGIN IMMEDIATE')
+    try {
+      for (let index = 0; index < 17_281; index++) {
+        const current = snapshot(index, 40, 15_000)
+        const longSample = buildObservabilityLongWindowSample(current, predecessor)
+        appendLong.run(current.observedAt, JSON.stringify(longSample))
+        predecessor = longSample.sampleSha256
+        if (index >= 17_281 - 360) appendRaw.run(current.observedAt, JSON.stringify(current))
+      }
+      raw.exec('COMMIT')
+    } catch (error) {
+      raw.exec('ROLLBACK')
+      throw error
+    } finally {
+      raw.close()
+    }
+
+    const reopenedDatabase = new ControlDatabase(directory)
+    const reopened = new PersistentObservabilityHistory(reopenedDatabase, 360, 17_281)
+    expect(reopened.size).toBe(360)
+    expect(reopened.longWindowReport()).toMatchObject({
+      result: 'pass', sampleCount: 17_281, spanMs: 72 * 60 * 60 * 1_000
+    })
+    reopenedDatabase.close()
+  }, 900_000)
+
+  it('fails closed when a persisted long-window payload is modified', () => {
+    const directory = temporaryDirectory()
+    const database = new ControlDatabase(directory)
+    const history = new PersistentObservabilityHistory(database, 4, 4)
+    history.ingest(snapshot(0, 10))
+    history.ingest(snapshot(1, 20))
+    database.close()
+
+    const raw = new DatabaseSync(path.join(directory, 'control.db'))
+    const row = raw.prepare(
+      'SELECT sequence, payload_json FROM observability_long_samples ORDER BY sequence ASC LIMIT 1'
+    ).get() as unknown as { sequence: number; payload_json: string }
+    const payload = JSON.parse(row.payload_json) as { performance: { ups: number } }
+    payload.performance.ups = 1
+    raw.prepare('UPDATE observability_long_samples SET payload_json = ? WHERE sequence = ?')
+      .run(JSON.stringify(payload), row.sequence)
+    raw.close()
+
+    const reopened = new ControlDatabase(directory)
+    try {
+      expect(() => new PersistentObservabilityHistory(reopened, 4, 4)).toThrowError(
+        expect.objectContaining<Partial<ObservabilityError>>({
+          code: 'OBSERVABILITY_LONG_WINDOW_PERSISTENCE_INVALID'
+        })
+      )
+    } finally {
+      reopened.close()
+    }
+  })
 })
 
 function temporaryDirectory(): string {
@@ -82,12 +155,14 @@ function temporaryDirectory(): string {
   return directory
 }
 
-function snapshot(index: number, cpuPercent: number) {
+function snapshot(index: number, cpuPercent: number, intervalMs = 1_000) {
   return buildServerObservabilitySnapshot({
     schemaVersion: 1,
-    observedAt: observedAt(index),
+    observedAt: new Date(baseTime + index * intervalMs).toISOString(),
     source: 'fixture.persistence',
-    runtime: { state: 'running', processId: 4242 },
+    runtime: {
+      state: 'running', processId: 4242, startedAt: '2026-08-29T23:00:00.000Z'
+    },
     host: {
       cpu: {
         logicalProcessorCount: 2,
@@ -109,7 +184,8 @@ function snapshot(index: number, cpuPercent: number) {
       threadCount: 200
     },
     network: { gamePort: { port: 8469, listening: true } },
-    simulation: { ups: 60, tps: 60, targetUps: 60 }
+    simulation: { ups: 60, tps: 60, targetUps: 60 },
+    automation: { storageDependencyKind: 'none', projectRootAvailable: true }
   })
 }
 

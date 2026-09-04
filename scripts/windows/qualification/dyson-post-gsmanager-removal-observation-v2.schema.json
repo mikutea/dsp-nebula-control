@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/dyson-post-gsmanager-removal-observation-v2.schema.json",
+  "title": "Dyson post-GSManager-removal observation v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "schemaVersion", "observationId", "runId", "targetIdentity", "releaseIdentity", "subjectBindingSha256", "cutoverObservation", "removalReceipt", "observationWindow", "inventory", "management", "game", "reboot", "save", "recoveryPackage", "deliverables", "observedAtUtc", "expiresAtUtc", "observationSha256"],
+  "properties": {
+    "protocol": { "const": "DYSON_POST_GSMANAGER_REMOVAL_OBSERVATION_V2" },
+    "schemaVersion": { "const": 2 },
+    "observationId": { "$ref": "#/$defs/uuid" },
+    "runId": { "$ref": "#/$defs/uuid" },
+    "targetIdentity": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "releaseIdentity": { "$ref": "#/$defs/release" },
+    "subjectBindingSha256": { "$ref": "#/$defs/digest" },
+    "cutoverObservation": { "$ref": "#/$defs/cutover" },
+    "removalReceipt": { "$ref": "#/$defs/removal" },
+    "observationWindow": { "$ref": "#/$defs/window" },
+    "inventory": { "$ref": "#/$defs/inventory" },
+    "management": { "$ref": "#/$defs/management" },
+    "game": { "$ref": "#/$defs/game" },
+    "reboot": { "$ref": "#/$defs/reboot" },
+    "save": { "$ref": "#/$defs/save" },
+    "recoveryPackage": { "$ref": "#/$defs/recovery" },
+    "deliverables": { "$ref": "#/$defs/deliverables" },
+    "observedAtUtc": { "$ref": "#/$defs/utc" },
+    "expiresAtUtc": { "$ref": "#/$defs/utc" },
+    "observationSha256": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "hostname": { "type": "string", "pattern": "^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$" },
+    "subject": { "subjectBindingSha256": { "$ref": "#/$defs/digest" } },
+    "release": {
+      "type": "object", "additionalProperties": false,
+      "required": ["releaseVersion", "subjectCommit", "runtimePayloadSha256", "releaseManifestSha256", "releaseChecksumsSha256"],
+      "properties": {
+        "releaseVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" },
+        "subjectCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "runtimePayloadSha256": { "$ref": "#/$defs/digest" },
+        "releaseManifestSha256": { "$ref": "#/$defs/digest" },
+        "releaseChecksumsSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "cutover": {
+      "type": "object", "additionalProperties": false,
+      "required": ["observationId", "observationSha256", "qualified", "observedAtUtc", "subjectBindingSha256"],
+      "properties": { "observationId": { "$ref": "#/$defs/uuid" }, "observationSha256": { "$ref": "#/$defs/digest" }, "qualified": { "const": true }, "observedAtUtc": { "$ref": "#/$defs/utc" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "removal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["receiptId", "receiptSha256", "outcome", "completedAtUtc", "subjectBindingSha256"],
+      "properties": { "receiptId": { "$ref": "#/$defs/uuid" }, "receiptSha256": { "$ref": "#/$defs/digest" }, "outcome": { "const": "removed" }, "completedAtUtc": { "$ref": "#/$defs/utc" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "window": {
+      "type": "object", "additionalProperties": false,
+      "required": ["windowId", "observerClass", "independent", "startedAtUtc", "completedAtUtc", "elapsedMonotonicSeconds", "subjectBindingSha256"],
+      "properties": { "windowId": { "$ref": "#/$defs/uuid" }, "observerClass": { "const": "independent-operator" }, "independent": { "const": true }, "startedAtUtc": { "$ref": "#/$defs/utc" }, "completedAtUtc": { "$ref": "#/$defs/utc" }, "elapsedMonotonicSeconds": { "type": "integer", "minimum": 3600, "maximum": 604800 }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "inventory": {
+      "type": "object", "additionalProperties": false,
+      "required": ["installationCount", "scheduledTaskCount", "serviceCount", "listeningPortCount", "processCount", "scannedAtUtc", "subjectBindingSha256", "inventorySha256"],
+      "properties": { "installationCount": { "const": 0 }, "scheduledTaskCount": { "const": 0 }, "serviceCount": { "const": 0 }, "listeningPortCount": { "const": 0 }, "processCount": { "const": 0 }, "scannedAtUtc": { "$ref": "#/$defs/utc" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" }, "inventorySha256": { "$ref": "#/$defs/digest" } }
+    },
+    "management": {
+      "type": "object", "additionalProperties": false,
+      "required": ["panelOriginAddress", "panelOriginPort", "loopbackOnly", "publicHost", "externalTlsVerified", "authenticatedPanelVerified", "tlsReceiptSha256", "authenticatedPanelReceiptSha256", "observedAtUtc", "subjectBindingSha256"],
+      "properties": { "panelOriginAddress": { "enum": ["127.0.0.1", "::1"] }, "panelOriginPort": { "type": "integer", "minimum": 1, "maximum": 65535 }, "loopbackOnly": { "const": true }, "publicHost": { "$ref": "#/$defs/hostname" }, "externalTlsVerified": { "const": true }, "authenticatedPanelVerified": { "const": true }, "tlsReceiptSha256": { "$ref": "#/$defs/digest" }, "authenticatedPanelReceiptSha256": { "$ref": "#/$defs/digest" }, "observedAtUtc": { "$ref": "#/$defs/utc" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "game": {
+      "type": "object", "additionalProperties": false,
+      "required": ["publicHost", "protocol", "serverAuthoritativeJoin", "serverAuthoritativeReconnect", "reachabilityOnly", "joinReceiptSha256", "reconnectReceiptSha256", "worldBindingSha256", "savePairSha256", "observedAtUtc", "subjectBindingSha256"],
+      "properties": { "publicHost": { "$ref": "#/$defs/hostname" }, "protocol": { "const": "nebula" }, "serverAuthoritativeJoin": { "const": true }, "serverAuthoritativeReconnect": { "const": true }, "reachabilityOnly": { "const": false }, "joinReceiptSha256": { "$ref": "#/$defs/digest" }, "reconnectReceiptSha256": { "$ref": "#/$defs/digest" }, "worldBindingSha256": { "$ref": "#/$defs/digest" }, "savePairSha256": { "$ref": "#/$defs/digest" }, "observedAtUtc": { "$ref": "#/$defs/utc" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "reboot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["checkpointSha256", "resumeReceiptSha256", "newBootObserved", "runtimeRecovered", "savePairSha256", "observedAtUtc", "subjectBindingSha256"],
+      "properties": { "checkpointSha256": { "$ref": "#/$defs/digest" }, "resumeReceiptSha256": { "$ref": "#/$defs/digest" }, "newBootObserved": { "const": true }, "runtimeRecovered": { "const": true }, "savePairSha256": { "$ref": "#/$defs/digest" }, "observedAtUtc": { "$ref": "#/$defs/utc" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "save": {
+      "type": "object", "additionalProperties": false,
+      "required": ["saveReceiptSha256", "savePairSha256", "saveManifestSha256", "worldBindingSha256", "pairedFilesIntact", "observedAtUtc", "subjectBindingSha256"],
+      "properties": { "saveReceiptSha256": { "$ref": "#/$defs/digest" }, "savePairSha256": { "$ref": "#/$defs/digest" }, "saveManifestSha256": { "$ref": "#/$defs/digest" }, "worldBindingSha256": { "$ref": "#/$defs/digest" }, "pairedFilesIntact": { "const": true }, "observedAtUtc": { "$ref": "#/$defs/utc" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "recovery": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bundleManifestSha256", "verificationReceiptSha256", "verified", "activationRequired", "activated", "savePairSha256", "observedAtUtc", "subjectBindingSha256"],
+      "properties": { "bundleManifestSha256": { "$ref": "#/$defs/digest" }, "verificationReceiptSha256": { "$ref": "#/$defs/digest" }, "verified": { "const": true }, "activationRequired": { "const": true }, "activated": { "const": false }, "savePairSha256": { "$ref": "#/$defs/digest" }, "observedAtUtc": { "$ref": "#/$defs/utc" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "deliverables": {
+      "type": "object", "additionalProperties": false,
+      "required": ["evidenceIndexSha256", "runbookSha256", "knownLimitationsSha256", "releaseChecksumsSha256", "checksumsVerified", "observedAtUtc", "subjectBindingSha256"],
+      "properties": { "evidenceIndexSha256": { "$ref": "#/$defs/digest" }, "runbookSha256": { "$ref": "#/$defs/digest" }, "knownLimitationsSha256": { "$ref": "#/$defs/digest" }, "releaseChecksumsSha256": { "$ref": "#/$defs/digest" }, "checksumsVerified": { "const": true }, "observedAtUtc": { "$ref": "#/$defs/utc" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    }
+  }
+}

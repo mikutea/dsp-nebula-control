@@ -7,12 +7,57 @@ transactions with real fixed-root publication, smoke/rollback contracts, and a
 deterministic authenticated client ZIP. None of those repository tests is
 evidence that the target Windows game tree has been changed or verified.
 
+The repository additionally publishes a GPL-3.0-only, source-only Nebula
+0.9.22 hostname-preserving WSS patch under
+`integrations/nebula-hostname-wss`. That patch is not a Nebula release-discovery
+result, acquired component, prepared activation artifact, generated client ZIP,
+or Dyson Control runtime release payload. Its offline builder accepts only the
+  official pinned Git commit and the exact two source-blob hashes, emits a
+  six-file source candidate, and rejects binaries and proprietary game
+  assemblies. The parser source preserves explicit `ws`/`wss` while promoting
+  only an implicit hostname route on final port 443; the client source preserves
+  hostname authority, remembered connection data, and password-retry argument
+  order. A lawful private Nebula build
+and a real external-client E2E remain separate manual gates; source fixtures do
+not prove connectivity.
+
 The preparation/staging response still reports `activationEnabled: false` and
 `boundary: staging-only` because staging never activates bytes by itself.
 Activation is a separate Administrator-only transaction and independent host
 gate. No planning response, staged directory, green compatibility decision,
 activation receipt, or generated client package is production verification
 until the target-host smoke and rollback gates pass.
+
+## Control-plane Node runtime boundary
+
+The Node.js executable that runs Dyson Control is not a DSP, Nebula, BepInEx,
+plugin, mod, or client-profile component. Discovery, acquisition, preparation,
+activation, and mod-lock routes therefore never install or update it. Windows
+operators maintain it in an independent protected `RuntimeRoot`, outside the
+control-plane `InstallRoot` and `DataRoot`, with an exact authenticated ZIP hash
+and `node.exe` hash. The RuntimeRoot direct parent is a dedicated protected
+container, separate from both control-plane roots; broad or service delete/write
+rights on that boundary fail closed. `Install-DysonNodeRuntime.ps1` acquires a
+protected `FileShare.None` transaction lease before it reads prior or pending
+state, then uses an operation-bound V2 intent, candidate marker, completion
+receipt, and same-volume stage/rename. `Repair-DysonNodeRuntime.ps1` restores an
+exact verified predecessor before commit or finalizes the verified candidate
+after a durable receipt; it never deletes a RuntimeRoot merely because an older
+intent recorded no predecessor. An existing-runtime upgrade also requires the
+previous expected node hash. Every control-plane start revalidates the container,
+ordinary path chain, protected ACL, exact bytes, and Node major version.
+Control-plane uninstall preserves the runtime and transaction journal by default.
+
+The control-plane environment is a separate protected deployment boundary too.
+Install, task registration, launcher start, status, and reboot acceptance all
+validate the exact environment contract, launcher-owned bindings, transaction
+chain, and config/DataRoot ACL fingerprints. Evidence contains hashes and byte
+length only. The top-level deployment wrapper supports initial creation,
+byte-identical reuse, and protected replacement. Replacement snapshots the old
+configuration before release mutation; on later failure it snapshots the new
+configuration and restores the protected predecessor before release/task
+rollback. A first-install failure still has no predecessor to restore and fails
+closed while retaining the coherent protected configuration.
 
 ## Version and compatibility model
 
@@ -226,6 +271,63 @@ preparation plan explicitly blocks DSP automation as
 guard codes, cookies, or tokens, and it does not claim that SteamCMD can install
 the licensed game for this workflow.
 
+## Official Steam client manual handoff
+
+DSP remains outside the artifact/component activation path. The separate
+manual-handoff transaction coordinates the safe server-side boundary around an
+operator updating DSP in the official Steam client. It never reads, stores, or
+automates a Steam account, password, Steam Guard code, cookie, token, client
+path, executable, or command. The authenticated boundary uses only:
+
+- `GET /api/v1/updates/steam-handoff/state`;
+- `GET /api/v1/updates/steam-handoff/recovery`;
+- `GET /api/v1/updates/steam-handoff/receipts/:requestId`;
+- `POST /api/v1/updates/steam-handoff/preview`;
+- `POST /api/v1/updates/steam-handoff/begin`;
+- `POST /api/v1/updates/steam-handoff/confirm`.
+
+Read, preview, and receipt routes require `updates.read`; begin and confirm
+require `updates.activate` and an independent, default-off host gate:
+
+```text
+DYSON_STEAM_MANUAL_HANDOFF_ENABLED=false
+```
+
+The configuration parser accepts `true` only with the Windows provider,
+lifecycle execution, and an absolute trusted-compatibility policy file. Offline
+artifact staging is not a prerequisite for this official-client flow. Enabling
+the gate does not manufacture host evidence capabilities: when the fixed
+transaction provider is absent, every handoff route remains uniformly
+unavailable with `503 DSP_STEAM_HANDOFF_NOT_CONFIGURED`.
+
+Preview is a strict `dryRun: true`, `accountAutomation: false` plan and invokes
+no lifecycle or persistence adapter. Begin accepts only a UUID, normalized
+target DSP version, exact expected state revision, and
+`BEGIN_STEAM_CLIENT_UPDATE_HANDOFF`. It captures the exact pre-update DSP,
+compatibility revision, and loaded-save identity; creates a durable paired-save
+protection point; requests a graceful stop; proves both process exit and port
+closure; then persists `awaiting-steam-client-update`. The host-mutation lease
+remains bound to that transaction while the operator uses the official Steam
+client manually.
+
+Confirm accepts only the same UUID and
+`CONFIRM_STEAM_CLIENT_UPDATE_COMPLETED`. It re-samples the installed DSP version
+and compatibility decision before any start. A wrong version or incompatible
+sample is rejected but remains retryable in `awaiting-steam-client-update`.
+Only an exact target may start, and success then requires the bridge heartbeat
+and loaded-save log to belong to the current startup generation and to prove
+the exact pre-update save identity. A process or open port is never accepted as
+load proof. A failed start/load proof, timeout, ambiguous journal, or
+interruption outside the safe waiting phase persists `recovery-required`.
+
+The journal and public receipt bind the baseline, protection manifest, target,
+state revisions, step results, expiry, and bounded audit events. Reusing the
+same UUID and identical request replays its receipt; a changed request under
+that UUID is rejected. Initialization reconciles durable state once before
+mutations are opened, so a service restart cannot silently restart or skip a
+handoff. Application assembly must bind a fixed Windows evidence provider and
+the default-off gate before these routes may be made available.
+
 ## Component activation and rollback
 
 The authenticated component workspace uses these routes:
@@ -242,17 +344,33 @@ Viewer and Operator roles may read and preview. Only an Administrator with
 `updates.activate` can submit the component-specific confirmation. The browser
 sends only a UUID, fixed component, opaque staged artifact ID, SHA-256, target
 version, expected state revision, and structured trusted compatibility
-evidence. DSP remains `manual/steam-client-required` and has no activation
-button.
+evidence. DSP remains `manual/steam-client-required`: it has no artifact
+activation button and is handled only by the official-client handoff above.
 
 The component transaction re-verifies the staged archive, assembles an
 immutable release, proves the managed process stopped and the game port closed,
 creates a paired-save protection point, revalidates revision/compatibility,
 publishes actual files to construction-time fixed roots, verifies every live
-file, and only then runs the fixed smoke adapter. A failed candidate restores
-the previous bytes and independently smokes the previous version. Durable
-journals, backups, receipts, UUID idempotency, cross-instance locks, and restart
-reconciliation retain `recoveryRequired` whenever rollback cannot be proven.
+file, and only then runs the fixed smoke adapter. Before publication, its
+rollback binding records the configuration snapshot identity and revision,
+server mod-lock digest and revision, paired-save protection-manifest digest,
+and exact previously loaded-save identity alongside the previous component
+bytes.
+
+A failed candidate restores and re-reads each bound item separately: component
+bytes, configuration, server mod lock, and the paired save. It then starts the
+old component and requires startup, bridge-heartbeat, and loaded-save-log
+evidence from the same current startup generation, proving the exact previous
+save identity. Process or port health alone is insufficient. The public receipt
+exposes the rollback-binding digest and per-step status without exposing paths,
+saves, or journal internals. A missing restoration capability, any readback
+mismatch, or absent current-generation exact-save proof is fail-closed as
+`recoveryRequired`; it must never set `rollbackVerified=true`.
+
+Durable journals, backups, receipts, UUID idempotency, cross-instance locks,
+and restart reconciliation retain `recoveryRequired` whenever rollback cannot
+be proven.
+
 Before Fastify reports ready, the application runs this reconciliation exactly
 once. The read-only recovery route reports `pending`, `reconciling`, `ready`,
 `recovery-required`, or `unavailable` without returning paths or adapter error
@@ -427,6 +545,58 @@ fixed content type/disposition/length plus the archive SHA-256. The Web
 workspace verifies the response and offers the package as a download. It does
 not redistribute DSP or third-party mod bytes and is still not an automatic
 installer. `MOD-004` is therefore `implemented`, not production-verified.
+
+### Production-qualified V2 delivery
+
+The V1 generator remains useful for planning and deterministic public metadata,
+but it can never claim that a real client joined the real server. Production
+delivery therefore uses a separate V2 request whose exact body is only:
+
+```json
+{"schemaVersion":2,"qualificationId":"10000000-0000-0000-0000-000000000001"}
+```
+
+The identifier in this fictional example is not production evidence. The
+server resolves it only inside protected, fixed Windows roots and independently
+rehashes the qualification document, four collector receipts, candidate
+binaries, client package, compatibility policy, server lock, and client-parity
+manifest. It also verifies the hostname-preserving `wss` contract on port 443,
+the `/socket` upgrade, the real external join/save/disconnect/reconnect chain,
+and PassWall-bypass observations. Caller-supplied paths, keys, receipt IDs,
+digests, authority, decision fields, and arbitrary qualification payloads are
+not accepted.
+
+`POST /api/v2/client-profile/issue` first verifies the protected record, then
+atomically consumes its replay claim, builds the profile artifacts, and
+persists one opaque download object. Repeating the same qualification and
+binding returns the same object; reusing a receipt or nonce across another
+binding fails closed. The JSON response contains no archive bytes or protected
+filesystem paths. It exposes only the persisted download identifier, public
+qualification projection, profile metadata, artifact sizes/digests, and receipt
+digest.
+
+The authenticated downloads are deliberately separate:
+
+```text
+GET /api/v2/client-profile/archive/{downloadId}
+GET /api/v2/client-profile/client/{downloadId}
+GET /api/v2/client-profile/runtime/{downloadId}
+```
+
+They return, respectively, the deterministic profile ZIP, the independently
+verified qualified Nebula client payload, and the canonical runtime binding
+manifest. Every read reopens and validates the persisted object, rehashes the
+bytes at the HTTP boundary, and returns fixed filename, media type, size,
+`X-Dyson-Content-SHA256`, `Cache-Control: no-store`, and
+`X-Content-Type-Options: nosniff`. The Web workspace binds those headers back
+to the signed issue metadata before offering the download. Profile, runtime,
+and client payload limits are 512 MiB, 4 MiB, and 1 GiB respectively.
+
+The production-qualified panel accepts only a canonical lowercase UUID. It
+never invents an example qualification, scans a workstation, or falls back to
+V1 after V2 rejection. When the protected service is disabled, both API and UI
+remain visible but fail closed; enabling it requires the complete Windows root
+and authority configuration described in `CONFIGURATION.md`.
 
 ## Verification still required
 

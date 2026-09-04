@@ -5,7 +5,10 @@ using System.Linq;
 using System.Text;
 using NebulaAPI;
 using NebulaAPI.GameState;
+using NebulaAPI.Networking;
+using NebulaModel.DataStructures.Chat;
 using NebulaModel.Networking;
+using NebulaModel.Packets.Chat;
 
 namespace DysonControl.Bridge
 {
@@ -18,6 +21,7 @@ namespace DysonControl.Bridge
         private const long PublishIntervalMilliseconds = 2000;
         private readonly object gate = new object();
         private readonly BridgeFileStore store;
+        private readonly NebulaNoticeRuntimeState noticeRuntimeState;
         private readonly Dictionary<ushort, RosterEntry> roster = new Dictionary<ushort, RosterEntry>();
         private string sessionId = Guid.NewGuid().ToString("D").ToLowerInvariant();
         private long nextPublishUnixMs;
@@ -25,11 +29,19 @@ namespace DysonControl.Bridge
         private long sequence;
         private bool dirty = true;
         private bool sessionActive;
+        private bool authoritativeAvailable;
         private bool disposed;
 
-        internal PlayerRosterPublisher(BridgeFileStore store)
+        internal PlayerRosterPublisher(
+            BridgeFileStore store,
+            NebulaNoticeRuntimeState noticeRuntimeState)
         {
             this.store = store ?? throw new ArgumentNullException(nameof(store));
+            if (!NebulaNoticeRuntimeCompatibility.IsKnownState(noticeRuntimeState))
+            {
+                throw new ArgumentOutOfRangeException(nameof(noticeRuntimeState));
+            }
+            this.noticeRuntimeState = noticeRuntimeState;
             NebulaModAPI.OnMultiplayerGameStarted += OnMultiplayerGameStarted;
             NebulaModAPI.OnMultiplayerGameEnded += OnMultiplayerGameEnded;
             NebulaModAPI.OnPlayerJoinedGame += OnPlayerJoinedGame;
@@ -61,6 +73,81 @@ namespace DysonControl.Bridge
             PublishAuthoritativeSnapshot(nowUnixMs);
         }
 
+        /// <summary>
+        /// Called only from the plugin Update loop. Identity is re-resolved against Nebula's live Connected
+        /// collection immediately before dispatch, so a recycled ushort ID or reconnected player fails closed.
+        /// </summary>
+        internal bool TryDispatchNotice(PlayerNoticeRequest request, out string errorCode)
+        {
+            errorCode = "NOTICE_DISPATCH_FAILED";
+            if (!NebulaNoticeRuntimeCompatibility.ActionsEnabled(noticeRuntimeState))
+            {
+                errorCode = NebulaNoticeRuntimeCompatibility.UnverifiedReasonCode;
+                return false;
+            }
+            if (request == null || !PlayerNoticeProtocol.TryResolveTemplate(request.TemplateId, out var message))
+            {
+                errorCode = "NOTICE_TEMPLATE_INVALID";
+                return false;
+            }
+            var session = NebulaModAPI.MultiplayerSession;
+            if (!NebulaModAPI.IsMultiplayerActive || session == null || !session.IsDedicated ||
+                !session.IsServer || !session.IsGameLoaded || !(session.Network is IServer server))
+            {
+                errorCode = "DEDICATED_SERVER_NOT_READY";
+                return false;
+            }
+
+            RosterEntry binding;
+            lock (gate)
+            {
+                if (!sessionActive || !authoritativeAvailable ||
+                    !string.Equals(sessionId, request.RosterSessionId, StringComparison.Ordinal) ||
+                    request.RosterSequence > sequence)
+                {
+                    errorCode = "STALE_ROSTER_GENERATION";
+                    return false;
+                }
+                binding = roster.Values.FirstOrDefault(entry =>
+                    string.Equals(entry.SessionPlayerId, request.SessionPlayerId, StringComparison.Ordinal));
+                if (binding == null || binding.JoinedAtUnixMs != request.TargetJoinedAtUnixMs)
+                {
+                    errorCode = "STALE_PLAYER_SESSION";
+                    return false;
+                }
+            }
+
+            var player = server.Players.Connected.Values.FirstOrDefault(candidate =>
+                candidate != null && ReferenceEquals(candidate.Connection, binding.Connection));
+            if (player == null ||
+                binding.Connection == null ||
+                player.Data == null || !ReferenceEquals(player.Data, binding.Data) ||
+                player.Connection == null || !ReferenceEquals(player.Connection, binding.Connection) ||
+                !player.Connection.IsAlive)
+            {
+                errorCode = "STALE_PLAYER_SESSION";
+                return false;
+            }
+
+            try
+            {
+                player.SendPacket(new NewChatMessagePacket(
+                    ChatMessageType.SystemWarnMessage,
+                    message,
+                    DateTime.Now,
+                    string.Empty));
+                errorCode = "NONE";
+                return true;
+            }
+            catch
+            {
+                // SendPacket is void and has no acknowledgement. An exception does not prove whether bytes
+                // were queued, so the caller emits an uncertain receipt and never retries automatically.
+                errorCode = "NOTICE_DISPATCH_UNCERTAIN";
+                return false;
+            }
+        }
+
         public void Dispose()
         {
             if (disposed)
@@ -83,6 +170,7 @@ namespace DysonControl.Bridge
                 nextPlayerOrdinal = 0;
                 roster.Clear();
                 sessionActive = true;
+                authoritativeAvailable = false;
                 dirty = true;
             }
         }
@@ -92,6 +180,7 @@ namespace DysonControl.Bridge
             lock (gate)
             {
                 sessionActive = false;
+                authoritativeAvailable = false;
                 roster.Clear();
                 dirty = true;
             }
@@ -106,7 +195,7 @@ namespace DysonControl.Bridge
             var nowUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             lock (gate)
             {
-                Upsert(playerData, nowUnixMs, true);
+                Upsert(playerData, null, nowUnixMs, true);
                 dirty = true;
             }
         }
@@ -174,30 +263,52 @@ namespace DysonControl.Bridge
                     }
                     foreach (var playerData in authoritative)
                     {
-                        Upsert(playerData, nowUnixMs, false);
+                        var connectedPlayer = server.Players.Connected.Values.FirstOrDefault(player =>
+                            player != null && ReferenceEquals(player.Data, playerData));
+                        Upsert(playerData, connectedPlayer?.Connection, nowUnixMs, false);
                     }
 
                     publicRows = authoritative.Select(playerData => ToPublicEntry(roster[playerData.PlayerId]))
                         .OrderBy(player => player.SessionPlayerId, StringComparer.Ordinal)
                         .ToList();
+                    authoritativeAvailable = true;
                 }
                 WriteSnapshot(nowUnixMs, "active", truncated, publicRows);
             }
             catch
             {
                 // A collection/read compatibility failure must never publish stale players as current.
+                lock (gate)
+                {
+                    authoritativeAvailable = false;
+                }
                 WriteSnapshot(nowUnixMs, "unavailable", false, Array.Empty<BridgePlayerEntry>());
             }
         }
 
-        private void Upsert(IPlayerData playerData, long nowUnixMs, bool forceNewConnection)
+        private void Upsert(
+            IPlayerData playerData,
+            INebulaConnection connection,
+            long nowUnixMs,
+            bool forceNewConnection)
         {
             if (roster.TryGetValue(playerData.PlayerId, out var existing) && !forceNewConnection)
             {
-                existing.Data = playerData;
-                return;
+                if (existing.Connection != null && connection != null &&
+                    !ReferenceEquals(existing.Connection, connection))
+                {
+                    forceNewConnection = true;
+                }
+                else
+                {
+                    existing.Data = playerData;
+                    if (connection != null)
+                    {
+                        existing.Connection = connection;
+                    }
+                    return;
+                }
             }
-
             nextPlayerOrdinal++;
             if (nextPlayerOrdinal > 999999999999L)
             {
@@ -206,6 +317,7 @@ namespace DysonControl.Bridge
             roster[playerData.PlayerId] = new RosterEntry
             {
                 Data = playerData,
+                Connection = connection,
                 JoinedAtUnixMs = nowUnixMs,
                 SessionPlayerId = "player-" + nextPlayerOrdinal.ToString("D6", CultureInfo.InvariantCulture)
             };
@@ -234,7 +346,8 @@ namespace DysonControl.Bridge
             store.WritePlayerCapabilities(new BridgePlayerCapabilitySnapshot
             {
                 SessionId = snapshot.SessionId,
-                WrittenAtUnixMs = snapshot.WrittenAtUnixMs
+                WrittenAtUnixMs = snapshot.WrittenAtUnixMs,
+                NoticeRuntimeState = noticeRuntimeState
             });
             store.WritePlayerSnapshot(snapshot);
         }
@@ -254,6 +367,7 @@ namespace DysonControl.Bridge
         private sealed class RosterEntry
         {
             internal IPlayerData Data { get; set; }
+            internal INebulaConnection Connection { get; set; }
             internal string SessionPlayerId { get; set; }
             internal long JoinedAtUnixMs { get; set; }
         }

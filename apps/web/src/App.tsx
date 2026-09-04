@@ -5,7 +5,7 @@ import {
 import {
   Activity, Archive, Boxes, Check, ChevronDown, CircleUserRound, ClipboardList,
   CircleMinus, CircleX, CloudDownload, Code2, Copy, Cpu, Database, Download, FileCog, FolderArchive,
-  FileJson, Gamepad2, Gauge, HardDrive, History, Home, Menu, MemoryStick, PackageCheck, Play,
+  FileJson, Gamepad2, Gauge, GitBranch, HardDrive, History, Home, Menu, MemoryStick, PackageCheck, Play,
   LockKeyhole, PlugZap, RefreshCw, RotateCw, Save, ScanSearch, Server, Settings2,
   ShieldCheck, Square, TerminalSquare, TriangleAlert, Undo2, Users, Wrench
 } from 'lucide-react'
@@ -16,6 +16,11 @@ import { ObservabilityQualificationPanel } from './ObservabilityQualificationPan
 import { VersionUpdateWorkspace } from './VersionUpdateWorkspace'
 import { ConfigHistoryWorkspace } from './ConfigHistoryWorkspace'
 import { ModSupplyWorkspace } from './ModSupplyWorkspace'
+import { QualifiedClientIssuePanel } from './QualifiedClientIssuePanel'
+import { PlayerNoticeWorkspace } from './PlayerNoticeWorkspace'
+import { PersistedSaveRecoveryLookup } from './PersistedSaveRecoveryLookup'
+import { SaveRecoveryPanel } from './SaveRecoveryPanel'
+import { SAVE_JOB_RECONCILE_CONFIRMATION } from './save-reconcile-contract'
 import type {
   BackupCatalogItem, GameConfigEntry, GameConfigFileId, GameConfigPreview, GameConfigSnapshot,
   GameConfigTransactionResult,
@@ -23,9 +28,11 @@ import type {
   JobRecord, LifecycleAction, LifecycleCheckId, LifecycleCheckStatus,
   LifecycleExecutionPhase, LifecycleExecutionResult, LifecyclePreview, NavKey,
   ClientProfileArchiveDownload, GeneratedClientProfile,
-  ModDeploymentOperation, ModDeploymentPreview, ModDeploymentReceipt,
+  ModDeploymentOperation, ModDeploymentPreview, ModDeploymentReceipt, ModDeploymentReceiptHistoryPage,
   ModDeploymentRecoveryDesired, ModDeploymentRecoveryPlan, ModDeploymentRecoveryStatus,
   ModDeploymentRequest, ModDeploymentStateSummary, ModServerLockEntry,
+  ManagedModConfigurationInspection, ManagedModConfigurationPreview, ManagedModConfigurationReceipt,
+  ManagedModConfigurationRequest, ManagedModConfigurationSchema,
   LateGameQualificationReport, ObservabilityQualificationEnvelope,
   NumericMetricAggregate, ObservabilityDownsamplePoint, ObservabilityDownsampleResult,
   ObservabilityAlertProjection, ObservabilityHealthStatus, ObservabilityHintCode, ObservabilityMetric,
@@ -46,6 +53,14 @@ const ObservabilityAlertPanel = lazy(async () => {
   const module = await import('./ObservabilityAlertPanel')
   return { default: module.ObservabilityAlertPanel }
 })
+const CutoverWorkspace = lazy(async () => {
+  const module = await import('./CutoverWorkspace')
+  return { default: module.CutoverWorkspace }
+})
+const TasksAuditWorkspace = lazy(async () => {
+  const module = await import('./TasksAuditWorkspace')
+  return { default: module.TasksAuditWorkspace }
+})
 
 const navGroups: Array<{ label: string; items: Array<{ key: NavKey; label: string; icon: ComponentType<{ size?: number }> }> }> = [
   { label: '运营', items: [
@@ -63,6 +78,7 @@ const navGroups: Array<{ label: string; items: Array<{ key: NavKey; label: strin
   { label: '系统', items: [
     { key: 'server', label: '服务器管理', icon: Server },
     { key: 'config', label: '配置管理', icon: FileCog },
+    { key: 'cutover', label: '权威切换', icon: GitBranch },
     { key: 'tasks', label: '任务与审计', icon: ClipboardList }
   ] }
 ]
@@ -175,19 +191,24 @@ function ControlShell({ user, onLogout }: { user: SessionUser; onLogout: () => v
   function selectPage(key: NavKey) {
     setActive(key)
     setMobileNavOpen(false)
+    document.documentElement.scrollTop = 0
+    document.body.scrollTop = 0
   }
 
   function openLifecycleWorkflow(action: LifecycleAction) {
     setLifecycleIntent(action)
     setActive('game')
     setMobileNavOpen(false)
+    document.documentElement.scrollTop = 0
+    document.body.scrollTop = 0
   }
 
   return (
     <div className="control-app">
       <TopBar provider={provider} environment={environment} user={user} onLogout={logout}
+        status={status}
         mobileNavOpen={mobileNavOpen} onToggleMobileNav={() => setMobileNavOpen((open) => !open)} />
-      <Sidebar active={active} onSelect={selectPage} mobileOpen={mobileNavOpen} />
+      <Sidebar active={active} onSelect={selectPage} mobileOpen={mobileNavOpen} provider={provider} status={status} />
       {mobileNavOpen && <button className="mobile-nav-backdrop" aria-label="关闭导航" onClick={() => setMobileNavOpen(false)} />}
       <main className="workspace">
         {error && <div className="error-banner"><span>{error}</span><button onClick={() => setError('')}>关闭</button></div>}
@@ -195,7 +216,9 @@ function ControlShell({ user, onLogout }: { user: SessionUser; onLogout: () => v
         {!status ? <div className="loading-state"><span className="spinner" />正在读取服务器状态…</div> :
           active === 'overview'
             ? <Overview status={status} jobs={jobs} refreshing={refreshing} onRefresh={refresh}
-                onLifecycleAction={openLifecycleWorkflow} provider={provider} user={user} />
+              onLifecycleAction={openLifecycleWorkflow} onOpenTasks={() => selectPage('tasks')}
+                onOpenSaves={() => selectPage('saves')}
+                provider={provider} user={user} />
             : <FeatureWorkspace active={active} status={status} jobs={jobs} onRefresh={refresh}
                 provider={provider} lifecycleIntent={lifecycleIntent} user={user} />}
       </main>
@@ -203,8 +226,9 @@ function ControlShell({ user, onLogout }: { user: SessionUser; onLogout: () => v
   )
 }
 
-export function TopBar({ provider, environment, user, onLogout, mobileNavOpen, onToggleMobileNav }: {
+export function TopBar({ provider, environment, status, user, onLogout, mobileNavOpen, onToggleMobileNav }: {
   provider: 'demo' | 'windows'; environment: 'development' | 'test' | 'production'
+  status?: Pick<ServerStatus, 'serverName'> | null
   user: SessionUser; onLogout: () => void; mobileNavOpen: boolean; onToggleMobileNav: () => void
 }) {
   const environmentLabel = provider === 'demo'
@@ -217,7 +241,7 @@ export function TopBar({ provider, environment, user, onLogout, mobileNavOpen, o
       <button className="mobile-nav-button" aria-label={mobileNavOpen ? '关闭导航' : '打开导航'}
         aria-expanded={mobileNavOpen} onClick={onToggleMobileNav}><Menu size={21} /></button>
       <div className="brand"><OrbitMark /><div><strong>Dyson Server Console</strong><span>自托管 DSP 多人服务器控制台</span></div></div>
-      <div className="context-item"><span>实例名称</span><strong>DSP 主服务器 <i className="online-dot" /></strong></div>
+      <div className="context-item"><span>实例名称</span><strong>{status?.serverName ?? (provider === 'demo' ? '演示实例' : '正在读取实例')} <i className="online-dot" /></strong></div>
       <div className="context-item"><span>环境</span><strong>{environmentLabel} <ChevronDown size={14} /></strong></div>
       <div className="context-item address"><span>连接地址</span><strong>{provider === 'demo' ? 'dsp.example.com:8469' : '由部署配置提供'} <Copy size={14} /></strong></div>
       <button className="user-menu" onClick={onLogout} title={`退出登录 · ${roleLabel(user.role)}`}><CircleUserRound size={20} /><span><strong>{user.name}</strong><small>{roleLabel(user.role)}</small></span><ChevronDown size={14} /></button>
@@ -232,7 +256,10 @@ function RoleAccessRail({ user }: { user: SessionUser }) {
       : '已显示管理员级高风险操作；每次请求仍由服务端重新授权。'}</small></span><em>前端提示不是安全边界</em></div>
 }
 
-function Sidebar({ active, onSelect, mobileOpen }: { active: NavKey; onSelect: (key: NavKey) => void; mobileOpen: boolean }) {
+function Sidebar({ active, onSelect, mobileOpen, provider, status }: {
+  active: NavKey; onSelect: (key: NavKey) => void; mobileOpen: boolean
+  provider: 'demo' | 'windows'; status: Pick<ServerStatus, 'serverName'> | null
+}) {
   return (
     <aside className={`sidebar${mobileOpen ? ' mobile-open' : ''}`}>
       <nav aria-label="主要导航">
@@ -245,16 +272,17 @@ function Sidebar({ active, onSelect, mobileOpen }: { active: NavKey; onSelect: (
         </div>)}
       </nav>
       <div className="instance-card">
-        <dl><div><dt>实例 ID</dt><dd>dsp-demo-01</dd></div><div><dt>运行方式</dt><dd>Windows Agent</dd></div><div><dt>控制面版本</dt><dd>0.1.0</dd></div></dl>
-        <span>独立控制平面 · 安全模式</span>
+        <dl><div><dt>实例</dt><dd>{status?.serverName ?? '正在读取'}</dd></div><div><dt>状态来源</dt><dd>{provider === 'demo' ? 'Demo Provider' : 'Windows Provider'}</dd></div><div><dt>版本来源</dt><dd>发布清单</dd></div></dl>
+        <span>独立控制平面 · 运行身份由部署状态提供</span>
       </div>
     </aside>
   )
 }
 
-function Overview({ status, jobs, refreshing, onRefresh, onLifecycleAction, provider, user }: {
+function Overview({ status, jobs, refreshing, onRefresh, onLifecycleAction, onOpenTasks, onOpenSaves, provider, user }: {
   status: ServerStatus; jobs: JobRecord[]; refreshing: boolean; onRefresh: () => void
-  onLifecycleAction: (action: LifecycleAction) => void; provider: 'demo' | 'windows'; user: SessionUser
+  onLifecycleAction: (action: LifecycleAction) => void; onOpenTasks: () => void; onOpenSaves: () => void
+  provider: 'demo' | 'windows'; user: SessionUser
 }) {
   return (
     <div className="overview page-enter">
@@ -266,19 +294,19 @@ function Overview({ status, jobs, refreshing, onRefresh, onLifecycleAction, prov
       </div>
       <StatusStrip status={status} />
       <div className="metrics-grid">
-        <Metric title="CPU" value={status.runtime.processCoresUsed === null ? '—' : `${status.runtime.processCoresUsed.toFixed(1)} 核`} sub="进程平均占用" color="cyan" points="2,40 14,33 27,36 39,25 52,31 65,24 78,28 91,20 104,26 118,18" />
-        <Metric title="内存" value={status.runtime.privateMemoryGiB === null ? '—' : `${status.runtime.privateMemoryGiB} GB`} sub="DSP 私有内存" color="cyan" kind="bars" points="2,38 14,37 27,36 39,36 52,35 65,35 78,34 91,34 104,33 118,33" />
-        <Metric title="目标 UPS" value={status.runtime.targetUps?.toString() ?? '—'} sub="配置目标 · 非实测值" color="green" points="2,24 14,24 27,24 39,24 52,24 65,24 78,24 91,24 104,24 118,24" />
-        <Metric title="线程" value={status.runtime.threadCount?.toString() ?? '—'} sub="DSP 活跃线程" color="amber" points="2,34 14,28 27,32 39,22 52,30 65,25 78,31 91,23 104,29 118,26" />
-        <Metric title="进程" value={status.runtime.processId ? `PID ${status.runtime.processId}` : '未运行'} sub={status.state === 'running' ? `${status.runtime.priority ?? '默认'} 优先级` : '等待启动'} color="blue" points="2,38 14,32 27,34 39,27 52,30 65,23 78,27 91,20 104,25 118,19" />
+        <Metric title="CPU" value={status.runtime.processCoresUsed === null ? '—' : `${status.runtime.processCoresUsed.toFixed(1)} 核`} sub="进程平均占用" color="cyan" points={provider === 'demo' ? '2,40 14,33 27,36 39,25 52,31 65,24 78,28 91,20 104,26 118,18' : undefined} />
+        <Metric title="内存" value={status.runtime.privateMemoryGiB === null ? '—' : `${status.runtime.privateMemoryGiB} GB`} sub="DSP 私有内存" color="cyan" kind="bars" points={provider === 'demo' ? '2,38 14,37 27,36 39,36 52,35 65,35 78,34 91,34 104,33 118,33' : undefined} />
+        <Metric title="目标 UPS" value={status.runtime.targetUps?.toString() ?? '—'} sub="配置目标 · 非实测值" color="green" points={provider === 'demo' ? '2,24 14,24 27,24 39,24 52,24 65,24 78,24 91,24 104,24 118,24' : undefined} />
+        <Metric title="线程" value={status.runtime.threadCount?.toString() ?? '—'} sub="DSP 活跃线程" color="amber" points={provider === 'demo' ? '2,34 14,28 27,32 39,22 52,30 65,25 78,31 91,23 104,29 118,26' : undefined} />
+        <Metric title="进程" value={status.runtime.processId ? `PID ${status.runtime.processId}` : '未运行'} sub={status.state === 'running' ? `${status.runtime.priority ?? '默认'} 优先级` : '等待启动'} color="blue" points={provider === 'demo' ? '2,38 14,32 27,34 39,27 52,30 65,23 78,27 91,20 104,25 118,19' : undefined} />
       </div>
       <div className="operations-row">
         <ConsoleLogPanel demo={provider === 'demo'} canExport={hasPermission(user, 'console.export')} />
         <DeploymentPanel status={status} onRefresh={onRefresh} canRefresh={hasPermission(user, 'status.refresh')} />
       </div>
       <div className="bottom-row">
-        <TaskTable jobs={jobs} />
-        <SavePanel status={status} />
+        <TaskTable jobs={jobs} onOpenTasks={onOpenTasks} />
+        <SavePanel status={status} onOpenSaves={onOpenSaves} canBackup={hasPermission(user, 'saves.backup')} />
       </div>
     </div>
   )
@@ -329,13 +357,13 @@ function StatusStrip({ status }: { status: ServerStatus }) {
     <div className="status-item" key={label}><Icon size={19} /><span>{label}<strong className={tone}>{value}</strong><small>{sub}</small></span></div>)}</section>
 }
 
-function Metric({ title, value, sub, color, points, kind = 'area' }: { title: string; value: string; sub: string; color: string; points: string; kind?: 'area' | 'bars' }) {
+export function Metric({ title, value, sub, color, points, kind = 'area' }: { title: string; value: string; sub: string; color: string; points?: string; kind?: 'area' | 'bars' }) {
   const fillId = `metric-fill-${useId().replace(/:/g, '')}`
-  const coordinates = points.split(' ').map((point) => point.split(',').map(Number))
+  const coordinates = points?.split(' ').map((point) => point.split(',').map(Number)) ?? []
   const [lastX, lastY] = coordinates.at(-1) ?? [118, 24]
   const chartColor = ({ cyan: '#11d7ff', green: '#45e47b', amber: '#f1b83a', blue: '#168de8' } as const)[color as 'cyan' | 'green' | 'amber' | 'blue'] ?? '#11d7ff'
   return <section className="metric"><div className="metric-head"><strong>{title}</strong><span>{value}</span></div>
-    <svg className="metric-chart" viewBox="0 0 120 48" preserveAspectRatio="none" aria-hidden="true" style={{ color: chartColor }}>
+    {points ? <svg className="metric-chart" viewBox="0 0 120 48" preserveAspectRatio="none" aria-hidden="true" style={{ color: chartColor }}>
       <defs><linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="currentColor" stopOpacity=".34" /><stop offset="1" stopColor="currentColor" stopOpacity=".035" /></linearGradient></defs>
       <g className="metric-chart-grid"><path d="M0 12H120M0 24H120M0 36H120" /><path d="M30 0V48M60 0V48M90 0V48" /></g>
       {kind === 'bars'
@@ -346,7 +374,7 @@ function Metric({ title, value, sub, color, points, kind = 'area' }: { title: st
         : <><polygon className="metric-area" points={`${points} 118,48 2,48`} fill={`url(#${fillId})`} />
           <polyline className="metric-line" points={points} />
           <circle className="metric-node" cx={lastX} cy={lastY} r="2.1" /></>}
-    </svg><small>{sub}</small></section>
+    </svg> : <div className="metric-chart-unavailable" aria-label="当前仅有单点快照">当前快照 · 暂无历史趋势</div>}<small>{sub}</small></section>
 }
 
 const demoLogs = [
@@ -361,7 +389,11 @@ const demoLogs = [
 
 function ConsoleLogPanel({ demo, canExport }: { demo: boolean; canExport: boolean }) {
   const [entries, setEntries] = useState<StructuredLogEntry[]>([])
+  const [demoCleared, setDemoCleared] = useState(false)
   const [level, setLevel] = useState<'all' | StructuredLogLevel>('all')
+  const [source, setSource] = useState('')
+  const [fromLocal, setFromLocal] = useState('')
+  const [toLocal, setToLocal] = useState('')
   const [search, setSearch] = useState('')
   const [autoScroll, setAutoScroll] = useState(true)
   const [state, setState] = useState<'connecting' | 'live' | 'error'>(demo ? 'live' : 'connecting')
@@ -370,10 +402,17 @@ function ConsoleLogPanel({ demo, canExport }: { demo: boolean; canExport: boolea
   const cursor = useRef<string | null>(null)
   const viewport = useRef<HTMLDivElement | null>(null)
   const normalizedSearch = search.trim()
+  const normalizedSource = source.trim()
+  const from = localDateTimeToIso(fromLocal)
+  const to = localDateTimeToIso(toLocal)
+  const invalidTimeRange = Boolean(from && to && from > to)
   const filters = useMemo<StructuredLogFilters>(() => ({
     ...(level === 'all' ? {} : { levels: [level] }),
+    ...(normalizedSource ? { source: normalizedSource } : {}),
+    ...(from ? { from } : {}),
+    ...(to ? { to } : {}),
     ...(normalizedSearch ? { text: normalizedSearch } : {})
-  }), [level, normalizedSearch])
+  }), [from, level, normalizedSearch, normalizedSource, to])
 
   useEffect(() => {
     if (demo) return
@@ -381,6 +420,11 @@ function ConsoleLogPanel({ demo, canExport }: { demo: boolean; canExport: boolea
     let timer = 0
     cursor.current = null
     setEntries([])
+    if (invalidTimeRange) {
+      setState('error')
+      setMessage('开始时间不能晚于结束时间')
+      return
+    }
     setState('connecting')
     setMessage('正在连接脱敏日志流…')
 
@@ -410,14 +454,14 @@ function ConsoleLogPanel({ demo, canExport }: { demo: boolean; canExport: boolea
     }
     timer = window.setTimeout(poll, 300)
     return () => { cancelled = true; window.clearTimeout(timer) }
-  }, [demo, filters])
+  }, [demo, filters, invalidTimeRange])
 
   useEffect(() => {
     if (autoScroll && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight
   }, [autoScroll, entries])
 
   async function download() {
-    if (!canExport) return
+    if (!canExport || invalidTimeRange) return
     setDownloading(true)
     try {
       const result = await api.downloadConsole(filters)
@@ -431,19 +475,32 @@ function ConsoleLogPanel({ demo, canExport }: { demo: boolean; canExport: boolea
     } finally { setDownloading(false) }
   }
 
-  const display = demo ? demoLogs.map(([time, demoLevel, source, text], index) => ({
+  const display = demo ? (demoCleared ? [] : demoLogs.map(([time, demoLevel, entrySource, text], index) => ({
     schemaVersion: 1 as const, id: `demo-${index}`, timestamp: `2026-08-30T${time}Z`,
     level: demoLevel === 'WARN' ? 'warning' as const : 'info' as const,
-    source, text, lineTruncated: false
-  })) : entries
+    source: entrySource, text, lineTruncated: false
+  })).filter((entry) => (
+    (level === 'all' || entry.level === level)
+    && (!normalizedSource || entry.source.toLocaleLowerCase('en-US').includes(normalizedSource.toLocaleLowerCase('en-US')))
+    && (!from || entry.timestamp >= from)
+    && (!to || entry.timestamp <= to)
+    && (!normalizedSearch || entry.text.toLocaleLowerCase('en-US').includes(normalizedSearch.toLocaleLowerCase('en-US')))
+  ))) : entries
 
-  return <section className="panel console-panel"><header><h2>实时服务器控制台</h2><div className="console-tools"><select aria-label="日志级别" value={level} onChange={(event) => setLevel(event.target.value as 'all' | StructuredLogLevel)}><option value="all">全部级别</option><option value="info">信息</option><option value="warning">警告</option><option value="error">错误</option><option value="fatal">严重</option><option value="debug">调试</option></select><input aria-label="搜索日志" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索脱敏日志…" /><label><input type="checkbox" checked={autoScroll} onChange={(event) => setAutoScroll(event.target.checked)} />自动滚动</label><button onClick={() => setEntries([])}>清屏</button><button onClick={download} disabled={demo || downloading || !canExport} title={demo ? '演示环境不生成下载' : canExport ? '下载结构化脱敏日志' : '当前角色没有日志导出权限'}><Download size={14} />{downloading ? '导出中' : '导出'}</button></div></header>
+  return <section className="panel console-panel"><header><h2>实时服务器控制台</h2><div className="console-tools"><select aria-label="日志级别" value={level} onChange={(event) => setLevel(event.target.value as 'all' | StructuredLogLevel)}><option value="all">全部级别</option><option value="info">信息</option><option value="warning">警告</option><option value="error">错误</option><option value="fatal">严重</option><option value="debug">调试</option></select><input aria-label="搜索日志" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索脱敏日志…" /><label><input type="checkbox" checked={autoScroll} onChange={(event) => setAutoScroll(event.target.checked)} />自动滚动</label><button onClick={() => demo ? setDemoCleared(true) : setEntries([])}>清屏</button><button onClick={download} disabled={demo || downloading || !canExport || invalidTimeRange} title={demo ? '演示环境不生成下载' : canExport ? '下载结构化脱敏日志' : '当前角色没有日志导出权限'}><Download size={14} />{downloading ? '导出中' : '导出'}</button></div></header>
+    <div className="console-filter-row"><label>来源<input aria-label="日志来源" value={source} onChange={(event) => setSource(event.target.value)} placeholder="例如 Nebula" /></label><label>开始时间<input aria-label="日志开始时间" type="datetime-local" value={fromLocal} onChange={(event) => setFromLocal(event.target.value)} /></label><label>结束时间<input aria-label="日志结束时间" type="datetime-local" value={toLocal} onChange={(event) => setToLocal(event.target.value)} /></label><button type="button" onClick={() => { setSource(''); setFromLocal(''); setToLocal('') }}>清除范围</button>{invalidTimeRange && <span role="alert">开始时间不能晚于结束时间</span>}</div>
     <div className={`console-stream-state ${state}`}><span />{message}</div>
     <div ref={viewport} className="console-body" aria-label={demo ? '演示控制台日志' : '结构化脱敏控制台日志'}>{display.length
       ? display.map((entry) => <div className="console-line" key={entry.id}><time>{formatLogTime(entry.timestamp)}</time><b className={consoleLevelClass(entry.level)}>[{entry.level.toUpperCase()}]</b><em>[{entry.source}]</em><span>{entry.text}{entry.lineTruncated ? ' … [行已截断]' : ''}</span></div>)
       : <div className="console-empty"><b className="info">[STREAM]</b><em>[Console]</em>{state === 'live' ? '当前筛选条件暂无新事件。' : message}</div>}</div>
     <div className="console-fixed-boundary"><LockKeyhole size={14} />不接受任意文本命令；服务器动作只能从固定动作控制区发起。</div>
   </section>
+}
+
+function localDateTimeToIso(value: string): string | undefined {
+  if (!value) return undefined
+  const milliseconds = Date.parse(value)
+  return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : undefined
 }
 
 const consoleCommandDefinitions: Array<{
@@ -578,19 +635,21 @@ function DeploymentPanel({ status, onRefresh, canRefresh }: {
   </section>
 }
 
-function TaskTable({ jobs }: { jobs: JobRecord[] }) {
+function TaskTable({ jobs, onOpenTasks }: { jobs: JobRecord[]; onOpenTasks: () => void }) {
   return <section className="panel tasks-panel"><header><h2>任务与活动（最近 24 小时）</h2></header>
     <div className="table-wrap"><table><thead><tr><th>时间</th><th>任务</th><th>状态</th><th>耗时</th><th>触发者</th></tr></thead>
       <tbody>{jobs.length ? jobs.slice(0, 6).map((job) => <tr key={job.id}><td>{new Date(job.createdAt).toLocaleTimeString('zh-CN')}</td><td>{job.summary}</td><td><span className={`job-state ${job.state}`}>{job.state === 'succeeded' ? '成功' : job.state === 'failed' ? '失败' : job.state === 'running' ? '运行中' : '排队中'}</span></td><td>{formatDuration(job.durationMs)}</td><td>{job.actor}</td></tr>) : <tr><td colSpan={5} className="empty-cell">点击右上角刷新后，任务会在这里留下审计记录。</td></tr>}</tbody></table></div>
-    <button className="text-link">查看全部任务与审计日志</button>
+    <button className="text-link" onClick={onOpenTasks}>查看全部任务与审计日志</button>
   </section>
 }
 
-function SavePanel({ status }: { status: ServerStatus }) {
+export function SavePanel({ status, onOpenSaves, canBackup }: {
+  status: Pick<ServerStatus, 'save'>; onOpenSaves: () => void; canBackup: boolean
+}) {
   return <section className="panel save-panel"><header><h2>存档与备份状态</h2></header>
     <div className="save-columns"><div><span>当前存档</span><strong>{status.save.name ?? '未发现'}</strong><dl><div><dt>配对状态</dt><dd>{status.save.dsvPresent ? '.dsv' : '缺少 .dsv'} + {status.save.serverPresent ? '.server' : '缺少 .server'}</dd></div><div><dt>最后保存</dt><dd>{relativeTime(status.save.lastSavedAt)} · {status.save.dsvSizeMiB === null ? '大小未知' : `${status.save.dsvSizeMiB} MiB`}</dd></div></dl></div>
       <div><span>完整性</span><strong className={status.save.consistent ? 'green' : 'amber'}>{status.save.consistent ? '已成对验证' : '需要处理'}</strong><dl><div><dt>最近备份</dt><dd>{status.save.backupPairPresent && status.save.backupManifestPresent ? relativeTime(status.save.latestBackupAt) : '尚无完整清单'}</dd></div><div><dt>恢复权限</dt><dd>当前锁定</dd></div></dl></div></div>
-    <div className="save-actions"><button><FolderArchive size={17} />管理存档</button><button disabled><Database size={17} />立即备份</button></div>
+    <div className="save-actions"><button onClick={onOpenSaves}><FolderArchive size={17} />管理存档</button><button onClick={onOpenSaves} disabled={!canBackup} title={canBackup ? '进入备份预演与确认' : '当前角色没有备份权限'}><Database size={17} />进入备份预演</button></div>
   </section>
 }
 
@@ -605,8 +664,8 @@ interface PendingSaveTransaction {
   executionEnabled: boolean
 }
 
-function SaveCatalogWorkspace({ status, canBackup, canRestore, user }: {
-  status: ServerStatus; canBackup: boolean; canRestore: boolean; user: SessionUser
+function SaveCatalogWorkspace({ status, canBackup, canRestore, user, demo }: {
+  status: ServerStatus; canBackup: boolean; canRestore: boolean; user: SessionUser; demo: boolean
 }) {
   const [saves, setSaves] = useState<SavePairCatalogItem[]>([])
   const [backups, setBackups] = useState<BackupCatalogItem[]>([])
@@ -619,6 +678,7 @@ function SaveCatalogWorkspace({ status, canBackup, canRestore, user }: {
   const [actionBusy, setActionBusy] = useState<string | null>(null)
   const [pending, setPending] = useState<PendingSaveTransaction | null>(null)
   const [receipt, setReceipt] = useState<SaveJobExecutionResult | null>(null)
+  const [reconcileBlockedJobId, setReconcileBlockedJobId] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     setBusy(true); setError('')
@@ -735,6 +795,73 @@ function SaveCatalogWorkspace({ status, canBackup, canRestore, user }: {
     finally { setActionBusy(null) }
   }
 
+  async function refreshRecoveryJob(jobId: string) {
+    setActionBusy(`refresh-recovery:${jobId}`); setError('')
+    try {
+      const current = (await api.saveJob(jobId)).data
+      setReceipt(current)
+      setReconcileBlockedJobId(null)
+      if (current.run.state === 'succeeded') await load()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '无法读取该存档作业；请保留存档对与事务证据。')
+    } finally {
+      setActionBusy(null)
+    }
+  }
+
+  async function reconcileRecoveryJob(
+    jobId: string,
+    confirmation: typeof SAVE_JOB_RECONCILE_CONFIRMATION
+  ) {
+    if (!canRestore || reconcileBlockedJobId === jobId) return
+    setActionBusy(`reconcile:${jobId}`); setError('')
+    let accepted: SaveJobExecutionResult | null = null
+    try {
+      accepted = (await api.reconcileSaveJob(jobId, confirmation)).data
+      setReceipt(accepted)
+      for (let attempt = 0; attempt < 2400 && ['queued', 'running'].includes(accepted.run.state); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+        accepted = (await api.saveJob(jobId)).data
+        setReceipt(accepted)
+      }
+      if (accepted.run.state === 'succeeded') {
+        setReconcileBlockedJobId(null)
+        await load()
+      } else if (['queued', 'running'].includes(accepted.run.state)) {
+        setError('持久化对账仍在后台执行；这里只会继续查询同一作业，绝不会重新提交授权。')
+      } else {
+        setReconcileBlockedJobId(jobId)
+        setError(accepted.run.recoveryRequired
+          ? `对账后仍需要人工核验（${accepted.run.errorCode ?? '未知错误'}）；已禁止再次提交。`
+          : `持久化对账未完成（${accepted.run.errorCode ?? '未知错误'}）。`)
+      }
+    } catch (reason) {
+      const ambiguous = !(reason instanceof ApiError) ||
+        (reason.status === 502 && reason.code === 'SAVE_JOB_BROWSER_RESPONSE_INVALID')
+      const conflict = reason instanceof ApiError && reason.status === 409
+      if (ambiguous || conflict) {
+        setReconcileBlockedJobId(jobId)
+        try {
+          const current = (await api.saveJob(jobId)).data
+          setReceipt(current)
+        } catch {
+          // Preserve the last strict receipt and the job ID; never repeat a possibly accepted mutation.
+        }
+      }
+      if (ambiguous) {
+        setError('对账请求结果未知；已查询同一作业并禁止再次提交。请先手动刷新，勿盲目重试。')
+      } else if (conflict) {
+        setError(reason.code === 'SAVE_JOB_RECONCILE_NOT_ALLOWED'
+          ? '服务端最新终态不允许自动对账；已锁定操作，请保留现场并人工核验。'
+          : '作业状态已并发变化；已刷新同一作业并锁定再次提交。')
+      } else {
+        setError(reason instanceof Error ? reason.message : '存档对账请求失败。')
+      }
+    } finally {
+      setActionBusy(null)
+    }
+  }
+
   if (busy) return <div className="loading-state compact"><span className="spinner" />正在建立存档与备份目录…</div>
   return <div className="catalog-workspace">
     <div className="workspace-toolbar"><div><strong>配对存档目录</strong><span>.dsv 与 .server 始终作为一个单元</span></div><button onClick={load}><RefreshCw size={16} />重新扫描</button></div>
@@ -748,13 +875,29 @@ function SaveCatalogWorkspace({ status, canBackup, canRestore, user }: {
       <span><strong>{saveJobTitle(receipt)}</strong><small>{saveJobDetail(receipt)}</small></span>
       <button onClick={() => setReceipt(null)}>关闭</button>
     </div>}
+    <PersistedSaveRecoveryLookup
+      disabled={demo || !canRestore}
+      onLoaded={(execution) => {
+        setReceipt(execution)
+        setReconcileBlockedJobId(null)
+      }}
+    />
+    <SaveRecoveryPanel
+      currentJob={receipt}
+      role={user.role}
+      busy={actionBusy === `reconcile:${receipt?.job.id}` || actionBusy === `refresh-recovery:${receipt?.job.id}`}
+      reconcileDisabled={receipt !== null && reconcileBlockedJobId === receipt.job.id}
+      reconcileDisabledReason="该请求可能已被服务端接受或终态已经变化；请先刷新同一作业，确认最新持久状态。"
+      onReconcile={reconcileRecoveryJob}
+      onRefresh={refreshRecoveryJob}
+    />
     <div className="catalog-summary">
       <div><span>存档单元</span><strong>{totals.saves}</strong><small>{saves.filter((item) => item.health === 'healthy').length} 个当前页健康</small></div>
       <div><span>保护点</span><strong>{totals.backups}</strong><small>{backups.filter((item) => item.health === 'healthy').length} 个当前页已验证</small></div>
       <div><span>恢复门禁</span><strong className={status.state === 'stopped' ? 'green' : 'amber'}>{status.state === 'stopped' ? '可预览' : '等待停服'}</strong><small>执行还需独立配置开关与二次确认</small></div>
     </div>
     <Suspense fallback={<div className="loading-state compact"><span className="spinner" />正在装载存档扩展工作区…</div>}>
-      <SaveRetentionWorkspace backups={backups} user={user} onCatalogChanged={load} />
+      <SaveRetentionWorkspace backups={backups} user={user} demo={demo} onCatalogChanged={load} />
       <SaveTransferWorkspace backups={backups} user={user} />
     </Suspense>
     {pending && <section className="save-transaction-confirm" role="alertdialog" aria-labelledby="save-transaction-title">
@@ -800,16 +943,18 @@ function saveJobTitle(receipt: SaveJobExecutionResult): string {
 
 function saveJobDetail(receipt: SaveJobExecutionResult): string {
   const result = receipt.run.result
+  const recovery = receipt.run.recoveryRequired ? ' · 需要持久化核验，禁止盲目重试' : ''
+  const error = receipt.run.errorCode ? ` · ${receipt.run.errorCode}` : ''
   if (result) {
     const reuse = receipt.reused || result.reused ? ' · 复用幂等结果' : ''
-    return `${formatBytes(result.pairBytes)} · 审计${result.auditStored ? '已持久化' : '待核验'} · 尝试 ${receipt.run.attemptCount}${reuse}`
+    const cleanup = result.cleanupPending ? ' · 清理待完成' : ''
+    const maintenance = result.maintenanceRequired ? ' · 需要维护' : ''
+    return `${formatBytes(result.pairBytes)} · 审计${result.auditStored ? '已持久化' : '待核验'} · 尝试 ${receipt.run.attemptCount}${reuse}${cleanup}${maintenance}${error}${recovery}`
   }
-  const recovery = receipt.run.recoveryRequired ? ' · 禁止自动重试' : ''
-  const error = receipt.run.errorCode ? ` · ${receipt.run.errorCode}` : ''
   return `任务 ${receipt.job.id.slice(0, 8)} · 尝试 ${receipt.run.attemptCount}${error}${recovery}`
 }
 
-export function PlayerWorkspace({ demo }: { demo: boolean }) {
+export function PlayerWorkspace({ demo, user }: { demo: boolean; user: SessionUser }) {
   const [roster, setRoster] = useState<PlayerRoster | null>(demo ? demoPlayerRoster : null)
   const [capabilities, setCapabilities] = useState<PlayerCapabilitiesProjection | null>(
     demo ? demoPlayerCapabilities : null
@@ -821,12 +966,12 @@ export function PlayerWorkspace({ demo }: { demo: boolean }) {
   const load = useCallback(async (signal?: AbortSignal) => {
     if (demo) {
       setRoster(demoPlayerRoster); setCapabilities(demoPlayerCapabilities); setBusy(false)
-      return
+      return true
     }
     const [rosterResult, capabilityResult] = await Promise.allSettled([
       api.players(signal), api.playerCapabilities(signal)
     ])
-    if (signal?.aborted) return
+    if (signal?.aborted) return false
     if (rosterResult.status === 'fulfilled') {
       setRoster(rosterResult.value.data); setRosterError('')
     } else {
@@ -840,6 +985,7 @@ export function PlayerWorkspace({ demo }: { demo: boolean }) {
         ? capabilityResult.reason.message : '签名玩家能力快照暂不可用')
     }
     setBusy(false)
+    return rosterResult.status === 'fulfilled' && capabilityResult.status === 'fulfilled'
   }, [demo])
 
   useEffect(() => {
@@ -858,14 +1004,14 @@ export function PlayerWorkspace({ demo }: { demo: boolean }) {
     {capabilityError && <div className="inline-warning"><TriangleAlert size={17} />{capabilityError}；所有玩家管理动作继续 fail-closed。</div>}
 
     {capabilities ? <section className="player-capability-panel">
-      <header><div><ShieldCheck size={17} /><span><strong>签名能力合同</strong><small>{capabilities.repository} · {capabilities.tag} · runtime {capabilities.runtimeFileVersion}</small></span></div><b>{capabilities.actionsEnabled ? 'ACTIONS ENABLED' : 'ACTIONS LOCKED'}</b></header>
+      <header><div><ShieldCheck size={17} /><span><strong>签名能力合同</strong><small>{capabilities.repository} · {capabilities.tag} · runtime {capabilities.runtimeFileVersion}</small></span></div><b>{capabilities.actionsEnabled ? 'SIGNED ACTION CONTRACT' : 'ACTIONS LOCKED'}</b></header>
       <div className="player-capability-evidence"><div><span>COMMIT</span><code>{capabilities.commit}</code></div><div><span>验证范围</span><strong>{capabilities.verificationScope}</strong></div><div><span>观测时间</span><strong>{relativeTime(capabilities.observedAt)}</strong></div></div>
       <div className="player-capability-grid">{capabilities.capabilities.map((entry) => <div key={entry.capability} className={entry.availability}>
         <span className="capability-signal">{entry.availability === 'available' ? <Check size={15} /> : <LockKeyhole size={15} />}</span>
         <div><strong>{playerCapabilityLabel(entry.capability)}</strong><small>{entry.reasonSummary}</small><code>{entry.reasonCode}</code></div>
-        <button type="button" disabled title={entry.reasonSummary}>{entry.capability === 'observe-roster' ? '只读能力' : '不可用'}</button>
+        <button type="button" disabled title={entry.reasonSummary}>{entry.capability === 'observe-roster' ? '只读能力' : entry.capability === 'notice' && entry.availability === 'available' ? '固定模板' : '不可用'}</button>
       </div>)}</div>
-    </section> : <section className="player-capability-panel unavailable"><TriangleAlert size={22} /><div><strong>能力状态不可用</strong><small>缺少经过签名验证的 public projection；disconnect、kick、ban、whitelist、permission 全部保持禁用。</small></div></section>}
+    </section> : <section className="player-capability-panel unavailable"><TriangleAlert size={22} /><div><strong>能力状态不可用</strong><small>缺少经过签名验证的 public projection；disconnect、kick、ban、whitelist、blacklist、notice、permission 全部保持禁用。</small></div></section>}
 
     {roster ? <>
       <div className="player-summary"><div><span>会话状态</span><strong className={roster.authoritative ? 'green' : 'amber'}>{roster.state === 'active' ? '活跃' : roster.state === 'inactive' ? '未运行' : '未知'}</strong></div><div><span>在线玩家</span><strong>{roster.playerCount ?? '—'}</strong></div><div><span>快照完整性</span><strong className={roster.truncated ? 'amber' : 'green'}>{roster.truncated ? '已达到 64 人上限' : '完整'}</strong></div></div>
@@ -873,7 +1019,10 @@ export function PlayerWorkspace({ demo }: { demo: boolean }) {
         <div className="player-table-head"><span>玩家</span><span>会话编号</span><span>位置摘要</span><span>加入时间</span><span>管理动作</span></div>
         <div className="player-list">{players.length ? players.map((player) => <PlayerRow player={player} key={player.sessionPlayerId} authoritative={roster.authoritative} />) : <div className="catalog-empty">{roster.authoritative ? '当前没有在线玩家。' : '没有可验证的最后已知清单。'}</div>}</div>
       </section>
-      <section className="presence-history"><header><div><History size={17} /><strong>本进程会话事件</strong></div><span>仅内存保存 · 重启控制面后清空</span></header><div>{roster.recentEvents.length ? roster.recentEvents.slice(-12).reverse().map((event) => <div key={event.sequence}><span className={event.type}>{event.type === 'join' ? '加入' : '离开'}</span><strong>{event.player.displayName}</strong><small>{relativeTime(event.occurredAt)}</small></div>) : <p>尚无可验证的加入/离开差分。</p>}</div></section>
+      <PlayerNoticeWorkspace roster={roster} capabilities={capabilities} user={user} demo={demo}
+        evidenceCurrent={!rosterError && !capabilityError}
+        onRefresh={() => load()} />
+      <section className="presence-history"><header><div><History size={17} /><strong>持久玩家会话事件</strong></div><span>SQLite 持久化 · 按服务端保留策略裁剪</span></header><div>{roster.recentEvents.length ? roster.recentEvents.slice(-12).reverse().map((event) => <div key={event.sequence}><span className={event.type}>{event.type === 'join' ? '加入' : '离开'}</span><strong>{event.player.displayName}</strong><small>{relativeTime(event.occurredAt)}</small></div>) : <p>尚无可验证的加入/离开差分。</p>}</div></section>
     </> : <div className="players-empty"><Users size={38} /><strong>玩家状态未知</strong><p>{rosterError || '尚未收到可信玩家快照；不会把不可用误报为 0 人在线。'}</p><button onClick={() => void load()}>重试</button></div>}
   </div>
 }
@@ -896,6 +1045,8 @@ function playerCapabilityLabel(capability: PlayerCapabilityId): string {
     kick: 'Kick 踢出',
     ban: 'Ban 封禁',
     whitelist: 'Whitelist 白名单',
+    blacklist: 'Blacklist 黑名单',
+    notice: 'Notice 通知',
     permission: 'Permission 权限'
   } satisfies Record<PlayerCapabilityId, string>)[capability]
 }
@@ -905,7 +1056,7 @@ const demoPlayerCapabilities: PlayerCapabilitiesProjection = {
   tag: 'v0.0.0-fictional',
   runtimeFileVersion: '0.0.0.0',
   commit: 'f'.repeat(40),
-  verificationScope: 'fictional-source-contract-only-runtime-unverified',
+  verificationScope: 'source-contract-only-runtime-unverified',
   actionsEnabled: false,
   observedAt: '2026-08-30T10:05:00.000+08:00',
   capabilities: [
@@ -914,13 +1065,16 @@ const demoPlayerCapabilities: PlayerCapabilitiesProjection = {
     { capability: 'kick', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_KICK_ABSENT', reasonSummary: 'Fictional runtime exposes no dedicated kick contract.' },
     { capability: 'ban', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_BAN_ABSENT', reasonSummary: 'Fictional runtime exposes no persistent ban contract.' },
     { capability: 'whitelist', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_WHITELIST_ABSENT', reasonSummary: 'Fictional runtime exposes no whitelist contract.' },
+    { capability: 'blacklist', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_BLACKLIST_ABSENT', reasonSummary: 'Fictional runtime exposes no blacklist persistence contract.' },
+    { capability: 'notice', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_NOTICE_ABSENT', reasonSummary: 'Fictional runtime exposes no acknowledged player-notice contract.' },
     { capability: 'permission', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_PERMISSION_ABSENT', reasonSummary: 'Fictional runtime exposes no per-player permission contract.' }
   ]
 }
 
 const demoPlayerRoster: PlayerRoster = {
   schemaVersion: 1, state: 'active', authoritative: true,
-  observedAt: '2026-08-30T10:05:00.000+08:00', sequence: 7, truncated: false, playerCount: 2,
+  observedAt: '2026-08-30T10:05:00.000+08:00', rosterGeneration: `roster-v1:${'f'.repeat(64)}`,
+  sequence: 7, truncated: false, playerCount: 2,
   players: [
     { sessionPlayerId: 'player-000001', displayName: 'Orion', online: true, joinedAt: '2026-08-30T09:30:00.000+08:00', location: 'planet:1001' },
     { sessionPlayerId: 'player-000002', displayName: 'Lyra', online: true, joinedAt: '2026-08-30T09:46:00.000+08:00', location: 'deep-space' }
@@ -934,10 +1088,11 @@ const demoPlayerRoster: PlayerRoster = {
 
 type ConfigDraftValue = boolean | number | string
 
-function ConfigurationWorkspace({ canPreview, canApply, canManageHistory }: {
+function ConfigurationWorkspace({ canPreview, canApply, canManageHistory, demo }: {
   canPreview: boolean
   canApply: boolean
   canManageHistory: boolean
+  demo: boolean
 }) {
   const [snapshot, setSnapshot] = useState<GameConfigSnapshot | null>(null)
   const [drafts, setDrafts] = useState<Record<string, ConfigDraftValue>>({})
@@ -994,7 +1149,7 @@ function ConfigurationWorkspace({ canPreview, canApply, canManageHistory }: {
   if (busy) return <div className="loading-state compact"><span className="spinner" />正在解析固定配置 Schema…</div>
   if (!snapshot) return <div className="configuration-workspace">
     <div className="configuration-empty"><FileCog size={34} /><strong>当前配置目录不可用</strong><p>{error || '请先完成 Windows 受管目录安装。'}</p><button onClick={load}>重试当前配置</button></div>
-    <ConfigHistoryWorkspace canManage={canManageHistory} onConfigurationChanged={load} />
+    <ConfigHistoryWorkspace canManage={canManageHistory} demo={demo} onConfigurationChanged={load} />
   </div>
   const groups = (['nebula', 'galaxy', 'bepinex', 'bridge'] as GameConfigFileId[]).map((file) => ({
     file, entries: snapshot.entries.filter((entry) => entry.file === file)
@@ -1019,7 +1174,7 @@ function ConfigurationWorkspace({ canPreview, canApply, canManageHistory }: {
       <p><ShieldCheck size={15} />提交将在独占锁内重新校验 revision，并在失败时恢复四个文件的原始字节。</p>
     </section>}
     {confirmOpen && preview && canApply && <div className="config-confirm" role="alertdialog" aria-labelledby="config-confirm-title"><div><TriangleAlert size={20} /><span><strong id="config-confirm-title">确认提交 {preview.diff.filter((entry) => entry.changed).length} 项配置变更</strong><small>将创建可验证快照并原子替换配置；不会自动重启服务器。包含“仅新游戏”参数时，现有星系不会被改写。</small></span></div><div><button onClick={() => setConfirmOpen(false)}>取消</button><button className="confirm-execute" onClick={applyChanges}>确认应用</button></div></div>}
-    <ConfigHistoryWorkspace canManage={canManageHistory} onConfigurationChanged={load} />
+    <ConfigHistoryWorkspace canManage={canManageHistory} demo={demo} onConfigurationChanged={load} />
   </div>
 }
 
@@ -1051,16 +1206,17 @@ function FeatureWorkspace({ active, status, jobs, onRefresh, provider, lifecycle
 }
 
 const featureDefinitions: Record<Exclude<NavKey, 'overview'>, { title: string; description: string; primaryTitle: string; phase: string; icon: ComponentType<{ size?: number }>; scope: string[]; safety: string }> = {
-  game: { title: '游戏管理', description: '统一管理 DSP 进程、Nebula 会话和安全生命周期。', primaryTitle: '游戏实例', phase: '安全预检已接入', icon: Gamepad2, scope: ['启动前检查', '保存请求', '优雅停服', '维护模式', '重启与回滚'], safety: '只读预检会留下审计记录；独立保存确认、持久回执与执行适配器完成验证前，写操作保持禁用。' },
+  game: { title: '游戏管理', description: '统一管理 DSP 进程、Nebula 会话和安全生命周期。', primaryTitle: '游戏实例', phase: '安全预检已接入', icon: Gamepad2, scope: ['启动前检查', '保存请求', '优雅停服', '受控重启与回滚'], safety: '只读预检会留下审计记录；独立保存确认、持久回执与执行适配器完成验证前，写操作保持禁用。' },
   console: { title: '实时控制台', description: '查看强制脱敏日志，并通过固定动作合同安全控制服务器。', primaryTitle: '服务器输出', phase: '固定动作已接入', icon: TerminalSquare, scope: ['四项固定动作', '预演与精确确认', '持久回执轮询', '脱敏日志续读', '结构化下载'], safety: '不提供任意 PowerShell、参数或文本命令；按钮权限只是 UX 提示，服务端仍逐请求授权。' },
-  players: { title: '玩家管理', description: '查看 Nebula 权威在线集合和签名能力边界。', primaryTitle: '当前玩家', phase: '清单与能力快照', icon: Users, scope: ['在线列表', '签名能力合同', '上游版本证据', '固定不可用原因', '进出历史'], safety: '不会返回 IP、Steam ID、player.key、HMAC 或文件路径；未验证的 disconnect/kick/ban/whitelist/permission 始终禁用。' },
+  players: { title: '玩家管理', description: '查看 Nebula 权威在线集合和签名能力边界。', primaryTitle: '当前玩家', phase: '清单与能力快照', icon: Users, scope: ['在线列表', '签名能力合同', '上游版本证据', '固定不可用原因', '进出历史'], safety: '不会返回 IP、Steam ID、player.key、HMAC 或文件路径；未验证的 disconnect/kick/ban/whitelist/blacklist/notice/permission 始终禁用。' },
   versions: { title: '版本更新管理', description: '协调 DSP、Nebula、BepInEx 与受控组件发布。', primaryTitle: '组件更新事务', phase: '预演与激活合同已接入', icon: CloudDownload, scope: ['活动 revision', '结构化兼容性证据', 'dry-run operations', '保护点与停止态', '回执、回滚与只读清理'], safety: 'DSP 始终通过 Steam 手动更新；托管组件仅能引用固定暂存 artifact，执行默认 fail-closed，生产激活仍需真实服务器验收。' },
   mods: { title: '模组更新管理', description: '以固定根目录事务部署服务端模组，并维护客户端 Parity。', primaryTitle: '模组部署矩阵', phase: '预演与原子发布已接入', icon: Boxes, scope: ['托管模组清单', '依赖与 Parity', '固定暂存候选', '五类部署预演', '快照、回滚与恢复'], safety: '浏览器只能提交逻辑 ID、版本和锁清单；不能提交主机路径、命令或 ZIP。执行默认禁用，并在发布前两次验证进程停止和端口关闭。' },
   saves: { title: '存档管理', description: '把 .dsv 与 .server 作为不可分割的一致性单元。', primaryTitle: '存档单元', phase: '事务与跨机传输', icon: FolderArchive, scope: ['成对发现', '原子备份', '停服恢复', '内容寻址导出', '隔离区导入'], safety: '跨机器导出仅接受已验证 backupId；导入固定进入 quarantine/inbox，不等于恢复。恢复仍需停服、保护点与独立确认。' },
-  client: { title: '客户端包', description: '从本地生成请求预览并下载可复现、独立校验的客户端 ZIP。', primaryTitle: '客户端交付', phase: '确定性 ZIP 已接入', icon: Archive, scope: ['本地 JSON 请求', 'Parity 报告', 'Profile 与版本', '六项固定清单', 'ZIP SHA-256 回执'], safety: '输入只在浏览器内存中读取；客户端 ZIP 只含公开元数据和校验值，不包含游戏/模组二进制、Steam 数据、服务器密码或玩家密钥。' },
+  client: { title: '客户端包', description: '签发资格绑定的客户端运行包，或预览公开的确定性配置资料。', primaryTitle: '客户端交付', phase: 'V2 资格门禁已接入', icon: Archive, scope: ['生产资格签发', '客户端运行包', 'Parity 报告', 'Profile 与版本', '运行时绑定清单'], safety: '生产签发只接受受保护资格 ID；三个下载都会绑定持久化回执并由服务端重新验哈希，不包含 Steam 凭据、服务器密码、存档或玩家资料。' },
   server: { title: '服务器管理', description: '查看 Windows 主机、DSP 进程、端口与可信性能轨迹。', primaryTitle: '主机与进程', phase: '实时观测已接入', icon: Server, scope: ['主机总 CPU 与内存', 'DSP 核等值、工作集与线程', '端口状态矛盾', '实际 UPS/TPS 可用性', '短历史与瓶颈提示'], safety: '不提供通用进程终止或主机重启；缺失指标明确标为不可用，目标 UPS 不会伪装成实测值。' },
-  config: { title: '配置管理', description: '通过固定 Schema 与内容寻址历史管理游戏、Nebula、性能和网络配置。', primaryTitle: '配置域', phase: '事务与历史恢复已接入', icon: FileCog, scope: ['Nebula 配置', '开服参数', 'UPS 与线程', '四文件快照', '脱敏差异与恢复对账'], safety: 'secret 只显示 configured 状态；恢复必须依次取得最新 revision、只读预演、dry-run 和精确确认，服务端仍独立执行停止态门禁。' },
-  tasks: { title: '任务与审计', description: '追踪每个读取、修改、更新、备份和回滚动作。', primaryTitle: '任务记录', phase: '基础已接入', icon: ClipboardList, scope: ['持久任务', '事件流', '操作人', '失败代码', '审计导出'], safety: '审计信息不记录密码、令牌、完整路径、玩家密钥或存档内容。' }
+  config: { title: '配置管理', description: '通过固定 Schema 与内容寻址历史管理四个受控配置文件。', primaryTitle: '配置域', phase: '事务与历史恢复已接入', icon: FileCog, scope: ['Nebula 服务端字段', '星系与黑雾参数', 'BepInEx 控制台开关', '游戏桥配置', '脱敏差异与恢复对账'], safety: 'secret 只显示 configured 状态；恢复必须依次取得最新 revision、只读预演、dry-run 和精确确认，服务端仍独立执行停止态门禁。' },
+  cutover: { title: '权威切换', description: '在 GSManager 与 Dyson 控制链之间执行持久、可恢复的唯一权威切换。', primaryTitle: 'Cutover 事务控制面', phase: '状态、回执与恢复已接入', icon: GitBranch, scope: ['持久恢复状态', '准备与激活事务', '两类显式回退', '服务端 request ID 恢复', '不可变回执与审计'], safety: '仅提供固定能力和精确确认；没有主机、路径或命令输入。普通切换与恢复门禁默认关闭，任何不确定状态都会保持 fail-closed。' },
+  tasks: { title: '任务与审计', description: '追踪每个读取、修改、更新、备份和回滚动作。', primaryTitle: '任务记录', phase: '分页与审计导出已接入', icon: ClipboardList, scope: ['稳定游标分页', '类型与状态过滤', '操作人与失败代码', 'JSON / NDJSON 预演', '管理员确认导出'], safety: '审计信息不记录密码、令牌、完整路径、玩家密钥或存档内容；导出只接受固定参数和精确确认。' }
 }
 
 function featureBody(
@@ -1073,8 +1229,8 @@ function featureBody(
   user: SessionUser
 ) {
   if (active === 'console') return <ConsoleWorkspace demo={provider === 'demo'} user={user} />
-  if (active === 'tasks') return <TaskTable jobs={jobs} />
-  if (active === 'players') return <PlayerWorkspace demo={provider === 'demo'} />
+  if (active === 'tasks') return <TasksAuditWorkspace user={user} />
+  if (active === 'players') return <PlayerWorkspace demo={provider === 'demo'} user={user} />
   if (active === 'versions') return <VersionUpdateWorkspace status={status} demo={provider === 'demo'} user={user} />
   if (active === 'mods') return <ModWorkspace
     demo={provider === 'demo'}
@@ -1084,16 +1240,19 @@ function featureBody(
     canImport={hasPermission(user, 'mods.mutate')}
   />
   if (active === 'saves') return <SaveCatalogWorkspace status={status}
-    canBackup={hasPermission(user, 'saves.backup')} canRestore={hasPermission(user, 'saves.restore')} user={user} />
+    canBackup={hasPermission(user, 'saves.backup')} canRestore={hasPermission(user, 'saves.restore')}
+    user={user} demo={provider === 'demo'} />
   if (active === 'client') return <ClientPackageWorkspace demo={provider === 'demo'} canGenerate={hasPermission(user, 'client-profile.generate')} />
   if (active === 'server') return <ServerObservabilityWorkspace
     canAcknowledge={hasPermission(user, 'observability.acknowledge')} />
+  if (active === 'cutover') return <CutoverWorkspace user={user} demo={provider === 'demo'} />
   if (active === 'game') return <GameLifecyclePanel status={status} onRefresh={onRefresh}
     provider={provider} initialAction={lifecycleIntent} canOperate={hasPermission(user, 'lifecycle.execute')} />
   if (active === 'config') return <ConfigurationWorkspace
     canPreview={hasPermission(user, 'configuration.preview')}
     canApply={hasPermission(user, 'configuration.apply')}
-    canManageHistory={user.role === 'administrator' && hasPermission(user, 'configuration.apply')} />
+    canManageHistory={user.role === 'administrator' && hasPermission(user, 'configuration.apply')}
+    demo={provider === 'demo'} />
   return null
 }
 
@@ -1106,6 +1265,8 @@ const modDeploymentOperations: Array<{ operation: ModDeploymentOperation; label:
 ]
 
 const modDeploymentRequestMaximumBytes = 2 * 1_024 * 1_024
+const modDeploymentHistoryPageSize = 8
+const modDeploymentRequestIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 interface SelectedModDeploymentRequest {
   fileName: string
@@ -1138,6 +1299,11 @@ export function ModWorkspace({
   const [selected, setSelected] = useState<SelectedModDeploymentRequest | null>(null)
   const [preview, setPreview] = useState<ModDeploymentPreview | null>(null)
   const [receipt, setReceipt] = useState<ModDeploymentReceipt | null>(null)
+  const [receiptHistory, setReceiptHistory] = useState<ModDeploymentReceiptHistoryPage | null>(null)
+  const [receiptRequestId, setReceiptRequestId] = useState('')
+  const [receiptHistoryError, setReceiptHistoryError] = useState('')
+  const [receiptHistoryLoading, setReceiptHistoryLoading] = useState(false)
+  const [receiptLookupLoading, setReceiptLookupLoading] = useState(false)
   const [confirmation, setConfirmation] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
@@ -1148,15 +1314,23 @@ export function ModWorkspace({
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const fileSequenceRef = useRef(0)
   const operationSequenceRef = useRef(0)
+  const receiptHistorySequenceRef = useRef(0)
+  const receiptLookupSequenceRef = useRef(0)
 
   const load = useCallback(async (signal?: AbortSignal, showLoading = true) => {
     if (showLoading) setLoading(true)
+    const historySequence = ++receiptHistorySequenceRef.current
     try {
-      const [stateResult, recoveryResult, recoveryStatusResult] = await Promise.all([
+      const [stateResult, recoveryResult, recoveryStatusResult, historyResult] = await Promise.all([
         api.modDeploymentState(signal),
         api.modDeploymentRecovery(signal),
-        api.modDeploymentRecoveryStatus(signal)
+        api.modDeploymentRecoveryStatus(signal),
+        api.modDeploymentHistory({ pageSize: modDeploymentHistoryPageSize }, signal).then(
+          (result) => ({ ok: true as const, result }),
+          (reason: unknown) => ({ ok: false as const, reason })
+        )
       ])
+      if (signal?.aborted) return
       setState(stateResult.data)
       setRecovery(recoveryResult.data)
       setRecoveryStatus(recoveryStatusResult.data)
@@ -1167,6 +1341,14 @@ export function ModWorkspace({
         setRecoveryDesired((current) => recoveryStatusResult.data.allowedDesired.includes(current)
           ? current
           : recoveryStatusResult.data.allowedDesired[0] ?? 'previous')
+      }
+      if (historySequence === receiptHistorySequenceRef.current) {
+        if (historyResult.ok) {
+          setReceiptHistory(historyResult.result.data)
+          setReceiptHistoryError('')
+        } else {
+          setReceiptHistoryError(formatModWorkspaceError(historyResult.reason, '模组部署回执历史暂不可用。'))
+        }
       }
       setError('')
     } catch (reason) {
@@ -1186,6 +1368,8 @@ export function ModWorkspace({
       controller.abort()
       fileSequenceRef.current++
       operationSequenceRef.current++
+      receiptHistorySequenceRef.current++
+      receiptLookupSequenceRef.current++
     }
   }, [load])
 
@@ -1409,6 +1593,64 @@ export function ModWorkspace({
     }
   }
 
+  async function loadMoreReceiptHistory(): Promise<void> {
+    const cursor = receiptHistory?.page.nextCursor
+    if (!cursor || receiptHistoryLoading) return
+    const sequence = ++receiptHistorySequenceRef.current
+    setReceiptHistoryLoading(true)
+    setReceiptHistoryError('')
+    try {
+      const result = await api.modDeploymentHistory({
+        cursor,
+        pageSize: modDeploymentHistoryPageSize
+      })
+      if (sequence !== receiptHistorySequenceRef.current) return
+      setReceiptHistory((current) => {
+        if (!current) return result.data
+        const requestIds = new Set<string>()
+        const items = [...current.items, ...result.data.items].filter((item) => {
+          if (requestIds.has(item.receipt.requestId)) return false
+          requestIds.add(item.receipt.requestId)
+          return true
+        })
+        return {
+          ...result.data,
+          items,
+          page: { ...result.data.page, returned: items.length }
+        }
+      })
+    } catch (reason) {
+      if (sequence === receiptHistorySequenceRef.current) {
+        setReceiptHistoryError(formatModWorkspaceError(reason, '无法加载更早的模组部署回执。'))
+      }
+    } finally {
+      if (sequence === receiptHistorySequenceRef.current) setReceiptHistoryLoading(false)
+    }
+  }
+
+  async function lookupReceipt(requestId = receiptRequestId): Promise<void> {
+    const normalizedRequestId = requestId.trim().toLowerCase()
+    if (!modDeploymentRequestIdPattern.test(normalizedRequestId)) {
+      setReceiptHistoryError('请输入完整有效的模组部署 request ID。')
+      return
+    }
+    const sequence = ++receiptLookupSequenceRef.current
+    setReceiptLookupLoading(true)
+    setReceiptHistoryError('')
+    try {
+      const result = await api.modDeploymentReceipt(normalizedRequestId)
+      if (sequence !== receiptLookupSequenceRef.current) return
+      setReceiptRequestId(normalizedRequestId)
+      setReceipt(result.data)
+    } catch (reason) {
+      if (sequence === receiptLookupSequenceRef.current) {
+        setReceiptHistoryError(formatModWorkspaceError(reason, '无法核验指定的模组部署回执。'))
+      }
+    } finally {
+      if (sequence === receiptLookupSequenceRef.current) setReceiptLookupLoading(false)
+    }
+  }
+
   return <div className="mod-workspace">
     <ModSupplyWorkspace
       demo={demo}
@@ -1452,6 +1694,9 @@ export function ModWorkspace({
       <div><span>DISABLED</span><strong>{state?.disabledCount ?? '—'}</strong><small>可恢复记录</small></div>
       <div className={executionEnabled && !mutationBlockedByRecovery ? 'gate-open' : 'gate-closed'}><span>MUTATION GATE</span><strong>{executionEnabled && !mutationBlockedByRecovery ? 'ENABLED' : 'FAIL-CLOSED'}</strong><small>{mutationBlockedByRecovery ? '必须先完成精确恢复或证明恢复状态正常' : executionEnabled ? '仍需精确确认与双停服证明' : '仅允许读取和预演'}</small></div>
     </section>
+
+    <ManagedModConfigurationWorkspace deployment={state} executionEnabled={executionEnabled && !mutationBlockedByRecovery}
+      canMutate={canMutate} />
 
     <div className="mod-workspace-grid">
       <section className="mod-managed-panel">
@@ -1513,6 +1758,27 @@ export function ModWorkspace({
       <b>{formatBytes(receipt.payloadSizeBytes)}</b>
     </section>}
 
+    <section className="mod-receipt-ledger">
+      <header><div><History size={17} /><span><strong>部署回执历史</strong><small>持久化时间倒序 · 精确 request ID 可重新核验</small></span></div><b>{receiptHistory ? `${receiptHistory.page.totalReceipts} RECEIPTS` : 'UNAVAILABLE'}</b></header>
+      <div className="mod-receipt-lookup">
+        <label><span>EXACT REQUEST ID</span><input aria-label="模组部署回执 request ID" value={receiptRequestId}
+          onChange={(event) => { setReceiptRequestId(event.target.value); setReceiptHistoryError('') }} placeholder="00000000-0000-4000-8000-000000000000" /></label>
+        <button type="button" disabled={receiptLookupLoading || !modDeploymentRequestIdPattern.test(receiptRequestId.trim())}
+          onClick={() => void lookupReceipt()}><ScanSearch className={receiptLookupLoading ? 'spin' : ''} size={14} />{receiptLookupLoading ? '核验中…' : '核验完整回执'}</button>
+      </div>
+      {receiptHistoryError && <p className="mod-receipt-history-error"><TriangleAlert size={14} />{receiptHistoryError}</p>}
+      <div className="mod-receipt-history-list">{receiptHistory?.items.length ? receiptHistory.items.map((item) =>
+        <article key={`${item.persistedAt}-${item.receipt.requestId}`} className={`status-${item.receipt.status}`}>
+          <span>{item.receipt.status === 'succeeded' ? <Check size={14} /> : <Undo2 size={14} />}</span>
+          <div><strong>{item.receipt.package.dependencyId}</strong><small>{item.receipt.operation} · {item.receipt.package.version} · {item.receipt.requestId}</small></div>
+          <time dateTime={item.persistedAt}>{new Date(item.persistedAt).toLocaleString('zh-CN', { hour12: false })}</time>
+          <button type="button" aria-label={`核验回执 ${item.receipt.requestId}`} onClick={() => void lookupReceipt(item.receipt.requestId)}>核验</button>
+        </article>) : <p>{loading ? '正在读取持久化回执…' : '尚无可展示的模组部署回执。'}</p>}</div>
+      <footer><span>当前展示 {receiptHistory?.items.length ?? 0} / {receiptHistory?.page.totalReceipts ?? 0}</span>
+        <button type="button" disabled={receiptHistoryLoading || !receiptHistory?.page.nextCursor}
+          onClick={() => void loadMoreReceiptHistory()}><RefreshCw className={receiptHistoryLoading ? 'spin' : ''} size={13} />{receiptHistoryLoading ? '加载中…' : receiptHistory?.page.nextCursor ? '加载更早回执' : '已到历史末端'}</button></footer>
+    </section>
+
     <section className={`mod-explicit-recovery status-${recoveryStatus?.phase ?? 'unavailable'}`}>
       <header><div><Undo2 size={17} /><span><strong>显式事务恢复</strong><small>独立开关 · 精确 request ID · 共享主机恢复租约</small></span></div><b>{recoveryStatus?.phase === 'ready' ? 'READY' : recoveryStatus?.phase === 'recovery-required' ? 'RECOVERY REQUIRED' : 'UNAVAILABLE'}</b></header>
       {recoveryStatus?.phase === 'recovery-required' ? <>
@@ -1542,10 +1808,138 @@ export function ModWorkspace({
   </div>
 }
 
+function ManagedModConfigurationWorkspace({
+  deployment, executionEnabled, canMutate
+}: {
+  deployment: ModDeploymentStateSummary | null
+  executionEnabled: boolean
+  canMutate: boolean
+}) {
+  const [schemas, setSchemas] = useState<ManagedModConfigurationSchema[]>([])
+  const [selectedId, setSelectedId] = useState('')
+  const [inspection, setInspection] = useState<ManagedModConfigurationInspection | null>(null)
+  const [drafts, setDrafts] = useState<Record<string, boolean | number | string>>({})
+  const [clearSecrets, setClearSecrets] = useState<Record<string, boolean>>({})
+  const [preview, setPreview] = useState<ManagedModConfigurationPreview | null>(null)
+  const [previewedRequest, setPreviewedRequest] = useState<ManagedModConfigurationRequest | null>(null)
+  const [receipt, setReceipt] = useState<ManagedModConfigurationReceipt | null>(null)
+  const [confirmation, setConfirmation] = useState('')
+  const [message, setMessage] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+
+  const selected = useMemo(() => schemas.find((schema) => schema.id === selectedId) ?? null, [schemas, selectedId])
+  const request = useMemo<ManagedModConfigurationRequest | null>(() => {
+    if (!selected || !inspection || !deployment) return null
+    const changes = selected.fields.flatMap((field) => {
+      const current = inspection.fields.find((entry) => entry.id === field.id)?.value
+      const draft = drafts[field.id]
+      if (field.secret) {
+        if (clearSecrets[field.id]) return [{ id: field.id, value: '' }]
+        return typeof draft === 'string' && draft.length > 0 ? [{ id: field.id, value: draft }] : []
+      }
+      return draft !== undefined && draft !== current ? [{ id: field.id, value: draft }] : []
+    })
+    if (changes.length === 0) return null
+    return {
+      requestId: createUiRequestId(), operation: 'configure', schemaId: selected.id, package: selected.package,
+      expectedDeploymentRevision: deployment.revision, expectedConfigurationRevision: inspection.configurationRevision, changes
+    }
+  }, [clearSecrets, deployment, drafts, inspection, selected])
+  const previewMatchesRequest = preview !== null && previewedRequest !== null && request !== null &&
+    preview.requestId === previewedRequest.requestId && request.requestId === previewedRequest.requestId
+  const confirmationPhrase = 'CONFIGURE_MANAGED_MOD'
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void api.managedModConfigurationSchemas(controller.signal).then((result) => {
+      if (controller.signal.aborted) return
+      setSchemas(result.data)
+      setSelectedId((current) => current || result.data[0]?.id || '')
+      setMessage(result.data.length ? '' : '没有已声明的受管模组配置 schema；未声明插件保持不可用。')
+    }).catch((reason) => {
+      if (!controller.signal.aborted) setMessage(formatModWorkspaceError(reason, '受管模组配置不可用；未声明插件保持 fail-closed。'))
+    }).finally(() => { if (!controller.signal.aborted) setLoading(false) })
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    if (!selected || !deployment) return
+    const controller = new AbortController()
+    setInspection(null); setPreview(null); setPreviewedRequest(null); setReceipt(null); setConfirmation(''); setDrafts({}); setClearSecrets({})
+    void api.inspectManagedModConfiguration({
+      schemaId: selected.id, package: selected.package, expectedDeploymentRevision: deployment.revision
+    }, controller.signal).then((result) => {
+      if (controller.signal.aborted) return
+      setInspection(result.data)
+      const next: Record<string, boolean | number | string> = {}
+      for (const field of result.data.fields) {
+        if (field.type !== 'secret' && typeof field.value !== 'object') next[field.id] = field.value
+      }
+      setDrafts(next); setMessage('')
+    }).catch((reason) => {
+      if (!controller.signal.aborted) setMessage(formatModWorkspaceError(reason, '此受管插件当前不可配置；没有 schema 的插件不会开放写入。'))
+    })
+    return () => controller.abort()
+  }, [deployment?.revision, selected])
+
+  useEffect(() => {
+    if (!previewedRequest || request?.requestId === previewedRequest.requestId) return
+    setPreview(null)
+    setPreviewedRequest(null)
+    setConfirmation('')
+  }, [previewedRequest, request?.requestId])
+
+  async function previewConfiguration(): Promise<void> {
+    if (!request) return
+    setBusy(true); setMessage('')
+    try {
+      const result = await api.previewManagedModConfiguration(request)
+      setPreview(result.data); setPreviewedRequest(request); setReceipt(null); setConfirmation('')
+    } catch (reason) {
+      setMessage(formatModWorkspaceError(reason, '配置预演被拒绝；未写入任何配置文件。'))
+    } finally { setBusy(false) }
+  }
+
+  async function executeConfiguration(): Promise<void> {
+    if (!preview || !previewedRequest || !previewMatchesRequest || !canMutate || !executionEnabled || confirmation !== confirmationPhrase) return
+    setBusy(true); setMessage('')
+    try {
+      const result = await api.executeManagedModConfiguration(previewedRequest, preview.requestFingerprint)
+      setReceipt(result.data); setPreview(null); setPreviewedRequest(null); setConfirmation('')
+      const refreshed = await api.inspectManagedModConfiguration({
+        schemaId: selected!.id, package: selected!.package, expectedDeploymentRevision: deployment!.revision
+      })
+      setInspection(refreshed.data)
+    } catch (reason) {
+      setMessage(formatModWorkspaceError(reason, '配置提交失败；服务端保留保护点、回执和回滚结果。'))
+    } finally { setBusy(false) }
+  }
+
+  return <section className="mod-receipt-ledger" aria-label="受管模组配置">
+    <header><div><FileCog size={17} /><span><strong>受管模组配置</strong><small>严格 schema · 脱敏差异 · 固定 BepInEx 根目录 · 无任意路径或脚本</small></span></div><b>{loading ? 'LOADING' : selected ? 'SCHEMA-BOUND' : 'UNAVAILABLE'}</b></header>
+    {schemas.length > 0 && <label><span>已声明 Schema</span><select aria-label="受管模组配置 schema" value={selectedId} onChange={(event) => setSelectedId(event.target.value)}>
+      {schemas.map((schema) => <option key={schema.id} value={schema.id}>{schema.package.dependencyId} · {schema.package.version}</option>)}
+    </select></label>}
+    {inspection && selected && <div className="mod-target-editor">
+      {selected.fields.map((field) => <label key={field.id}><span>{field.id}{field.secret ? '（已脱敏）' : ''}</span>{field.type === 'boolean'
+        ? <select aria-label={`配置 ${field.id}`} value={String(drafts[field.id] ?? false)} onChange={(event) => setDrafts((current) => ({ ...current, [field.id]: event.target.value === 'true' }))}><option value="true">true</option><option value="false">false</option></select>
+        : field.type === 'integer'
+          ? <input aria-label={`配置 ${field.id}`} type="number" min={field.minimum} max={field.maximum} step={1} value={String(drafts[field.id] ?? '')} onChange={(event) => setDrafts((current) => ({ ...current, [field.id]: Number(event.target.value) }))} />
+          : <span className="mod-secret-editor"><input aria-label={`配置 ${field.id}`} type="password" maxLength={field.maximumLength} autoComplete="new-password" disabled={Boolean(clearSecrets[field.id])} value={String(drafts[field.id] ?? '')} onChange={(event) => { const value = event.target.value; setDrafts((current) => ({ ...current, [field.id]: value })); if (value.length > 0) setClearSecrets((current) => ({ ...current, [field.id]: false })) }} placeholder={(inspection.fields.find((entry) => entry.id === field.id)?.value as { configured?: boolean } | undefined)?.configured ? '已配置；留空保持不变' : '留空保持不变'} /><button type="button" aria-label={`清除 ${field.id}`} aria-pressed={Boolean(clearSecrets[field.id])} onClick={() => { setDrafts((current) => ({ ...current, [field.id]: '' })); setClearSecrets((current) => ({ ...current, [field.id]: !current[field.id] })) }}>{clearSecrets[field.id] ? '取消清除' : '清除当前密钥'}</button></span>}</label>)}
+    </div>}
+    {message && <p className="mod-receipt-history-error" role="status"><TriangleAlert size={14} />{message}</p>}
+    {request && <div className="mod-preview-gate"><div><ScanSearch size={19} /><span><strong>{previewMatchesRequest ? '配置预演已建立' : '仅提交变更字段；未知字段会被拒绝'}</strong><small>{previewMatchesRequest && preview ? `${preview.changes.filter((entry) => entry.changed).length} 项差异 · secret 只显示已配置状态` : '先进行 dry-run，服务器重新绑定部署 revision 与配置 revision。'}</small></span></div><button type="button" disabled={busy} onClick={() => void previewConfiguration()}>{busy ? '预演中…' : '生成配置预演'}</button></div>}
+    {previewMatchesRequest && preview && <><div className="mod-preview-result">{preview.changes.map((change) => <div key={change.id}><span>{change.id}</span><strong>{change.changed ? '将变更' : '无变化'}</strong><small>{typeof change.before === 'object' ? `已配置: ${change.before.configured ? '是' : '否'}` : `${String(change.before)} → ${typeof change.after === 'object' ? `已配置: ${change.after.configured ? '是' : '否'}` : String(change.after)}`}</small></div>)}</div><div className="mod-execution-confirm"><div><TriangleAlert size={22} /><span><strong>精确确认配置写入</strong><small>输入 <code>{confirmationPhrase}</code>；执行使用共享主机 mutation lease、停服门禁、原子写入和保护点。</small></span></div><input aria-label="受管模组配置精确确认" value={confirmation} disabled={!canMutate} onChange={(event) => setConfirmation(event.target.value)} placeholder={confirmationPhrase} /><button type="button" className="confirm-execute" disabled={busy || !canMutate || !executionEnabled || confirmation !== confirmationPhrase} onClick={() => void executeConfiguration()}>{busy ? '提交中…' : !canMutate ? '需要 Administrator' : !executionEnabled ? '写操作未启用' : '提交受管配置'}</button></div></>}
+    {receipt && <div className={`mod-deployment-receipt status-${receipt.status === 'applied' ? 'succeeded' : receipt.status}`} aria-live="polite"><span className="receipt-icon">{receipt.status === 'applied' ? <Check size={19} /> : <Undo2 size={19} />}</span><div><strong>{receipt.status === 'applied' ? '受管配置已提交' : '受管配置已回滚或需恢复'}</strong><small>{receipt.changedFieldIds.join(', ') || '无字段变化'} · {receipt.requestId}</small></div><code>{receipt.newConfigurationRevision ? shortHash(receipt.newConfigurationRevision, 16) : 'ROLLBACK'}</code></div>}
+    {!loading && !selected && <p><ShieldCheck size={15} />没有声明 schema 的插件不可配置；浏览器不能提交路径、节、键或脚本。</p>}
+  </section>
+}
+
 function parseLogicalModDeploymentRequest(input: unknown): ModDeploymentRequest {
   if (!isPlainRecord(input) || hasUnexpectedKeys(input, ['requestId', 'operation', 'package', 'manifest', 'expectedRevision'])
       || containsForbiddenModTransport(input)) throw new Error('INVALID_LOGICAL_MOD_REQUEST')
-  if (typeof input.requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.requestId)
+  if (typeof input.requestId !== 'string' || !modDeploymentRequestIdPattern.test(input.requestId)
       || !modDeploymentOperations.some((item) => item.operation === input.operation)
       || typeof input.expectedRevision !== 'string' || !/^[0-9a-f]{64}$/.test(input.expectedRevision)
       || !isPlainRecord(input.package) || hasUnexpectedKeys(input.package, ['dependencyId', 'version'])
@@ -1899,6 +2293,7 @@ export function ClientPackageWorkspace({ demo, canGenerate = true }: { demo: boo
   }
 
   return <div className="client-package-workspace">
+    <QualifiedClientIssuePanel canGenerate={canGenerate} />
     {!canGenerate && <div className="permission-lock-note"><LockKeyhole size={15} /><span><strong>客户端生成只读</strong><small>当前角色可以查看页面边界，但不能向生成 API 提交请求或下载 ZIP。</small></span></div>}
     <section className="client-package-intake">
       <div className={`client-drop-zone${dragging ? ' dragging' : ''}`}
@@ -2243,7 +2638,7 @@ const lifecycleActions: Array<{
   description: string
   icon: ComponentType<{ size?: number }>
 }> = [
-  { action: 'start', label: '启动预检', description: '停止证据、固定任务与端口复核', icon: Play },
+  { action: 'start', label: '启动预检', description: '会话、Steam、生命周期代理与端口复核', icon: Play },
   { action: 'save', label: '保存预检', description: '存档配对、备份与保存回执', icon: Save },
   { action: 'graceful-stop', label: '停服预检', description: '进程身份、会话任务与停服回执', icon: Square },
   { action: 'restart', label: '重启预检', description: '停服链、开服任务与回滚点', icon: RotateCw }
@@ -2267,6 +2662,9 @@ const lifecycleCheckLabels: Record<LifecycleCheckId, string> = {
   'task-history': '计划任务事件历史',
   'receipt-channel': '持久生命周期回执',
   'save-trigger': '独立保存确认',
+  'interactive-session': '受管交互会话',
+  'steam-session': 'Steam 登录会话',
+  'lifecycle-broker': 'SYSTEM 生命周期代理',
   'execution-lock': '执行总锁'
 }
 

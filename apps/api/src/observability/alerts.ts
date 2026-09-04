@@ -46,7 +46,11 @@ const allowedSeveritiesByCode = {
   SIMULATION_BELOW_TARGET: ['warning', 'critical'],
   SIMULATION_TELEMETRY_UNAVAILABLE: ['info'],
   RUNTIME_STATE_UNKNOWN: ['info'],
-  OBSERVABILITY_INCOMPLETE: ['info']
+  OBSERVABILITY_INCOMPLETE: ['info'],
+  PROJECT_ROOT_UNAVAILABLE: ['critical'],
+  SMB_GLOBAL_MAPPING_UNAVAILABLE: ['critical'],
+  STORAGE_RECOVERY_TASK_FAILED: ['critical'],
+  STORAGE_DEPENDENCY_UNCLASSIFIED: ['info']
 } as const satisfies Record<ObservabilityHintCode, readonly ObservabilityHintSeverity[]>
 
 const relatedMetricOptionsByCode = {
@@ -81,7 +85,13 @@ const relatedMetricOptionsByCode = {
   SIMULATION_BELOW_TARGET: [['simulation.ups', 'simulation.targetUps']],
   SIMULATION_TELEMETRY_UNAVAILABLE: [['simulation.ups', 'simulation.tps']],
   RUNTIME_STATE_UNKNOWN: [[]],
-  OBSERVABILITY_INCOMPLETE: []
+  OBSERVABILITY_INCOMPLETE: [],
+  PROJECT_ROOT_UNAVAILABLE: [['automation.projectRootAvailable']],
+  SMB_GLOBAL_MAPPING_UNAVAILABLE: [['automation.globalMappingAvailable']],
+  STORAGE_RECOVERY_TASK_FAILED: [[
+    'automation.storageTask.state', 'automation.storageTask.lastResult'
+  ]],
+  STORAGE_DEPENDENCY_UNCLASSIFIED: [[]]
 } as const satisfies Record<
   ObservabilityHintCode,
   readonly (readonly ObservabilityMetricPath[])[]
@@ -93,7 +103,12 @@ const incompleteMetricOrder: readonly ObservabilityMetricPath[] = [
   'runtime.gamePort.port',
   'runtime.gamePort.listening',
   'runtime.processId',
-  'process.workingSetBytes'
+  'runtime.startedAt',
+  'process.workingSetBytes',
+  'automation.projectRootAvailable',
+  'automation.globalMappingAvailable',
+  'automation.storageTask.state',
+  'automation.storageTask.lastResult'
 ]
 
 export const OBSERVABILITY_ALERT_ERROR_CODES = [

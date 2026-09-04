@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const POLICY_ID = 'dyson-public-release-hygiene'
-export const POLICY_VERSION = '1.4.2'
+export const POLICY_VERSION = '1.4.14'
 
 export const DEFAULT_LIMITS = Object.freeze({
   maximumWorktreeFiles: 50_000,
@@ -107,9 +107,43 @@ export const EXACT_ALLOWLIST = Object.freeze([
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'apps/api/src/client-profile/generator.test.ts' },
   // These sources contain protocol/extended-path syntax, not a deployment endpoint.
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'integrations/dyson-control-bridge/BridgeProtocol.cs' },
+  { scope: 'artifact', ruleId: 'UNC_PATH', path: 'integrations/dyson-control-bridge/BridgeProtocol.cs' },
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/public-release/scanner.mjs' },
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/windows/DysonHostMutationLease.Common.ps1' },
-  { scope: 'worktree', ruleId: 'USER_ABSOLUTE_PATH', path: 'apps/api/src/update-pipeline/activation-http.test.ts' },
+  { scope: 'artifact', ruleId: 'UNC_PATH', path: 'scripts/windows/DysonHostMutationLease.Common.ps1' },
+  { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1' },
+  { scope: 'artifact', ruleId: 'UNC_PATH', path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1' },
+  { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1' },
+  { scope: 'artifact', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1' },
+  { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1' },
+  { scope: 'artifact', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1' },
+  // The V2 network self-test must prove that private/special-use addresses fail closed.
+  { scope: 'worktree', ruleId: 'PRIVATE_IP_ADDRESS', path: 'scripts/windows/network/SelfTest-DysonNebulaNetworkV2.ps1' },
+  { scope: 'artifact', ruleId: 'PRIVATE_IP_ADDRESS', path: 'scripts/windows/network/SelfTest-DysonNebulaNetworkV2.ps1' },
+  {
+    scope: 'history',
+    ruleId: 'UNC_PATH',
+    path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1',
+    blobId: '367812fdf0c579c9a4f987202b01fda1751126b0'
+  },
+  {
+    scope: 'history',
+    ruleId: 'UNC_PATH',
+    path: 'scripts/windows/deployment/DysonDeployment.Common.ps1',
+    blobId: '6b3ffe2c56b921d17ed980b6cbf8724eaa4a54e4'
+  },
+  {
+    scope: 'history',
+    ruleId: 'UNC_PATH',
+    path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1',
+    blobId: 'f2ca6521af2412de66015decb40b48238df8174d'
+  },
+  {
+    scope: 'history',
+    ruleId: 'PRIVATE_IP_ADDRESS',
+    path: 'scripts/windows/network/SelfTest-DysonNebulaNetworkV2.ps1',
+    blobId: '7958a0c9088f2069e4f7182eeed54f9221ffcbee'
+  },
   {
     scope: 'history',
     ruleId: 'HIGH_ENTROPY_SECRET_ASSIGNMENT',
@@ -121,6 +155,12 @@ export const EXACT_ALLOWLIST = Object.freeze([
     ruleId: 'HIGH_ENTROPY_SECRET_ASSIGNMENT',
     path: 'scripts/public-release/scanner.mjs',
     blobId: 'f9117ffbcd2c3d8636c35bccbc04d13907e678c0'
+  },
+  {
+    scope: 'history',
+    ruleId: 'HIGH_ENTROPY_SECRET_ASSIGNMENT',
+    path: 'scripts/public-release/scanner.mjs',
+    blobId: '02d2ef9b2ab7df0af6a28775f71ee26215c4be5c'
   },
   {
     scope: 'history',
@@ -174,6 +214,12 @@ export const EXACT_ALLOWLIST = Object.freeze([
   {
     scope: 'history',
     ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'scripts/public-release/scanner.mjs',
+    blobId: '02d2ef9b2ab7df0af6a28775f71ee26215c4be5c'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
     path: 'scripts/public-release/scanner.test.mjs',
     blobId: '7dd287661db2099d9ea50d04e37f7c7a89246337'
   },
@@ -182,6 +228,12 @@ export const EXACT_ALLOWLIST = Object.freeze([
     ruleId: 'SECRET_LITERAL_ASSIGNMENT',
     path: 'scripts/public-release/scanner.test.mjs',
     blobId: '8ead511c515b359e28ed7a0e327a5aec11bf2b74'
+  },
+  {
+    scope: 'history',
+    ruleId: 'SECRET_LITERAL_ASSIGNMENT',
+    path: 'scripts/public-release/scanner.test.mjs',
+    blobId: '49851ff9aa4655f86875ed17eff2be1087ff9a35'
   },
   {
     scope: 'history',
@@ -216,6 +268,12 @@ export const EXACT_ALLOWLIST = Object.freeze([
   {
     scope: 'history',
     ruleId: 'UNC_PATH',
+    path: 'scripts/public-release/scanner.mjs',
+    blobId: '02d2ef9b2ab7df0af6a28775f71ee26215c4be5c'
+  },
+  {
+    scope: 'history',
+    ruleId: 'UNC_PATH',
     path: 'scripts/windows/DysonHostMutationLease.Common.ps1',
     blobId: '21be43203aff9862b83bd2d069d337a963007fb2'
   },
@@ -232,16 +290,23 @@ export const EXACT_ALLOWLIST = Object.freeze([
 // as categories merely because the artifact builder selected reviewed files
 // from those trees.
 export const ARTIFACT_EXACT_ALLOWED_PATHS = Object.freeze([
+  'docs/DATAROOT-RECOVERY.md',
   'docs/GSM-EVALUATION.md',
+  'docs/MIGRATION-GSMANAGER.md',
+  'docs/NETWORK-CONNECTIVITY.md',
   'docs/WINDOWS-DEPLOYMENT-DRAFT.md',
   'integrations/dyson-control-bridge/BridgeFileStore.cs',
   'integrations/dyson-control-bridge/BridgeProtocol.cs',
   'integrations/dyson-control-bridge/DysonControlBridge.csproj',
   'integrations/dyson-control-bridge/DysonControlBridgePlugin.cs',
   'integrations/dyson-control-bridge/GameSaveAdapter.cs',
+  'integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.cs',
   'integrations/dyson-control-bridge/PlayerRosterPublisher.cs',
+  'integrations/dyson-control-bridge/SimulationTelemetrySampler.cs',
   'integrations/dyson-control-bridge/README.md',
-  'integrations/dyson-control-bridge/dyson-control-bridge.cfg.example'
+  'integrations/dyson-control-bridge/dyson-control-bridge.cfg.example',
+  'integrations/nebula-hostname-wss/contract.json',
+  'integrations/nebula-hostname-wss/patches/nebula-v0.9.22-hostname-wss.patch'
 ])
 
 // These are public package registries, source forges, standards bodies, and
@@ -250,8 +315,11 @@ export const ARTIFACT_EXACT_ALLOWED_PATHS = Object.freeze([
 export const PUBLIC_REFERENCE_HOSTS = Object.freeze([
   'fsf.org',
   'api.github.com',
+  'api.nuget.org',
   'gcdn.thunderstore.io',
   'github.com',
+  'json-schema.org',
+  'nuget.bepinex.dev',
   'objects.githubusercontent.com',
   'opencollective.com',
   'react.dev',

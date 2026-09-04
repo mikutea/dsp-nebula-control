@@ -464,8 +464,12 @@ function isProvenRecoveryTerminalReceipt(
   requestId: string
 ): boolean {
   if (receipt.requestId !== requestId || receipt.recoveryRequired) return false
-  if (receipt.status === 'succeeded') return receipt.failureCode === null
-  return receipt.status === 'rolled-back' && receipt.rollbackVerified && receipt.failureCode !== null
+  if (receipt.status === 'succeeded') {
+    return receipt.failureCode === null && receipt.rollbackBindingSha256 !== null
+  }
+  return receipt.status === 'rolled-back' && receipt.rollbackVerified && receipt.failureCode !== null &&
+    receipt.rollbackBindingSha256 !== null &&
+    Object.values(receipt.rollbackSteps).every((status) => status === 'verified')
 }
 
 function samePersistedTerminalReceipt(
@@ -485,6 +489,8 @@ function samePersistedTerminalReceipt(
     recovered.previousRevision === persisted.previousRevision &&
     recovered.resultingRevision === persisted.resultingRevision &&
     recovered.protectionBackupId === persisted.protectionBackupId &&
+    recovered.rollbackBindingSha256 === persisted.rollbackBindingSha256 &&
+    JSON.stringify(recovered.rollbackSteps) === JSON.stringify(persisted.rollbackSteps) &&
     recovered.failureCode === persisted.failureCode &&
     recovered.rollbackVerified === persisted.rollbackVerified &&
     recovered.recoveryRequired === persisted.recoveryRequired &&

@@ -19,6 +19,7 @@ describe('server observability snapshot builder', () => {
       runtime: {
         state: 'running',
         processId: { status: 'available', value: 4242 },
+        startedAt: { status: 'available', value: '2026-08-30T11:00:00.000Z' },
         gamePort: {
           port: { status: 'available', value: 8469 },
           listening: { status: 'available', value: true }
@@ -159,6 +160,33 @@ describe('server observability snapshot builder', () => {
     ]))
   })
 
+  it('fails closed when the project root, SMB mapping, or recovery task is unhealthy', () => {
+    const input = sample()
+    input.automation = {
+      storageDependencyKind: 'smb-global-mapping',
+      projectRootAvailable: false,
+      globalMappingAvailable: false,
+      storageTask: { state: 'disabled', lastResult: 1312 }
+    }
+    const snapshot = buildServerObservabilitySnapshot(input)
+
+    expect(snapshot.health.status).toBe('critical')
+    expect(snapshot.health.hints).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'PROJECT_ROOT_UNAVAILABLE', severity: 'critical' }),
+      expect.objectContaining({ code: 'SMB_GLOBAL_MAPPING_UNAVAILABLE', severity: 'critical' }),
+      expect.objectContaining({ code: 'STORAGE_RECOVERY_TASK_FAILED', severity: 'critical' })
+    ]))
+  })
+
+  it('does not require SMB-only metrics for a classified non-SMB project root', () => {
+    const snapshot = buildServerObservabilitySnapshot(sample())
+    expect(snapshot.automation.storageDependencyKind).toBe('none')
+    expect(snapshot.automation.globalMappingAvailable.status).toBe('unavailable')
+    expect(snapshot.health.hints.map((hint) => hint.code)).toEqual(expect.not.arrayContaining([
+      'STORAGE_DEPENDENCY_UNCLASSIFIED', 'OBSERVABILITY_INCOMPLETE'
+    ]))
+  })
+
   it('rejects non-finite, out-of-range, oversized, and unknown input values', () => {
     const invalidValues: unknown[] = [
       withMutation((input) => { input.host.cpu!.totalPercent = Number.NaN }),
@@ -215,6 +243,29 @@ describe('server observability snapshot builder', () => {
       health: { ...snapshot.health, unavailableMetrics: ['simulation.ups', 'simulation.ups'] }
     }), 'OBSERVABILITY_SNAPSHOT_INVALID')
   })
+
+  it('loads pre-automation snapshots only by normalizing storage evidence to unknown', () => {
+    const snapshot = buildServerObservabilitySnapshot(sample())
+    const { automation: _legacyMissingField, ...legacy } = snapshot
+    const normalized = parseServerObservabilitySnapshot(legacy)
+
+    expect(normalized.automation.storageDependencyKind).toBe('unknown')
+    expect(normalized.automation.projectRootAvailable.status).toBe('unavailable')
+    expect(normalized.health.status).not.toBe('healthy')
+    expect(normalized.health.hints.map((hint) => hint.code)).toEqual(expect.arrayContaining([
+      'STORAGE_DEPENDENCY_UNCLASSIFIED', 'OBSERVABILITY_INCOMPLETE'
+    ]))
+  })
+
+  it('loads a pre-generation snapshot only with process identity marked unavailable', () => {
+    const snapshot = buildServerObservabilitySnapshot(sample())
+    const { startedAt: _legacyMissingField, ...legacyRuntime } = snapshot.runtime
+    const normalized = parseServerObservabilitySnapshot({ ...snapshot, runtime: legacyRuntime })
+
+    expect(normalized.runtime.startedAt).toEqual({ status: 'unavailable', reason: 'not-provided' })
+    expect(normalized.health.status).not.toBe('healthy')
+    expect(normalized.health.unavailableMetrics).toContain('runtime.startedAt')
+  })
 })
 
 function sample(): TrustedServerObservabilitySample {
@@ -222,7 +273,11 @@ function sample(): TrustedServerObservabilitySample {
     schemaVersion: 1 as const,
     observedAt: '2026-08-30T12:00:00.000Z',
     source: 'fixture.windows-status',
-    runtime: { state: 'running' as const, processId: 4242 },
+    runtime: {
+      state: 'running' as const,
+      processId: 4242,
+      startedAt: '2026-08-30T11:00:00.000Z'
+    },
     host: {
       cpu: {
         logicalProcessorCount: 4,
@@ -251,6 +306,10 @@ function sample(): TrustedServerObservabilitySample {
       workingSetBytes: 4 * gibibyte,
       privateBytes: 5 * gibibyte,
       threadCount: 256
+    },
+    automation: {
+      storageDependencyKind: 'none',
+      projectRootAvailable: true
     },
     network: { gamePort: { port: 8469, listening: true } },
     simulation: { ups: 40, tps: 39, targetUps: 60 }

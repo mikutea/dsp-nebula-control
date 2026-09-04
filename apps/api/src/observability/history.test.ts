@@ -150,7 +150,8 @@ function snapshot(
       threadCount: 200
     },
     network: { gamePort: { port: 8469, listening: true } },
-    simulation: { ups, tps: ups, targetUps: 60 }
+    simulation: { ups, tps: ups, targetUps: 60 },
+    automation: { storageDependencyKind: 'none', projectRootAvailable: true }
   })
 }
 

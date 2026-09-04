@@ -9,6 +9,7 @@ import {
   type ModDeploymentRequest
 } from './mods/index.js'
 import { DemoProvider } from './providers/demo.js'
+import type { WindowsLifecycleBrokerClient } from './providers/windows-lifecycle-broker.js'
 import { hashPassword } from './security/password.js'
 
 const origin = 'http://127.0.0.1:13010'
@@ -150,6 +151,7 @@ describe('authenticated mod deployment routes', () => {
     const service = deploymentService()
     application = await buildApplication(enabledConfig(), {
       statusProvider: new DemoProvider(),
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       modDeploymentService: service
     })
     const cookie = await login(application)
@@ -189,6 +191,7 @@ describe('authenticated mod deployment routes', () => {
     })
     application = await buildApplication(recoveryEnabledConfig(), {
       statusProvider: new DemoProvider(),
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       modDeploymentService: service
     })
     const administrator = await login(application)
@@ -242,6 +245,7 @@ describe('authenticated mod deployment routes', () => {
     const service = deploymentService()
     application = await buildApplication(enabledConfig(), {
       statusProvider: new DemoProvider(),
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       modDeploymentService: service
     })
     const cookie = await login(application)
@@ -260,6 +264,7 @@ describe('authenticated mod deployment routes', () => {
     service.preview.mockRejectedValueOnce(new ModDeploymentError('MOD_DEPLOYMENT_STOP_GATE_REJECTED'))
     application = await buildApplication(enabledConfig(), {
       statusProvider: new DemoProvider(),
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       modDeploymentService: service
     })
     const cookie = await login(application)
@@ -300,6 +305,7 @@ describe('authenticated mod deployment routes', () => {
     service.execute.mockRejectedValueOnce(new ModDeploymentError(code))
     application = await buildApplication(enabledConfig(), {
       statusProvider: new DemoProvider(),
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       modDeploymentService: service
     })
     const cookie = await login(application)
@@ -397,6 +403,13 @@ function enabledConfig() {
     NODE_ENV: 'test',
     DYSON_PROVIDER: 'windows',
     DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+    DYSON_LIFECYCLE_ENABLED: 'true',
+    DYSON_LIFECYCLE_BROKER_PROFILE_FILE:
+      'C:\\ProgramData\\DysonControl\\data\\lifecycle-broker\\broker-profile.json',
+    DYSON_RUNTIME_SERVICE_USER: '.\\FictionalDyson',
+    DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+    DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
+    DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
     DYSON_MOD_DEPLOYMENT_ENABLED: 'true',
     DYSON_MOD_STAGING_ROOT: 'C:\\Fictional\\Dyson\\staged-mods',
     DYSON_MOD_PLUGINS_ROOT: 'C:\\Fictional\\Dyson\\server\\BepInEx\\plugins\\dyson-managed-mods',
@@ -421,6 +434,13 @@ function recoveryEnabledConfig() {
     NODE_ENV: 'test',
     DYSON_PROVIDER: 'windows',
     DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+    DYSON_LIFECYCLE_ENABLED: 'true',
+    DYSON_LIFECYCLE_BROKER_PROFILE_FILE:
+      'C:\\ProgramData\\DysonControl\\data\\lifecycle-broker\\broker-profile.json',
+    DYSON_RUNTIME_SERVICE_USER: '.\\FictionalDyson',
+    DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+    DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
+    DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
     DYSON_MOD_DEPLOYMENT_ENABLED: 'false',
     DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED: 'true',
     DYSON_MOD_STAGING_ROOT: 'C:\\Fictional\\Dyson\\staged-mods',
@@ -430,6 +450,13 @@ function recoveryEnabledConfig() {
     DYSON_PUBLIC_ORIGIN: origin
   })
 }
+
+const unusedLifecycleBrokerClient = {
+  preflight: async () => { throw new Error('unused lifecycle broker preflight') },
+  dispatch: async () => { throw new Error('unused lifecycle broker dispatch') },
+  verify: async () => { throw new Error('unused lifecycle broker verify') },
+  status: async () => { throw new Error('unused lifecycle broker status') }
+} satisfies WindowsLifecycleBrokerClient
 
 function deploymentRequest(): ModDeploymentRequest {
   const dependencyId = 'Fictional-ExampleMod-1.0.0'

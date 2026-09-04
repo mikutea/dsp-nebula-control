@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/dyson/reversible-cutover-observation.v2.schema.json",
+  "title": "Dyson reversible cutover observation v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol", "schemaVersion", "qualificationRunId", "targetIdentity", "maintenanceWindow", "release",
+    "dataRootIdentity", "saveGenerationId", "protectionPoint", "gsManagerAuthority", "switchToDysonControl",
+    "dysonControlHealth", "switchBackToGsManager", "restoredGsManagerHealth", "restoredSavePair",
+    "bidirectionalNoLoss", "audit", "collectorEffects", "observedAtUtc", "expiresAtUtc", "observationSha256"
+  ],
+  "properties": {
+    "protocol": { "const": "DYSON_REVERSIBLE_CUTOVER_OBSERVATION_V2" },
+    "schemaVersion": { "const": 2 },
+    "qualificationRunId": { "$ref": "#/$defs/guid" },
+    "targetIdentity": { "$ref": "#/$defs/pathIdentity" },
+    "maintenanceWindow": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "approvalId", "windowId", "startsAtUtc", "endsAtUtc", "sourceSha256"],
+      "properties": {
+        "protocol": { "const": "DYSON_APPROVED_MAINTENANCE_WINDOW_V2" },
+        "approvalId": { "$ref": "#/$defs/guid" }, "windowId": { "$ref": "#/$defs/guid" },
+        "startsAtUtc": { "$ref": "#/$defs/timestamp" }, "endsAtUtc": { "$ref": "#/$defs/timestamp" },
+        "sourceSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "release": {
+      "type": "object", "additionalProperties": false,
+      "required": ["controlRelease", "subjectCommit", "runtimePayloadSha256", "releaseManifestSha256"],
+      "properties": {
+        "controlRelease": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9a-z.-]+)?$" },
+        "subjectCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "runtimePayloadSha256": { "$ref": "#/$defs/sha256" }, "releaseManifestSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "dataRootIdentity": { "$ref": "#/$defs/pathIdentity" }, "saveGenerationId": { "$ref": "#/$defs/guid" },
+    "protectionPoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "protectionPointId", "pairSha256", "createdAtUtc", "expiresAtUtc", "sourceSha256"],
+      "properties": {
+        "protocol": { "const": "DYSON_CONTROL_PAIRED_SAVE_PROTECTION_POINT_V2" },
+        "protectionPointId": { "$ref": "#/$defs/guid" }, "pairSha256": { "$ref": "#/$defs/sha256" },
+        "createdAtUtc": { "$ref": "#/$defs/timestamp" }, "expiresAtUtc": { "$ref": "#/$defs/timestamp" },
+        "sourceSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "gsManagerAuthority": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "snapshotId", "inventoryRevision", "runtimeOwner", "capturedAtUtc", "sourceSha256"],
+      "properties": {
+        "protocol": { "const": "DYSON_GSMANAGER_AUTHORITY_PROFILE_V1" }, "snapshotId": { "$ref": "#/$defs/guid" },
+        "inventoryRevision": { "$ref": "#/$defs/sha256" }, "runtimeOwner": { "const": "gsmanager" },
+        "capturedAtUtc": { "$ref": "#/$defs/timestamp" }, "sourceSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "switchToDysonControl": { "$ref": "#/$defs/switchSummary" },
+    "dysonControlHealth": { "$ref": "#/$defs/healthSummary" },
+    "switchBackToGsManager": { "$ref": "#/$defs/switchSummary" },
+    "restoredGsManagerHealth": { "$ref": "#/$defs/healthSummary" },
+    "restoredSavePair": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dsvLength", "dsvSha256", "serverLength", "serverSha256", "pairSha256"],
+      "properties": {
+        "dsvLength": { "type": "integer", "minimum": 1 }, "dsvSha256": { "$ref": "#/$defs/sha256" },
+        "serverLength": { "type": "integer", "minimum": 1 }, "serverSha256": { "$ref": "#/$defs/sha256" },
+        "pairSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "bidirectionalNoLoss": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "forwardSwitchProved", "reverseSwitchProved", "generationPreserved", "pairPreserved", "beforePairSha256", "afterPairSha256"],
+      "properties": {
+        "protocol": { "const": "DYSON_REVERSIBLE_CUTOVER_NO_LOSS_PROOF_V2" },
+        "forwardSwitchProved": { "const": true }, "reverseSwitchProved": { "const": true },
+        "generationPreserved": { "const": true }, "pairPreserved": { "const": true },
+        "beforePairSha256": { "$ref": "#/$defs/sha256" }, "afterPairSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "audit": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "firstSequence", "lastSequence", "entryCount", "sourceSha256", "terminalEvidenceSha256"],
+      "properties": {
+        "protocol": { "const": "DYSON_REVERSIBLE_CUTOVER_AUDIT_V2" }, "firstSequence": { "const": 1 },
+        "lastSequence": { "const": 7 }, "entryCount": { "const": 7 },
+        "sourceSha256": { "$ref": "#/$defs/sha256" }, "terminalEvidenceSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "collectorEffects": {
+      "type": "object", "additionalProperties": false, "required": ["networkTouched", "productionChanged"],
+      "properties": { "networkTouched": { "const": false }, "productionChanged": { "const": false } }
+    },
+    "observedAtUtc": { "$ref": "#/$defs/timestamp" }, "expiresAtUtc": { "$ref": "#/$defs/timestamp" },
+    "observationSha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "guid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "pathIdentity": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "timestamp": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,7})?Z$" },
+    "switchSummary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "receiptId", "state", "persisted", "actionCount", "completedAtUtc", "sourceSha256"],
+      "properties": {
+        "protocol": { "const": "DYSON_REVERSIBLE_CUTOVER_SWITCH_RECEIPT_V2" }, "receiptId": { "$ref": "#/$defs/guid" },
+        "state": { "const": "succeeded" }, "persisted": { "const": true }, "actionCount": { "const": 3 },
+        "completedAtUtc": { "$ref": "#/$defs/timestamp" }, "sourceSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "healthSummary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "healthId", "authority", "authenticatedManagement", "gameProtocolHandshake", "simulationProgressObserved", "observedAtUtc", "sourceSha256"],
+      "properties": {
+        "protocol": { "const": "DYSON_REVERSIBLE_CUTOVER_HEALTH_OBSERVATION_V2" }, "healthId": { "$ref": "#/$defs/guid" },
+        "authority": { "enum": ["dyson-control", "gsmanager"] }, "authenticatedManagement": { "const": true },
+        "gameProtocolHandshake": { "const": true }, "simulationProgressObserved": { "const": true },
+        "observedAtUtc": { "$ref": "#/$defs/timestamp" }, "sourceSha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

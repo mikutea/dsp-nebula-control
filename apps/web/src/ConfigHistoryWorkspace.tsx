@@ -24,8 +24,9 @@ const reconcileConfirmation = 'RECONCILE_CONFIG_RESTORE'
 
 type HistoryAction = 'capture' | 'restore-preview' | 'dry-run' | 'restore' | 'reconcile' | null
 
-export function ConfigHistoryWorkspace({ canManage, onConfigurationChanged }: {
+export function ConfigHistoryWorkspace({ canManage, demo = false, onConfigurationChanged }: {
   canManage: boolean
+  demo?: boolean
   onConfigurationChanged: () => void | Promise<void>
 }) {
   const [snapshots, setSnapshots] = useState<GameConfigHistorySnapshotSummary[]>([])
@@ -92,6 +93,7 @@ export function ConfigHistoryWorkspace({ canManage, onConfigurationChanged }: {
   }, [])
 
   useEffect(() => {
+    if (demo) return
     void loadHistory()
     return () => {
       listControllerRef.current?.abort()
@@ -101,9 +103,10 @@ export function ConfigHistoryWorkspace({ canManage, onConfigurationChanged }: {
       detailControllerRef.current = null
       actionControllerRef.current = null
     }
-  }, [loadHistory])
+  }, [demo, loadHistory])
 
   useEffect(() => {
+    if (demo) return
     detailControllerRef.current?.abort()
     if (previousSelectedIdRef.current !== selectedId) {
       previousSelectedIdRef.current = selectedId
@@ -133,7 +136,7 @@ export function ConfigHistoryWorkspace({ canManage, onConfigurationChanged }: {
       }
     })
     return () => controller.abort()
-  }, [detailRefresh, resetRestoreWorkflow, selectedId])
+  }, [demo, detailRefresh, resetRestoreWorkflow, selectedId])
 
   const selectedSummary = useMemo(
     () => snapshots.find(({ snapshotId }) => snapshotId === selectedId) ?? null,
@@ -297,6 +300,20 @@ export function ConfigHistoryWorkspace({ canManage, onConfigurationChanged }: {
     } finally {
       finishAction(controller)
     }
+  }
+
+  if (demo) {
+    return <section className="config-history-workspace" aria-labelledby="config-history-title">
+      <header>
+        <div className="config-history-orbit"><History size={18} /><i /><i /></div>
+        <div><strong id="config-history-title">CONFIGURATION HISTORY ARRAY</strong><small>四文件内容寻址快照 · 脱敏差异 · 受控恢复</small></div>
+        <span><b>0</b><small>DEMO READ-ONLY</small></span>
+      </header>
+      <div className="config-history-readonly">
+        <ShieldCheck size={18} /><span><strong>演示环境未装载持久化配置历史控制器</strong><small>这里不会伪造快照、差异或恢复回执，也不会请求生产专用接口。Windows Provider 会继续执行 revision、停止态、dry-run、确认与补偿门禁。</small></span>
+      </div>
+      <footer><ShieldCheck size={14} /><strong>演示边界</strong><span>配置历史必须来自固定四文件的真实内容寻址快照；虚构数据不能取得恢复资格。</span></footer>
+    </section>
   }
 
   return <section className="config-history-workspace" aria-labelledby="config-history-title">

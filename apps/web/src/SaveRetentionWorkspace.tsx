@@ -28,9 +28,10 @@ const defaultPolicy: BackupRetentionPolicy = {
   allowUnhealthyDeletion: false
 }
 
-export function SaveRetentionWorkspace({ backups, user, onCatalogChanged }: {
+export function SaveRetentionWorkspace({ backups, user, demo = false, onCatalogChanged }: {
   backups: BackupCatalogItem[]
   user: SessionUser
+  demo?: boolean
   onCatalogChanged?: () => void | Promise<void>
 }) {
   const canManage = user.role === 'administrator' && user.permissions.includes('saves.restore')
@@ -69,12 +70,13 @@ export function SaveRetentionWorkspace({ backups, user, onCatalogChanged }: {
   const busy = phase !== 'idle' && phase !== 'loading'
 
   useEffect(() => {
+    if (demo) return
     void loadAnnotations()
     return () => {
       sequenceRef.current += 1
       abortRef.current?.abort()
     }
-  }, [])
+  }, [demo])
 
   useEffect(() => {
     if (selectedBackupId && backups.some((backup) => backup.backupId === selectedBackupId)) return
@@ -286,6 +288,13 @@ export function SaveRetentionWorkspace({ backups, user, onCatalogChanged }: {
     return <section className="save-retention-workspace readonly">
       <header><div><FileLock2 size={18} /><span><strong>备份保留与清理</strong><small>退役区 · 等待期 · 可恢复事务</small></span></div><b>ADMINISTRATOR ONLY</b></header>
       <div className="retention-readonly"><ShieldCheck size={22} /><span><strong>当前角色仅可浏览保护点</strong><small>保护备注、保留策略、退役、恢复和永久清理均会改变服务器数据，只对拥有 saves.restore 的 Administrator 开放。</small></span></div>
+    </section>
+  }
+
+  if (demo) {
+    return <section className="save-retention-workspace readonly">
+      <header><div><FileLock2 size={18} /><span><strong>备份保留与清理</strong><small>退役区 · 等待期 · 可恢复事务</small></span></div><b>DEMO READ-ONLY</b></header>
+      <div className="retention-readonly"><ShieldCheck size={22} /><span><strong>演示环境未装载持久化保留控制器</strong><small>这里不会伪造备注、退役或永久清理结果，也不会请求生产专用接口。切换到已配置 Windows Provider 后，服务端会重新执行权限、锁、摘要和恢复状态门禁。</small></span></div>
     </section>
   }
 

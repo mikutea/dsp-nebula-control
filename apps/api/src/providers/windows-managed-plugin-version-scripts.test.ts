@@ -1,20 +1,22 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { copyFile, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { normalizeVersion } from '../updates/version.js'
+import { promisify } from 'node:util'
 import { PowerShellLifecycleRunner, type LifecycleScriptName } from './powershell-runner.js'
 
 const temporaryRoots: string[] = []
+const execFileAsync = promisify(execFile)
 
 afterEach(async () => {
   await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
 describe.runIf(process.platform === 'win32')('Windows managed plugin version host script', () => {
-  it('reads FileVersionInfo from only the fixed bridge DLL and emits the bounded protocol', async () => {
+  it.each(['1.2.3', '1.2.3-rc.4'])('reads the exact %s informational release from only the fixed bridge DLL', async (version) => {
     const projectRoot = await createProjectFixture()
-    await installVersionedFixture(projectRoot, 'bridge')
+    await installVersionedFixture(projectRoot, 'bridge', version)
 
     const output = JSON.parse(await createRunner().run(
       'Get-DysonManagedPluginVersion.ps1',
@@ -28,7 +30,7 @@ describe.runIf(process.platform === 'win32')('Windows managed plugin version hos
       fileName: 'DysonControlBridge.dll',
       relativePath: 'plugins/dyson-control-bridge/DysonControlBridge.dll',
       state: 'available',
-      version: normalizeVersion(process.versions.node, 'plugin')
+      version
     })
   }, 30_000)
 
@@ -65,7 +67,7 @@ describe.runIf(process.platform === 'win32')('Windows managed plugin version hos
 
   it('does not accept a caller-selected path or unknown component', async () => {
     const projectRoot = await createProjectFixture()
-    await installVersionedFixture(projectRoot, 'bridge')
+    await installVersionedFixture(projectRoot, 'bridge', '1.2.3-rc.4')
     const runner = createRunner()
 
     await expect(runner.run(
@@ -82,7 +84,7 @@ describe.runIf(process.platform === 'win32')('Windows managed plugin version hos
 })
 
 describe('Windows managed plugin version script policy', () => {
-  it('contains only the fixed component-to-DLL mapping and FileVersionInfo probe', async () => {
+  it('contains only the fixed component-to-DLL mapping and managed informational-version probe', async () => {
     const source = await readFile(scriptPath(), 'utf8')
 
     expect(source).toContain("[ValidateSet('bridge', 'control')]")
@@ -90,7 +92,12 @@ describe('Windows managed plugin version script policy', () => {
     expect(source).toContain("directoryName = 'dyson-control'")
     expect(source).toContain("relativePath = 'plugins/dyson-control-bridge/DysonControlBridge.dll'")
     expect(source).toContain("relativePath = 'plugins/dyson-control/DysonControl.dll'")
+    expect(source).toContain("assemblyName = 'DysonControlBridge'")
+    expect(source).toContain("assemblyName = 'DysonControl'")
+    expect(source).toContain('[System.Reflection.AssemblyName]::GetAssemblyName')
     expect(source).toContain('[System.Diagnostics.FileVersionInfo]::GetVersionInfo')
+    expect(source).toContain('$versionInfo.ProductVersion')
+    expect(source).not.toContain('$versionInfo.FileVersion')
     expect(source).toContain('[System.IO.FileAttributes]::ReparsePoint')
     expect(source).not.toMatch(
       /\[Parameter\([^\r\n]*\)\]\[[^\]]+\]\$(?:Path|Dll|FileName|Command)\b/i
@@ -119,14 +126,34 @@ async function createProjectFixture(): Promise<string> {
   return projectRoot
 }
 
-async function installVersionedFixture(projectRoot: string, component: 'bridge' | 'control'): Promise<void> {
+async function installVersionedFixture(
+  projectRoot: string,
+  component: 'bridge' | 'control',
+  releaseVersion: string
+): Promise<void> {
   const destination = pluginPath(projectRoot, component)
   await mkdir(path.dirname(destination), { recursive: true })
-  try {
-    await link(process.execPath, destination)
-  } catch {
-    await copyFile(process.execPath, destination)
-  }
+  const assemblyName = component === 'bridge' ? 'DysonControlBridge' : 'DysonControl'
+  const coreVersion = releaseVersion.split('-rc.', 1)[0]
+  const fixtureScript = path.join(projectRoot, `build-${component}-fixture.ps1`)
+  await writeFile(fixtureScript, [
+    '[CmdletBinding()]',
+    'param([Parameter(Mandatory)][string]$OutputAssembly)',
+    '$ErrorActionPreference = \'Stop\'',
+    '$source = @\"',
+    'using System.Reflection;',
+    `[assembly: AssemblyVersion("${coreVersion}.0")]`,
+    `[assembly: AssemblyFileVersion("${coreVersion}.0")]`,
+    `[assembly: AssemblyInformationalVersion("${releaseVersion}")]`,
+    `public sealed class ${assemblyName}Fixture { }`,
+    '\"@',
+    'Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $OutputAssembly -OutputType Library',
+    ''
+  ].join('\n'), 'utf8')
+  await execFileAsync('powershell.exe', [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', fixtureScript, '-OutputAssembly', destination
+  ], { windowsHide: true, timeout: 20_000 })
 }
 
 function pluginDirectoryPath(projectRoot: string, component: 'bridge' | 'control'): string {

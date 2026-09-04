@@ -2,19 +2,23 @@
 param(
     [string]$InstallRoot = (Join-Path $env:ProgramFiles 'DysonControl'),
     [string]$DataRoot = (Join-Path $env:ProgramData 'DysonControl'),
+    [Parameter(Mandatory)][string]$RuntimeRoot,
     [Parameter(Mandatory)][string]$NodeExecutable,
+    [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedNodeSha256,
     [ValidatePattern('^[\p{L}\p{N}_. -]{1,128}$')][string]$TaskName = 'Dyson-Control-Plane',
-    [ValidateSet('NT AUTHORITY\LOCAL SERVICE', 'NT AUTHORITY\NETWORK SERVICE', 'SYSTEM')]
+    [ValidateSet('NT AUTHORITY\LOCAL SERVICE')]
     [string]$ServiceAccount = 'NT AUTHORITY\LOCAL SERVICE',
     [string]$EnvironmentFile,
     [ValidateRange(1, 120)][int]$LockTimeoutSeconds = 30,
     [Parameter(DontShow)][System.IO.FileStream]$ExistingDeploymentLock,
-    [Parameter(DontShow)][switch]$SelfTestSkipAdministratorCheck
+    [Parameter(DontShow)][switch]$SelfTestSkipAdministratorCheck,
+    [Parameter(DontShow)][string]$SelfTestConfigurationShadowRoot
 )
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 . (Join-Path $PSScriptRoot 'DysonDeployment.Common.ps1')
+. (Join-Path $PSScriptRoot 'DysonDeployment.Configuration.ps1')
 
 $installFull = Assert-DysonSafeRoot -Path $InstallRoot -Name 'InstallRoot'
 $dataFull = Assert-DysonSafeRoot -Path $DataRoot -Name 'DataRoot'
@@ -24,23 +28,39 @@ $commonPath = Join-Path $bootstrapRoot 'DysonDeployment.Common.ps1'
 foreach ($required in @($launcherPath, $commonPath)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Installed bootstrap file is missing: $required" }
 }
-$nodePath = Resolve-DysonNodeExecutablePath -NodeExecutable $NodeExecutable
+$nodeProtection = Assert-DysonNodeRuntimeProtection -RuntimeRoot $RuntimeRoot `
+    -NodeExecutable $NodeExecutable -ExpectedNodeSha256 $ExpectedNodeSha256 `
+    -InstallRoot $installFull -DataRoot $dataFull
+$runtimeFull = [string]$nodeProtection.runtimeRoot
+$nodePath = [string]$nodeProtection.nodeExecutable
 $active = Get-DysonActiveRelease -InstallRoot $installFull -DataRoot $dataFull
 if (-not $active) { throw 'No Dyson Control release is active.' }
-if (-not $EnvironmentFile) { $EnvironmentFile = Join-Path (Join-Path $dataFull 'config') 'dyson-control.env' }
+$fixedEnvironmentFile = Join-Path (Join-Path $dataFull 'config') 'dyson-control.env'
+if (-not $EnvironmentFile) { $EnvironmentFile = $fixedEnvironmentFile }
 $environmentFull = Get-DysonFullPath -Path $EnvironmentFile
-if (-not (Test-DysonPathWithin -Candidate $environmentFull -Parent (Join-Path $dataFull 'config'))) {
-    throw 'EnvironmentFile must remain below the deployment config directory.'
+if (-not [string]::Equals(
+        $environmentFull,
+        (Get-DysonFullPath -Path $fixedEnvironmentFile),
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+    throw 'EnvironmentFile must be the fixed protected deployment configuration file.'
 }
 if (-not (Test-Path -LiteralPath $environmentFull -PathType Leaf)) {
     throw 'The production environment file must exist before the startup task is installed.'
 }
-foreach ($argumentPath in @($installFull, $dataFull, $nodePath, $environmentFull, $launcherPath)) {
+foreach ($argumentPath in @($installFull, $dataFull, $runtimeFull, $nodePath, $environmentFull, $launcherPath)) {
     if ($argumentPath -match '["\r\n]') { throw 'Scheduled-task paths cannot contain quotes or line breaks.' }
 }
 if ($SelfTestSkipAdministratorCheck) {
     Assert-DysonDeploymentTaskSelfTestScope -InstallRoot $installFull -DataRoot $dataFull
 }
+$configurationModuleRoot = Get-DysonDeploymentConfigurationVerificationModuleRoot `
+    -InstallRoot $installFull -DataRoot $dataFull `
+    -SelfTestConfigurationShadowRoot $SelfTestConfigurationShadowRoot
+$configurationEvidence = Invoke-DysonDeploymentConfigurationTest `
+    -DataRoot $dataFull -ScriptRoot (Join-Path ([string]$active.releaseRoot) 'scripts\windows') `
+    -RuntimeBootstrapRoot $bootstrapRoot -DeploymentVersion ([string]$active.pointer.version) `
+    -ServiceAccount $ServiceAccount -ConfigurationModuleRoot $configurationModuleRoot
 
 if (-not $PSCmdlet.ShouldProcess($TaskName, 'back up and install the fixed loopback Dyson Control startup task')) {
     [ordered]@{
@@ -49,13 +69,31 @@ if (-not $PSCmdlet.ShouldProcess($TaskName, 'back up and install the fixed loopb
         taskName = $TaskName
         serviceAccount = $ServiceAccount
         launcher = $launcherPath
+        runtimeRootIdentity = [string]$nodeProtection.runtimeRootIdentity
+        nodeExecutableSha256 = [string]$nodeProtection.nodeExecutableSha256
+        nodeRuntimeProtected = $true
         nodeRuntimeWillBeVerified = $true
+        configurationSha256 = [string]$configurationEvidence.configurationSha256
+        configurationLength = [int64]$configurationEvidence.configurationLength
+        configurationNamesSha256 = [string]$configurationEvidence.configurationNamesSha256
+        configurationBindingsSha256 = [string]$configurationEvidence.configurationBindingsSha256
+        configurationContractSha256 = [string]$configurationEvidence.configurationContractSha256
+        configurationAclFingerprint = [string]$configurationEvidence.configurationAclFingerprint
+        configurationParentAclFingerprint = [string]$configurationEvidence.configurationParentAclFingerprint
         gameTasksChanged = $false
     } | ConvertTo-DysonJsonLine
     exit 0
 }
 
-[void](Test-DysonNodeRuntime -NodeExecutable $nodePath -MinimumMajor $active.nodeMinimumMajor)
+[void](Test-DysonNodeRuntime -RuntimeRoot $runtimeFull -NodeExecutable $nodePath `
+    -ExpectedNodeSha256 $ExpectedNodeSha256 -InstallRoot $installFull -DataRoot $dataFull `
+    -MinimumMajor $active.nodeMinimumMajor)
+$configurationBeforeMutation = Invoke-DysonDeploymentConfigurationTest `
+    -DataRoot $dataFull -ScriptRoot (Join-Path ([string]$active.releaseRoot) 'scripts\windows') `
+    -RuntimeBootstrapRoot $bootstrapRoot -DeploymentVersion ([string]$active.pointer.version) `
+    -ServiceAccount $ServiceAccount -ConfigurationModuleRoot $configurationModuleRoot
+Assert-DysonDeploymentConfigurationEvidenceMatch `
+    -Expected $configurationEvidence -Actual $configurationBeforeMutation
 
 if (-not $SelfTestSkipAdministratorCheck) {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -75,11 +113,15 @@ else {
     $ownsDeploymentLock = $true
 }
 try {
+$configurationUnderLock = Invoke-DysonDeploymentConfigurationTest `
+    -DataRoot $dataFull -ScriptRoot (Join-Path ([string]$active.releaseRoot) 'scripts\windows') `
+    -RuntimeBootstrapRoot $bootstrapRoot -DeploymentVersion ([string]$active.pointer.version) `
+    -ServiceAccount $ServiceAccount -ConfigurationModuleRoot $configurationModuleRoot
+Assert-DysonDeploymentConfigurationEvidenceMatch `
+    -Expected $configurationBeforeMutation -Actual $configurationUnderLock
+$configurationBeforeMutation = $configurationUnderLock
 $taskRollbackState = Get-DysonControlTaskRollbackState -TaskName $TaskName
-[void](New-DysonDirectory -Path $dataFull)
 Write-DysonDeploymentAudit -DataRoot $dataFull -Operation 'install-control-task' -Outcome 'started' -Code 'TASK_INSTALL_STARTED'
-$originalDataAcl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $dataFull -ErrorAction Stop
-$originalDataSddl = $originalDataAcl.Sddl
 $backupId = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmssfff') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $backupPath = $null
 $hadExistingTask = $false
@@ -87,21 +129,6 @@ $existingTaskWasRunning = $false
 $existingTaskStopped = $false
 $taskRegistrationAttempted = $false
 try {
-    $serviceSid = switch ($ServiceAccount) {
-        'NT AUTHORITY\LOCAL SERVICE' { [System.Security.Principal.SecurityIdentifier]::new('S-1-5-19') }
-        'NT AUTHORITY\NETWORK SERVICE' { [System.Security.Principal.SecurityIdentifier]::new('S-1-5-20') }
-        'SYSTEM' { [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18') }
-    }
-    $dataAcl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $dataFull -ErrorAction Stop
-    $dataRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-        $serviceSid,
-        [System.Security.AccessControl.FileSystemRights]::Modify,
-        [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
-        [System.Security.AccessControl.PropagationFlags]::None,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-    $dataAcl.SetAccessRule($dataRule)
-    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $dataFull -AclObject $dataAcl -ErrorAction Stop
     $backupRoot = New-DysonDirectory -Path (Join-Path (Join-Path $dataFull 'snapshots') 'tasks')
     $backupPath = Join-Path $backupRoot ($backupId + '.xml')
 
@@ -134,8 +161,10 @@ try {
 
     $powerShellExecutable = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $powerShellExecutable -PathType Leaf)) { throw 'Windows PowerShell is unavailable.' }
-    $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -InstallRoot "{1}" -DataRoot "{2}" -NodeExecutable "{3}" -EnvironmentFile "{4}"' -f
-        $launcherPath, $installFull, $dataFull, $nodePath, $environmentFull
+    $arguments = Get-DysonControlTaskActionArguments -LauncherPath $launcherPath `
+        -InstallRoot $installFull -DataRoot $dataFull -RuntimeRoot $runtimeFull `
+        -NodeExecutable $nodePath -ExpectedNodeSha256 $ExpectedNodeSha256 `
+        -EnvironmentFile $environmentFull
     $action = New-ScheduledTaskAction -Execute $powerShellExecutable -Argument $arguments
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $taskPrincipal = New-ScheduledTaskPrincipal -UserId $ServiceAccount -LogonType ServiceAccount -RunLevel Limited
@@ -161,16 +190,17 @@ try {
     $installedTasks = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
     if ($installedTasks.Count -ne 1) { throw 'The installed control-plane task identity is not unique.' }
     $installed = $installedTasks[0]
-    $installedActions = @($installed.Actions | Where-Object { $null -ne $_ })
-    if ([string]$installed.TaskPath -cne $script:DysonControlTaskPath -or
-        $installed.Principal.LogonType.ToString() -ne 'ServiceAccount' -or
-        -not [string]::Equals($installed.Principal.UserId, $ServiceAccount, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $installedActions.Count -ne 1 -or
-        -not [string]::Equals($installedActions[0].Execute, $powerShellExecutable, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $installedActions[0].Arguments -ne $arguments) {
-        throw 'The installed control-plane task did not match its fixed definition.'
+    $installedContract = Assert-DysonControlTaskContract -Task $installed `
+        -TaskName $TaskName -ExpectedPowerShellExecutable $powerShellExecutable `
+        -ExpectedArguments $arguments -AllowedStates @('Ready', 'Running')
+    if ($existingTaskWasRunning) {
+        Start-ScheduledTask -InputObject $installed -ErrorAction Stop
+        $runningTasks = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
+        if ($runningTasks.Count -ne 1) { throw 'The restarted control-plane task identity is not unique.' }
+        $installedContract = Assert-DysonControlTaskContract -Task $runningTasks[0] `
+            -TaskName $TaskName -ExpectedPowerShellExecutable $powerShellExecutable `
+            -ExpectedArguments $arguments -AllowedStates @('Running')
     }
-    if ($existingTaskWasRunning) { Start-ScheduledTask -InputObject $installed -ErrorAction Stop }
 }
 catch {
     $installError = $_
@@ -182,9 +212,6 @@ catch {
         elseif ($existingTaskStopped -and $existingTaskWasRunning) {
             Start-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonControlTaskPath -ErrorAction Stop
         }
-        $restoredAcl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $dataFull -ErrorAction Stop
-        $restoredAcl.SetSecurityDescriptorSddlForm($originalDataSddl)
-        Microsoft.PowerShell.Security\Set-Acl -LiteralPath $dataFull -AclObject $restoredAcl -ErrorAction Stop
         Write-DysonDeploymentAudit -DataRoot $dataFull -Operation 'install-control-task' -Outcome 'failed-rolled-back' -SnapshotId $backupId -Code 'TASK_INSTALL_ROLLED_BACK'
     }
     catch {
@@ -204,7 +231,19 @@ Write-DysonDeploymentAudit -DataRoot $dataFull -Operation 'install-control-task'
     previousTaskWasRunning = $existingTaskWasRunning
     replacementTaskRestarted = $existingTaskWasRunning
     taskBackupId = if ($hadExistingTask) { $backupId } else { $null }
+    taskContractIdentity = [string]$installedContract.taskIdentity
     loopbackForcedByLauncher = $true
+    runtimeRootIdentity = [string]$nodeProtection.runtimeRootIdentity
+    nodeExecutableSha256 = [string]$nodeProtection.nodeExecutableSha256
+    nodeRuntimeProtected = $true
+    configurationSha256 = [string]$configurationBeforeMutation.configurationSha256
+    configurationLength = [int64]$configurationBeforeMutation.configurationLength
+    configurationNamesSha256 = [string]$configurationBeforeMutation.configurationNamesSha256
+    configurationBindingsSha256 = [string]$configurationBeforeMutation.configurationBindingsSha256
+    configurationContractSha256 = [string]$configurationBeforeMutation.configurationContractSha256
+    configurationAclFingerprint = [string]$configurationBeforeMutation.configurationAclFingerprint
+    configurationParentAclFingerprint = [string]$configurationBeforeMutation.configurationParentAclFingerprint
+    runtimeChanged = $false
     gameTasksChanged = $false
 } | ConvertTo-DysonJsonLine
 }

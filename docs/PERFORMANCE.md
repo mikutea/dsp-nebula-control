@@ -16,6 +16,68 @@ The production defaults sample every 15 seconds and retain 2,048 samples,
 covering a little over eight and a half hours; the bounded capacity can be set
 from 360 through 4,096 with `DYSON_OBSERVABILITY_HISTORY_CAPACITY`.
 
+## Persistent 72-hour continuity window
+
+The six-hour raw history remains the authoritative input for the detailed
+late-game performance profile. In parallel, every accepted raw snapshot now
+produces a path-free, size-bounded continuity sample in the same SQLite
+transaction. The default long-window capacity is 20,000 samples. At the fixed
+15-second cadence, a complete 72-hour interval contains exactly 17,281 samples;
+the default therefore retains about 83 hours while leaving deterministic room
+for delayed collection and restart recovery.
+
+Each slim sample carries the managed runtime identity and state, game-port
+listener state, the bounded performance summary, project-root availability,
+the declared storage dependency, SMB global-mapping and recovery-task state
+when applicable, and the evaluated health status. It contains no host path,
+save name, player value, endpoint, credential, or raw provider response. Samples
+form a SHA-256 predecessor chain. Startup re-parses the retained chain and fails
+closed on malformed, reordered, duplicated, spliced, or digest-mismatched data;
+retention always removes the oldest complete records.
+
+The `dyson-observability-72h-continuity-report` requires at least 17,281 samples,
+at least 72 hours of monotonic wall-clock span, no gap above 30 seconds, one
+stable source and runtime identity, a continuously running process and game
+listener, and an explicitly classified storage dependency. The project root
+must remain available in every sample. For `smb-global-mapping`, the mapping
+must remain available and the recovery task must report `ready` or `running`
+with result `0`; `none` marks those two SMB checks not applicable, while
+`unknown` can never qualify. This report proves continuity only and does not
+replace the detailed six-hour UPS/CPU/memory qualification or the production
+fault and external-client drills.
+
+## Trusted save and backup latency
+
+Latency is derived only from lifecycle receipts and save-job records already
+accepted by the control database. A successful save uses its server-written
+phase start and finish times. A successful backup additionally requires the
+bound backup job and run to agree, a committed result with audit storage, and
+no cleanup, maintenance, or recovery flag. Failed and incomplete operations are
+counted explicitly but receive no duration and therefore cannot improve P50,
+P95, or maximum latency. There is intentionally no request-body parser that
+accepts a client-supplied latency value. The derivation and summary interface is
+projected through the authenticated read-only qualification route together with
+the 72-hour continuity report. The API and Web UI keep missing values as
+`unknown`/`null`, never substitute `0 ms`, and always label these statistics as
+`NOT QUALIFIED`; they do not constitute completed production drill evidence.
+
+Measured simulation UPS/TPS comes from the public Bridge sampler, not from the
+configured `-Ups` target. The sampler publishes a bounded HMAC-authenticated
+record. The Windows reader accepts it only when its runtime-session ID, DSP
+process ID and start time, Bridge start generation, monotonic sequence, sample
+window, timestamp freshness, and signature all agree with the independently
+validated runtime identity. It returns only the bounded measurement and public
+binding metadata; the shared secret, raw file contents, paths, and signature do
+not enter provider or API output. Tamper, replay, stale data, a prior process,
+or a prior Bridge generation fails closed instead of falling back to the target
+UPS value.
+
+The release artifact contains the public C# sampler and the two runtime
+PowerShell reader/wrapper files. Their adversarial PowerShell 5.1 Shadow
+self-test remains repository-only and is run against the packaged runtime
+files during release-artifact validation. This is implementation evidence, not
+evidence that a production DSP/Nebula process emitted valid telemetry.
+
 The fixed checks are:
 
 | Check | Requirement |
@@ -84,6 +146,22 @@ If that pattern fails qualification, the response is to profile the actual
 late-game save and reduce the limiting simulation work or use a faster CPU
 core. Assigning more vCPUs alone is not accepted as a fix unless a new soak
 window demonstrates improved UPS and removes the bottleneck signature.
+
+## Qualification-harness boundary
+
+The repository-only [production qualification runbook](PRODUCTION-QUALIFICATION.md)
+binds this telemetry profile to the fixed `six-hour-soak` step and to the other
+reboot, crash, storage, update, restore, and external-client steps required by
+`PRD-005`. Its Windows PowerShell 5.1 Shadow self-test advances a marked
+temporary fixture by exactly six virtual hours to verify timer, checkpoint, and
+resume logic. The result is explicitly `shadow-virtual` and cannot satisfy a
+production soak.
+
+Run `npm run qualification:selftest` only as repository validation. A qualifying
+soak still needs at least six real monotonic hours, the representative workload,
+complete genuine telemetry, exact release/runtime/save bindings, and private
+evidence linked into the final acceptance gate. The v1 harness has no production
+adapter and does not authorize a real fault or host mutation.
 
 ## Evidence procedure
 

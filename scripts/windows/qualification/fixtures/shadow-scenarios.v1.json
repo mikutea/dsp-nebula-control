@@ -1,0 +1,42 @@
+{
+  "protocol": "DYSON_QUALIFICATION_SHADOW_SCENARIOS_V1",
+  "schemaVersion": 1,
+  "shadowOnly": true,
+  "scenarios": [
+    "preview-non-mutating",
+    "canonical-array-shape",
+    "plan-state-checkpoint-resume",
+    "external-client-dual-receipt",
+    "external-client-invalid",
+    "normal-path",
+    "process-hard-exit",
+    "checkpoint-tamper-rejected",
+    "checkpoint-resume",
+    "receipt-file-tamper-rejected",
+    "receipt-unknown-field-rejected",
+    "duplicate-request",
+    "evidence-tamper",
+    "evidence-expired",
+    "evidence-out-of-order",
+    "execution-disabled",
+    "canonical-uuid-rejected",
+    "environment-gate-rejected",
+    "confirmation-rejected",
+    "target-mismatch-rejected",
+    "maintenance-window-rejected",
+    "stale-protection-point-rejected",
+    "protection-point-tamper-rejected",
+    "real-backend-unsupported",
+    "rollback-failure",
+    "manual-recovery-latched",
+    "six-hour-soak-virtual-clock",
+    "isolated-side-effect-scan"
+  ],
+  "prohibitedSideEffects": [
+    "scheduler",
+    "service-control",
+    "network",
+    "production-save",
+    "production-filesystem"
+  ]
+}

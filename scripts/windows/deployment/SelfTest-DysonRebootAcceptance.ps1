@@ -39,7 +39,19 @@ function New-RebootAcceptanceFixtureContext {
         [Parameter(Mandatory)][string]$CheckpointId,
         [Parameter(Mandatory)][hashtable]$AclState,
         [string]$ControlTaskLastRunAt,
-        [string]$GameTaskLastRunAt
+        [string]$GameTaskLastRunAt,
+        [bool]$LifecycleBrokerReady = $true,
+        [bool]$ReadinessValidated = $true,
+        [string]$RuntimeRootIdentity = ('sha256:' + [string]::new([char]'6', 64)),
+        [string]$NodeExecutableSha256 = ([string]::new([char]'7', 64)),
+        [string]$ConfigurationSha256 = ([string]::new([char]'8', 64)),
+        [int64]$ConfigurationLength = 4096,
+        [string]$ConfigurationNamesSha256 = ([string]::new([char]'9', 64)),
+        [string]$ConfigurationBindingsSha256 = ([string]::new([char]'a', 64)),
+        [string]$ConfigurationContractSha256 = ([string]::new([char]'b', 64)),
+        [string]$ConfigurationAclFingerprint = ([string]::new([char]'c', 64)),
+        [string]$ConfigurationParentAclFingerprint = ([string]::new([char]'d', 64)),
+        [bool]$NodeRuntimeProtected = $true
     )
 
     $controlRunAt = if ([string]::IsNullOrWhiteSpace($ControlTaskLastRunAt)) { $Now } else { $ControlTaskLastRunAt }
@@ -61,6 +73,18 @@ function New-RebootAcceptanceFixtureContext {
                 payloadSha256 = $ControlPayloadSha256
                 activePointerSha256 = $ActivePointerSha256
                 taskIdentity = $ControlTaskIdentity
+                runtimeRootIdentity = $RuntimeRootIdentity
+                nodeExecutableSha256 = $NodeExecutableSha256
+                nodeRuntimeProtected = $NodeRuntimeProtected
+                configurationSha256 = $ConfigurationSha256
+                configurationLength = $ConfigurationLength
+                configurationNamesSha256 = $ConfigurationNamesSha256
+                configurationBindingsSha256 = $ConfigurationBindingsSha256
+                configurationContractSha256 = $ConfigurationContractSha256
+                configurationAclFingerprint = $ConfigurationAclFingerprint
+                configurationParentAclFingerprint = $ConfigurationParentAclFingerprint
+                lifecycleBrokerReady = $LifecycleBrokerReady
+                readinessValidated = $ReadinessValidated
                 taskState = 'Running'
                 taskLastRunAt = $controlRunAt
             }
@@ -128,6 +152,8 @@ try {
         -Context $baseline -TaskName 'Dyson-Control-Plane' -GamePort 8469 `
         -ValidityHours 24 -Apply $false
     Assert-RebootAcceptanceFixture -Condition ($preview.state -eq 'preview' -and
+        [bool]$preview.lifecycleBrokerReady -and [bool]$preview.readinessValidated -and
+        [bool]$preview.nodeRuntimeProtected -and
         -not [bool]$preview.realRebootObserved -and -not [bool]$preview.qualifyingProductionEvidence) `
         -Message 'the preview receipt overstated reboot or production evidence'
     Assert-RebootAcceptanceFixture -Condition (-not (Test-Path -LiteralPath (Join-Path $dataRoot 'acceptance'))) `
@@ -144,6 +170,8 @@ try {
     $checkpoint = Read-DysonRebootAcceptanceCheckpoint -DataRoot $dataRoot `
         -CheckpointId $checkpointId -Context $baseline
     Assert-RebootAcceptanceFixture -Condition ([string]$checkpoint.controlVersion -ceq '1.0.0' -and
+        [bool]$checkpoint.lifecycleBrokerReady -and [bool]$checkpoint.readinessValidated -and
+        [bool]$checkpoint.nodeRuntimeProtected -and
         [string]$checkpoint.checkpointSha256 -cmatch '^[0-9a-f]{64}$') `
         -Message 'the immutable checkpoint did not round-trip through strict validation'
     Assert-RebootAcceptanceFixture -Condition ($aclState.Count -ge 2) `
@@ -266,6 +294,21 @@ try {
             -CheckpointId $checkpointId -Context $controlDrift)
     }) -Message 'control-plane version or payload drift was accepted after reboot'
 
+    $configurationDrift = New-RebootAcceptanceFixtureContext `
+        -HostIdentity $hostA -BootIdentity $bootB `
+        -BootStartedAt '2026-09-01T00:20:00.0000000+00:00' `
+        -Now '2026-09-01T00:30:00.0000000+00:00' `
+        -ControlVersion '1.0.0' -ControlPayloadSha256 $payloadA `
+        -ActivePointerSha256 $pointerA -ControlTaskIdentity $taskA `
+        -ProjectRootIdentity $projectA -AccountIdentity $accountA `
+        -ConfigurationSha256 ([string]::new([char]'e', 64)) `
+        -CheckpointId ([guid]::NewGuid().ToString('D')) -AclState $aclState
+    Assert-RebootAcceptanceFixture -Condition (Test-RebootAcceptanceRejected `
+        -ExpectedMessage 'DYSON_REBOOT_ACCEPTANCE_CONTROL_DRIFT' -Operation {
+            [void](Invoke-DysonTestRebootAcceptanceResume -DataRoot $dataRoot `
+                -CheckpointId $checkpointId -Context $configurationDrift)
+        }) -Message 'protected configuration drift was accepted after reboot'
+
     $gameDrift = New-RebootAcceptanceFixtureContext `
         -HostIdentity $hostA -BootIdentity $bootB `
         -BootStartedAt '2026-09-01T00:20:00.0000000+00:00' `
@@ -304,12 +347,72 @@ try {
         -CheckpointId $checkpointId -Context $resumedContext
     Assert-RebootAcceptanceFixture -Condition ($resumed.state -eq 'fixture-resume-validated' -and
         [bool]$resumed.fixtureBootTransitionValidated -and -not [bool]$resumed.realRebootObserved -and
+        [bool]$resumed.lifecycleBrokerReady -and [bool]$resumed.readinessValidated -and
         [bool]$resumed.controlTaskExecutionInNewBootValidated -and
         [bool]$resumed.gameTaskExecutionInNewBootValidated -and
         -not [bool]$resumed.automaticTaskTriggerProven -and
         -not [bool]$resumed.unattendedStartupValidated -and
         -not [bool]$resumed.qualifyingProductionEvidence -and [bool]$resumed.requiresPrivateEvidenceBundle) `
         -Message 'the fixture resume result impersonated real reboot or production evidence'
+
+    $missingBrokerEvidence = & $baseline.GetControlObservation 'Dyson-Control-Plane'
+    $missingBrokerEvidence.lifecycleBrokerReady = $false
+    Assert-RebootAcceptanceFixture -Condition (Test-RebootAcceptanceRejected `
+        -ExpectedMessage 'The control-plane deployment is not ready for reboot acceptance.' -Operation {
+            Assert-DysonRebootAcceptanceControlObservation -Observation $missingBrokerEvidence
+        }) -Message 'a control observation without static lifecycle broker readiness was accepted'
+    $missingDeepReadiness = & $baseline.GetControlObservation 'Dyson-Control-Plane'
+    $missingDeepReadiness.readinessValidated = $false
+    Assert-RebootAcceptanceFixture -Condition (Test-RebootAcceptanceRejected `
+        -ExpectedMessage 'The control-plane deployment is not ready for reboot acceptance.' -Operation {
+            Assert-DysonRebootAcceptanceControlObservation -Observation $missingDeepReadiness
+        }) -Message 'a control observation without required deep readiness was accepted'
+
+    $script:rebootReadinessFixtureMode = 'not-applicable'
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][uri]$Uri,
+            [switch]$UseBasicParsing,
+            [int]$TimeoutSec
+        )
+        $checks = [ordered]@{
+            deploymentVersion = 'pass'
+            statusProvider = 'pass'
+            lifecycleBroker = if ($script:rebootReadinessFixtureMode -ceq 'pass') { 'pass' } else { 'not-applicable' }
+        }
+        if ($script:rebootReadinessFixtureMode -cne 'missing') {
+            $checks['cutoverRecovery'] = 'pass'
+        }
+        return [pscustomobject]@{
+            StatusCode = 200
+            Headers = @{ 'X-Dyson-Control-Release' = '1.0.0' }
+            Content = ([ordered]@{
+                status = 'ready'
+                deploymentVersion = '1.0.0'
+                checks = $checks
+            } | ConvertTo-Json -Depth 4 -Compress)
+        }
+    }
+    $fixtureReadinessUri = [uri]'http://127.0.0.1:13010/readyz'
+    Assert-RebootAcceptanceFixture -Condition (Test-RebootAcceptanceRejected `
+        -ExpectedMessage 'The loopback control-plane readiness check did not prove the expected release before the deadline.' `
+        -Operation {
+            [void](Test-DysonLoopbackReadiness -ReadinessUri $fixtureReadinessUri -ExpectedVersion '1.0.0' `
+                -RequiredChecks @('lifecycleBroker', 'cutoverRecovery') -TimeoutSeconds 1)
+        }) -Message 'a required lifecycleBroker not-applicable state was accepted as ready'
+    $script:rebootReadinessFixtureMode = 'missing'
+    Assert-RebootAcceptanceFixture -Condition (Test-RebootAcceptanceRejected `
+        -ExpectedMessage 'The loopback control-plane readiness check did not prove the expected release before the deadline.' `
+        -Operation {
+            [void](Test-DysonLoopbackReadiness -ReadinessUri $fixtureReadinessUri -ExpectedVersion '1.0.0' `
+                -RequiredChecks @('lifecycleBroker', 'cutoverRecovery') -TimeoutSeconds 1)
+        }) -Message 'a missing required cutoverRecovery check was accepted as ready'
+    $script:rebootReadinessFixtureMode = 'pass'
+    Assert-RebootAcceptanceFixture -Condition ([bool](Test-DysonLoopbackReadiness `
+        -ReadinessUri $fixtureReadinessUri -ExpectedVersion '1.0.0' `
+        -RequiredChecks @('lifecycleBroker', 'cutoverRecovery') -TimeoutSeconds 1)) `
+        -Message 'literal pass values for required readiness checks were rejected'
 
     $tampered = $checkpointBeforeCollision | ConvertFrom-Json
     $tampered.controlVersion = '9.9.9'
@@ -352,12 +455,18 @@ try {
         Assert-RebootAcceptanceFixture -Condition (-not $publicSource.Contains($forbidden)) `
             -Message "a reboot or Task Scheduler mutation appeared in a public acceptance script: $forbidden"
     }
+    Assert-RebootAcceptanceFixture -Condition (
+        $publicSource.Contains('Assert-DysonControlTaskContract') -and
+        -not $publicSource.Contains('$argumentPattern')
+    ) -Message 'reboot acceptance did not reuse the single complete control-task contract verifier'
     $parameterContracts = [ordered]@{
         'New-DysonRebootAcceptanceCheckpoint.ps1' = @(
-            'InstallRoot', 'DataRoot', 'ReadinessUri', 'TaskName', 'GamePort', 'ValidityHours'
+            'InstallRoot', 'DataRoot', 'RuntimeRoot', 'NodeExecutable', 'ExpectedNodeSha256',
+            'ReadinessUri', 'TaskName', 'GamePort', 'ValidityHours'
         )
         'Test-DysonRebootAcceptanceResume.ps1' = @(
-            'InstallRoot', 'DataRoot', 'CheckpointId', 'ReadinessUri'
+            'InstallRoot', 'DataRoot', 'RuntimeRoot', 'NodeExecutable', 'ExpectedNodeSha256',
+            'CheckpointId', 'ReadinessUri'
         )
     }
     foreach ($contract in $parameterContracts.GetEnumerator()) {
@@ -391,10 +500,15 @@ try {
         differentHostRejected = $true
         expiredCheckpointRejected = $true
         controlDriftRejected = $true
+        configurationDriftRejected = $true
         gameDriftRejected = $true
         checkpointTamperRejected = $true
         traversalIdRejected = $true
         fixtureResumeValidated = $true
+        lifecycleBrokerEvidenceRequired = $true
+        deepReadinessEvidenceRequired = $true
+        requiredReadinessChecksFailClosed = $true
+        sharedCompleteControlTaskContractValidated = $true
         realRebootObserved = $false
         nativeTaskSchedulerValidated = $false
         productionChanged = $false

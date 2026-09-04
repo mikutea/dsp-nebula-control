@@ -424,7 +424,10 @@ function Resolve-DysonAccountSid {
 }
 
 function Test-DysonNativeServerTask {
-    param([Parameter(Mandatory)][object]$Account)
+    param(
+        [Parameter(Mandatory)][object]$Account,
+        [Parameter(Mandatory)][string]$RuntimeBootstrapRoot
+    )
 
     try {
         $taskMatches = @(Get-ScheduledTask -TaskName $script:DysonServerTaskName -ErrorAction Stop)
@@ -479,8 +482,14 @@ function Test-DysonNativeServerTask {
         if (-not $definition.Success) { throw 'The fixed server task arguments are not allowlisted.' }
         $ups = [int]$definition.Groups['ups'].Value
         if ($ups -lt 5 -or $ups -gt 240) { throw 'The fixed server task UPS is outside the supported range.' }
+        $resolvedBootstrapRoot = (Resolve-Path -LiteralPath $RuntimeBootstrapRoot -ErrorAction Stop).ProviderPath
+        $bootstrapItem = Get-Item -LiteralPath $resolvedBootstrapRoot -Force -ErrorAction Stop
+        if (-not $bootstrapItem.PSIsContainer -or
+            ($bootstrapItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw 'The fixed runtime bootstrap root is unavailable or redirected.'
+        }
         $expectedStartScript = (Resolve-Path -LiteralPath (
-            Join-Path (Split-Path -Parent $PSScriptRoot) 'Start-DysonServer.ps1'
+            Join-Path $resolvedBootstrapRoot 'Start-DysonServer.ps1'
         ) -ErrorAction Stop).ProviderPath
         $actualStartScript = (Resolve-Path -LiteralPath $definition.Groups['script'].Value -ErrorAction Stop).ProviderPath
         $projectRoot = (Resolve-Path -LiteralPath $definition.Groups['root'].Value -ErrorAction Stop).ProviderPath
@@ -623,6 +632,8 @@ function Test-DysonRestrictedBackupAcl {
 }
 
 function New-DysonNativeSessionContext {
+    param([string]$RuntimeBootstrapRoot)
+
     Add-DysonSessionNativeTypes
     $backupRoot = Join-Path (
         [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
@@ -637,7 +648,13 @@ function New-DysonNativeSessionContext {
             param([object]$Account, [System.Security.SecureString]$Password)
             Test-DysonNativeInteractiveCredential -Account $Account -Password $Password
         }
-        ValidateTask = { param([object]$Account) Test-DysonNativeServerTask -Account $Account }
+        ValidateTask = {
+            param([object]$Account)
+            if ([string]::IsNullOrWhiteSpace($RuntimeBootstrapRoot)) {
+                return [pscustomobject]@{ Ready = $false; Code = 'SERVER_TASK_INVALID'; Message = 'The fixed runtime bootstrap root was not supplied.'; ProjectRoot = $null }
+            }
+            Test-DysonNativeServerTask -Account $Account -RuntimeBootstrapRoot $RuntimeBootstrapRoot
+        }.GetNewClosure()
         ValidatePolicy = { Test-DysonNativeAutoLogonPolicy }
         ProbeSession = { param([object]$Account) Get-DysonNativeInteractiveSessionProbe -Account $Account }
         ApplyAcl = {

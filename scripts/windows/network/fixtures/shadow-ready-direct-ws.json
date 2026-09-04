@@ -1,0 +1,43 @@
+{
+  "protocol": "DYSON_NEBULA_NETWORK_SHADOW_FIXTURE_V1",
+  "schemaVersion": 1,
+  "gameData": {
+    "target": "game.example.com",
+    "port": 8469,
+    "transport": "ws",
+    "dnsStatus": "resolved",
+    "addresses": ["203.0.113.42", "2001:db8::42"],
+    "tcpOutcome": "reachable",
+    "websocketOutcome": "upgrade-accepted",
+    "websocketStatusCode": 101
+  },
+  "management": {
+    "target": "control.example.com",
+    "port": 443,
+    "transport": "https",
+    "dnsStatus": "resolved",
+    "addresses": ["198.51.100.20"],
+    "tcpOutcome": "reachable"
+  },
+  "localListener": {
+    "state": "listening",
+    "bindingAddresses": ["0.0.0.0"],
+    "processNames": ["DSPGAME"],
+    "processCount": 1,
+    "identityState": "matched"
+  },
+  "passWallEvidence": {
+    "protocol": "DYSON_PASSWALL_BYPASS_EVIDENCE_V1",
+    "schemaVersion": 1,
+    "expectedRoute": "direct",
+    "ruleRendered": "verified",
+    "ruleValidated": "verified",
+    "ruleActive": "verified",
+    "realFlowCounterDelta": "verified",
+    "selectedDestinationClass": "documentation",
+    "actualIngressInterfaceClass": "lan",
+    "actualRouteClass": "direct",
+    "externalPathWitness": "verified"
+  },
+  "expectedState": "ready"
+}

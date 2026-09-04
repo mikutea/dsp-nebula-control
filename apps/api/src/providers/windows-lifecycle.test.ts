@@ -10,6 +10,12 @@ import {
 } from '../domain.js'
 import { DemoProvider } from './demo.js'
 import type { LifecycleScriptName, LifecycleScriptRunner } from './powershell-runner.js'
+import type {
+  LifecycleBrokerDispatchEvidence,
+  LifecycleBrokerPreflightEvidence,
+  LifecycleBrokerStatusEvidence,
+  WindowsLifecycleBrokerClient
+} from './windows-lifecycle-broker.js'
 import { WindowsLifecycleAdapter, type LifecycleBridgeClient } from './windows-lifecycle.js'
 
 const requestId = '11111111-2222-4333-8444-555555555555'
@@ -30,12 +36,15 @@ describe('Windows lifecycle adapter', () => {
   })
 
   it('maps fixed host scripts and the signed bridge receipt into bounded phase results', async () => {
-    const { adapter, runner, bridge } = createAdapter()
+    const { adapter, runner, bridge, broker } = createAdapter()
     const context = operationContext('restart')
 
     await expect(adapter.createProtectionPoint(context)).resolves.toMatchObject({
       protectionPointId: `save:${requestId}`,
-      evidence: { manifestVerified: true, dsvBytes: 1024, serverBytes: 256 }
+      evidence: {
+        manifestVerified: true, sourcePairVerified: true, mutationPerformed: true,
+        dsvBytes: 1024, serverBytes: 256
+      }
     })
     await expect(adapter.requestSave(context)).resolves.toMatchObject({
       evidence: {
@@ -46,39 +55,30 @@ describe('Windows lifecycle adapter', () => {
       }
     })
     await expect(adapter.requestGracefulStop(context)).resolves.toMatchObject({
-      evidence: { outcome: 'stopped', processVerified: true }
+      evidence: { dispatched: true, taskName: 'Dyson-Nebula-Stop', readyVerified: true }
     })
     await expect(adapter.verifyStopped(context)).resolves.toMatchObject({
       evidence: { processVerified: true, gamePortListening: false }
     })
     await expect(adapter.requestStart(context)).resolves.toMatchObject({
-      evidence: { outcome: 'started', processVerified: true }
+      evidence: { dispatched: true, taskName: 'Dyson-Nebula-Server', readyVerified: true }
     })
     await expect(adapter.verifyRunning(context)).resolves.toMatchObject({
       evidence: { processVerified: true, gamePortListening: true }
     })
     await expect(adapter.requestRollbackStart(context)).resolves.toMatchObject({
-      evidence: { outcome: 'started', processVerified: true }
+      evidence: { dispatched: true, taskName: 'Dyson-Nebula-Server', readyVerified: true }
     })
 
     expect(bridge.saveRequestIds).toEqual([requestId])
-    expect(runner.calls.map((call) => call.scriptName)).toEqual([
-      'New-DysonSaveProtectionPoint.ps1',
-      'Invoke-DysonScheduledTask.ps1',
-      'Test-DysonRuntimeState.ps1',
-      'Invoke-DysonScheduledTask.ps1',
-      'Test-DysonRuntimeState.ps1',
-      'Invoke-DysonScheduledTask.ps1'
+    expect(runner.calls.map((call) => call.scriptName)).toEqual(['New-DysonSaveProtectionPoint.ps1'])
+    expect(runner.calls[0]?.arguments).toEqual([
+      '-ProjectRoot', 'C:\\Fictional\\Dyson', '-RequestId', requestId
     ])
-    expect(runner.calls[1]?.arguments).toEqual(expect.arrayContaining(['-Operation', 'graceful-stop']))
-    expect(runner.calls[3]?.arguments).toEqual([
-      '-ProjectRoot', 'C:\\Fictional\\Dyson',
-      '-RequestId', requestId,
-      '-Operation', 'start',
-      '-TaskName', 'Dyson-Nebula-Server',
-      '-GamePort', '8469'
+    expect(broker.dispatches.map((call) => call.operation)).toEqual([
+      'graceful-stop', 'start', 'rollback-start'
     ])
-    expect(runner.calls[5]?.arguments).toEqual(expect.arrayContaining(['-Operation', 'rollback-start']))
+    expect(broker.verifications.map((call) => call.expected)).toEqual(['stopped', 'running'])
   })
 
   it('allows a stopped-runtime start preview without probing the unavailable in-game bridge', async () => {
@@ -92,16 +92,59 @@ describe('Windows lifecycle adapter', () => {
     expect(fixture.bridge.probeCalls).toBe(0)
   })
 
-  it('fails closed when a start preview omits any required stopped-runtime evidence', async () => {
+  it('uses the SYSTEM broker as the authoritative source when legacy preflight omits runtime evidence', async () => {
     const provider = new StartReadyStatusProvider()
     provider.omitGamePortEvidence = true
     const fixture = createAdapter(provider)
 
     const preview = await fixture.adapter.previewLifecycle('start')
 
-    expect(preview.allowed).toBe(false)
-    expect(preview.blockers).toContain('start-preflight-incomplete')
+    expect(preview.allowed).toBe(true)
+    expect(preview.checks.find((check) => check.id === 'game-port')).toMatchObject({ status: 'pass' })
     expect(fixture.runner.calls).toEqual([])
+  })
+
+  it('fails closed when the SYSTEM lifecycle broker is unavailable', async () => {
+    const fixture = createAdapter(new StartReadyStatusProvider())
+    fixture.broker.preflightFailure = true
+
+    const preview = await fixture.adapter.previewLifecycle('start')
+
+    expect(preview.allowed).toBe(false)
+    expect(preview.blockers).toEqual(expect.arrayContaining([
+      'lifecycle-broker-unavailable', 'start-preflight-incomplete'
+    ]))
+    expect(preview.checks.find((check) => check.id === 'lifecycle-broker'))
+      .toMatchObject({ status: 'block' })
+  })
+
+  it('never reports an allowed preview when broker-derived checks are blocking', async () => {
+    const fixture = createAdapter(new StartReadyStatusProvider())
+    fixture.broker.preflightOverride = {
+      ...await fixture.broker.preflight({
+        action: 'start', signal: new AbortController().signal
+      }),
+      runtime: {
+        ...brokerRuntime('stopped'),
+        steam: { status: 'missing', pid: null, sessionId: null }
+      }
+    }
+
+    const preview = await fixture.adapter.previewLifecycle('start')
+
+    expect(preview.allowed).toBe(false)
+    expect(preview.checks.find((check) => check.id === 'steam-session')).toMatchObject({ status: 'block' })
+  })
+
+  it('fails verification when an injected broker contradicts the requested runtime state', async () => {
+    const fixture = createAdapter()
+    fixture.broker.verifyOverride = {
+      expected: 'running', matched: false, blockers: [], runtime: brokerRuntime('stopped')
+    }
+
+    await expect(fixture.adapter.verifyRunning(operationContext('start'))).rejects.toMatchObject({
+      code: 'WINDOWS_LIFECYCLE_BROKER_RESULT_INVALID'
+    })
   })
 
   it('keeps execution blocked for a stale or incompatible bridge and preserves bridge failure codes', async () => {
@@ -151,11 +194,47 @@ describe('Windows lifecycle adapter', () => {
     await expect(fixture.adapter.createProtectionPoint(operationContext('save'))).rejects.toEqual(
       expect.objectContaining<Partial<LifecycleExecutionError>>({ code: 'HOST_RECEIPT_INVALID' })
     )
+
+    const preview = createAdapter()
+    preview.runner.previewProtection = true
+    await expect(preview.adapter.createProtectionPoint(operationContext('save'))).rejects.toEqual(
+      expect.objectContaining<Partial<LifecycleExecutionError>>({ code: 'HOST_RECEIPT_INVALID' })
+    )
+  })
+
+  it('accepts only request-bound, self-consistent protection execution receipts', async () => {
+    const reused = createAdapter()
+    reused.runner.protectionMode = 'reused'
+    await expect(reused.adapter.createProtectionPoint(operationContext('save'))).resolves.toMatchObject({
+      protectionPointId: `save:${requestId}`,
+      evidence: {
+        sourcePairVerified: true, manifestVerified: true,
+        mutationPerformed: false, reused: true
+      }
+    })
+
+    const wrongPoint = createAdapter()
+    wrongPoint.runner.protectionMode = 'wrong-point'
+    await expect(wrongPoint.adapter.createProtectionPoint(operationContext('save'))).rejects.toEqual(
+      expect.objectContaining<Partial<LifecycleExecutionError>>({ code: 'HOST_RECEIPT_MISMATCH' })
+    )
+
+    const inconsistent = createAdapter()
+    inconsistent.runner.protectionMode = 'inconsistent'
+    await expect(inconsistent.adapter.createProtectionPoint(operationContext('save'))).rejects.toEqual(
+      expect.objectContaining<Partial<LifecycleExecutionError>>({ code: 'HOST_RECEIPT_INVALID' })
+    )
+
+    const unverified = createAdapter()
+    unverified.runner.protectionMode = 'source-unverified'
+    await expect(unverified.adapter.createProtectionPoint(operationContext('save'))).rejects.toEqual(
+      expect.objectContaining<Partial<LifecycleExecutionError>>({ code: 'HOST_RECEIPT_INVALID' })
+    )
   })
 })
 
 class FakeBridgeClient implements LifecycleBridgeClient {
-  pluginVersion = '0.1.0'
+  pluginVersion = '0.1.0-rc.1'
   probeFailure = false
   probeCalls = 0
   failedSaveCode: string | null = null
@@ -213,30 +292,35 @@ class FakeBridgeClient implements LifecycleBridgeClient {
 class FakeLifecycleScriptRunner implements LifecycleScriptRunner {
   readonly calls: Array<{ scriptName: LifecycleScriptName; arguments: string[] }> = []
   malformedProtection = false
+  previewProtection = false
+  protectionMode: 'created' | 'reused' | 'wrong-point' | 'inconsistent' | 'source-unverified' = 'created'
 
   async run(scriptName: LifecycleScriptName, arguments_: string[]): Promise<string> {
     this.calls.push({ scriptName, arguments: arguments_ })
     if (scriptName === 'New-DysonSaveProtectionPoint.ps1') {
       if (this.malformedProtection) return '{"unexpected":true}'
+      if (this.previewProtection) {
+        return JSON.stringify({
+          protocol: 'DYSON_CONTROL_PROTECTION_V1', schemaVersion: 1, requestId,
+          state: 'preview', dryRun: true, mutationPerformed: false,
+          protectionPointId: `save:${requestId}`, sourcePairVerified: true,
+          dsvBytes: 1024, serverBytes: 256, manifestVerified: false, reused: false,
+          wouldCreate: true, wouldRemoveStaleStaging: false
+        })
+      }
       return JSON.stringify({
-        protocol: 'DYSON_CONTROL_PROTECTION_V1', requestId, state: 'succeeded',
-        protectionPointId: `save:${requestId}`, dsvBytes: 1024, serverBytes: 256,
-        manifestVerified: true, reused: false
+        protocol: 'DYSON_CONTROL_PROTECTION_V1', schemaVersion: 1, requestId,
+        state: 'succeeded', dryRun: false,
+        mutationPerformed: this.protectionMode !== 'reused',
+        protectionPointId: this.protectionMode === 'wrong-point'
+          ? 'save:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+          : `save:${requestId}`,
+        sourcePairVerified: this.protectionMode !== 'source-unverified',
+        dsvBytes: 1024, serverBytes: 256, manifestVerified: true,
+        reused: this.protectionMode === 'reused' || this.protectionMode === 'inconsistent'
       })
     }
-    if (scriptName === 'Invoke-DysonScheduledTask.ps1') {
-      const operation = argumentValue(arguments_, '-Operation') as 'graceful-stop' | 'start' | 'rollback-start'
-      return JSON.stringify({
-        protocol: 'DYSON_CONTROL_TASK_RECEIPT_V1', requestId, operation, state: 'succeeded',
-        outcome: operation === 'graceful-stop' ? 'stopped' : 'started', processVerified: true,
-        writtenAt: new Date().toISOString()
-      })
-    }
-    const expected = argumentValue(arguments_, '-Expected') as 'running' | 'stopped'
-    return JSON.stringify({
-      protocol: 'DYSON_CONTROL_RUNTIME_V1', expected, state: 'matched', processVerified: true,
-      gamePortListening: expected === 'running'
-    })
+    throw new Error(`Unexpected lifecycle script fixture: ${scriptName}`)
   }
 }
 
@@ -244,22 +328,122 @@ function createAdapter(statusProvider: StatusProvider = new DemoProvider()): {
   adapter: WindowsLifecycleAdapter
   bridge: FakeBridgeClient
   runner: FakeLifecycleScriptRunner
+  broker: FakeLifecycleBrokerClient
 } {
   const bridge = new FakeBridgeClient()
   const runner = new FakeLifecycleScriptRunner()
+  const broker = new FakeLifecycleBrokerClient()
   const adapter = new WindowsLifecycleAdapter({
     projectRoot: 'C:\\Fictional\\Dyson',
+    runtimeBootstrapRoot: 'C:\\Program Files\\DysonControl\\bootstrap',
     statusProvider,
     scriptRunner: runner,
+    brokerClient: broker,
     bridgeClient: bridge
   })
-  return { adapter, bridge, runner }
+  return { adapter, bridge, runner, broker }
 }
 
 function operationContext(action: LifecycleAction): LifecycleOperationContext {
   return {
     jobId: 'fixture-job', requestId, action, protectionPointId: null,
-    signal: new AbortController().signal
+    signal: new AbortController().signal,
+    hostMutation: {
+      assertActive: () => undefined,
+      toPowerShellBorrowArguments: () => [
+        '-DataRoot', 'C:\\Fictional\\DysonData',
+        '-LeaseInstanceId', 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        '-LeaseToken', 'A'.repeat(43)
+      ]
+    }
+  }
+}
+
+class FakeLifecycleBrokerClient implements WindowsLifecycleBrokerClient {
+  preflightFailure = false
+  preflightOverride: LifecycleBrokerPreflightEvidence | null = null
+  verifyOverride: Awaited<ReturnType<WindowsLifecycleBrokerClient['verify']>> | null = null
+  readonly dispatches: Array<{ operation: 'start' | 'graceful-stop' | 'rollback-start' }> = []
+  readonly verifications: Array<{ expected: 'running' | 'stopped' }> = []
+
+  async preflight(input: {
+    action: LifecycleAction
+    outerRequestId?: string
+    signal: AbortSignal
+  }): Promise<LifecycleBrokerPreflightEvidence> {
+    if (this.preflightFailure) throw new Error('fixture lifecycle broker is unavailable')
+    if (this.preflightOverride) return this.preflightOverride
+    const stopped = input.action === 'start'
+    return {
+      action: input.action,
+      allowed: true,
+      blockers: [],
+      task: {
+        valid: true,
+        server: { name: 'Dyson-Nebula-Server', path: '\\', state: 'Ready' },
+        stop: { name: 'Dyson-Nebula-Stop', path: '\\', state: 'Ready' }
+      },
+      runtime: brokerRuntime(stopped ? 'stopped' : 'running'),
+      dispatch: { attempted: false, taskName: null }
+    }
+  }
+
+  async dispatch(input: {
+    operation: 'start' | 'graceful-stop' | 'rollback-start'
+    outerRequestId: string
+    signal: AbortSignal
+  }): Promise<LifecycleBrokerDispatchEvidence> {
+    this.dispatches.push({ operation: input.operation })
+    return {
+      operation: input.operation,
+      dispatched: true,
+      blockers: [],
+      taskName: input.operation === 'graceful-stop' ? 'Dyson-Nebula-Stop' : 'Dyson-Nebula-Server',
+      taskPath: '\\',
+      readyVerified: true
+    }
+  }
+
+  async verify(input: {
+    expected: 'running' | 'stopped'
+    outerRequestId: string
+    signal: AbortSignal
+  }) {
+    this.verifications.push({ expected: input.expected })
+    if (this.verifyOverride) return this.verifyOverride
+    return {
+      expected: input.expected,
+      matched: true,
+      blockers: [],
+      runtime: brokerRuntime(input.expected)
+    }
+  }
+
+  async status(): Promise<LifecycleBrokerStatusEvidence> {
+    const runtime = brokerRuntime('running')
+    return {
+      lifecycleState: runtime.lifecycleState,
+      task: {
+        valid: true,
+        server: { name: 'Dyson-Nebula-Server', path: '\\', state: 'Running' },
+        stop: { name: 'Dyson-Nebula-Stop', path: '\\', state: 'Ready' }
+      },
+      runtime
+    }
+  }
+}
+
+function brokerRuntime(expected: 'running' | 'stopped') {
+  const running = expected === 'running'
+  return {
+    lifecycleState: running ? 'running_verified' as const : 'stopped_verified' as const,
+    session: { status: 'verified' as const, id: 3, count: 1 },
+    steam: { status: 'verified' as const, pid: 300, sessionId: 3 },
+    process: running
+      ? { status: 'verified' as const, pid: 4242, owner: 'FICTIONAL\\DysonGame', sessionId: 3 }
+      : { status: 'absent' as const, pid: null, owner: null, sessionId: null },
+    port: { port: 8469, listenerCount: running ? 1 : 0 },
+    pidFile: { present: running, valid: running }
   }
 }
 
@@ -294,10 +478,4 @@ class StartReadyStatusProvider implements StatusProvider {
       rollback: { strategy: 'no-op', ready: true, summary: 'start does not change the save pair' }
     }
   }
-}
-
-function argumentValue(arguments_: string[], name: string): string {
-  const index = arguments_.indexOf(name)
-  if (index < 0 || !arguments_[index + 1]) throw new Error(`Missing fixture argument: ${name}`)
-  return arguments_[index + 1]!
 }

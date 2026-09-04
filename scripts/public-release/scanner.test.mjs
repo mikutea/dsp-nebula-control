@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -10,15 +11,60 @@ import {
   canonicalEvidenceJson,
   runPublicReleaseScan
 } from './scanner.mjs'
+import { EXACT_ALLOWLIST } from './policy.mjs'
 
 const execFileAsync = promisify(execFile)
+const projectRoot = path.resolve(import.meta.dirname, '..', '..')
 const temporaryRoots = []
+
+function gitTextBlobId (bytes) {
+  // Git stores text blobs with LF even when a Windows checkout materializes
+  // the same file as CRLF through `.gitattributes` (`eol=crlf`).  Bind the
+  // reviewed history exception to those canonical repository bytes instead
+  // of the platform-specific working-tree representation.
+  const canonicalBytes = Buffer.from(bytes.toString('latin1').replaceAll('\r\n', '\n'), 'latin1')
+  const blobHeader = Buffer.from(`blob ${canonicalBytes.length}\0`, 'utf8')
+  return createHash('sha1').update(blobHeader).update(canonicalBytes).digest('hex')
+}
 
 afterEach(async () => {
   await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
 describe('public release hygiene gate', () => {
+  it('pins reviewed parser and negative-test history exceptions to the current Git blobs', async () => {
+    const bindings = [
+      ['HIGH_ENTROPY_SECRET_ASSIGNMENT', 'scripts/public-release/scanner.mjs'],
+      ['SECRET_LITERAL_ASSIGNMENT', 'scripts/public-release/scanner.mjs'],
+      ['UNC_PATH', 'scripts/public-release/scanner.mjs'],
+      ['SECRET_LITERAL_ASSIGNMENT', 'scripts/public-release/scanner.test.mjs'],
+      ['UNC_PATH', 'scripts/windows/configuration/DysonConfiguration.Common.ps1'],
+      ['UNC_PATH', 'scripts/windows/deployment/DysonDeployment.Common.ps1'],
+      ['UNC_PATH', 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1'],
+      ['PRIVATE_IP_ADDRESS', 'scripts/windows/network/SelfTest-DysonNebulaNetworkV2.ps1']
+    ]
+    for (const [ruleId, relativePath] of bindings) {
+      const bytes = await readFile(path.join(projectRoot, ...relativePath.split('/')))
+      const blobId = gitTextBlobId(bytes)
+      const crlfBytes = Buffer.from(bytes.toString('latin1').replaceAll('\r\n', '\n').replaceAll('\n', '\r\n'), 'latin1')
+      assert.equal(gitTextBlobId(crlfBytes), blobId, `Git text hash changed across EOL checkout: ${relativePath}`)
+      const matches = EXACT_ALLOWLIST.filter((entry) => entry.scope === 'history'
+        && entry.ruleId === ruleId && entry.path === relativePath && entry.blobId === blobId)
+      assert.equal(matches.length, 1, `stale or missing history binding: ${relativePath}`)
+    }
+
+    const repository = await newRepository()
+    for (const relativePath of [...new Set(bindings.map(([, file]) => file))]) {
+      const bytes = await readFile(path.join(projectRoot, ...relativePath.split('/')))
+      const canonicalBytes = Buffer.from(bytes.toString('latin1').replaceAll('\r\n', '\n'), 'latin1')
+      await write(repository, relativePath, canonicalBytes)
+    }
+    await commitAll(repository, 'reviewed parser blobs')
+    const evidence = await runPublicReleaseScan({ repositoryRoot: repository, history: true })
+    assert.equal(evidence.passed, true)
+    assert.deepEqual(evidence.findings, [])
+  })
+
   it('keeps command-line failures machine-readable and free of host paths', async () => {
     let failure
     try {
@@ -59,6 +105,8 @@ describe('public release hygiene gate', () => {
       'https://release-assets.githubusercontent.com/fictional/signed.zip',
       'https://objects.githubusercontent.com/fictional/signed.zip',
       'https://gcdn.thunderstore.io/package/Fictional/ServerHelper/1.2.3/',
+      'https://api.nuget.org/v3/index.json',
+      'https://nuget.bepinex.dev/v3/index.json',
       'https://react.dev/errors/418'
     ].join('\n'))
     await commitAll(repository, 'fixed public GitHub content host references')
@@ -66,10 +114,37 @@ describe('public release hygiene gate', () => {
     const evidence = await runPublicReleaseScan({ repositoryRoot: repository })
     assert.equal(evidence.passed, true)
 
-    const lookalikeHost = ['react', 'dev', 'invalidly-real', 'net'].join('.')
-    await write(repository, 'references.txt', `https://${lookalikeHost}/errors/418\n`)
+    const lookalikeHost = ['api', 'nuget', 'org', 'invalidly-real', 'net'].join('.')
+    await write(repository, 'references.txt', `https://${lookalikeHost}/v3/index.json\n`)
     const rejected = await runPublicReleaseScan({ repositoryRoot: repository })
     assertRules(rejected, ['PRODUCTION_ENDPOINT', 'REPOSITORY_DIRTY'])
+
+    const bepinexLookalikeHost = ['nuget', 'bepinex', 'dev', 'invalidly-real', 'net'].join('.')
+    await write(repository, 'references.txt', `https://${bepinexLookalikeHost}/v3/index.json\n`)
+    const bepinexRejected = await runPublicReleaseScan({ repositoryRoot: repository })
+    assertRules(bepinexRejected, ['PRODUCTION_ENDPOINT', 'REPOSITORY_DIRTY'])
+  })
+
+  it('allows only the exact canonical JSON Schema host and rejects its lookalikes', async () => {
+    const repository = await newRepository()
+    await write(repository, 'schema.json', JSON.stringify({
+      $schema: 'https://json-schema.org/draft/2020-12/schema'
+    }))
+    await commitAll(repository, 'canonical JSON Schema dialect fixture')
+
+    const accepted = await runPublicReleaseScan({ repositoryRoot: repository })
+    assert.equal(accepted.passed, true)
+
+    const lookalikeSchemaHost = 'evil' + 'json-schema.org'
+    await write(repository, 'schema.json', JSON.stringify({
+      $schema: `https://${lookalikeSchemaHost}/draft/2020-12/schema`
+    }))
+    const rejected = await runPublicReleaseScan({ repositoryRoot: repository })
+    assert.deepEqual(
+      rejected.findings.filter((entry) => entry.ruleId === 'PRODUCTION_ENDPOINT').map((entry) => entry.path),
+      ['schema.json']
+    )
+    assert.equal(rejected.passed, false)
   })
 
   it('refuses provenance when the repository has no committed HEAD', async () => {
@@ -164,6 +239,41 @@ describe('public release hygiene gate', () => {
     assertRules(rejected, ['REPOSITORY_DIRTY', 'SECRET_LITERAL_ASSIGNMENT'])
   })
 
+  it('accepts only shaped assembly public key tokens while retaining ordinary secret detection', async () => {
+    const repository = await newRepository()
+    await write(repository, 'assembly-identities.ps1', [
+      "$NebulaPublicKeyToken = '0123456789abcdef'",
+      "$UnsignedAssemblyPublicKeyToken = 'none'"
+    ].join('\n'))
+    await commitAll(repository, 'assembly public key token fixture')
+
+    const accepted = await runPublicReleaseScan({ repositoryRoot: repository })
+    assert.equal(accepted.passed, true)
+
+    const secretAssignments = [
+      ['api-key.ps1', "$API_KEY = 'ordinary-live-value'"],
+      ['password.ps1', "$Password = 'ordinary-live-value'"],
+      ['public-key-token-invalid.ps1', "$NebulaPublicKeyToken = 'ordinary-live-value'"],
+      ['secret.ps1', "$Secret = 'ordinary-live-value'"],
+      ['token.ps1', "$Token = 'ordinary-live-value'"],
+      ['websocket-token.ps1', "$WebSocketToken = 'ordinary-live-value'"]
+    ]
+    for (const [relativePath, content] of secretAssignments) {
+      await write(repository, relativePath, `${content}\n`)
+    }
+    await commitAll(repository, 'ordinary secret assignment fixtures')
+
+    const rejected = await runPublicReleaseScan({ repositoryRoot: repository })
+    assert.deepEqual(
+      rejected.findings
+        .filter((entry) => entry.ruleId === 'SECRET_LITERAL_ASSIGNMENT')
+        .map((entry) => entry.path)
+        .sort(),
+      secretAssignments.map(([relativePath]) => relativePath).sort()
+    )
+    assert.equal(rejected.passed, false)
+  })
+
   it('fails closed on embedded image metadata and bounded historical blobs', async () => {
     const repository = await newRepository()
     await write(repository, 'image.png', pngWithMetadata())
@@ -228,24 +338,73 @@ describe('public release hygiene gate', () => {
     assert.equal(canonicalEvidenceJson(tampered).includes(repository), false)
   })
 
-  it('accepts only the exact Bridge sources and migration docs in the artifact protocol', async () => {
+  it('accepts only the exact Bridge and hostname-WSS sources plus reviewed migration, recovery, or network docs in the artifact protocol', async () => {
     const repository = await newRepository()
     await write(repository, 'README.md', 'Fictional repository\n')
     await commitAll(repository, 'fixture')
     const artifact = await mkdtemp(path.join(tmpdir(), 'dyson-public-release-contract-artifact-'))
     temporaryRoots.push(artifact)
+    const windowsSeparator = String.fromCharCode(92)
+    const reviewedProtocolPattern = `${windowsSeparator.repeat(2)}A[0-9]+${windowsSeparator.repeat(2)}z`
+    const reviewedExtendedPath = [windowsSeparator.repeat(2) + '?', 'UNC', 'placeholder-host'].join(windowsSeparator)
+    const privateV2Address = ['10', '0', '0', '1'].join('.')
     const protocolFiles = [
       { path: 'apps/api/dist/index.js', bytes: Buffer.from('export const fixture = true\n') },
+      { path: 'docs/DATAROOT-RECOVERY.md', bytes: Buffer.from('# Fictional DataRoot recovery\n') },
       { path: 'docs/GSM-EVALUATION.md', bytes: Buffer.from('# Fictional GSM evaluation\n') },
+      { path: 'docs/MIGRATION-GSMANAGER.md', bytes: Buffer.from('# Fictional GSManager removal\n') },
+      { path: 'docs/NETWORK-CONNECTIVITY.md', bytes: Buffer.from('# Fictional network contract\n') },
       { path: 'docs/WINDOWS-DEPLOYMENT-DRAFT.md', bytes: Buffer.from('# Fictional deployment draft\n') },
+      { path: 'scripts/windows/network/dyson-nebula-network-assessment-v1.schema.json', bytes: Buffer.from('{"title":"Fictional schema"}\n') },
+      { path: 'scripts/windows/network/DysonNetwork.Common.ps1', bytes: Buffer.from("$script:Fixture = 'fictional'\n") },
+      { path: 'scripts/windows/network/fixtures/shadow-ready-direct-ws.json', bytes: Buffer.from('{"fixture":"fictional"}\n') },
+      { path: 'scripts/windows/network/fixtures/shadow-websocket-classification.json', bytes: Buffer.from('{"fixture":"fictional"}\n') },
+      { path: 'scripts/windows/network/fixtures/shadow-wss-hostname-boundary.json', bytes: Buffer.from('{"fixture":"fictional"}\n') },
+      { path: 'scripts/windows/network/SelfTest-DysonNebulaNetwork.ps1', bytes: Buffer.from("Write-Output 'fictional network self-test'\n") },
+      {
+        path: 'scripts/windows/network/SelfTest-DysonNebulaNetworkV2.ps1',
+        bytes: Buffer.from(`$script:RejectedPrivateAddress = '${privateV2Address}'\n`)
+      },
+      { path: 'scripts/windows/network/Test-DysonNebulaNetwork.ps1', bytes: Buffer.from("Write-Output 'fictional network assessment'\n") },
+      { path: 'scripts/windows/migration/DysonGsManagerRemoval.Common.ps1', bytes: Buffer.from("$script:Fixture = 'fictional'\n") },
+      { path: 'scripts/windows/migration/Remove-DysonGsManagerInstallation.ps1', bytes: Buffer.from("Write-Output 'fictional removal'\n") },
+      { path: 'scripts/windows/migration/Restore-DysonGsManagerRemoval.ps1', bytes: Buffer.from("Write-Output 'fictional restore'\n") },
+      { path: 'scripts/windows/migration/SelfTest-DysonGsManagerRemoval.ps1', bytes: Buffer.from("Write-Output 'fictional self-test'\n") },
+      { path: 'scripts/windows/migration/Test-DysonGsManagerRemoval.ps1', bytes: Buffer.from("Write-Output 'fictional inspection'\n") },
+      {
+        path: 'scripts/windows/DysonHostMutationLease.Common.ps1',
+        bytes: Buffer.from(`$script:ReviewedExtendedPath = '${reviewedExtendedPath}'\n`)
+      },
+      {
+        path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1',
+        bytes: Buffer.from(`$script:ReviewedExtendedPath = '${reviewedExtendedPath}'\n`)
+      },
+      {
+        path: 'scripts/windows/deployment/DysonDeployment.Common.ps1',
+        bytes: Buffer.from(`$script:ReviewedExtendedPath = '${reviewedExtendedPath}'\n`)
+      },
+      {
+        path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1',
+        bytes: Buffer.from(`$script:ReviewedExtendedPath = '${reviewedExtendedPath}'\n`)
+      },
       { path: 'integrations/dyson-control-bridge/BridgeFileStore.cs', bytes: Buffer.from('namespace Fictional;\n') },
-      { path: 'integrations/dyson-control-bridge/BridgeProtocol.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      {
+        path: 'integrations/dyson-control-bridge/BridgeProtocol.cs',
+        bytes: Buffer.from(`namespace Fictional { const string ReviewedPattern = "${reviewedProtocolPattern}"; }\n`)
+      },
       { path: 'integrations/dyson-control-bridge/DysonControlBridge.csproj', bytes: Buffer.from('<Project />\n') },
       { path: 'integrations/dyson-control-bridge/DysonControlBridgePlugin.cs', bytes: Buffer.from('namespace Fictional;\n') },
       { path: 'integrations/dyson-control-bridge/GameSaveAdapter.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      { path: 'integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.cs', bytes: Buffer.from('namespace Fictional;\n') },
       { path: 'integrations/dyson-control-bridge/PlayerRosterPublisher.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      { path: 'integrations/dyson-control-bridge/SimulationTelemetrySampler.cs', bytes: Buffer.from('namespace Fictional;\n') },
       { path: 'integrations/dyson-control-bridge/README.md', bytes: Buffer.from('# Fictional Bridge\n') },
-      { path: 'integrations/dyson-control-bridge/dyson-control-bridge.cfg.example', bytes: Buffer.from('Enabled=false\n') }
+      { path: 'integrations/dyson-control-bridge/dyson-control-bridge.cfg.example', bytes: Buffer.from('Enabled=false\n') },
+      { path: 'integrations/nebula-hostname-wss/contract.json', bytes: Buffer.from('{"protocol":"FICTIONAL_HOSTNAME_WSS_CONTRACT"}\n') },
+      {
+        path: 'integrations/nebula-hostname-wss/patches/nebula-v0.9.22-hostname-wss.patch',
+        bytes: Buffer.from('diff --git a/src/fictional.cs b/src/fictional.cs\n')
+      }
     ]
     for (const file of protocolFiles) {
       await mkdir(path.dirname(path.join(artifact, ...file.path.split('/'))), { recursive: true })
@@ -255,11 +414,44 @@ describe('public release hygiene gate', () => {
 
     const valid = await runPublicReleaseScan({ repositoryRoot: repository, artifactPath: artifact })
     assert.equal(valid.passed, true)
+    assert.equal(valid.totals.allowlistedMatchCount, 6)
     assert.equal(valid.findings.some((entry) => entry.ruleId === 'ARTIFACT_PATH_NOT_ALLOWED'), false)
 
     const unexpectedFiles = [
       { path: 'docs/UNREVIEWED.md', bytes: Buffer.from('# Unreviewed fixture\n') },
-      { path: 'integrations/dyson-control-bridge/Unreviewed.cs', bytes: Buffer.from('namespace Fictional;\n') }
+      { path: 'integrations/dyson-control-bridge/Unreviewed.cs', bytes: Buffer.from('namespace Fictional;\n') },
+      {
+        path: 'integrations/dyson-control-bridge/BridgeProtocol.Copy.cs',
+        bytes: Buffer.from(`namespace Fictional { const string ReviewedPattern = "${reviewedProtocolPattern}"; }\n`)
+      },
+      {
+        path: 'integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.Copy.cs',
+        bytes: Buffer.from('namespace Fictional;\n')
+      },
+      {
+        path: 'integrations/nebula-hostname-wss/README.md',
+        bytes: Buffer.from('# Unreviewed hostname-WSS fixture\n')
+      },
+      {
+        path: 'scripts/windows/DysonHostMutationLease.Copy.ps1',
+        bytes: Buffer.from(`$script:ReviewedExtendedPath = '${reviewedExtendedPath}'\n`)
+      },
+      {
+        path: 'scripts/windows/configuration/DysonConfiguration.Copy.ps1',
+        bytes: Buffer.from(`$script:ReviewedExtendedPath = '${reviewedExtendedPath}'\n`)
+      },
+      {
+        path: 'scripts/windows/deployment/DysonDeployment.Copy.ps1',
+        bytes: Buffer.from(`$script:ReviewedExtendedPath = '${reviewedExtendedPath}'\n`)
+      },
+      {
+        path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.Copy.ps1',
+        bytes: Buffer.from(`$script:ReviewedExtendedPath = '${reviewedExtendedPath}'\n`)
+      },
+      {
+        path: 'scripts/windows/network/SelfTest-DysonNebulaNetworkV2.Copy.ps1',
+        bytes: Buffer.from(`$script:RejectedPrivateAddress = '${privateV2Address}'\n`)
+      }
     ]
     for (const file of unexpectedFiles) {
       await writeFile(path.join(artifact, ...file.path.split('/')), file.bytes)
@@ -271,10 +463,63 @@ describe('public release hygiene gate', () => {
     const rejected = await runPublicReleaseScan({ repositoryRoot: repository, artifactPath: artifact })
     assert.deepEqual(
       rejected.findings.filter((entry) => entry.ruleId === 'ARTIFACT_PATH_NOT_ALLOWED').map((entry) => entry.path),
-      ['docs/UNREVIEWED.md', 'integrations/dyson-control-bridge/Unreviewed.cs']
+      [
+        'docs/UNREVIEWED.md',
+        'integrations/dyson-control-bridge/BridgeProtocol.Copy.cs',
+        'integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.Copy.cs',
+        'integrations/dyson-control-bridge/Unreviewed.cs',
+        'integrations/nebula-hostname-wss/README.md'
+      ]
+    )
+    assert.deepEqual(
+      rejected.findings.filter((entry) => entry.ruleId === 'UNC_PATH').map((entry) => entry.path),
+      [
+        'integrations/dyson-control-bridge/BridgeProtocol.Copy.cs',
+        'scripts/windows/DysonHostMutationLease.Copy.ps1',
+        'scripts/windows/configuration/DysonConfiguration.Copy.ps1',
+        'scripts/windows/deployment/DysonDeployment.Copy.ps1',
+        'scripts/windows/deployment/SelfTest-DysonControlDeployment.Copy.ps1'
+      ]
+    )
+    assert.deepEqual(
+      rejected.findings.filter((entry) => entry.ruleId === 'PRIVATE_IP_ADDRESS').map((entry) => entry.path),
+      ['scripts/windows/network/SelfTest-DysonNebulaNetworkV2.Copy.ps1']
     )
     assert.equal(rejected.findings.some((entry) => entry.ruleId === 'ARTIFACT_MANIFEST_INVALID'), false)
     assert.equal(rejected.passed, false)
+
+    for (const file of unexpectedFiles) {
+      await rm(path.join(artifact, ...file.path.split('/')))
+    }
+    const privateAddress = ['10', '20', '30', '40'].join('.')
+    const differentSensitiveLiteral = [windowsSeparator.repeat(2) + privateAddress, 'share'].join(windowsSeparator)
+    const differentBridgeProtocol = {
+      path: 'integrations/dyson-control-bridge/BridgeProtocol.cs',
+      bytes: Buffer.from(`namespace Fictional { const string Endpoint = "${differentSensitiveLiteral}"; }\n`)
+    }
+    await writeFile(
+      path.join(artifact, ...differentBridgeProtocol.path.split('/')),
+      differentBridgeProtocol.bytes
+    )
+    const differentLiteralFiles = protocolFiles.map((file) => (
+      file.path === differentBridgeProtocol.path ? differentBridgeProtocol : file
+    ))
+    await writeFile(
+      path.join(artifact, 'artifact-manifest.json'),
+      JSON.stringify(buildArtifactManifestForFixture(differentLiteralFiles))
+    )
+
+    const differentLiteralRejected = await runPublicReleaseScan({ repositoryRoot: repository, artifactPath: artifact })
+    assert.deepEqual(
+      differentLiteralRejected.findings.filter((entry) => entry.ruleId === 'PRIVATE_IP_ADDRESS').map((entry) => entry.path),
+      ['integrations/dyson-control-bridge/BridgeProtocol.cs']
+    )
+    assert.equal(
+      differentLiteralRejected.findings.some((entry) => entry.ruleId === 'UNC_PATH'
+        && entry.path === 'integrations/dyson-control-bridge/BridgeProtocol.cs'),
+      false
+    )
+    assert.equal(differentLiteralRejected.passed, false)
   })
 
   it('suppresses only generic vendored examples while retaining high-signal artifact blocks', async () => {
@@ -398,7 +643,10 @@ async function commitAll(repository, message) {
 }
 
 async function git(repository, args) {
-  await execFileAsync('git', args, { cwd: repository, windowsHide: true })
+  await execFileAsync('git', ['-c', `safe.directory=${repository}`, ...args], {
+    cwd: repository,
+    windowsHide: true
+  })
 }
 
 async function write(repository, relative, value) {

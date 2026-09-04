@@ -3,6 +3,10 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 export const bridgeRequestProtocol = 'DYSON_CONTROL_REQUEST_V1' as const
 export const bridgeReceiptProtocol = 'DYSON_CONTROL_RECEIPT_V2' as const
 export const bridgeHeartbeatProtocol = 'DYSON_CONTROL_HEARTBEAT_V1' as const
+export const bridgeRuntimeSessionProtocol = 'DYSON_CONTROL_RUNTIME_SESSION_V1' as const
+export const bridgeSimulationTelemetryProtocol = 'DYSON_CONTROL_SIMULATION_TELEMETRY_V1' as const
+export const bridgeSimulationUpsSource = 'fpscontroller-stopwatch' as const
+export const bridgeSimulationTpsSource = 'gamemain-tick-wallclock' as const
 export const bridgeLastExitSaveName = '_lastexit_' as const
 export const bridgeUnavailableSaveName = '_unavailable_' as const
 const legacyBridgeReceiptProtocol = 'DYSON_CONTROL_RECEIPT_V1' as const
@@ -83,6 +87,37 @@ export interface BridgeHeartbeat {
   hmac: string
 }
 
+export interface BridgeRuntimeSession {
+  protocol: typeof bridgeRuntimeSessionProtocol
+  sessionId: string
+  pluginVersion: string
+  processId: number
+  processStartedAtUnixMs: number
+  bridgeStartedAtUnixMs: number
+  issuedAtUnixMs: number
+  hmac: string
+}
+
+export interface BridgeSimulationTelemetry {
+  protocol: typeof bridgeSimulationTelemetryProtocol
+  sessionId: string
+  processId: number
+  processStartedAtUnixMs: number
+  bridgeStartedAtUnixMs: number
+  sequence: number
+  sampleStartedAtUnixMs: number
+  sampleFinishedAtUnixMs: number
+  writtenAtUnixMs: number
+  windowDurationMs: number
+  tickStarted: number
+  tickFinished: number
+  upsMilli: number
+  tpsMilli: number
+  upsSource: typeof bridgeSimulationUpsSource
+  tpsSource: typeof bridgeSimulationTpsSource
+  hmac: string
+}
+
 export class BridgeProtocolError extends Error {
   readonly code: string
 
@@ -105,6 +140,16 @@ const receiptKeys = [
 const heartbeatKeys = [
   'protocol', 'pluginVersion', 'processId', 'startedAtUnixMs', 'writtenAtUnixMs', 'state', 'hmac'
 ] as const
+const runtimeSessionKeys = [
+  'protocol', 'sessionId', 'pluginVersion', 'processId', 'processStartedAtUnixMs',
+  'bridgeStartedAtUnixMs', 'issuedAtUnixMs', 'hmac'
+] as const
+const simulationTelemetryKeys = [
+  'protocol', 'sessionId', 'processId', 'processStartedAtUnixMs', 'bridgeStartedAtUnixMs',
+  'sequence', 'sampleStartedAtUnixMs', 'sampleFinishedAtUnixMs', 'writtenAtUnixMs',
+  'windowDurationMs', 'tickStarted', 'tickFinished', 'upsMilli', 'tpsMilli',
+  'upsSource', 'tpsSource', 'hmac'
+] as const
 const guidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const noncePattern = /^[A-Za-z0-9_-]{22,64}$/
 const hmacPattern = /^[0-9a-f]{64}$/i
@@ -113,6 +158,7 @@ const pluginVersionPattern = /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,32})?$/
 const canonicalInt64Pattern = /^(?:-1|0|[1-9]\d{0,18})$/
 const maximumInt64 = 9_223_372_036_854_775_807n
 const generationIdPrefix = 'generation-v1:'
+const maximumSimulationMilliRate = 10_000_000
 
 export function validateBridgeSecret(secret: string): string {
   const normalized = secret.trim()
@@ -305,6 +351,104 @@ export function parseBridgeHeartbeat(payload: string, secret: string): BridgeHea
   return heartbeat
 }
 
+export function buildBridgeRuntimeSession(
+  values: Omit<BridgeRuntimeSession, 'protocol' | 'hmac'>,
+  secret: string
+): { session: BridgeRuntimeSession; payload: string } {
+  const session: BridgeRuntimeSession = {
+    protocol: bridgeRuntimeSessionProtocol,
+    sessionId: normalizeSessionId(values.sessionId),
+    pluginVersion: requirePattern(values.pluginVersion, pluginVersionPattern, 'BRIDGE_VERSION_INVALID'),
+    processId: requireSafeInteger(values.processId),
+    processStartedAtUnixMs: requireSafeInteger(values.processStartedAtUnixMs),
+    bridgeStartedAtUnixMs: requireSafeInteger(values.bridgeStartedAtUnixMs),
+    issuedAtUnixMs: requireSafeInteger(values.issuedAtUnixMs),
+    hmac: ''
+  }
+  validateRuntimeSessionSemantics(session)
+  session.hmac = signRuntimeSession(session, validateBridgeSecret(secret))
+  return { session, payload: serialize(runtimeSessionKeys, session) }
+}
+
+export function parseBridgeRuntimeSession(payload: string, secret: string): BridgeRuntimeSession {
+  const values = parse(payload, runtimeSessionKeys)
+  const session: BridgeRuntimeSession = {
+    protocol: requireLiteral(values.protocol, bridgeRuntimeSessionProtocol),
+    sessionId: normalizeSessionId(values.sessionId),
+    pluginVersion: requirePattern(values.pluginVersion, pluginVersionPattern, 'BRIDGE_VERSION_INVALID'),
+    processId: parseSafeInteger(values.processId, 1, 0x7fffffff),
+    processStartedAtUnixMs: parseSafeInteger(values.processStartedAtUnixMs, 1, Number.MAX_SAFE_INTEGER),
+    bridgeStartedAtUnixMs: parseSafeInteger(values.bridgeStartedAtUnixMs, 1, Number.MAX_SAFE_INTEGER),
+    issuedAtUnixMs: parseSafeInteger(values.issuedAtUnixMs, 1, Number.MAX_SAFE_INTEGER),
+    hmac: requirePattern(values.hmac, hmacPattern, 'BRIDGE_HMAC_INVALID').toLowerCase()
+  }
+  validateRuntimeSessionSemantics(session)
+  assertSignature(session.hmac, signRuntimeSession(session, validateBridgeSecret(secret)))
+  return session
+}
+
+export function buildBridgeSimulationTelemetry(
+  values: Omit<BridgeSimulationTelemetry, 'protocol' | 'hmac' | 'upsSource' | 'tpsSource'>,
+  secret: string
+): { telemetry: BridgeSimulationTelemetry; payload: string } {
+  const telemetry: BridgeSimulationTelemetry = {
+    protocol: bridgeSimulationTelemetryProtocol,
+    sessionId: normalizeSessionId(values.sessionId),
+    processId: requireSafeInteger(values.processId),
+    processStartedAtUnixMs: requireSafeInteger(values.processStartedAtUnixMs),
+    bridgeStartedAtUnixMs: requireSafeInteger(values.bridgeStartedAtUnixMs),
+    sequence: requireSafeInteger(values.sequence),
+    sampleStartedAtUnixMs: requireSafeInteger(values.sampleStartedAtUnixMs),
+    sampleFinishedAtUnixMs: requireSafeInteger(values.sampleFinishedAtUnixMs),
+    writtenAtUnixMs: requireSafeInteger(values.writtenAtUnixMs),
+    windowDurationMs: requireSafeInteger(values.windowDurationMs),
+    tickStarted: requireNonnegativeSafeInteger(values.tickStarted),
+    tickFinished: requireNonnegativeSafeInteger(values.tickFinished),
+    upsMilli: requireNonnegativeSafeInteger(values.upsMilli),
+    tpsMilli: requireNonnegativeSafeInteger(values.tpsMilli),
+    upsSource: bridgeSimulationUpsSource,
+    tpsSource: bridgeSimulationTpsSource,
+    hmac: ''
+  }
+  validateSimulationTelemetrySemantics(telemetry)
+  telemetry.hmac = signSimulationTelemetry(telemetry, validateBridgeSecret(secret))
+  return { telemetry, payload: serialize(simulationTelemetryKeys, telemetry) }
+}
+
+export function parseBridgeSimulationTelemetry(payload: string, secret: string): BridgeSimulationTelemetry {
+  const values = parse(payload, simulationTelemetryKeys)
+  const telemetry: BridgeSimulationTelemetry = {
+    protocol: requireLiteral(values.protocol, bridgeSimulationTelemetryProtocol),
+    sessionId: normalizeSessionId(values.sessionId),
+    processId: parseSafeInteger(values.processId, 1, 0x7fffffff),
+    processStartedAtUnixMs: parseSafeInteger(values.processStartedAtUnixMs, 1, Number.MAX_SAFE_INTEGER),
+    bridgeStartedAtUnixMs: parseSafeInteger(values.bridgeStartedAtUnixMs, 1, Number.MAX_SAFE_INTEGER),
+    sequence: parseSafeInteger(values.sequence, 1, Number.MAX_SAFE_INTEGER),
+    sampleStartedAtUnixMs: parseSafeInteger(values.sampleStartedAtUnixMs, 1, Number.MAX_SAFE_INTEGER),
+    sampleFinishedAtUnixMs: parseSafeInteger(values.sampleFinishedAtUnixMs, 1, Number.MAX_SAFE_INTEGER),
+    writtenAtUnixMs: parseSafeInteger(values.writtenAtUnixMs, 1, Number.MAX_SAFE_INTEGER),
+    windowDurationMs: parseSafeInteger(values.windowDurationMs, 1_000, 10_000),
+    tickStarted: parseSafeInteger(values.tickStarted, 0, Number.MAX_SAFE_INTEGER),
+    tickFinished: parseSafeInteger(values.tickFinished, 0, Number.MAX_SAFE_INTEGER),
+    upsMilli: parseSafeInteger(values.upsMilli, 0, maximumSimulationMilliRate),
+    tpsMilli: parseSafeInteger(values.tpsMilli, 0, maximumSimulationMilliRate),
+    upsSource: requireLiteral(values.upsSource, bridgeSimulationUpsSource),
+    tpsSource: requireLiteral(values.tpsSource, bridgeSimulationTpsSource),
+    hmac: requirePattern(values.hmac, hmacPattern, 'BRIDGE_HMAC_INVALID').toLowerCase()
+  }
+  validateSimulationTelemetrySemantics(telemetry)
+  assertSignature(telemetry.hmac, signSimulationTelemetry(telemetry, validateBridgeSecret(secret)))
+  return telemetry
+}
+
+export function actualSimulationRates(telemetry: BridgeSimulationTelemetry): {
+  ups: number
+  tps: number
+} {
+  validateSimulationTelemetrySemantics(telemetry)
+  return { ups: telemetry.upsMilli / 1_000, tps: telemetry.tpsMilli / 1_000 }
+}
+
 function validateReceiptSemantics(receipt: BridgeReceiptV2): void {
   if (receipt.finishedAtUnixMs < receipt.startedAtUnixMs) {
     throw new BridgeProtocolError('BRIDGE_TIME_INVALID')
@@ -375,9 +519,76 @@ function signHeartbeat(
   ], secret)
 }
 
+function signRuntimeSession(
+  session: Omit<BridgeRuntimeSession, 'hmac'> | BridgeRuntimeSession,
+  secret: string
+): string {
+  return hmac([
+    bridgeRuntimeSessionProtocol,
+    session.sessionId,
+    session.pluginVersion,
+    String(session.processId),
+    String(session.processStartedAtUnixMs),
+    String(session.bridgeStartedAtUnixMs),
+    String(session.issuedAtUnixMs)
+  ], secret)
+}
+
+function signSimulationTelemetry(
+  telemetry: Omit<BridgeSimulationTelemetry, 'hmac'> | BridgeSimulationTelemetry,
+  secret: string
+): string {
+  return hmac([
+    bridgeSimulationTelemetryProtocol,
+    telemetry.sessionId,
+    String(telemetry.processId),
+    String(telemetry.processStartedAtUnixMs),
+    String(telemetry.bridgeStartedAtUnixMs),
+    String(telemetry.sequence),
+    String(telemetry.sampleStartedAtUnixMs),
+    String(telemetry.sampleFinishedAtUnixMs),
+    String(telemetry.writtenAtUnixMs),
+    String(telemetry.windowDurationMs),
+    String(telemetry.tickStarted),
+    String(telemetry.tickFinished),
+    String(telemetry.upsMilli),
+    String(telemetry.tpsMilli),
+    telemetry.upsSource,
+    telemetry.tpsSource
+  ], secret)
+}
+
 function validateHeartbeatSemantics(heartbeat: BridgeHeartbeat): void {
   if (heartbeat.writtenAtUnixMs < heartbeat.startedAtUnixMs) {
     throw new BridgeProtocolError('BRIDGE_TIME_INVALID')
+  }
+}
+
+function validateRuntimeSessionSemantics(session: BridgeRuntimeSession): void {
+  if (session.bridgeStartedAtUnixMs < session.processStartedAtUnixMs ||
+      session.issuedAtUnixMs < session.bridgeStartedAtUnixMs - 5_000 ||
+      session.issuedAtUnixMs > session.bridgeStartedAtUnixMs + 120_000) {
+    throw new BridgeProtocolError('BRIDGE_RUNTIME_SESSION_INCONSISTENT')
+  }
+}
+
+function validateSimulationTelemetrySemantics(telemetry: BridgeSimulationTelemetry): void {
+  if (telemetry.bridgeStartedAtUnixMs < telemetry.processStartedAtUnixMs ||
+      telemetry.sampleFinishedAtUnixMs < telemetry.sampleStartedAtUnixMs ||
+      telemetry.writtenAtUnixMs < telemetry.sampleFinishedAtUnixMs ||
+      telemetry.writtenAtUnixMs - telemetry.sampleFinishedAtUnixMs > 5_000 ||
+      telemetry.sampleFinishedAtUnixMs - telemetry.sampleStartedAtUnixMs > 120_000 ||
+      telemetry.sampleStartedAtUnixMs < telemetry.bridgeStartedAtUnixMs - 5_000 ||
+      telemetry.windowDurationMs < 1_000 || telemetry.windowDurationMs > 10_000 ||
+      telemetry.tickFinished < telemetry.tickStarted ||
+      telemetry.upsMilli < 0 || telemetry.upsMilli > maximumSimulationMilliRate ||
+      telemetry.tpsMilli < 0 || telemetry.tpsMilli > maximumSimulationMilliRate) {
+    throw new BridgeProtocolError('BRIDGE_TELEMETRY_INCONSISTENT')
+  }
+  const expectedTpsMilli = (telemetry.tickFinished - telemetry.tickStarted) * 1_000_000 /
+    telemetry.windowDurationMs
+  if (!Number.isFinite(expectedTpsMilli) || Math.abs(expectedTpsMilli - telemetry.tpsMilli) > 1) {
+    throw new BridgeProtocolError('BRIDGE_TELEMETRY_INCONSISTENT')
   }
 }
 
@@ -421,6 +632,11 @@ function normalizeRequestId(value: string): string {
   return value.toLowerCase()
 }
 
+function normalizeSessionId(value: string): string {
+  if (!guidPattern.test(value)) throw new BridgeProtocolError('BRIDGE_SESSION_ID_INVALID')
+  return value.toLowerCase()
+}
+
 function parseSafeInteger(value: string, minimum: number, maximum: number): number {
   if (!/^(?:-1|0|[1-9]\d*)$/.test(value)) throw new BridgeProtocolError('BRIDGE_NUMBER_INVALID')
   const parsed = Number(value)
@@ -437,6 +653,11 @@ function requireSafeInteger(value: number): number {
 
 function requireSignedSafeInteger(value: number): number {
   if (!Number.isSafeInteger(value) || value < -1) throw new BridgeProtocolError('BRIDGE_NUMBER_INVALID')
+  return value
+}
+
+function requireNonnegativeSafeInteger(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new BridgeProtocolError('BRIDGE_NUMBER_INVALID')
   return value
 }
 

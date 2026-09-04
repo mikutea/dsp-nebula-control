@@ -25,8 +25,8 @@ function Get-SelectedTreeFiles {
         $relative = Get-DysonArtifactRelativePath -Root $SourceRoot -File $file.FullName
         $lower = $relative.ToLowerInvariant()
         if ($lower.EndsWith('.map')) { continue }
-        if ($Kind -eq 'api' -and ($lower -match '(^|/)[^/]+\.(test|spec)\.js$' -or
-            $lower.StartsWith('cli/') -or $lower.StartsWith('unused/'))) { continue }
+        $artifactRelative = "apps/$Kind/dist/$relative"
+        if (Test-DysonArtifactRepositoryOnlyPath -RelativePath $artifactRelative) { continue }
         $selected += [ordered]@{ source = $file.FullName; relative = $relative }
     }
     return @($selected)
@@ -109,21 +109,95 @@ $outputParent = [System.IO.Path]::GetDirectoryName($outputFull)
 if ([string]::IsNullOrWhiteSpace($outputParent)) { throw 'OutputPath must have a parent directory.' }
 
 $apiDist = Assert-DysonArtifactPlainDirectory -Path (Join-Path $repository 'apps\api\dist')
+$apiObservabilitySourceRoot = Assert-DysonArtifactPlainDirectory -Path `
+    (Join-Path $repository 'apps\api\src\observability')
 $webDist = Assert-DysonArtifactPlainDirectory -Path (Join-Path $repository 'apps\web\dist')
 $windowsScripts = Assert-DysonArtifactPlainDirectory -Path (Join-Path $repository 'scripts\windows')
+$configurationScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'configuration')
+$gameBootstrapScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'bootstrap')
+$cutoverScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'cutover')
+$cutoverBrokerScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'cutover-broker')
+$lifecycleBrokerScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'lifecycle-broker')
+$dataRecoveryScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'data-recovery')
+$networkScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'network')
+$qualificationScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'qualification')
 $migrationScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'migration')
 $evidenceScriptRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $windowsScripts 'evidence')
 $bridgeSourceRoot = Assert-DysonArtifactPlainDirectory -Path (Join-Path $repository 'integrations\dyson-control-bridge')
+$hostnameWssSourceRoot = Assert-DysonArtifactPlainDirectory -Path `
+    (Join-Path $repository 'integrations\nebula-hostname-wss')
 $apiPackagePath = Join-Path $repository 'apps\api\package.json'
 $apiLockPath = Join-Path $repository 'apps\api\package-lock.json'
 $licensePath = Join-Path $repository 'LICENSE'
+$hashPasswordTestPath = Join-Path $repository 'apps\api\src\cli\hash-password.test.ts'
+$apiLifecycleFiles = @($script:DysonArtifactRequiredApiLifecycleFiles | ForEach-Object {
+    [ordered]@{ source = Join-Path $repository $_.Replace('/', '\'); relative = $_ }
+})
+$apiHostnameWssRuntimeFiles = @($script:DysonArtifactRequiredApiHostnameWssRuntimeFiles | ForEach-Object {
+    [ordered]@{ source = Join-Path $repository $_.Replace('/', '\'); relative = $_ }
+})
+$apiUpdateRuntimeFiles = @($script:DysonArtifactRequiredApiUpdateRuntimeFiles | ForEach-Object {
+    [ordered]@{ source = Join-Path $repository $_.Replace('/', '\'); relative = $_ }
+})
 $migrationDocFiles = @($script:DysonArtifactRequiredMigrationDocs | ForEach-Object {
     [ordered]@{ source = Join-Path $repository $_.Replace('/', '\'); relative = $_ }
 })
-foreach ($requiredFile in @($apiPackagePath, $apiLockPath, $licensePath, (Join-Path $apiDist 'index.js'), (Join-Path $webDist 'index.html')) + @($migrationDocFiles | ForEach-Object { $_.source })) {
+$gsManagerRemovalDocFiles = @($script:DysonArtifactRequiredGsManagerRemovalDocs | ForEach-Object {
+    [ordered]@{ source = Join-Path $repository $_.Replace('/', '\'); relative = $_ }
+})
+$recoveryDocFiles = @($script:DysonArtifactRequiredRecoveryDocs | ForEach-Object {
+    [ordered]@{ source = Join-Path $repository $_.Replace('/', '\'); relative = $_ }
+})
+$networkDocFiles = @($script:DysonArtifactRequiredNetworkDocs | ForEach-Object {
+    [ordered]@{ source = Join-Path $repository $_.Replace('/', '\'); relative = $_ }
+})
+$qualificationDocFiles = @($script:DysonArtifactRequiredQualificationDocs | ForEach-Object {
+    [ordered]@{ source = Join-Path $repository $_.Replace('/', '\'); relative = $_ }
+})
+foreach ($requiredFile in @($apiPackagePath, $apiLockPath, $licensePath, $hashPasswordTestPath, (Join-Path $apiDist 'index.js'), (Join-Path $webDist 'index.html')) +
+    @($apiLifecycleFiles | ForEach-Object { $_.source }) +
+    @($apiHostnameWssRuntimeFiles | ForEach-Object { $_.source }) +
+    @($apiUpdateRuntimeFiles | ForEach-Object { $_.source }) +
+    @($script:DysonArtifactRequiredApiObservabilityRuntimeFiles | ForEach-Object {
+        Join-Path $repository $_.Replace('/', '\')
+    }) +
+    @($script:DysonArtifactRequiredApiObservabilitySourceFiles | ForEach-Object {
+        Join-Path $repository $_.Replace('/', '\')
+    }) +
+    @($script:DysonArtifactRequiredQualificationRuntimeFiles | ForEach-Object {
+        Join-Path $repository $_.Replace('/', '\')
+    }) +
+    @($script:DysonArtifactRequiredNebulaHostnameWssSources | ForEach-Object {
+        Join-Path $repository $_.Replace('/', '\')
+    }) +
+    @($migrationDocFiles | ForEach-Object { $_.source }) +
+    @($gsManagerRemovalDocFiles | ForEach-Object { $_.source }) +
+    @($recoveryDocFiles | ForEach-Object { $_.source }) +
+    @($networkDocFiles | ForEach-Object { $_.source }) +
+    @($qualificationDocFiles | ForEach-Object { $_.source })) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) { throw "Required built release input is missing: $requiredFile" }
     $requiredItem = Get-Item -LiteralPath $requiredFile -Force -ErrorAction Stop
     if ($requiredItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'Required release inputs cannot be redirected.' }
+}
+[void](Test-DysonArtifactPackageVersionBinding -ArtifactRoot $repository -ExpectedVersion $Version)
+[void](Assert-DysonArtifactBridgeFixedReferenceContract `
+    -ProjectPath (Join-Path $bridgeSourceRoot 'DysonControlBridge.csproj') `
+    -CommonScriptPath (Join-Path $windowsScripts 'bridge\DysonBridge.Common.ps1'))
+
+$observabilitySourcePrefixLength = 'apps/api/src/observability/'.Length
+$expectedObservabilitySourceFiles = @($script:DysonArtifactRequiredApiObservabilitySourceFiles |
+    ForEach-Object { $_.Substring($observabilitySourcePrefixLength) } |
+    Sort-Object -CaseSensitive)
+$actualObservabilitySourceFiles = @(Get-DysonArtifactPlainFiles -Root $apiObservabilitySourceRoot |
+    ForEach-Object { Get-DysonArtifactRelativePath -Root $apiObservabilitySourceRoot -File $_.FullName } |
+    Where-Object {
+        $_.EndsWith('.ts', [System.StringComparison]::OrdinalIgnoreCase) -and
+        -not $_.EndsWith('.d.ts', [System.StringComparison]::OrdinalIgnoreCase) -and
+        $_ -cnotmatch '\.(?:test|spec|fixture|fixtures)\.ts$'
+    } | Sort-Object -CaseSensitive)
+if ([string]::Join("`n", $actualObservabilitySourceFiles) -cne
+    [string]::Join("`n", $expectedObservabilitySourceFiles)) {
+    throw 'The observability production source tree and fixed dist package are inconsistent.'
 }
 
 foreach ($sourceRoot in @($apiDist, $webDist, $windowsScripts, $bridgeSourceRoot)) {
@@ -150,42 +224,32 @@ $apiFiles = @(Get-SelectedTreeFiles -SourceRoot $apiDist -Kind api)
 $webFiles = @(Get-SelectedTreeFiles -SourceRoot $webDist -Kind web)
 if ($apiFiles.Count -eq 0 -or $webFiles.Count -eq 0) { throw 'The built API or web release input is empty.' }
 
-$runtimeTopLevelScripts = @(
-    'Get-DysonLifecyclePreflight.ps1',
-    'Get-DysonManagedPluginVersion.ps1',
-    'Get-DysonStatus.ps1',
-    'Install-DysonRuntimeTasks.ps1',
-    'Invoke-DysonScheduledTask.ps1',
-    'New-DysonSaveProtectionPoint.ps1',
-    'Start-DysonServer.ps1',
-    'Stop-DysonServer.ps1',
-    'Test-DysonRuntimeState.ps1'
-)
-$runtimeReleaseScripts = @(
-    'DysonReleasePackaging.Common.ps1',
-    'Test-DysonControlReleaseArtifact.ps1'
-)
-$runtimeDeploymentScripts = @(
-    'DysonDeployment.Common.ps1',
-    'DysonRebootAcceptance.Common.ps1',
-    'Install-DysonControl.ps1',
-    'Install-DysonControlTask.ps1',
-    'Invoke-DysonControlDeployment.ps1',
-    'New-DysonRebootAcceptanceCheckpoint.ps1',
-    'Start-DysonControl.ps1',
-    'Test-DysonControlDeployment.ps1',
-    'Test-DysonRebootAcceptanceResume.ps1',
-    'Uninstall-DysonControl.ps1'
-)
-$runtimeSessionScripts = @(
-    'Configure-DysonInteractiveSession.ps1',
-    'Disable-DysonInteractiveSession.ps1',
-    'DysonSession.Common.ps1',
-    'Test-DysonInteractiveSession.ps1'
-)
+$runtimeTopLevelScripts = @($script:DysonArtifactRequiredTopLevelWindowsScripts | ForEach-Object {
+    [System.IO.Path]::GetFileName($_)
+})
+$runtimeReleaseScripts = @($script:DysonArtifactRequiredReleaseScripts | ForEach-Object {
+    [System.IO.Path]::GetFileName($_)
+})
+$runtimeDeploymentScripts = @($script:DysonArtifactRequiredDeploymentScripts | ForEach-Object {
+    [System.IO.Path]::GetFileName($_)
+})
+$runtimeConfigurationFiles = @($script:DysonArtifactRequiredConfigurationFiles)
+$runtimeSessionScripts = @($script:DysonArtifactRequiredSessionScripts | ForEach-Object {
+    [System.IO.Path]::GetFileName($_)
+})
 $runtimeMigrationScripts = @($script:DysonArtifactRequiredMigrationScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+$runtimeGsManagerRemovalScripts = @($script:DysonArtifactRequiredGsManagerRemovalScripts | ForEach-Object {
+    [System.IO.Path]::GetFileName($_)
+})
 $runtimeEvidenceScripts = @($script:DysonArtifactRequiredEvidenceScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
 $runtimeHostMutationScripts = @($script:DysonArtifactRequiredHostMutationScripts)
+$runtimeGameBootstrapScripts = @($script:DysonArtifactRequiredGameBootstrapScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+$runtimeCutoverScripts = @($script:DysonArtifactRequiredCutoverScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+$runtimeCutoverBrokerScripts = @($script:DysonArtifactRequiredCutoverBrokerScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+$runtimeLifecycleBrokerScripts = @($script:DysonArtifactRequiredLifecycleBrokerScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+$runtimeDataRecoveryScripts = @($script:DysonArtifactRequiredDataRecoveryScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+$runtimeNetworkFiles = @($script:DysonArtifactRequiredNetworkFiles)
+$runtimeQualificationFiles = @($script:DysonArtifactRequiredQualificationRuntimeFiles)
 $runtimeBridgeScripts = @($script:DysonArtifactRequiredBridgeScripts | ForEach-Object { [System.IO.Path]::GetFileName($_) })
 $bridgeSourceFiles = @($script:DysonArtifactRequiredBridgeSources | ForEach-Object { [System.IO.Path]::GetFileName($_) })
 $scriptFiles = @()
@@ -200,6 +264,45 @@ foreach ($relative in $runtimeHostMutationScripts) {
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required host-mutation lease script is missing: $name" }
     $scriptFiles += [ordered]@{ source = $source; relative = $relative }
 }
+foreach ($name in $runtimeGameBootstrapScripts) {
+    $source = Join-Path $gameBootstrapScriptRoot $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required stable game bootstrap script is missing: $name" }
+    $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/bootstrap/$name" }
+}
+foreach ($name in $runtimeCutoverScripts) {
+    $source = Join-Path $cutoverScriptRoot $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required cutover host script is missing: $name" }
+    $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/cutover/$name" }
+}
+foreach ($name in $runtimeCutoverBrokerScripts) {
+    $source = Join-Path $cutoverBrokerScriptRoot $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required cutover broker script is missing: $name" }
+    $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/cutover-broker/$name" }
+}
+foreach ($name in $runtimeLifecycleBrokerScripts) {
+    $source = Join-Path $lifecycleBrokerScriptRoot $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required lifecycle broker script is missing: $name" }
+    $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/lifecycle-broker/$name" }
+}
+foreach ($name in $runtimeDataRecoveryScripts) {
+    $source = Join-Path $dataRecoveryScriptRoot $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required DataRoot recovery script is missing: $name" }
+    $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/data-recovery/$name" }
+}
+foreach ($relative in $runtimeNetworkFiles) {
+    $source = Join-Path $repository $relative.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Required Nebula network assessment file is missing: $relative"
+    }
+    $scriptFiles += [ordered]@{ source = $source; relative = $relative }
+}
+foreach ($relative in $runtimeQualificationFiles) {
+    $source = Join-Path $repository $relative.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Required qualification runtime file is missing: $relative"
+    }
+    $scriptFiles += [ordered]@{ source = $source; relative = $relative }
+}
 foreach ($name in $runtimeReleaseScripts) {
     $source = Join-Path (Join-Path $windowsScripts 'release') $name
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required release verifier script is missing: $name" }
@@ -210,12 +313,19 @@ foreach ($name in $runtimeDeploymentScripts) {
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required deployment script is missing: $name" }
     $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/deployment/$name" }
 }
+foreach ($relative in $runtimeConfigurationFiles) {
+    $source = Join-Path $repository $relative.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Required protected configuration file is missing: $relative"
+    }
+    $scriptFiles += [ordered]@{ source = $source; relative = $relative }
+}
 foreach ($name in $runtimeSessionScripts) {
     $source = Join-Path (Join-Path $windowsScripts 'session') $name
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required interactive-session script is missing: $name" }
     $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/session/$name" }
 }
-foreach ($name in $runtimeMigrationScripts) {
+foreach ($name in @($runtimeMigrationScripts + $runtimeGsManagerRemovalScripts)) {
     $source = Join-Path $migrationScriptRoot $name
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Required GSManager migration script is missing: $name" }
     $scriptFiles += [ordered]@{ source = $source; relative = "scripts/windows/migration/$name" }
@@ -233,7 +343,7 @@ foreach ($name in $runtimeBridgeScripts) {
 $actualMigrationFiles = @(Get-DysonArtifactPlainFiles -Root $migrationScriptRoot | ForEach-Object {
     Get-DysonArtifactRelativePath -Root $migrationScriptRoot -File $_.FullName
 } | Sort-Object -CaseSensitive)
-$expectedMigrationFiles = @($runtimeMigrationScripts | Sort-Object -CaseSensitive)
+$expectedMigrationFiles = @(@($runtimeMigrationScripts + $runtimeGsManagerRemovalScripts) | Sort-Object -CaseSensitive)
 if ([string]::Join("`n", $actualMigrationFiles) -ne [string]::Join("`n", $expectedMigrationFiles)) {
     throw 'The GSManager migration source tree contains files outside its release allowlist.'
 }
@@ -244,6 +354,77 @@ $expectedEvidenceFiles = @($runtimeEvidenceScripts | Sort-Object -CaseSensitive)
 if ([string]::Join("`n", $actualEvidenceFiles) -ne [string]::Join("`n", $expectedEvidenceFiles)) {
     throw 'The private acceptance evidence source tree contains files outside its release allowlist.'
 }
+$actualCutoverFiles = @(Get-DysonArtifactPlainFiles -Root $cutoverScriptRoot | ForEach-Object {
+    Get-DysonArtifactRelativePath -Root $cutoverScriptRoot -File $_.FullName
+} | Sort-Object -CaseSensitive)
+$expectedCutoverFiles = @($runtimeCutoverScripts | Sort-Object -CaseSensitive)
+if ([string]::Join("`n", $actualCutoverFiles) -ne [string]::Join("`n", $expectedCutoverFiles)) {
+    throw 'The cutover host source tree contains files outside its release allowlist.'
+}
+$actualCutoverBrokerFiles = @(Get-DysonArtifactPlainFiles -Root $cutoverBrokerScriptRoot | ForEach-Object {
+    Get-DysonArtifactRelativePath -Root $cutoverBrokerScriptRoot -File $_.FullName
+} | Sort-Object -CaseSensitive)
+$expectedCutoverBrokerFiles = @($runtimeCutoverBrokerScripts | Sort-Object -CaseSensitive)
+if ([string]::Join("`n", $actualCutoverBrokerFiles) -ne [string]::Join("`n", $expectedCutoverBrokerFiles)) {
+    throw 'The cutover broker source tree contains files outside its release allowlist.'
+}
+$actualLifecycleBrokerFiles = @(Get-DysonArtifactPlainFiles -Root $lifecycleBrokerScriptRoot | ForEach-Object {
+    Get-DysonArtifactRelativePath -Root $lifecycleBrokerScriptRoot -File $_.FullName
+} | Sort-Object -CaseSensitive)
+$expectedLifecycleBrokerFiles = @($runtimeLifecycleBrokerScripts | Sort-Object -CaseSensitive)
+if ([string]::Join("`n", $actualLifecycleBrokerFiles) -ne [string]::Join("`n", $expectedLifecycleBrokerFiles)) {
+    throw 'The lifecycle broker source tree contains files outside its release allowlist.'
+}
+$actualDataRecoveryFiles = @(Get-DysonArtifactPlainFiles -Root $dataRecoveryScriptRoot | ForEach-Object {
+    Get-DysonArtifactRelativePath -Root $dataRecoveryScriptRoot -File $_.FullName
+} | Sort-Object -CaseSensitive)
+$expectedDataRecoveryFiles = @($runtimeDataRecoveryScripts | Sort-Object -CaseSensitive)
+if ([string]::Join("`n", $actualDataRecoveryFiles) -ne [string]::Join("`n", $expectedDataRecoveryFiles)) {
+    throw 'The DataRoot recovery source tree contains files outside its release allowlist.'
+}
+$actualConfigurationFiles = @(Get-DysonArtifactPlainFiles -Root $configurationScriptRoot | ForEach-Object {
+    Get-DysonArtifactRelativePath -Root $configurationScriptRoot -File $_.FullName
+} | Sort-Object -CaseSensitive)
+$configurationPrefixLength = 'scripts/windows/configuration/'.Length
+$expectedConfigurationFiles = @($runtimeConfigurationFiles | ForEach-Object {
+    $_.Substring($configurationPrefixLength)
+} | Sort-Object -CaseSensitive)
+if ([string]::Join("`n", $actualConfigurationFiles) -ne
+    [string]::Join("`n", $expectedConfigurationFiles)) {
+    throw 'The protected configuration source tree contains files outside its release allowlist.'
+}
+$actualNetworkFiles = @(Get-DysonArtifactPlainFiles -Root $networkScriptRoot | ForEach-Object {
+    Get-DysonArtifactRelativePath -Root $networkScriptRoot -File $_.FullName
+} | Sort-Object -CaseSensitive)
+$networkPrefixLength = 'scripts/windows/network/'.Length
+$expectedNetworkFiles = @($runtimeNetworkFiles | ForEach-Object {
+    $_.Substring($networkPrefixLength)
+} | Sort-Object -CaseSensitive)
+if ([string]::Join("`n", $actualNetworkFiles) -ne [string]::Join("`n", $expectedNetworkFiles)) {
+    throw 'The Nebula network assessment source tree contains files outside its release allowlist.'
+}
+$hostnameWssFiles = @()
+foreach ($relative in $script:DysonArtifactRequiredNebulaHostnameWssSources) {
+    $source = Join-Path $repository $relative.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Required hostname-WSS source contract file is missing: $relative"
+    }
+    $hostnameWssFiles += [ordered]@{ source = $source; relative = $relative }
+}
+$actualHostnameWssFiles = @(Get-DysonArtifactPlainFiles -Root $hostnameWssSourceRoot | ForEach-Object {
+    Get-DysonArtifactRelativePath -Root $hostnameWssSourceRoot -File $_.FullName
+} | Sort-Object -CaseSensitive)
+$hostnameWssPrefix = 'integrations/nebula-hostname-wss/'
+$expectedHostnameWssFiles = @((
+    $script:DysonArtifactRequiredNebulaHostnameWssSources +
+    @($script:DysonArtifactRepositoryOnlyPaths | Where-Object {
+        $_.StartsWith($hostnameWssPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+) | ForEach-Object { $_.Substring($hostnameWssPrefix.Length) } | Sort-Object -CaseSensitive)
+if ([string]::Join("`n", $actualHostnameWssFiles) -ne
+    [string]::Join("`n", $expectedHostnameWssFiles)) {
+    throw 'The hostname-WSS source contract tree contains files outside its exact release policy.'
+}
 $bridgeFiles = @()
 foreach ($name in $bridgeSourceFiles) {
     $source = Join-Path $bridgeSourceRoot $name
@@ -253,16 +434,25 @@ foreach ($name in $bridgeSourceFiles) {
 $actualBridgeSourceFiles = @(Get-DysonArtifactPlainFiles -Root $bridgeSourceRoot | ForEach-Object {
     Get-DysonArtifactRelativePath -Root $bridgeSourceRoot -File $_.FullName
 } | Sort-Object -CaseSensitive)
-$bridgeRepositoryOnlyFiles = @(
-    'protocol-tests/DysonControlBridge.ProtocolTests.csproj',
-    'protocol-tests/Program.cs'
-)
+$bridgeRepositoryOnlyPrefix = 'integrations/dyson-control-bridge/'
+$bridgeRepositoryOnlyFiles = @($script:DysonArtifactRepositoryOnlyPaths | Where-Object {
+    $_.StartsWith($bridgeRepositoryOnlyPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+} | ForEach-Object {
+    $_.Substring($bridgeRepositoryOnlyPrefix.Length)
+} | Sort-Object -CaseSensitive)
 $actualBridgeContractFiles = @($actualBridgeSourceFiles | Where-Object {
     -not ($_.StartsWith('bin/', [System.StringComparison]::Ordinal) -or
         $_.StartsWith('obj/', [System.StringComparison]::Ordinal) -or
         $_.StartsWith('protocol-tests/bin/', [System.StringComparison]::Ordinal) -or
         $_.StartsWith('protocol-tests/obj/', [System.StringComparison]::Ordinal))
 })
+$actualGameBootstrapFiles = @(Get-DysonArtifactPlainFiles -Root $gameBootstrapScriptRoot | ForEach-Object {
+    Get-DysonArtifactRelativePath -Root $gameBootstrapScriptRoot -File $_.FullName
+} | Sort-Object -CaseSensitive)
+$expectedGameBootstrapFiles = @($runtimeGameBootstrapScripts | Sort-Object -CaseSensitive)
+if ([string]::Join("`n", $actualGameBootstrapFiles) -ne [string]::Join("`n", $expectedGameBootstrapFiles)) {
+    throw 'The stable game bootstrap source tree contains files outside its release allowlist.'
+}
 $expectedBridgeSourceFiles = @(@($bridgeSourceFiles + $bridgeRepositoryOnlyFiles) | Sort-Object -CaseSensitive)
 if ([string]::Join("`n", $actualBridgeContractFiles) -ne [string]::Join("`n", $expectedBridgeSourceFiles)) {
     throw 'The public Bridge source tree contains files outside its release allowlist.'
@@ -277,7 +467,12 @@ $selected = @(
     }
     $scriptFiles
     $bridgeFiles
+    $hostnameWssFiles
     $migrationDocFiles
+    $gsManagerRemovalDocFiles
+    $recoveryDocFiles
+    $networkDocFiles
+    $qualificationDocFiles
     [ordered]@{ source = $apiPackagePath; relative = 'apps/api/package.json' }
     [ordered]@{ source = $apiLockPath; relative = 'apps/api/package-lock.json' }
     [ordered]@{ source = $licensePath; relative = 'LICENSE' }
@@ -304,13 +499,34 @@ $preview = [ordered]@{
     outputPath = $outputFull
     entryPoint = $script:DysonArtifactEntryPoint
     builtApiFiles = $apiFiles.Count
+    requiredApiLifecycleFiles = $apiLifecycleFiles.Count
+    requiredApiHostnameWssRuntimeFiles = $apiHostnameWssRuntimeFiles.Count
+    requiredApiUpdateRuntimeFiles = $apiUpdateRuntimeFiles.Count
+    requiredApiObservabilityRuntimeFiles = $script:DysonArtifactRequiredApiObservabilityRuntimeFiles.Count
     builtWebFiles = $webFiles.Count
     runtimeWindowsScripts = $scriptFiles.Count
     hostMutationLeaseScripts = $runtimeHostMutationScripts.Count
+    cutoverHostScripts = $runtimeCutoverScripts.Count
+    cutoverBrokerScripts = $runtimeCutoverBrokerScripts.Count
+    lifecycleBrokerScripts = $runtimeLifecycleBrokerScripts.Count
+    dataRootRecoveryScripts = $runtimeDataRecoveryScripts.Count
+    nebulaNetworkAssessmentFiles = $runtimeNetworkFiles.Count
+    hostnameWssQualificationProtocolFiles = $script:DysonArtifactRequiredHostnameWssQualificationFiles.Count
+    qualificationOrchestrationV2Files = $script:DysonArtifactRequiredQualificationOrchestrationV2Files.Count
+    qualificationFrameworkFiles = $script:DysonArtifactRequiredQualificationFrameworkFiles.Count
+    strictQualificationV2Files = $script:DysonArtifactRequiredStrictQualificationV2Files.Count
+    qualificationRuntimeFiles = $runtimeQualificationFiles.Count
+    hostnameWssSourceContractFiles = $hostnameWssFiles.Count
     gsManagerMigrationScripts = $runtimeMigrationScripts.Count
+    gsManagerRemovalScripts = $runtimeGsManagerRemovalScripts.Count
     privateAcceptanceEvidenceScripts = $runtimeEvidenceScripts.Count
     migrationDocuments = $migrationDocFiles.Count
+    gsManagerRemovalDocuments = $gsManagerRemovalDocFiles.Count
+    recoveryDocuments = $recoveryDocFiles.Count
+    networkDocuments = $networkDocFiles.Count
+    qualificationDocuments = $qualificationDocFiles.Count
     publicBridgeSourceFiles = $bridgeFiles.Count
+    bridgeSimulationTelemetryFiles = $script:DysonArtifactRequiredBridgeSimulationTelemetryFiles.Count
     privateBridgeDllPackaged = $false
     dependencyInstall = 'npm-ci-omit-dev-ignore-scripts'
     dependencyPruning = 'non-runtime-package-content-v1'
@@ -326,7 +542,8 @@ if (-not $PSCmdlet.ShouldProcess($outputFull, "build verified Dyson Control rele
 
 $npmPath = Resolve-DysonNpmExecutable -Path $NpmExecutable
 [void](New-DysonArtifactDirectory -Path $outputParent)
-$temporaryRoot = Join-Path $outputParent ('.partial-dyson-control-' + [guid]::NewGuid().ToString('N'))
+$temporaryToken = [Convert]::ToBase64String([guid]::NewGuid().ToByteArray()).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+$temporaryRoot = Join-Path $outputParent ('.p-' + $temporaryToken)
 if (-not (Test-DysonArtifactPathWithin -Candidate $temporaryRoot -Parent $outputParent)) {
     throw 'The temporary artifact directory escaped OutputPath parent.'
 }
@@ -336,8 +553,15 @@ try {
     Copy-SelectedFiles -Files $selected -DestinationRoot $temporaryRoot
 
     $apiTarget = Join-Path $temporaryRoot 'apps\api'
-    $npmOutput = & $npmPath 'ci' '--omit=dev' '--ignore-scripts' '--no-audit' '--no-fund' '--loglevel=error' '--prefix' $apiTarget 2>&1
-    if ($LASTEXITCODE -ne 0) { throw 'npm ci failed while assembling production-only API dependencies.' }
+    $npmExitCode = $null
+    Push-Location -LiteralPath $apiTarget
+    try {
+        $npmOutput = & $npmPath 'ci' '--omit=dev' '--ignore-scripts' '--no-audit' '--no-fund' `
+            '--loglevel=error' '--prefix' $apiTarget 2>&1
+        $npmExitCode = $LASTEXITCODE
+    }
+    finally { Pop-Location }
+    if ($npmExitCode -ne 0) { throw 'npm ci failed while assembling production-only API dependencies.' }
     $npmInternalLock = Join-Path $apiTarget 'node_modules\.package-lock.json'
     if (Test-Path -LiteralPath $npmInternalLock -PathType Leaf) { Remove-Item -LiteralPath $npmInternalLock -Force }
     $prunedDependencyDirectories = Remove-DysonNonRuntimeDependencyContent -NodeModulesRoot (Join-Path $apiTarget 'node_modules')
@@ -358,19 +582,42 @@ try {
         productionOnlyNodeModules = $true
         prunedDependencyDirectories = $prunedDependencyDirectories
         deploymentSourceCompatible = $true
+        packageLockManifestVersionBound = $true
+        coreWindowsRuntimeAllowlistVerified = $true
         publicBridgeSourcePackaged = $true
+        bridgeSimulationTelemetryPackaged = $true
+        bridgeFixedReferenceContractPackaged = $true
         privateBridgeBinariesPackaged = $false
+        gameRuntimeReceiptApiPackaged = $true
+        hostnameWssClientQualificationApiPackaged = $true
+        observabilityRuntimeApiPackaged = $true
+        windowsUpdateRuntimeApiPackaged = $true
         gsManagerParallelMigrationPackaged = $true
         migrationDocumentationPackaged = $true
+        gsManagerRecoverableRemovalPackaged = $true
+        gsManagerRemovalDocumentationPackaged = $true
         privateAcceptanceEvidenceToolingPackaged = $true
         hostMutationLeaseToolingPackaged = $true
+        stableGameBootstrapPackaged = $true
+        cutoverHostToolingPackaged = $true
+        cutoverBrokerToolingPackaged = $true
+        lifecycleBrokerToolingPackaged = $true
+        dataRootRecoveryToolingPackaged = $true
+        dataRootRecoveryDocumentationPackaged = $true
+        nebulaNetworkAssessmentPackaged = $true
+        hostnameWssQualificationRuntimePackaged = $true
+        qualificationOrchestrationV2Packaged = $true
+        qualificationFrameworkPackaged = $true
+        strictQualificationV2Packaged = $true
+        productionQualificationDocumentationPackaged = $true
+        networkConnectivityDocumentationPackaged = $true
         productionChanged = $false
     } | ConvertTo-DysonArtifactJsonLine
 }
 finally {
     if (-not $published -and (Test-Path -LiteralPath $temporaryRoot)) {
         if (-not (Test-DysonArtifactPathWithin -Candidate $temporaryRoot -Parent $outputParent) -or
-            -not ([System.IO.Path]::GetFileName($temporaryRoot).StartsWith('.partial-dyson-control-', [System.StringComparison]::Ordinal))) {
+            [System.IO.Path]::GetFileName($temporaryRoot) -cnotmatch '^\.p-[A-Za-z0-9_-]{22}$') {
             throw 'Refusing to clean an unexpected artifact path.'
         }
         Remove-Item -LiteralPath $temporaryRoot -Recurse -Force

@@ -614,8 +614,8 @@ function scanText(text, identity, collector) {
     ...collectMatches(text, iniSecretAssignment)
   ]
   for (const match of assignments) {
-    if (!isSecretBearingKey(match.groups.key)) continue
     const value = match.groups.value.trim()
+    if (!isSecretBearingKey(match.groups.key, value)) continue
     if (isSafePlaceholder(value)) continue
     const highEntropy = isHighEntropy(value)
     if (!vendoredArtifact || highEntropy) collector.add('SECRET_LITERAL_ASSIGNMENT', identity)
@@ -987,8 +987,13 @@ function isSafePlaceholder(value) {
   ].some((marker) => normalized.includes(marker))
 }
 
-function isSecretBearingKey(value) {
+function isSecretBearingKey(value, assignedValue) {
   const key = value.toLocaleLowerCase('en-US')
+  const normalizedKey = key.replace(/[._-]/g, '')
+  const normalizedValue = assignedValue.trim().replace(/^["']|["']$/g, '')
+  if (normalizedKey.endsWith('publickeytoken') && /^(?:none|[0-9a-f]{16})$/i.test(normalizedValue)) {
+    return false
+  }
   if (/(?:file|path|name|status|storage|boundary|present|removed|passed|calls|invalid|enabled|rejected|content|text|cookie)$/.test(key)) {
     return false
   }

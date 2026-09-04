@@ -70,14 +70,22 @@ export interface ScheduledTaskStatus {
   lastRunAt: string | null
 }
 
+export const jobKinds = [
+  'status.refresh',
+  'game.start.preview', 'game.save.preview', 'game.stop.preview', 'game.restart.preview',
+  'game.start', 'game.save', 'game.stop', 'game.restart',
+  'save.backup', 'save.restore',
+  'player.notice.preview', 'player.notice',
+  'audit.export'
+] as const
+
+export type JobKind = (typeof jobKinds)[number]
+export type JobState = 'queued' | 'running' | 'succeeded' | 'failed'
+
 export interface JobRecord {
   id: string
-  kind:
-    | 'status.refresh'
-    | 'game.start.preview' | 'game.save.preview' | 'game.stop.preview' | 'game.restart.preview'
-    | 'game.start' | 'game.save' | 'game.stop' | 'game.restart'
-    | 'save.backup' | 'save.restore'
-  state: 'queued' | 'running' | 'succeeded' | 'failed'
+  kind: JobKind
+  state: JobState
   actor: string
   createdAt: string
   startedAt: string | null
@@ -87,22 +95,167 @@ export interface JobRecord {
   errorCode: string | null
 }
 
+export interface JobPageQuery {
+  pageSize?: number
+  cursor?: string
+  kind?: JobKind
+  state?: JobState
+}
+
+export interface JobPage {
+  data: JobRecord[]
+  page: { nextCursor: string | null }
+}
+
+export type JobAuditExportFormat = 'json' | 'ndjson'
+
+export interface JobAuditExportInput {
+  cursor?: string
+  maximumRecords?: number
+  kind?: JobKind
+  state?: JobState
+  format: JobAuditExportFormat
+}
+
+export interface JobAuditExportPreview {
+  mode: 'dry-run'
+  format: JobAuditExportFormat
+  recordCount: number
+  byteLength: number
+  truncated: boolean
+  nextCursor: string | null
+  filters: { kind: JobKind | null; state: JobState | null }
+  requiredConfirmation: 'EXPORT_JOB_AUDIT'
+}
+
+export interface JobAuditExportDownload {
+  blob: Blob
+  fileName: 'dyson-job-audit.json' | 'dyson-job-audit.ndjson'
+  format: JobAuditExportFormat
+  byteLength: number
+  recordCount: number
+  truncated: boolean
+  nextCursor: string | null
+}
+
 export type ControlRole = 'viewer' | 'operator' | 'administrator'
 
 export type ControlPermission =
-  | 'status.read' | 'status.refresh' | 'jobs.read' | 'observability.read' | 'observability.acknowledge'
+  | 'status.read' | 'status.refresh' | 'jobs.read' | 'jobs.export'
+  | 'observability.read' | 'observability.acknowledge'
   | 'players.read' | 'players.moderate'
   | 'console.read' | 'console.export' | 'console.command'
   | 'saves.read' | 'saves.backup' | 'saves.restore' | 'saves.transfer'
-  | 'lifecycle.preview' | 'lifecycle.execute'
+  | 'lifecycle.read' | 'lifecycle.preview' | 'lifecycle.execute'
   | 'configuration.read' | 'configuration.preview' | 'configuration.apply'
   | 'updates.read' | 'updates.stage' | 'updates.activate'
-  | 'mods.read' | 'mods.mutate' | 'client-profile.generate'
+  | 'mods.read' | 'mods.mutate'
+  | 'cutover.read' | 'cutover.execute'
+  | 'client-profile.generate'
 
 export interface SessionUser {
   name: string
   role: ControlRole
   permissions: ControlPermission[]
+}
+
+export type CutoverDesiredAuthority = 'previous' | 'candidate'
+export type CutoverRollbackMode = 'immediate-compensation' | 'later-operator-rollback'
+export type CutoverPreviewOperation = 'prepare' | 'activate' | 'rollback'
+export type CutoverPreviewRequest =
+  | Readonly<{ requestId: string; operation: 'prepare' }>
+  | Readonly<{ requestId: string; operation: 'activate' }>
+  | Readonly<{ requestId: string; operation: 'rollback'; mode: CutoverRollbackMode }>
+export type CutoverPublicPhase =
+  | 'prepared' | 'activated'
+  | 'rolled-back-immediate' | 'rolled-back-later'
+  | 'recovered-candidate' | 'recovered-previous'
+export type CutoverPublicStatus = 'succeeded' | 'rolled-back' | 'failed-safe'
+export type CutoverRecoveryPhase =
+  | 'pending' | 'reconciling' | 'ready' | 'recovery-required' | 'unavailable'
+export type CutoverRecoveryState =
+  | 'ready' | 'interrupted' | 'terminal-pending-release' | 'evidence-invalid'
+  | 'pending' | 'reconciling' | 'unavailable'
+
+export type CutoverErrorCode =
+  | 'CUTOVER_REQUEST_INVALID'
+  | 'CUTOVER_CONFIRMATION_REQUIRED'
+  | 'CUTOVER_ROLLBACK_CONFIRMATION_REQUIRED'
+  | 'CUTOVER_PREVIEW_REQUIRED'
+  | 'CUTOVER_PREVIEW_CONFLICT'
+  | 'CUTOVER_IDEMPOTENCY_CONFLICT'
+  | 'CUTOVER_NOT_PREPARED'
+  | 'CUTOVER_NOT_CANDIDATE_ACTIVE'
+  | 'CUTOVER_RECOVERY_REQUIRED'
+  | 'CUTOVER_RECOVERY_NOT_REQUIRED'
+  | 'CUTOVER_RECOVERY_TARGET_NOT_ALLOWED'
+  | 'CUTOVER_RECOVERY_EVIDENCE_INVALID'
+  | 'CUTOVER_DURABLE_STATE_INVALID'
+  | 'CUTOVER_DURABLE_STORE_FAILED'
+  | 'CUTOVER_AUTHORITY_DRIFT'
+  | 'CUTOVER_RUNTIME_DRIFT'
+  | 'CUTOVER_PREPARE_INVARIANT_FAILED'
+  | 'CUTOVER_SAVE_PROTECTION_FAILED'
+  | 'CUTOVER_SAVE_RESTORE_FAILED'
+  | 'CUTOVER_STOP_GATE_FAILED'
+  | 'CUTOVER_HEALTH_GATE_FAILED'
+  | 'CUTOVER_UNIQUE_AUTHORITY_FAILED'
+  | 'CUTOVER_ADAPTER_FAILED'
+  | 'CUTOVER_HOST_LEASE_BUSY'
+  | 'CUTOVER_HOST_LEASE_DIRTY'
+  | 'CUTOVER_HOST_LEASE_RECOVERY_REQUIRED'
+  | 'CUTOVER_HOST_LEASE_RECOVERY_NOT_REQUIRED'
+  | 'CUTOVER_HOST_LEASE_RECOVERY_MISMATCH'
+  | 'CUTOVER_HOST_LEASE_LOST'
+  | 'CUTOVER_HOST_LEASE_UNAVAILABLE'
+
+export interface CutoverPublicSummary {
+  candidateDefined: boolean
+  candidateDisabled: boolean
+  previousAuthorityEnabled: boolean
+  candidateAuthorityEnabled: boolean
+  previousRuntimeHealthy: boolean
+  candidateRuntimeHealthy: boolean
+  processesStopped: boolean
+  portClosed: boolean
+  uniqueAuthority: boolean
+  saveProtected: boolean
+  baselineRestored: boolean
+  currentProgressProtected: boolean
+  reused: boolean
+}
+
+export interface CutoverReceipt {
+  requestId: string
+  phase: CutoverPublicPhase
+  status: CutoverPublicStatus
+  allowedDesired: CutoverDesiredAuthority[]
+  summary: CutoverPublicSummary
+  errorCode: CutoverErrorCode | null
+}
+
+export interface CutoverPreviewReceipt {
+  format: 'dyson-control-cutover-preview'
+  schemaVersion: 1
+  operation: CutoverPreviewOperation
+  requestId: string
+  rollbackMode: CutoverRollbackMode | null
+  stateRevision: string
+  evidenceDigest: string
+  planFingerprint: string
+  summary: CutoverPublicSummary
+}
+
+export interface CutoverRecoveryStatus {
+  schemaVersion: 1
+  phase: CutoverRecoveryPhase
+  status: CutoverRecoveryState
+  mutationBlocked: boolean
+  recoveryRequired: boolean
+  requestId: string | null
+  allowedDesired: CutoverDesiredAuthority[]
+  summary: CutoverPublicSummary
+  errorCode: string | null
 }
 
 export type LifecycleAction = 'start' | 'save' | 'graceful-stop' | 'restart'
@@ -113,7 +266,7 @@ export type LifecycleCheckId =
   | 'server-task' | 'server-task-principal' | 'server-task-action'
   | 'stop-task' | 'stop-task-principal' | 'stop-task-action'
   | 'stop-task-result' | 'task-history' | 'receipt-channel' | 'save-trigger'
-  | 'execution-lock'
+  | 'interactive-session' | 'steam-session' | 'lifecycle-broker' | 'execution-lock'
 export type LifecycleBlockerCode =
   | 'project-root-unavailable' | 'managed-executable-unavailable'
   | 'managed-process-unverified' | 'server-already-running' | 'pid-file-unverified'
@@ -125,7 +278,9 @@ export type LifecycleBlockerCode =
   | 'stop-task-missing' | 'stop-task-principal-mismatch' | 'stop-task-not-interactive'
   | 'stop-task-action-unallowlisted' | 'stop-task-last-result-failed'
   | 'receipt-channel-missing' | 'save-trigger-unverified' | 'execution-disabled'
-  | 'execution-lock-busy'
+  | 'interactive-session-missing' | 'interactive-session-ambiguous'
+  | 'steam-session-missing' | 'task-definition-mismatch'
+  | 'runtime-state-mismatch' | 'lifecycle-broker-unavailable' | 'execution-lock-busy'
 
 export interface LifecyclePreview {
   collectedAt: string
@@ -371,6 +526,8 @@ export interface SaveJobResultSummary {
   rollback: 'not-required' | 'succeeded' | 'failed'
   reused: boolean
   auditStored: boolean
+  cleanupPending: boolean
+  maintenanceRequired: boolean
 }
 
 export interface SaveJobRunRecord {
@@ -415,6 +572,53 @@ export interface SavePairImportReceipt {
   saveName: string
   archiveBytes: number
   archiveSha256: string
+  dsvBytes: number
+  serverBytes: number
+  completedAt: string
+  restoreExecuted: false
+  reused: boolean
+}
+
+export type SavePairPromotionBlocker = 'space-insufficient' | 'space-unavailable'
+
+export interface SavePairPromotionPlan {
+  format: 'dyson-control-save-promotion-plan'
+  schemaVersion: 1
+  mode: 'dry-run'
+  requestId: string
+  importRequestId: string
+  inboxId: string
+  backupId: string
+  saveName: string
+  sourceArchiveSha256: string
+  dsvBytes: number
+  serverBytes: number
+  requiredBytes: number
+  availableBytes: number | null
+  allowed: boolean
+  blockers: SavePairPromotionBlocker[]
+  reused: boolean
+  requiredConfirmation: 'PROMOTE_IMPORTED_SAVE_PAIR'
+  effects: {
+    quarantinePreserved: true
+    verifiedBackupCreated: boolean
+    liveSaveChanged: false
+    restoreExecuted: false
+  }
+  executionEnabled: boolean
+}
+
+export interface SavePairPromotionReceipt {
+  format: 'dyson-control-save-promotion-receipt'
+  schemaVersion: 1
+  operation: 'promote-import'
+  requestId: string
+  importRequestId: string
+  inboxId: string
+  backupId: string
+  saveName: string
+  sourceArchiveSha256: string
+  manifestSha256: string
   dsvBytes: number
   serverBytes: number
   completedAt: string
@@ -623,6 +827,9 @@ export interface StructuredLogPage {
 
 export interface StructuredLogFilters {
   levels?: StructuredLogLevel[]
+  source?: string
+  from?: string
+  to?: string
   text?: string
 }
 
@@ -653,6 +860,7 @@ export interface PlayerRoster {
   state: 'active' | 'inactive' | 'unavailable'
   authoritative: boolean
   observedAt: string
+  rosterGeneration: string
   sequence: number
   truncated: boolean
   playerCount: number | null
@@ -662,7 +870,7 @@ export interface PlayerRoster {
 }
 
 export type PlayerCapabilityId =
-  | 'observe-roster' | 'disconnect' | 'kick' | 'ban' | 'whitelist' | 'permission'
+  | 'observe-roster' | 'disconnect' | 'kick' | 'ban' | 'whitelist' | 'blacklist' | 'notice' | 'permission'
 
 export interface PlayerCapabilityProjection {
   capability: PlayerCapabilityId
@@ -677,10 +885,48 @@ export interface PlayerCapabilitiesProjection {
   tag: string
   runtimeFileVersion: string
   commit: string
-  verificationScope: string
+  verificationScope: 'source-contract-only-runtime-unverified' | 'runtime-assembly-identity-verified'
   actionsEnabled: boolean
   observedAt: string
   capabilities: PlayerCapabilityProjection[]
+}
+
+export type PlayerNoticeTemplateId = 'maintenance-5m' | 'maintenance-now' | 'reconnect-required'
+
+export interface PlayerNoticePreviewInput {
+  rosterGeneration: string
+  rosterSequence: number
+  sessionPlayerId: string
+  templateId: PlayerNoticeTemplateId
+}
+
+export interface PlayerNoticePlan extends PlayerNoticePreviewInput {
+  action: 'player.notice'
+  mode: 'dry-run'
+  allowed: boolean
+  executionEnabled: boolean
+  targetJoinedAtUnixMs: number | null
+  checks: Array<{ id: string; status: 'pass' | 'block'; message: string }>
+  blockers: string[]
+  mutation: false
+  rollback: { strategy: 'not-possible'; ready: false; summary: string }
+}
+
+export interface PlayerNoticeReceipt {
+  requestId: string
+  action: 'player.notice'
+  state: 'transport-dispatched' | 'rejected' | 'failed' | 'uncertain'
+  startedAt: string
+  finishedAt: string
+  rosterGeneration: string
+  rosterSequence: number
+  sessionPlayerId: string
+  targetJoinedAt: string
+  templateId: PlayerNoticeTemplateId
+  mutationMayHaveOccurred: boolean
+  recoveryRequired: boolean
+  rollback: { strategy: 'not-possible'; summary: string }
+  errorCode: string
 }
 
 export interface DiscoveredArtifact {
@@ -1185,12 +1431,14 @@ export type UpdateActivationOperation =
   | 'verify-staged-artifact-and-archive'
   | 'assemble-immutable-release'
   | 'prove-process-stopped-and-port-closed'
+  | 'capture-config-mod-lock-and-loaded-save-baseline'
   | 'create-paired-save-protection-point'
+  | 'bind-rollback-context-journal'
   | 'revalidate-stop-revision-and-compatibility'
-  | 'atomically-switch-active-manifest'
   | 'publish-and-verify-fixed-live-component'
   | 'run-fixed-health-check'
-  | 'rollback-and-verify-on-failure'
+  | 'restore-component-config-mod-lock-and-paired-save-on-failure'
+  | 'prove-current-generation-exact-save-load'
   | 'persist-audit-safe-receipt'
   | 'release-global-update-lock'
 
@@ -1231,6 +1479,14 @@ export interface UpdateActivationReceipt {
   previousRevision: string
   resultingRevision: string
   protectionBackupId: string | null
+  rollbackBindingSha256: string | null
+  rollbackSteps: {
+    component: 'not-required' | 'pending' | 'verified' | 'failed'
+    configuration: 'not-required' | 'pending' | 'verified' | 'failed'
+    serverModLock: 'not-required' | 'pending' | 'verified' | 'failed'
+    pairedSave: 'not-required' | 'pending' | 'verified' | 'failed'
+    previousSaveLoad: 'not-required' | 'pending' | 'verified' | 'failed'
+  }
   failureCode: string | null
   rollbackVerified: boolean
   recoveryRequired: boolean
@@ -1253,7 +1509,7 @@ export interface UpdateCleanupPlan {
   }>
 }
 
-export type ModDeploymentOperation = 'install' | 'update' | 'enable' | 'disable' | 'remove'
+export type ModDeploymentOperation = 'install' | 'update' | 'enable' | 'disable' | 'remove' | 'configure'
 export type ModClientRequirement = 'required' | 'optional' | 'not-required'
 
 export interface ModServerLockEntry {
@@ -1367,6 +1623,78 @@ export interface ModDeploymentStateSummary {
   disabledCount: number
 }
 
+export interface ManagedModConfigurationSchema {
+  id: string
+  package: { dependencyId: string; version: string }
+  fields: Array<{
+    id: string
+    type: 'boolean' | 'integer' | 'secret'
+    secret: boolean
+    minimum?: number
+    maximum?: number
+    maximumLength?: number
+  }>
+}
+
+export interface ManagedModConfigurationRequest {
+  requestId: string
+  operation: 'configure'
+  schemaId: string
+  package: { dependencyId: string; version: string }
+  expectedDeploymentRevision: string
+  expectedConfigurationRevision: string
+  changes: Array<{ id: string; value: boolean | number | string }>
+}
+
+export interface ManagedModConfigurationPreview {
+  dryRun: true
+  operation: 'configure'
+  requestId: string
+  schemaId: string
+  package: { dependencyId: string; version: string }
+  deploymentRevision: string
+  configurationRevision: string
+  nextConfigurationRevision: string
+  requestFingerprint: string
+  changes: Array<{ id: string; before: boolean | number | string | { configured: boolean }; after: boolean | number | string | { configured: boolean }; changed: boolean }>
+  stoppedStateRequiredForExecute: true
+  executionSupported: true
+}
+
+export interface ManagedModConfigurationInspection {
+  schemaId: string
+  package: { dependencyId: string; version: string }
+  deploymentRevision: string
+  configurationRevision: string
+  fields: Array<{ id: string; type: 'boolean' | 'integer' | 'secret'; value: boolean | number | string | { configured: boolean } }>
+}
+
+export interface ManagedModConfigurationReceipt {
+  format: 'dyson-control-managed-mod-configuration-receipt'
+  schemaVersion: 1
+  requestId: string
+  operation: 'configure'
+  schemaId: string
+  package: { dependencyId: string; version: string }
+  deploymentRevision: string
+  previousConfigurationRevision: string
+  newConfigurationRevision: string | null
+  status: 'applied' | 'rolled-back' | 'rollback-failed'
+  rollback: 'not-needed' | 'succeeded' | 'failed'
+  protectionPointCreated: boolean
+  changedFieldIds: string[]
+  errorCode: 'MOD_CONFIGURATION_EXECUTION_FAILED' | 'MOD_CONFIGURATION_ROLLBACK_FAILED' | null
+  completedAt: string
+  reused: boolean
+}
+
+export interface ManagedModConfigurationHistoryPage {
+  format: 'dyson-control-managed-mod-configuration-history'
+  schemaVersion: 1
+  items: Array<{ persistedAt: string; receipt: ManagedModConfigurationReceipt }>
+  page: { limit: number; returned: number; totalReceipts: number; nextCursor: string | null }
+}
+
 export interface ModDeploymentPreview {
   dryRun: true
   operation: ModDeploymentOperation
@@ -1401,6 +1729,24 @@ export interface ModDeploymentReceipt {
   payloadSizeBytes: number
   errorCode: 'MOD_DEPLOYMENT_EXECUTION_FAILED' | 'MOD_DEPLOYMENT_ROLLBACK_FAILED' | null
   reused: boolean
+}
+
+export interface ModDeploymentReceiptHistoryItem {
+  persistedAt: string
+  receipt: ModDeploymentReceipt
+}
+
+export interface ModDeploymentReceiptHistoryPage {
+  format: 'dyson-control-mod-deployment-receipt-history'
+  schemaVersion: 1
+  order: 'persisted-at-descending'
+  items: ModDeploymentReceiptHistoryItem[]
+  page: {
+    limit: number
+    returned: number
+    totalReceipts: number
+    nextCursor: string | null
+  }
 }
 
 export interface ModDeploymentRecoveryPlan {
@@ -1520,6 +1866,86 @@ export interface ClientProfileArchiveDownload {
   sizeBytes: number
 }
 
+export interface QualifiedClientProfileIssueRequest {
+  schemaVersion: 2
+  qualificationId: string
+}
+
+export interface QualifiedClientProfileIssueReference {
+  downloadId: string
+  issueReceiptSha256: string
+  qualificationId: string
+  bindingSha256: string
+  expiresAtUtc: string
+  metadata: {
+    format: 'dyson-control-qualified-client-profile-issue'
+    schemaVersion: 1
+    productionQualified: true
+    qualification: {
+      qualificationId: string
+      runId: string
+      bindingSha256: string
+      expiresAtUtc: string
+      decision: 'qualified'
+      blockerCodes: []
+    }
+    profile: {
+      profileId: string
+      displayName: string
+      connection: {
+        protocol: 'nebula'
+        transport: 'wss'
+        topology: 'http-websocket-tunnel'
+        path: '/socket'
+        authoritySemantics: 'hostname-preserved'
+        host: string
+        port: 443
+        displayAddress: string
+        websocketUrl: string
+      }
+      runtime: {
+        dsp: string
+        nebula: string
+        bepInEx: string
+        compatibilityEntryId: string
+      }
+      provenance: {
+        serverLockSha256: string
+        clientParitySha256: string
+        compatibilityPolicySha256: string
+        qualificationDocumentSha256: string
+      }
+      requiredModCount: number
+      optionalModCount: number
+    }
+    artifacts: {
+      profileArtifactSetSha256: string
+      profileArchive: QualifiedClientArtifactMetadata
+      qualifiedClientPayload: QualifiedClientArtifactMetadata
+      qualifiedRuntime: {
+        entryName: 'qualified-client-runtime.json'
+        mediaType: 'application/json'
+        sizeBytes: number
+        sha256: string
+      }
+    }
+  }
+  archive: QualifiedClientArtifactMetadata
+}
+
+export interface QualifiedClientArtifactMetadata {
+  fileName: string
+  mediaType: 'application/zip'
+  sizeBytes: number
+  sha256: string
+}
+
+export type QualifiedClientArtifactKind = 'profile' | 'client' | 'runtime'
+
+export interface QualifiedClientArtifactDownload extends ClientProfileArchiveDownload {
+  kind: QualifiedClientArtifactKind
+}
+
 export type ObservabilityUnavailableReason =
   | 'not-provided' | 'source-reported-unavailable' | 'dependency-unavailable' | 'process-not-running'
 export type ObservabilityMetric<T> =
@@ -1546,6 +1972,7 @@ export interface ServerObservabilitySnapshot {
   runtime: {
     state: ServerStatus['state']
     processId: ObservabilityMetric<number>
+    startedAt: ObservabilityMetric<string>
     gamePort: {
       port: ObservabilityMetric<number>
       listening: ObservabilityMetric<boolean>
@@ -1675,12 +2102,17 @@ export type QualificationCheckId =
   | 'window.samples' | 'window.duration'
   | 'runtime.running-coverage' | 'health.critical-ratio'
   | 'simulation.ups-coverage' | 'simulation.ups-floor'
+  | 'simulation.tps-coverage' | 'simulation.tps-floor'
   | 'host.cpu-coverage' | 'host.cpu-p95'
   | 'host.per-core-coverage' | 'host.hottest-core-saturation'
   | 'process.multicore-coverage' | 'process.single-core-bottleneck'
   | 'host.memory-coverage' | 'host.memory-peak'
   | 'storage.project-coverage' | 'storage.project-peak-used' | 'storage.project-minimum-free'
   | 'storage.save-coverage' | 'storage.save-peak-used' | 'storage.save-minimum-free'
+  | 'storage.dependency-classification'
+  | 'storage.project-root-coverage' | 'storage.project-root-available'
+  | 'storage.smb-mapping-coverage' | 'storage.smb-mapping-available'
+  | 'storage.recovery-task-coverage' | 'storage.recovery-task-healthy'
 
 export type QualificationRemainingEvidence =
   | 'SAVE_LATENCY_DRILL_REQUIRED'
@@ -1707,6 +2139,8 @@ export interface LateGameQualificationReport {
   sampleCount: number
   spanMs: number
   checks: QualificationCheck[]
+  continuity72h: ObservabilityLongWindowReport
+  latency: ServerReceiptLatencyReport
   remainingEvidence: [
     'SAVE_LATENCY_DRILL_REQUIRED',
     'REBOOT_RECOVERY_DRILL_REQUIRED',
@@ -1715,15 +2149,68 @@ export interface LateGameQualificationReport {
   ]
 }
 
+export type ObservabilityLongWindowCheckId =
+  | 'window.samples' | 'window.duration' | 'window.maximum-gap'
+  | 'runtime.source-stable' | 'runtime.identity-stable'
+  | 'runtime.running' | 'runtime.game-port-listening'
+  | 'storage.dependency-kind-stable' | 'storage.dependency-classified'
+  | 'storage.project-root-available' | 'storage.smb-mapping-available'
+  | 'storage.recovery-task-healthy'
+
+export interface ObservabilityLongWindowCheck {
+  id: ObservabilityLongWindowCheckId
+  status: QualificationStatus
+  observed: Record<string, number | string | boolean | null>
+  required: Record<string, number | string | boolean>
+}
+
+export interface ObservabilityLongWindowReport {
+  schemaVersion: 1
+  kind: 'dyson-observability-72h-continuity-report'
+  result: QualificationStatus
+  chainIntegrity: 'verified' | 'unknown'
+  sampleCount: number
+  from: string | null
+  to: string | null
+  spanMs: number
+  checks: ObservabilityLongWindowCheck[]
+}
+
+export type ObservabilityLatencyEvidenceStatus = 'unknown' | 'not-qualified'
+
+export interface OperationLatencySummary {
+  operation: 'save' | 'backup'
+  evidenceStatus: ObservabilityLatencyEvidenceStatus
+  totalReceipts: number
+  successfulReceipts: number
+  failedReceipts: number
+  incompleteReceipts: number
+  p50Ms: number | null
+  p95Ms: number | null
+  maximumMs: number | null
+}
+
+export interface ServerReceiptLatencyReport {
+  schemaVersion: 1
+  kind: 'dyson-server-receipt-latency-report'
+  evidenceStatus: ObservabilityLatencyEvidenceStatus
+  generatedAt: string
+  scannedJobs: number
+  truncated: boolean
+  save: OperationLatencySummary
+  backup: OperationLatencySummary
+}
+
 export interface ObservabilityQualificationEnvelope {
   data: LateGameQualificationReport
   meta: {
     provider: 'demo' | 'windows'
     environment: 'development' | 'test' | 'production'
     capacity: number
+    longWindowCapacity: number
   }
 }
 
 export type NavKey =
   | 'overview' | 'game' | 'console' | 'players' | 'versions' | 'mods'
-  | 'saves' | 'client' | 'server' | 'config' | 'tasks'
+  | 'saves' | 'client' | 'server' | 'config' | 'cutover' | 'tasks'

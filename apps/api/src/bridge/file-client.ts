@@ -5,12 +5,17 @@ import { performance } from 'node:perf_hooks'
 import {
   BridgeProtocolError,
   assertBridgeReceiptV2,
+  actualSimulationRates,
   buildBridgeRequest,
   parseBridgeHeartbeat,
   parseBridgeReceipt,
+  parseBridgeRuntimeSession,
+  parseBridgeSimulationTelemetry,
   validateBridgeSecret,
   type BridgeHeartbeat,
-  type BridgeReceiptV2
+  type BridgeReceiptV2,
+  type BridgeRuntimeSession,
+  type BridgeSimulationTelemetry
 } from './protocol.js'
 
 export interface FileBridgeClientOptions {
@@ -20,10 +25,24 @@ export interface FileBridgeClientOptions {
   pollMs?: number
   requestLifetimeMs?: number
   heartbeatMaxAgeMs?: number
+  telemetryMaxAgeMs?: number
+}
+
+export interface BridgeSimulationTelemetryExpectation {
+  processId: number
+  processStartedAtUnixMs: number
+}
+
+export interface AcceptedBridgeSimulationTelemetry {
+  session: BridgeRuntimeSession
+  telemetry: BridgeSimulationTelemetry
+  actualUps: number
+  actualTps: number
 }
 
 export class FileBridgeClient {
   readonly #options: Required<FileBridgeClientOptions>
+  readonly #acceptedTelemetrySequences = new Map<string, number>()
 
   constructor(options: FileBridgeClientOptions) {
     if (!path.isAbsolute(options.controlRoot) || path.parse(options.controlRoot).root === path.resolve(options.controlRoot)) {
@@ -45,7 +64,11 @@ export class FileBridgeClient {
     if (!Number.isInteger(heartbeatMaxAgeMs) || heartbeatMaxAgeMs < 2_000 || heartbeatMaxAgeMs > 120_000) {
       throw new BridgeProtocolError('BRIDGE_HEARTBEAT_AGE_INVALID')
     }
-    this.#options = { ...options, pollMs, requestLifetimeMs, heartbeatMaxAgeMs }
+    const telemetryMaxAgeMs = options.telemetryMaxAgeMs ?? 10_000
+    if (!Number.isInteger(telemetryMaxAgeMs) || telemetryMaxAgeMs < 2_000 || telemetryMaxAgeMs > 120_000) {
+      throw new BridgeProtocolError('BRIDGE_TELEMETRY_AGE_INVALID')
+    }
+    this.#options = { ...options, pollMs, requestLifetimeMs, heartbeatMaxAgeMs, telemetryMaxAgeMs }
   }
 
   async probe(signal?: AbortSignal): Promise<BridgeHeartbeat> {
@@ -53,29 +76,70 @@ export class FileBridgeClient {
     const root = path.resolve(this.#options.controlRoot)
     await this.#assertDirectory(root)
     const secret = await this.#readSecret()
-    const heartbeatPath = path.join(root, 'heartbeat')
-    let stats
-    try {
-      stats = await fs.lstat(heartbeatPath)
-    } catch {
-      throw new BridgeProtocolError('BRIDGE_HEARTBEAT_UNAVAILABLE')
-    }
-    if (!stats.isFile() || stats.isSymbolicLink() || stats.size <= 0 || stats.size > 4096) {
-      throw new BridgeProtocolError('BRIDGE_HEARTBEAT_FILE_INVALID')
-    }
-    let heartbeat: BridgeHeartbeat
-    try {
-      heartbeat = parseBridgeHeartbeat(await fs.readFile(heartbeatPath, 'utf8'), secret)
-    } catch (error) {
-      if (error instanceof BridgeProtocolError) throw error
-      throw new BridgeProtocolError('BRIDGE_HEARTBEAT_READ_FAILED')
+    return this.#readHeartbeat(root, secret, signal)
+  }
+
+  async readSimulationTelemetry(
+    expectation: BridgeSimulationTelemetryExpectation,
+    signal?: AbortSignal
+  ): Promise<AcceptedBridgeSimulationTelemetry> {
+    if (!Number.isSafeInteger(expectation.processId) || expectation.processId <= 0 ||
+        !Number.isSafeInteger(expectation.processStartedAtUnixMs) || expectation.processStartedAtUnixMs <= 0) {
+      throw new BridgeProtocolError('BRIDGE_TELEMETRY_EXPECTATION_INVALID')
     }
     signal?.throwIfAborted()
-    const ageMs = Date.now() - heartbeat.writtenAtUnixMs
-    if (ageMs < -5_000 || ageMs > this.#options.heartbeatMaxAgeMs) {
-      throw new BridgeProtocolError('BRIDGE_HEARTBEAT_STALE')
+    const root = path.resolve(this.#options.controlRoot)
+    await this.#assertDirectory(root)
+    const secret = await this.#readSecret()
+    const heartbeatBefore = await this.#readHeartbeat(root, secret, signal)
+    const session = parseBridgeRuntimeSession(
+      await this.#readBoundedFile(root, 'runtime-session', 'BRIDGE_RUNTIME_SESSION'),
+      secret
+    )
+    const telemetry = parseBridgeSimulationTelemetry(
+      await this.#readBoundedFile(root, 'simulation-telemetry', 'BRIDGE_TELEMETRY'),
+      secret
+    )
+    const heartbeatAfter = await this.#readHeartbeat(root, secret, signal)
+    signal?.throwIfAborted()
+
+    if (heartbeatBefore.processId !== heartbeatAfter.processId ||
+        heartbeatBefore.startedAtUnixMs !== heartbeatAfter.startedAtUnixMs ||
+        heartbeatBefore.pluginVersion !== heartbeatAfter.pluginVersion) {
+      throw new BridgeProtocolError('BRIDGE_SESSION_CHANGED')
     }
-    return heartbeat
+    if (session.processId !== heartbeatAfter.processId ||
+        session.bridgeStartedAtUnixMs !== heartbeatAfter.startedAtUnixMs ||
+        session.pluginVersion !== heartbeatAfter.pluginVersion ||
+        session.processId !== expectation.processId ||
+        session.processStartedAtUnixMs !== expectation.processStartedAtUnixMs) {
+      throw new BridgeProtocolError('BRIDGE_RUNTIME_IDENTITY_MISMATCH')
+    }
+    if (telemetry.sessionId !== session.sessionId || telemetry.processId !== session.processId ||
+        telemetry.processStartedAtUnixMs !== session.processStartedAtUnixMs ||
+        telemetry.bridgeStartedAtUnixMs !== session.bridgeStartedAtUnixMs) {
+      throw new BridgeProtocolError('BRIDGE_TELEMETRY_IDENTITY_MISMATCH')
+    }
+    const nowUnixMs = Date.now()
+    if (session.issuedAtUnixMs > nowUnixMs + 5_000 || session.bridgeStartedAtUnixMs > nowUnixMs + 5_000) {
+      throw new BridgeProtocolError('BRIDGE_RUNTIME_SESSION_FUTURE')
+    }
+    const telemetryAgeMs = nowUnixMs - telemetry.writtenAtUnixMs
+    if (telemetryAgeMs < -5_000 || telemetryAgeMs > this.#options.telemetryMaxAgeMs) {
+      throw new BridgeProtocolError('BRIDGE_TELEMETRY_STALE')
+    }
+    const lastSequence = this.#acceptedTelemetrySequences.get(session.sessionId)
+    if (lastSequence !== undefined && telemetry.sequence <= lastSequence) {
+      throw new BridgeProtocolError('BRIDGE_TELEMETRY_REPLAY')
+    }
+    this.#acceptedTelemetrySequences.set(session.sessionId, telemetry.sequence)
+    while (this.#acceptedTelemetrySequences.size > 8) {
+      const oldest = this.#acceptedTelemetrySequences.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.#acceptedTelemetrySequences.delete(oldest)
+    }
+    const rates = actualSimulationRates(telemetry)
+    return { session, telemetry, actualUps: rates.ups, actualTps: rates.tps }
   }
 
   async requestSave(requestId: string = randomUUID(), signal?: AbortSignal): Promise<BridgeReceiptV2> {
@@ -116,6 +180,48 @@ export class FileBridgeClient {
       await this.#delay(this.#options.pollMs, signal)
     }
     throw new BridgeProtocolError('BRIDGE_RECEIPT_TIMEOUT')
+  }
+
+  async #readHeartbeat(root: string, secret: string, signal?: AbortSignal): Promise<BridgeHeartbeat> {
+    let heartbeat: BridgeHeartbeat
+    try {
+      heartbeat = parseBridgeHeartbeat(
+        await this.#readBoundedFile(root, 'heartbeat', 'BRIDGE_HEARTBEAT'),
+        secret
+      )
+    } catch (error) {
+      if (error instanceof BridgeProtocolError) throw error
+      throw new BridgeProtocolError('BRIDGE_HEARTBEAT_READ_FAILED')
+    }
+    signal?.throwIfAborted()
+    const ageMs = Date.now() - heartbeat.writtenAtUnixMs
+    if (ageMs < -5_000 || ageMs > this.#options.heartbeatMaxAgeMs) {
+      throw new BridgeProtocolError('BRIDGE_HEARTBEAT_STALE')
+    }
+    return heartbeat
+  }
+
+  async #readBoundedFile(root: string, fileName: string, codePrefix: string): Promise<string> {
+    const filePath = path.join(root, fileName)
+    let stats
+    try {
+      stats = await fs.lstat(filePath)
+    } catch {
+      throw new BridgeProtocolError(`${codePrefix}_UNAVAILABLE`)
+    }
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.size <= 0 || stats.size > 4096) {
+      throw new BridgeProtocolError(`${codePrefix}_FILE_INVALID`)
+    }
+    try {
+      const bytes = await fs.readFile(filePath)
+      if (bytes.length <= 0 || bytes.length > 4096) {
+        throw new BridgeProtocolError(`${codePrefix}_FILE_INVALID`)
+      }
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    } catch (error) {
+      if (error instanceof BridgeProtocolError) throw error
+      throw new BridgeProtocolError(`${codePrefix}_READ_FAILED`)
+    }
   }
 
   async #readReceipt(receiptPath: string, secret: string, requestId: string): Promise<BridgeReceiptV2 | null> {

@@ -1,15 +1,26 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { buildApplication, type BuiltApplication } from '../app.js'
+import {
+  buildBridgeHeartbeat,
+  buildBridgeRuntimeSession,
+  buildBridgeSimulationTelemetry
+} from '../bridge/protocol.js'
 import { loadConfig } from '../config.js'
 import type { LifecycleAction, LifecyclePreview, ServerStatus, StatusProvider } from '../domain.js'
 import { BoundedObservabilityHistory } from './history.js'
 
 const origin = 'http://127.0.0.1:13010'
+const bridgeSecret = 'fictional-route-bridge-secret-that-is-long-enough-123456'
 let application: BuiltApplication | null = null
+const temporaryRoots: string[] = []
 
 afterEach(async () => {
   if (application) await application.close()
   application = null
+  await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
 })
 
 describe('authenticated server observability API', () => {
@@ -137,6 +148,18 @@ describe('authenticated server observability API', () => {
         profileId: 'late-game-6h-v1',
         result: 'insufficient',
         sampleCount: 1,
+        continuity72h: {
+          kind: 'dyson-observability-72h-continuity-report',
+          result: 'insufficient',
+          chainIntegrity: 'verified',
+          sampleCount: 1
+        },
+        latency: {
+          kind: 'dyson-server-receipt-latency-report',
+          evidenceStatus: 'unknown',
+          save: { evidenceStatus: 'unknown', p50Ms: null, p95Ms: null, maximumMs: null },
+          backup: { evidenceStatus: 'unknown', p50Ms: null, p95Ms: null, maximumMs: null }
+        },
         remainingEvidence: [
           'SAVE_LATENCY_DRILL_REQUIRED',
           'REBOOT_RECOVERY_DRILL_REQUIRED',
@@ -144,7 +167,7 @@ describe('authenticated server observability API', () => {
           'EXTERNAL_JOIN_SOAK_REQUIRED'
         ]
       },
-      meta: { provider: 'windows', environment: 'test', capacity: 2_048 }
+      meta: { provider: 'windows', environment: 'test', capacity: 2_048, longWindowCapacity: 20_000 }
     })
 
     for (const query of ['points=0', 'points=121', 'points=2&unknown=true']) {
@@ -202,6 +225,83 @@ describe('authenticated server observability API', () => {
     })
     expect(provider.collections).toBe(4)
   })
+
+  it('projects signed Windows bridge UPS/TPS once for concurrent reads of the same status', async () => {
+    const fixture = await createWindowsBridgeFixture()
+    const provider = new FixedStatusProvider(fixture.status)
+    application = await buildApplication(windowsTestConfig(fixture, true), { statusProvider: provider })
+    const cookie = await login(application)
+
+    const [snapshot, history] = await Promise.all([
+      application.app.inject({
+        method: 'GET', url: '/api/v1/observability/snapshot',
+        cookies: { dyson_session: cookie }
+      }),
+      application.app.inject({
+        method: 'GET', url: '/api/v1/observability/history',
+        cookies: { dyson_session: cookie }
+      })
+    ])
+
+    expect(snapshot.statusCode).toBe(200)
+    expect(snapshot.json()).toMatchObject({
+      data: {
+        source: 'windows.server-status.bridge-telemetry-v1',
+        observedAt: fixture.status.collectedAt,
+        simulation: {
+          ups: { status: 'available', value: 59.25 },
+          tps: { status: 'available', value: 58.5 },
+          targetUps: { status: 'available', value: 60 }
+        }
+      },
+      meta: { retainedSamples: 1, provider: 'windows', environment: 'test' }
+    })
+    expect(history.statusCode).toBe(200)
+    expect(history.json()).toMatchObject({ data: { retainedSamples: 1, droppedSamples: 0 } })
+
+    const duplicate = await application.app.inject({
+      method: 'GET', url: '/api/v1/observability/snapshot',
+      cookies: { dyson_session: cookie }
+    })
+    expect(duplicate.statusCode).toBe(200)
+    expect(duplicate.json()).toMatchObject({
+      data: {
+        source: 'windows.server-status.bridge-telemetry-v1',
+        simulation: {
+          ups: { status: 'available', value: 59.25 },
+          tps: { status: 'available', value: 58.5 }
+        }
+      },
+      meta: { retainedSamples: 1 }
+    })
+    expect(provider.collections).toBe(1)
+  })
+
+  it('preserves legacy unavailable UPS/TPS when the Windows bridge is not configured', async () => {
+    const fixture = await createWindowsBridgeFixture()
+    const provider = new FixedStatusProvider(fixture.status)
+    application = await buildApplication(windowsTestConfig(fixture, false), { statusProvider: provider })
+    const cookie = await login(application)
+
+    const response = await application.app.inject({
+      method: 'GET', url: '/api/v1/observability/snapshot',
+      cookies: { dyson_session: cookie }
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toMatchObject({
+      data: {
+        source: 'windows.server-status',
+        simulation: {
+          ups: { status: 'unavailable', reason: 'not-provided' },
+          tps: { status: 'unavailable', reason: 'not-provided' },
+          targetUps: { status: 'available', value: 60 }
+        }
+      },
+      meta: { retainedSamples: 1, provider: 'windows', environment: 'test' }
+    })
+    expect(provider.collections).toBe(1)
+  })
 })
 
 function testConfig() {
@@ -211,6 +311,75 @@ function testConfig() {
     DYSON_DEV_ADMIN_PASSWORD: 'test-password-long-enough',
     DYSON_PUBLIC_ORIGIN: origin,
     DYSON_GAME_PORT: '8469'
+  })
+}
+
+interface WindowsBridgeRouteFixture {
+  controlRoot: string
+  dataRoot: string
+  projectRoot: string
+  secretFile: string
+  status: ServerStatus
+}
+
+async function createWindowsBridgeFixture(): Promise<WindowsBridgeRouteFixture> {
+  const root = await mkdtemp(path.join(tmpdir(), 'dyson-observability-routes-'))
+  temporaryRoots.push(root)
+  const controlRoot = path.join(root, 'control')
+  const dataRoot = path.join(root, 'data')
+  const projectRoot = path.join(root, 'project')
+  const secretFile = path.join(root, 'bridge.secret')
+  await Promise.all([
+    mkdir(controlRoot, { recursive: true }),
+    mkdir(dataRoot, { recursive: true }),
+    mkdir(projectRoot, { recursive: true }),
+    writeFile(secretFile, `${bridgeSecret}\n`, 'utf8')
+  ])
+
+  const now = Date.now()
+  const processStartedAtUnixMs = now - 120_000
+  const bridgeStartedAtUnixMs = now - 60_000
+  const sessionId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
+  const status = statusFixture(new Date(now).toISOString(), 37.5, 'healthy')
+  status.runtime.startedAt = new Date(processStartedAtUnixMs).toISOString()
+  status.runtime.uptimeSeconds = 120
+
+  const heartbeat = buildBridgeHeartbeat({
+    pluginVersion: '0.1.0', processId: 4242,
+    startedAtUnixMs: bridgeStartedAtUnixMs, writtenAtUnixMs: now
+  }, bridgeSecret)
+  const session = buildBridgeRuntimeSession({
+    sessionId, pluginVersion: '0.1.0', processId: 4242,
+    processStartedAtUnixMs, bridgeStartedAtUnixMs, issuedAtUnixMs: bridgeStartedAtUnixMs
+  }, bridgeSecret)
+  const telemetry = buildBridgeSimulationTelemetry({
+    sessionId, processId: 4242, processStartedAtUnixMs, bridgeStartedAtUnixMs,
+    sequence: 7, sampleStartedAtUnixMs: now - 2_000,
+    sampleFinishedAtUnixMs: now, writtenAtUnixMs: now, windowDurationMs: 2_000,
+    tickStarted: 1_000, tickFinished: 1_117, upsMilli: 59_250, tpsMilli: 58_500
+  }, bridgeSecret)
+  await Promise.all([
+    writeFile(path.join(controlRoot, 'heartbeat'), heartbeat.payload, 'utf8'),
+    writeFile(path.join(controlRoot, 'runtime-session'), session.payload, 'utf8'),
+    writeFile(path.join(controlRoot, 'simulation-telemetry'), telemetry.payload, 'utf8')
+  ])
+
+  return { controlRoot, dataRoot, projectRoot, secretFile, status }
+}
+
+function windowsTestConfig(fixture: WindowsBridgeRouteFixture, withBridge: boolean) {
+  return loadConfig({
+    NODE_ENV: 'test',
+    DYSON_PROVIDER: 'windows',
+    DYSON_PROJECT_ROOT: fixture.projectRoot,
+    DYSON_DATA_DIR: fixture.dataRoot,
+    DYSON_DEV_ADMIN_PASSWORD: 'test-password-long-enough',
+    DYSON_PUBLIC_ORIGIN: origin,
+    DYSON_GAME_PORT: '8469',
+    ...(withBridge ? {
+      DYSON_BRIDGE_CONTROL_ROOT: fixture.controlRoot,
+      DYSON_BRIDGE_SECRET_FILE: fixture.secretFile
+    } : {})
   })
 }
 
@@ -254,6 +423,22 @@ class SequentialStatusProvider implements StatusProvider {
     const cpuPercent = 37.5 + this.collections
     this.collections++
     return statusFixture(collectedAt, cpuPercent, this.#gamePortStatus)
+  }
+
+  async previewLifecycle(_action: LifecycleAction): Promise<LifecyclePreview> {
+    throw new Error('not used by observability route tests')
+  }
+}
+
+class FixedStatusProvider implements StatusProvider {
+  readonly name = 'windows' as const
+  collections = 0
+
+  constructor(readonly status: ServerStatus) {}
+
+  async collectStatus(): Promise<ServerStatus> {
+    this.collections++
+    return this.status
   }
 
   async previewLifecycle(_action: LifecycleAction): Promise<LifecyclePreview> {

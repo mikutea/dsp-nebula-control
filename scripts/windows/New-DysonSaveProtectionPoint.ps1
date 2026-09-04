@@ -1,4 +1,4 @@
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [Parameter(Mandatory)][string]$ProjectRoot,
     [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f-]{36}$')][string]$RequestId,
@@ -59,6 +59,63 @@ function Test-EqualEvidence {
         [string]::Equals([string]$Left.sha256, [string]$Right.sha256, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-StableSourcePairEvidence {
+    param(
+        [Parameter(Mandatory)][string]$DsvPath,
+        [Parameter(Mandatory)][string]$ServerPath,
+        [Parameter(Mandatory)][int]$Attempts
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $beforeDsv = Get-FileEvidence -LiteralPath $DsvPath
+        $beforeServer = Get-FileEvidence -LiteralPath $ServerPath
+        $afterDsv = Get-FileEvidence -LiteralPath $DsvPath
+        $afterServer = Get-FileEvidence -LiteralPath $ServerPath
+        if (
+            (Test-EqualEvidence -Left $beforeDsv -Right $afterDsv) -and
+            (Test-EqualEvidence -Left $beforeServer -Right $afterServer)
+        ) {
+            return [ordered]@{ dsv = $afterDsv; server = $afterServer }
+        }
+        if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds 250 }
+    }
+    throw 'The paired save changed while its protection point was being previewed.'
+}
+
+function Write-ProtectionReceipt {
+    param(
+        [Parameter(Mandatory)][ValidateSet('preview', 'succeeded', 'cancelled')][string]$State,
+        [Parameter(Mandatory)][bool]$DryRun,
+        [Parameter(Mandatory)][bool]$MutationPerformed,
+        [Parameter(Mandatory)][bool]$ManifestVerified,
+        [Parameter(Mandatory)][bool]$Reused,
+        [Parameter(Mandatory)][int64]$DsvBytes,
+        [Parameter(Mandatory)][int64]$ServerBytes,
+        [bool]$WouldCreate = $false,
+        [bool]$WouldRemoveStaleStaging = $false
+    )
+
+    $receipt = [ordered]@{
+        protocol = $protocol
+        schemaVersion = 1
+        requestId = $normalizedRequestId
+        state = $State
+        dryRun = $DryRun
+        mutationPerformed = $MutationPerformed
+        protectionPointId = 'save:' + $normalizedRequestId
+        sourcePairVerified = $true
+        dsvBytes = $DsvBytes
+        serverBytes = $ServerBytes
+        manifestVerified = $ManifestVerified
+        reused = $Reused
+    }
+    if ($State -ceq 'preview') {
+        $receipt['wouldCreate'] = $WouldCreate
+        $receipt['wouldRemoveStaleStaging'] = $WouldRemoveStaleStaging
+    }
+    $receipt | ConvertTo-Json -Depth 5 -Compress
+}
+
 function Read-VerifiedProtectionPoint {
     param([Parameter(Mandatory)][string]$DirectoryPath)
     Assert-NormalDirectory -LiteralPath $DirectoryPath | Out-Null
@@ -91,42 +148,74 @@ function Read-VerifiedProtectionPoint {
 
 $resolvedProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot -ErrorAction Stop).ProviderPath
 Assert-NormalDirectory -LiteralPath $resolvedProjectRoot | Out-Null
+$backupRoot = Join-Path $resolvedProjectRoot 'backups\saves'
+$backupRootExists = Test-Path -LiteralPath $backupRoot
+if ($backupRootExists) {
+    $backupRoot = Assert-NormalDirectory -LiteralPath $backupRoot
+}
+else {
+    $backupRoot = [System.IO.Path]::GetFullPath($backupRoot)
+}
+$finalRoot = Join-Path $backupRoot ('tx-' + $normalizedRequestId)
+$stagingRoot = Join-Path $backupRoot ('.staging-' + $normalizedRequestId)
+
+if (Test-Path -LiteralPath $finalRoot) {
+    $verified = Read-VerifiedProtectionPoint -DirectoryPath $finalRoot
+    Write-ProtectionReceipt -State $(if ($WhatIfPreference) { 'preview' } else { 'succeeded' }) `
+        -DryRun ([bool]$WhatIfPreference) -MutationPerformed $false -ManifestVerified $true -Reused $true `
+        -DsvBytes ([int64]$verified['.dsv'].bytes) -ServerBytes ([int64]$verified['.server'].bytes) `
+        -WouldCreate $false -WouldRemoveStaleStaging $false
+    exit 0
+}
+
 $saveRoot = Join-Path $resolvedProjectRoot 'userdata\Save'
 Assert-NormalDirectory -LiteralPath $saveRoot | Out-Null
 $sourceDsv = Join-Path $saveRoot ($SaveName + '.dsv')
 $sourceServer = Join-Path $saveRoot ($SaveName + '.server')
 Assert-NormalFile -LiteralPath $sourceDsv | Out-Null
 Assert-NormalFile -LiteralPath $sourceServer | Out-Null
+$sourceEvidence = Get-StableSourcePairEvidence -DsvPath $sourceDsv -ServerPath $sourceServer `
+    -Attempts $SnapshotAttempts
 
-$backupRoot = Join-Path $resolvedProjectRoot 'backups\saves'
-[System.IO.Directory]::CreateDirectory($backupRoot) | Out-Null
-$backupRoot = Assert-NormalDirectory -LiteralPath $backupRoot
-$finalRoot = Join-Path $backupRoot ('tx-' + $normalizedRequestId)
-$stagingRoot = Join-Path $backupRoot ('.staging-' + $normalizedRequestId)
-
-if (Test-Path -LiteralPath $finalRoot) {
-    $verified = Read-VerifiedProtectionPoint -DirectoryPath $finalRoot
-    [ordered]@{
-        protocol = $protocol
-        requestId = $normalizedRequestId
-        state = 'succeeded'
-        protectionPointId = 'save:' + $normalizedRequestId
-        dsvBytes = [int64]$verified['.dsv'].bytes
-        serverBytes = [int64]$verified['.server'].bytes
-        manifestVerified = $true
-        reused = $true
-    } | ConvertTo-Json -Depth 5 -Compress
-    exit 0
-}
-
+$staleStagingPresent = $false
 if (Test-Path -LiteralPath $stagingRoot) {
     $stagingItem = Get-Item -LiteralPath $stagingRoot -Force -ErrorAction Stop
     $expectedParent = [System.IO.Path]::GetFullPath($backupRoot).TrimEnd('\') + '\'
     $actualStaging = [System.IO.Path]::GetFullPath($stagingItem.FullName)
     if (-not $actualStaging.StartsWith($expectedParent, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $stagingItem.Name -cne ('.staging-' + $normalizedRequestId)) {
+        $stagingItem.Name -cne ('.staging-' + $normalizedRequestId) -or
+        -not $stagingItem.PSIsContainer -or
+        ($stagingItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         throw 'The stale staging directory identity is invalid.'
     }
+    $staleStagingPresent = $true
+}
+
+if ($WhatIfPreference) {
+    Write-ProtectionReceipt -State 'preview' -DryRun $true -MutationPerformed $false `
+        -ManifestVerified $false -Reused $false -DsvBytes ([int64]$sourceEvidence.dsv.bytes) `
+        -ServerBytes ([int64]$sourceEvidence.server.bytes) -WouldCreate $true `
+        -WouldRemoveStaleStaging $staleStagingPresent
+    exit 0
+}
+
+$shouldCreate = $PSCmdlet.ShouldProcess(
+    ('save:' + $normalizedRequestId),
+    'Create or replace the staged paired-save protection point'
+)
+if (-not $shouldCreate) {
+    Write-ProtectionReceipt -State 'cancelled' -DryRun $false -MutationPerformed $false `
+        -ManifestVerified $false -Reused $false -DsvBytes ([int64]$sourceEvidence.dsv.bytes) `
+        -ServerBytes ([int64]$sourceEvidence.server.bytes)
+    exit 0
+}
+
+if (-not $backupRootExists) {
+    [System.IO.Directory]::CreateDirectory($backupRoot) | Out-Null
+    $backupRoot = Assert-NormalDirectory -LiteralPath $backupRoot
+}
+
+if ($staleStagingPresent) {
     Remove-Item -LiteralPath $stagingItem.FullName -Recurse -Force
 }
 [System.IO.Directory]::CreateDirectory($stagingRoot) | Out-Null
@@ -188,13 +277,6 @@ catch {
 }
 
 $verified = Read-VerifiedProtectionPoint -DirectoryPath $finalRoot
-[ordered]@{
-    protocol = $protocol
-    requestId = $normalizedRequestId
-    state = 'succeeded'
-    protectionPointId = 'save:' + $normalizedRequestId
-    dsvBytes = [int64]$verified['.dsv'].bytes
-    serverBytes = [int64]$verified['.server'].bytes
-    manifestVerified = $true
-    reused = $false
-} | ConvertTo-Json -Depth 5 -Compress
+Write-ProtectionReceipt -State 'succeeded' -DryRun $false -MutationPerformed $true `
+    -ManifestVerified $true -Reused $false -DsvBytes ([int64]$verified['.dsv'].bytes) `
+    -ServerBytes ([int64]$verified['.server'].bytes)

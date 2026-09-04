@@ -1,4 +1,5 @@
 export * from './dependency.js'
+export * from './configuration.js'
 export * from './deployment.js'
 export * from './deployment-types.js'
 export * from './manifest.js'

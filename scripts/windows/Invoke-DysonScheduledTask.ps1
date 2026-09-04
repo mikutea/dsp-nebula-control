@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f-]{36}$')][string]$RequestId,
     [Parameter(Mandatory)][ValidateSet('graceful-stop', 'start', 'rollback-start')][string]$Operation,
     [Parameter(Mandatory)][ValidatePattern('^[\p{L}\p{N}_. -]{1,128}$')][string]$TaskName,
+    [Parameter(Mandatory)][string]$AllowedTaskScriptRoot,
     [ValidateRange(1, 65535)][int]$GamePort = 8469,
     [ValidateRange(10, 300)][int]$TimeoutSeconds = 180
 )
@@ -15,6 +16,12 @@ $parsedRequestId = [guid]::Empty
 if (-not [guid]::TryParseExact($RequestId, 'D', [ref]$parsedRequestId)) { throw 'The lifecycle request ID is invalid.' }
 $normalizedRequestId = $parsedRequestId.ToString('D').ToLowerInvariant()
 $resolvedProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot -ErrorAction Stop).ProviderPath
+$taskScriptRootItem = Get-Item -LiteralPath $AllowedTaskScriptRoot -Force -ErrorAction Stop
+if (-not $taskScriptRootItem.PSIsContainer -or
+    ($taskScriptRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+    throw 'The stable runtime bootstrap root is unavailable or redirected.'
+}
+$resolvedTaskScriptRoot = $taskScriptRootItem.FullName
 $expectedExecutable = [System.IO.Path]::GetFullPath((Join-Path $resolvedProjectRoot 'server\DSPGAME.exe'))
 $executableItem = Get-Item -LiteralPath $expectedExecutable -Force -ErrorAction Stop
 if ($executableItem.PSIsContainer -or ($executableItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
@@ -96,7 +103,7 @@ function Assert-FixedTaskDefinition {
     if ($expectedScriptName -eq 'Stop-DysonServer.ps1' -and ($boundedValue -lt 10 -or $boundedValue -gt 300)) {
         throw 'The configured stop timeout is outside the fixed bounds.'
     }
-    $expectedScript = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot $expectedScriptName) -ErrorAction Stop).ProviderPath
+    $expectedScript = (Resolve-Path -LiteralPath (Join-Path $resolvedTaskScriptRoot $expectedScriptName) -ErrorAction Stop).ProviderPath
     $scriptItem = Get-Item -LiteralPath $expectedScript -Force -ErrorAction Stop
     if ($scriptItem.PSIsContainer -or ($scriptItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         throw 'The fixed lifecycle action script is unavailable or redirected.'

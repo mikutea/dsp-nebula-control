@@ -22,6 +22,11 @@ import {
 import { BACKUP_MANIFEST_PROTOCOL } from './schemas.js'
 
 const roots: string[] = []
+// The test deliberately inventories more than one maximum execution batch,
+// verifies every pair twice, and persists a journal entry for every move. Keep
+// a finite integration-test budget so loaded Windows/NTFS runners do not start
+// afterEach cleanup while that awaited transaction is still completing.
+const largeInventoryTestTimeoutMs = 60_000
 const policy = {
   keepLastHealthy: 1,
   keepDailyDays: 0,
@@ -204,7 +209,7 @@ describe('recoverable backup retention execution', () => {
     expect(executed.receipt.retired.map((entry) => entry.backupId))
       .toEqual(preview.executionBatch.selectedBackupIds)
     await expect(stat(path.join(fixture, backupIds[1]!))).resolves.toBeDefined()
-  })
+  }, largeInventoryTestTimeoutMs)
 
   it('persists versioned annotations and makes protection part of the executable plan digest', async () => {
     const fixture = await fixtureRoot()
@@ -849,9 +854,7 @@ async function createBackup(root: string, createdAt: string, marker: string): Pr
   const dsv = Buffer.from(marker.toUpperCase())
   const server = Buffer.from(`SERVER-${marker.toUpperCase()}`)
   await mkdir(directory)
-  await writeFile(path.join(directory, `${saveName}.dsv`), dsv)
-  await writeFile(path.join(directory, `${saveName}.server`), server)
-  await writeFile(path.join(directory, 'manifest.json'), JSON.stringify({
+  const manifest = JSON.stringify({
     protocol: BACKUP_MANIFEST_PROTOCOL,
     schemaVersion: 1,
     requestId,
@@ -861,7 +864,12 @@ async function createBackup(root: string, createdAt: string, marker: string): Pr
       { name: `${saveName}.dsv`, bytes: dsv.length, sha256: sha256(dsv) },
       { name: `${saveName}.server`, bytes: server.length, sha256: sha256(server) }
     ]
-  }))
+  })
+  await Promise.all([
+    writeFile(path.join(directory, `${saveName}.dsv`), dsv),
+    writeFile(path.join(directory, `${saveName}.server`), server),
+    writeFile(path.join(directory, 'manifest.json'), manifest)
+  ])
   return backupId
 }
 

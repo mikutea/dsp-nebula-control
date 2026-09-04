@@ -1,22 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Archive, Check, Download, FileArchive, LockKeyhole, RefreshCw,
-  ShieldCheck, TriangleAlert, Undo2, Upload
+  Archive, ArrowRight, Check, Database, Download, FileArchive, HardDrive,
+  LockKeyhole, RefreshCw, ShieldCheck, TriangleAlert, Undo2, Upload
 } from 'lucide-react'
-import { api, ApiError, sha256ArrayBuffer } from './api'
+import { api, ApiError, SAVE_PAIR_PROMOTION_CONFIRMATION, sha256ArrayBuffer } from './api'
 import { relativeTime } from './format'
 import { createUiRequestId } from './request-id'
 import type {
   BackupCatalogItem, SavePairExportReceipt, SavePairImportReceipt,
-  SavePairTransferDownload, SessionUser
+  SavePairPromotionPlan, SavePairPromotionReceipt, SavePairTransferDownload, SessionUser
 } from './model'
 
 type TransferGate = 'server-enforced' | 'accepted' | 'fail-closed'
 type ExportPhase = 'idle' | 'preparing' | 'prepared' | 'downloading' | 'downloaded' | 'cancelled' | 'error'
 type ImportPhase = 'idle' | 'selected' | 'reading' | 'hashing' | 'uploading' | 'quarantined' | 'cancelled' | 'error'
+type PromotionPhase = 'idle' | 'previewing' | 'previewed' | 'executing' | 'completed' | 'cancelled' | 'error'
 
 const maximumArchiveBytes = 16 * 1024 * 1024 * 1024
 const savePairExtension = '.dyson-save-pair'
+const promotionUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 export function SaveTransferWorkspace({ backups, user }: {
   backups: BackupCatalogItem[]
@@ -37,12 +39,23 @@ export function SaveTransferWorkspace({ backups, user }: {
   const [importReceipt, setImportReceipt] = useState<SavePairImportReceipt | null>(null)
   const [importPhase, setImportPhase] = useState<ImportPhase>('idle')
   const [importError, setImportError] = useState('')
+  const [promotionGate, setPromotionGate] = useState<TransferGate>('server-enforced')
+  const [promotionImportRequestId, setPromotionImportRequestId] = useState('')
+  const [promotionRequestId, setPromotionRequestId] = useState('')
+  const [promotionPlan, setPromotionPlan] = useState<SavePairPromotionPlan | null>(null)
+  const [promotionReceipt, setPromotionReceipt] = useState<SavePairPromotionReceipt | null>(null)
+  const [promotionConfirmation, setPromotionConfirmation] = useState('')
+  const [promotionPhase, setPromotionPhase] = useState<PromotionPhase>('idle')
+  const [promotionError, setPromotionError] = useState('')
   const [dragging, setDragging] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const exportAbortRef = useRef<AbortController | null>(null)
   const importAbortRef = useRef<AbortController | null>(null)
+  const promotionAbortRef = useRef<AbortController | null>(null)
   const exportSequenceRef = useRef(0)
   const importSequenceRef = useRef(0)
+  const promotionSequenceRef = useRef(0)
+  const promotionBusyRef = useRef(false)
   const objectUrlRef = useRef<string | null>(null)
 
   useEffect(() => {
@@ -57,14 +70,19 @@ export function SaveTransferWorkspace({ backups, user }: {
   useEffect(() => () => {
     exportAbortRef.current?.abort()
     importAbortRef.current?.abort()
+    promotionAbortRef.current?.abort()
     if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current)
     exportSequenceRef.current += 1
     importSequenceRef.current += 1
+    promotionSequenceRef.current += 1
+    promotionBusyRef.current = false
   }, [])
 
   const selectedBackup = verifiedBackups.find((backup) => backup.backupId === selectedBackupId) ?? null
   const exportBusy = exportPhase === 'preparing' || exportPhase === 'downloading'
   const importBusy = importPhase === 'reading' || importPhase === 'hashing' || importPhase === 'uploading'
+  const promotionBusy = promotionPhase === 'previewing' || promotionPhase === 'executing'
+  const promotionLocked = gate === 'fail-closed' || promotionGate === 'fail-closed'
 
   function resetExport(newRequestId = true): void {
     exportAbortRef.current?.abort()
@@ -206,6 +224,8 @@ export function SaveTransferWorkspace({ backups, user }: {
       setImportReceipt(result.data)
       setImportPhase('quarantined')
       setGate('accepted')
+      resetPromotionEvidence()
+      setPromotionImportRequestId(result.data.requestId)
     } catch (reason) {
       if (sequence !== importSequenceRef.current || isAbortError(reason)) return
       setImportPhase('error')
@@ -216,18 +236,149 @@ export function SaveTransferWorkspace({ backups, user }: {
     }
   }
 
+  function resetPromotionEvidence(clearImport = false): void {
+    promotionAbortRef.current?.abort()
+    promotionAbortRef.current = null
+    promotionSequenceRef.current += 1
+    promotionBusyRef.current = false
+    if (clearImport) setPromotionImportRequestId('')
+    setPromotionRequestId('')
+    setPromotionPlan(null)
+    setPromotionReceipt(null)
+    setPromotionConfirmation('')
+    setPromotionPhase('idle')
+    setPromotionError('')
+  }
+
+  function updatePromotionImportRequestId(value: string): void {
+    resetPromotionEvidence()
+    setPromotionImportRequestId(value.toLowerCase())
+  }
+
+  async function previewPromotion(): Promise<void> {
+    if (!canTransfer || promotionLocked || promotionBusyRef.current) return
+    const normalizedImportRequestId = promotionImportRequestId.trim().toLowerCase()
+    if (promotionImportRequestId !== promotionImportRequestId.trim() ||
+        !promotionUuidPattern.test(normalizedImportRequestId)) {
+      setPromotionPhase('error')
+      setPromotionError('只接受隔离导入回执中的完整 import request UUID；不会提交路径、URL 或命令。')
+      return
+    }
+    const requestId = createUiRequestId().toLowerCase()
+    const sequence = ++promotionSequenceRef.current
+    const controller = new AbortController()
+    promotionAbortRef.current?.abort()
+    promotionAbortRef.current = controller
+    promotionBusyRef.current = true
+    setPromotionImportRequestId(normalizedImportRequestId)
+    setPromotionRequestId(requestId)
+    setPromotionPlan(null)
+    setPromotionReceipt(null)
+    setPromotionConfirmation('')
+    setPromotionPhase('previewing')
+    setPromotionError('')
+    try {
+      const result = await api.previewSavePairPromotion(requestId, normalizedImportRequestId, controller.signal)
+      if (sequence !== promotionSequenceRef.current) return
+      setPromotionPlan(result.data)
+      setPromotionPhase('previewed')
+      setPromotionGate('accepted')
+    } catch (reason) {
+      if (sequence !== promotionSequenceRef.current || isAbortError(reason)) return
+      setPromotionPhase('error')
+      setPromotionError(formatTransferError(reason, '隔离存档晋升预演失败。'))
+      if (isPromotionFailClosedFailure(reason)) setPromotionGate('fail-closed')
+    } finally {
+      if (sequence === promotionSequenceRef.current) promotionBusyRef.current = false
+      if (promotionAbortRef.current === controller) promotionAbortRef.current = null
+    }
+  }
+
+  async function executePromotion(): Promise<void> {
+    if (!canTransfer || promotionLocked || promotionBusyRef.current || !promotionPlan ||
+        promotionConfirmation !== SAVE_PAIR_PROMOTION_CONFIRMATION || !promotionPlan.allowed ||
+        !promotionPlan.executionEnabled) return
+    if (promotionImportRequestId.trim().toLowerCase() !== promotionPlan.importRequestId) {
+      setPromotionConfirmation('')
+      setPromotionPhase('error')
+      setPromotionError('隔离 import UUID 已变化；旧预演已失效，请重新生成。')
+      return
+    }
+
+    const expected = promotionPlan
+    const sequence = ++promotionSequenceRef.current
+    const controller = new AbortController()
+    promotionAbortRef.current?.abort()
+    promotionAbortRef.current = controller
+    promotionBusyRef.current = true
+    setPromotionPhase('executing')
+    setPromotionError('')
+    try {
+      const refreshed = (await api.previewSavePairPromotion(
+        expected.requestId,
+        expected.importRequestId,
+        controller.signal
+      )).data
+      if (sequence !== promotionSequenceRef.current) return
+      if (!samePromotionPlan(expected, refreshed)) {
+        setPromotionPlan(refreshed)
+        setPromotionConfirmation('')
+        setPromotionPhase('previewed')
+        setPromotionGate('accepted')
+        setPromotionError('执行前的零写入预演证据已变化；确认词已清空，请核对新目标、哈希和空间后重新确认。')
+        return
+      }
+      const receipt = (await api.executeSavePairPromotion(
+        refreshed.requestId,
+        refreshed.importRequestId,
+        SAVE_PAIR_PROMOTION_CONFIRMATION,
+        controller.signal
+      )).data
+      if (sequence !== promotionSequenceRef.current) return
+      if (!promotionReceiptMatchesPlan(receipt, refreshed)) {
+        throw new ApiError(502, '晋升回执与刚刚复核的预演证据不一致。', 'SAVE_PROMOTION_RECEIPT_MISMATCH')
+      }
+      setPromotionPlan(refreshed)
+      setPromotionReceipt(receipt)
+      setPromotionConfirmation('')
+      setPromotionPhase('completed')
+      setPromotionGate('accepted')
+    } catch (reason) {
+      if (sequence !== promotionSequenceRef.current || isAbortError(reason)) return
+      setPromotionPhase('error')
+      setPromotionError(formatTransferError(reason, '隔离存档未能晋升为已验证保护点。'))
+      if (isPromotionFailClosedFailure(reason)) setPromotionGate('fail-closed')
+    } finally {
+      if (sequence === promotionSequenceRef.current) promotionBusyRef.current = false
+      if (promotionAbortRef.current === controller) promotionAbortRef.current = null
+    }
+  }
+
+  function cancelPromotion(): void {
+    promotionAbortRef.current?.abort()
+    promotionAbortRef.current = null
+    promotionSequenceRef.current += 1
+    promotionBusyRef.current = false
+    setPromotionConfirmation('')
+    setPromotionPhase('cancelled')
+    setPromotionError('已取消浏览器等待；如执行请求已经送达，请用同一 request ID 核对幂等回执，不要生成恢复动作。')
+  }
+
   function requestServerDecisionAgain(): void {
     setGate('server-enforced')
+    setPromotionGate('server-enforced')
     setExportError('')
     setImportError('')
+    setPromotionError('')
     if (exportPhase === 'error') setExportPhase(exportReceipt ? 'prepared' : 'idle')
     if (importPhase === 'error') setImportPhase(selectedFile ? 'selected' : 'idle')
+    if (promotionPhase === 'error') setPromotionPhase(promotionPlan ? 'previewed' : 'idle')
   }
 
   if (!canTransfer) {
     return <section className="save-transfer-workspace readonly">
-      <header><div><Archive size={18} /><span><strong>跨机器配对存档传输</strong><small>固定媒体类型 · 内容寻址 · 隔离区导入</small></span></div><b>ADMINISTRATOR ONLY</b></header>
-      <div className="save-transfer-readonly"><LockKeyhole size={24} /><span><strong>{user.role === 'viewer' ? 'Viewer 只读说明' : 'Operator 只读说明'}</strong><small>跨机器导出会复制完整存档制品，导入会写入服务器隔离区，因此仅 Administrator 且拥有 saves.transfer 权限时显示操作控件。恢复仍是另一条独立停服事务。</small></span></div>
+      <header><div><Archive size={18} /><span><strong>跨机器配对存档传输</strong><small>固定媒体类型 · 隔离导入 · 已验证保护点晋升</small></span></div><b>ADMINISTRATOR ONLY</b></header>
+      <div className="save-transfer-readonly"><LockKeyhole size={24} /><span><strong>{user.role === 'viewer' ? 'Viewer 只读说明' : 'Operator 只读说明'}</strong><small>跨机器导出会复制完整存档制品，导入会写入服务器隔离区，晋升会创建新的已验证保护点；因此仅 Administrator 且拥有 saves.transfer 权限时显示操作控件。任何一步都不会恢复或覆盖 live save。</small></span></div>
       <footer><ShieldCheck size={14} />此页面不会向浏览器暴露或提交服务器路径、URL、命令、Steam 状态或存档散件。</footer>
     </section>
   }
@@ -235,6 +386,11 @@ export function SaveTransferWorkspace({ backups, user }: {
   const gateLabel = gate === 'fail-closed' ? 'FAIL-CLOSED' : gate === 'accepted' ? 'SERVER ACCEPTED' : 'DEFAULT CLOSED'
   const gateDetail = gate === 'fail-closed' ? '403 / 423 / 503 后本地控件已锁定'
     : gate === 'accepted' ? '最近一次请求已由服务端校验' : '每次操作由服务端权限与配置最终裁决'
+  const promotionGateLabel = promotionLocked ? 'FAIL-CLOSED'
+    : promotionGate === 'accepted' ? 'SERVER ACCEPTED' : 'PREVIEW ONLY'
+  const promotionGateDetail = promotionLocked ? '403 / 423 后晋升控件已锁定'
+    : promotionGate === 'accepted' ? '最近一次晋升预演已由服务端验证'
+      : '预演零写入；执行仍由服务端开关裁决'
 
   return <section className="save-transfer-workspace">
     <header><div><Archive size={18} /><span><strong>跨机器配对存档传输</strong><small>verified backup → content-addressed artifact → quarantine inbox</small></span></div><b>ADMINISTRATOR · SAVES.TRANSFER</b></header>
@@ -292,13 +448,65 @@ export function SaveTransferWorkspace({ backups, user }: {
       </section>
     </div>
 
+    <section className={`save-promotion-panel${promotionLocked ? ' locked' : promotionReceipt ? ' completed' : ''}`}>
+      <header><div><Database size={18} /><span><strong>隔离存档晋升为已验证保护点</strong><small>quarantine UUID → zero-write preview → immutable verified backup</small></span></div><b>{promotionGateLabel}</b></header>
+
+      {promotionError && <div className={`save-promotion-alert${promotionLocked ? ' locked' : ''}`} role="alert"><TriangleAlert size={16} /><span><strong>{promotionPhase === 'cancelled' ? '浏览器等待已取消' : '晋升流程已停止'}</strong><small>{promotionError}</small></span></div>}
+      {promotionLocked && <div className="save-promotion-lock"><LockKeyhole size={17} /><span><strong>晋升门禁已在浏览器侧锁闭</strong><small>{promotionGateDetail}。重新请求只会再次询问服务端，不会修改配置或绕过主机变更租约。</small></span><button type="button" onClick={requestServerDecisionAgain}><RefreshCw size={14} />重新请求服务端裁决</button></div>}
+
+      <div className="save-promotion-flow" aria-label="存档晋升阶段">
+        <article className={promotionImportRequestId ? 'ready' : ''}><span>01</span><div><strong>选择 IMPORT UUID</strong><small>只引用隔离导入回执，不接受服务器路径</small></div><Archive size={17} /></article>
+        <ArrowRight size={15} />
+        <article className={promotionPlan ? 'ready' : ''}><span>02</span><div><strong>零写入预演</strong><small>核对目标、来源哈希、空间、复用与执行开关</small></div><ShieldCheck size={17} /></article>
+        <ArrowRight size={15} />
+        <article className={promotionReceipt ? 'ready' : ''}><span>03</span><div><strong>发布 VERIFIED BACKUP</strong><small>原子发布新保护点；live save 与 inbox 保持不变</small></div><HardDrive size={17} /></article>
+      </div>
+
+      <div className="save-promotion-intent">
+        <label><span>隔离导入 REQUEST UUID</span><input aria-label="隔离导入 request UUID" type="text" inputMode="text" autoComplete="off" spellCheck={false} maxLength={36} placeholder="00000000-0000-4000-8000-000000000000" value={promotionImportRequestId} disabled={promotionBusy || promotionLocked} onChange={(event) => updatePromotionImportRequestId(event.target.value)} /><small>{importReceipt?.requestId === promotionImportRequestId ? '已从本次 QUARANTINE RECEIPT 自动选择' : '可粘贴另一份已持久化导入回执的 UUID；不会读取路径'}</small></label>
+        <div className="save-promotion-request"><span>PROMOTION REQUEST UUID</span><code>{promotionRequestId || '预演时由浏览器新建，不可编辑'}</code><small>每次重新生成预演都会使用新的 UUID；执行复核复用同一 UUID</small></div>
+        <div className="save-promotion-intent-actions"><button type="button" disabled={!promotionImportRequestId || promotionBusy || promotionLocked} onClick={() => void previewPromotion()}><RefreshCw className={promotionPhase === 'previewing' ? 'spin' : ''} size={15} />{promotionPhase === 'previewing' ? '正在生成预演' : '生成零写入晋升预演'}</button>{promotionBusy && <button type="button" className="cancel" onClick={cancelPromotion}>取消晋升等待</button>}</div>
+      </div>
+
+      {!promotionPlan && !promotionReceipt && promotionPhase !== 'previewing' && <div className="save-promotion-empty"><ShieldCheck size={19} /><span><strong>只从隔离区创建新的验证保护点</strong><small>预演和执行都不会选择、覆盖或恢复 live save；源 quarantine/inbox 会完整保留。</small></span></div>}
+
+      {promotionPlan && <div className="save-promotion-preview">
+        <header><div><ShieldCheck size={16} /><span><strong>DRY-RUN · ZERO WRITE</strong><small>{promotionPlan.saveName} · 服务端固定目标</small></span></div><b>{promotionPlan.allowed ? promotionPlan.executionEnabled ? 'EXECUTION READY' : 'DEFAULT OFF' : 'BLOCKED'}</b></header>
+        <dl>
+          <div><dt>destinationBackupId</dt><dd>{promotionPlan.backupId}</dd></div>
+          <div><dt>source archive SHA-256</dt><dd>{promotionPlan.sourceArchiveSha256}</dd></div>
+          <div><dt>pair bytes</dt><dd>.dsv {formatBytes(promotionPlan.dsvBytes)} + .server {formatBytes(promotionPlan.serverBytes)}</dd></div>
+          <div><dt>space</dt><dd>{formatBytes(promotionPlan.requiredBytes)} required · {promotionPlan.availableBytes === null ? 'unavailable / reused' : `${formatBytes(promotionPlan.availableBytes)} available`}</dd></div>
+          <div><dt>manifest</dt><dd>{promotionPlan.effects.verifiedBackupCreated ? '执行时生成并验证 canonical manifest' : '已验证目标 manifest，允许幂等复用'}</dd></div>
+          <div><dt>reuse</dt><dd>{promotionPlan.reused ? '是 · 不再复制 pair' : '否 · 将原子发布新目录'}</dd></div>
+        </dl>
+        <div className="save-promotion-effects">
+          <span><Check size={14} /><strong>INBOX 保留</strong><small>quarantinePreserved=true</small></span>
+          <span><Check size={14} /><strong>LIVE SAVE 不变</strong><small>liveSaveChanged=false</small></span>
+          <span><Check size={14} /><strong>不会执行恢复</strong><small>restoreExecuted=false</small></span>
+          <span className={promotionPlan.executionEnabled && promotionPlan.allowed ? 'ready' : 'blocked'}>{promotionPlan.executionEnabled && promotionPlan.allowed ? <Check size={14} /> : <LockKeyhole size={14} />}<strong>{promotionPlan.executionEnabled ? promotionPlan.allowed ? '执行门禁已满足' : '空间门禁未满足' : '执行默认关闭'}</strong><small>{promotionPlan.blockers.length ? promotionPlan.blockers.map(promotionBlockerLabel).join(' · ') : '无空间阻断项'}</small></span>
+        </div>
+        {!promotionReceipt && <div className="save-promotion-confirmation">
+          <div><LockKeyhole size={16} /><span><strong>执行前会重新运行同一零写入预演</strong><small>目标、哈希、空间、复用或门禁任一变化都会清空确认并停止执行。</small></span></div>
+          <label><span>输入精确确认词 <code>{SAVE_PAIR_PROMOTION_CONFIRMATION}</code></span><input aria-label="输入存档晋升确认词" type="text" autoComplete="off" spellCheck={false} value={promotionConfirmation} disabled={promotionBusy || promotionLocked || !promotionPlan.allowed || !promotionPlan.executionEnabled} onChange={(event) => setPromotionConfirmation(event.target.value)} /></label>
+          <button type="button" disabled={promotionConfirmation !== SAVE_PAIR_PROMOTION_CONFIRMATION || promotionBusy || promotionLocked || !promotionPlan.allowed || !promotionPlan.executionEnabled} onClick={() => void executePromotion()}><Database size={15} />{promotionPhase === 'executing' ? '复核并发布中' : '确认晋升为已验证保护点'}</button>
+        </div>}
+      </div>}
+
+      {promotionReceipt && <div className="save-promotion-receipt">
+        <header><Check size={16} /><span><strong>VERIFIED BACKUP RECEIPT</strong><small>{promotionReceipt.reused ? '幂等复用既有保护点' : '新保护点已原子发布并重新读取验证'}</small></span><b>{relativeTime(promotionReceipt.completedAt)}</b></header>
+        <dl><div><dt>backupId</dt><dd>{promotionReceipt.backupId}</dd></div><div><dt>manifest SHA-256</dt><dd>{promotionReceipt.manifestSha256}</dd></div><div><dt>source archive SHA-256</dt><dd>{promotionReceipt.sourceArchiveSha256}</dd></div><div><dt>pair bytes</dt><dd>.dsv {formatBytes(promotionReceipt.dsvBytes)} + .server {formatBytes(promotionReceipt.serverBytes)}</dd></div></dl>
+        <footer><ShieldCheck size={15} /><span><strong>晋升完成，但没有恢复存档</strong><small>源 {promotionReceipt.inboxId} 仍保留；live save 未选择、未写入，restoreExecuted=false。</small></span><button type="button" onClick={() => resetPromotionEvidence(true)}>准备下一次晋升</button></footer>
+      </div>}
+    </section>
+
     <div className="save-transfer-boundaries">
       <div><ShieldCheck size={17} /><span><strong>导出来源固定</strong><small>只能从当前目录中已验证的 backupId 选择，不能输入服务器路径。</small></span></div>
       <div><FileArchive size={17} /><span><strong>传输格式固定</strong><small>浏览器下载统一命名为 .dyson-save-pair，线级媒体类型由协议固定。</small></span></div>
-      <div><Archive size={17} /><span><strong>导入只到隔离区</strong><small>服务端验证 archive、manifest、双文件身份和 SHA-256 后发布到 inbox。</small></span></div>
+      <div><Archive size={17} /><span><strong>导入先到隔离区</strong><small>服务端验证 archive、manifest、双文件身份和 SHA-256 后发布到 inbox；晋升仍需独立预演和确认。</small></span></div>
       <div><Undo2 size={17} /><span><strong>恢复是另一事务</strong><small>仍需停服、revision、保护点和独立确认；本工作区没有恢复动作。</small></span></div>
     </div>
-    <footer><ShieldCheck size={14} />浏览器不会提交服务器路径、URL、命令、可执行文件、凭据或单独的 `.dsv` / `.server`；取消只终止浏览器等待，幂等 request ID 用于安全核对重复请求。</footer>
+    <footer><ShieldCheck size={14} />浏览器不会提交服务器路径、URL、命令、可执行文件、凭据或单独的 `.dsv` / `.server`；晋升只引用 import UUID，且始终保留 inbox 与 live save。</footer>
   </section>
 }
 
@@ -312,6 +520,41 @@ function isVerifiedBackup(backup: BackupCatalogItem): boolean {
 
 function isFailClosedFailure(reason: unknown): boolean {
   return reason instanceof ApiError && [403, 423, 503].includes(reason.status)
+}
+
+function isPromotionFailClosedFailure(reason: unknown): boolean {
+  return reason instanceof ApiError && [403, 423].includes(reason.status)
+}
+
+function samePromotionPlan(left: SavePairPromotionPlan, right: SavePairPromotionPlan): boolean {
+  return JSON.stringify([
+    left.format, left.schemaVersion, left.mode, left.requestId, left.importRequestId, left.inboxId,
+    left.backupId, left.saveName, left.sourceArchiveSha256, left.dsvBytes, left.serverBytes,
+    left.requiredBytes, left.availableBytes, left.allowed, left.blockers, left.reused,
+    left.requiredConfirmation, left.effects.quarantinePreserved, left.effects.verifiedBackupCreated,
+    left.effects.liveSaveChanged, left.effects.restoreExecuted, left.executionEnabled
+  ]) === JSON.stringify([
+    right.format, right.schemaVersion, right.mode, right.requestId, right.importRequestId, right.inboxId,
+    right.backupId, right.saveName, right.sourceArchiveSha256, right.dsvBytes, right.serverBytes,
+    right.requiredBytes, right.availableBytes, right.allowed, right.blockers, right.reused,
+    right.requiredConfirmation, right.effects.quarantinePreserved, right.effects.verifiedBackupCreated,
+    right.effects.liveSaveChanged, right.effects.restoreExecuted, right.executionEnabled
+  ])
+}
+
+function promotionReceiptMatchesPlan(
+  receipt: SavePairPromotionReceipt,
+  plan: SavePairPromotionPlan
+): boolean {
+  return receipt.requestId === plan.requestId && receipt.importRequestId === plan.importRequestId &&
+    receipt.inboxId === plan.inboxId && receipt.backupId === plan.backupId &&
+    receipt.saveName === plan.saveName && receipt.sourceArchiveSha256 === plan.sourceArchiveSha256 &&
+    receipt.dsvBytes === plan.dsvBytes && receipt.serverBytes === plan.serverBytes &&
+    receipt.restoreExecuted === false && receipt.reused === plan.reused
+}
+
+function promotionBlockerLabel(blocker: SavePairPromotionPlan['blockers'][number]): string {
+  return blocker === 'space-insufficient' ? '可用空间不足' : '无法读取可用空间'
 }
 
 function isAbortError(reason: unknown): boolean {

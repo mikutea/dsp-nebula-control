@@ -17,10 +17,24 @@ describe('host-mutation lifecycle coordinator', () => {
 
     const result = await coordinator.runExclusive(
       { requestId: 'request:fixture:0001', action: 'restart' },
-      async (scope) => ({ value: scope.signal, disposition: 'release' })
+      async (scope) => {
+        scope.assertActive()
+        return {
+          value: {
+            signal: scope.signal,
+            borrowArguments: scope.toPowerShellBorrowArguments()
+          },
+          disposition: 'release'
+        }
+      }
     )
 
-    expect(result).toBe(runner.signal)
+    expect(result.signal).toBe(runner.signal)
+    expect(result.borrowArguments).toEqual([
+      '-DataRoot', 'C:\\fixture\\data',
+      '-LeaseInstanceId', '00000000-0000-4000-8000-000000000303',
+      '-LeaseToken', 'C'.repeat(43)
+    ])
     expect(runner.requests).toEqual([{
       dataRoot: 'C:\\fixture\\data',
       owner: 'fixture-owner',
@@ -131,8 +145,13 @@ class FakeLeaseRunner {
         if (!this.#active) {
           throw new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_SCOPE_INACTIVE')
         }
-      }
-    } as HostMutationLease
+      },
+      toPowerShellBorrowArguments: () => [
+        '-DataRoot', 'C:\\fixture\\data',
+        '-LeaseInstanceId', '00000000-0000-4000-8000-000000000303',
+        '-LeaseToken', 'C'.repeat(43)
+      ]
+    } as unknown as HostMutationLease
     try {
       const result = await action(lease)
       this.finishes.push('release')

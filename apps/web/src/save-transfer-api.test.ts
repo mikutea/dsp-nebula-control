@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api, ApiError, sha256ArrayBuffer } from './api'
-import type { SavePairExportReceipt, SavePairImportReceipt } from './model'
+import {
+  api, ApiError, SAVE_PAIR_PROMOTION_CONFIRMATION, sha256ArrayBuffer
+} from './api'
+import type {
+  SavePairExportReceipt, SavePairImportReceipt, SavePairPromotionPlan, SavePairPromotionReceipt
+} from './model'
 
 const exportRequestId = '11111111-2222-4333-8444-555555555555'
 const importRequestId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+const promotionRequestId = '99999999-8888-4777-8666-555555555555'
 const backupId = 'fictional-backup-0001'
 
 afterEach(() => {
@@ -112,6 +117,86 @@ describe('save pair transfer web client contract', () => {
     expect(error).toBeInstanceOf(ApiError)
     expect(error).toMatchObject({ status: 423, code: 'SAVE_TRANSFER_DISABLED' })
   })
+
+  it('previews quarantine promotion with UUID-only input and a strict zero-write plan', async () => {
+    const plan = promotionPlanFixture()
+    const fetchMock = vi.fn(async (path: RequestInfo | URL, init?: RequestInit) => {
+      expect(path).toBe('/api/v1/saves/transfers/promotions/preview')
+      expect(init).toMatchObject({ method: 'POST', credentials: 'same-origin', cache: 'no-store' })
+      expect(new Headers(init?.headers).get('Content-Type')).toBe('application/json')
+      expect(JSON.parse(String(init?.body))).toEqual({
+        requestId: promotionRequestId,
+        importRequestId
+      })
+      expect(String(init?.body)).not.toMatch(/(?:path|url|command|credential)/i)
+      return jsonResponse({ data: plan }, 200)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.previewSavePairPromotion(promotionRequestId, importRequestId)).resolves.toEqual({
+      data: plan
+    })
+    expect(plan).toMatchObject({
+      mode: 'dry-run',
+      backupId: `tx-${promotionRequestId}`,
+      requiredConfirmation: SAVE_PAIR_PROMOTION_CONFIRMATION,
+      effects: { quarantinePreserved: true, liveSaveChanged: false, restoreExecuted: false }
+    })
+  })
+
+  it('executes promotion only with the exact confirmation and validates the durable receipt', async () => {
+    await expect(api.executeSavePairPromotion(
+      promotionRequestId,
+      importRequestId,
+      'PROMOTE' as typeof SAVE_PAIR_PROMOTION_CONFIRMATION
+    )).rejects.toMatchObject({ status: 400, code: 'SAVE_PROMOTION_CLIENT_REQUEST_INVALID' })
+
+    const receipt = promotionReceiptFixture()
+    const fetchMock = vi.fn(async (path: RequestInfo | URL, init?: RequestInit) => {
+      expect(path).toBe('/api/v1/saves/transfers/promotions/execute')
+      expect(JSON.parse(String(init?.body))).toEqual({
+        requestId: promotionRequestId,
+        importRequestId,
+        confirmation: SAVE_PAIR_PROMOTION_CONFIRMATION
+      })
+      return jsonResponse({ data: receipt }, 201)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.executeSavePairPromotion(
+      promotionRequestId,
+      importRequestId,
+      SAVE_PAIR_PROMOTION_CONFIRMATION
+    )).resolves.toEqual({ data: receipt })
+    expect(receipt).toMatchObject({
+      backupId: `tx-${promotionRequestId}`,
+      restoreExecuted: false,
+      manifestSha256: 'cd'.repeat(32)
+    })
+  })
+
+  it('rejects promotion response drift and never displays an arbitrary server message', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({
+      data: { ...promotionPlanFixture(), serverPath: 'C:\\Fictional\\private-save' }
+    }, 200)))
+    await expect(api.previewSavePairPromotion(promotionRequestId, importRequestId)).rejects.toMatchObject({
+      status: 502,
+      code: 'SAVE_PROMOTION_RESPONSE_INVALID'
+    })
+
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({
+      error: {
+        code: 'SAVE_PROMOTION_HOST_MUTATION_BLOCKED',
+        message: 'secret C:\\Fictional\\lease path must never be displayed'
+      }
+    }, 423)))
+    const error = await api.previewSavePairPromotion(promotionRequestId, importRequestId)
+      .then(() => null, (reason: unknown) => reason)
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error).toMatchObject({ status: 423, code: 'SAVE_PROMOTION_HOST_MUTATION_BLOCKED' })
+    expect((error as Error).message).not.toContain('Fictional')
+    expect((error as Error).message).toContain('门禁')
+  })
 })
 
 function exportReceiptFixture(archiveBytes: number, archiveSha256: string): SavePairExportReceipt {
@@ -144,6 +229,55 @@ function importReceiptFixture(archiveBytes: number, archiveSha256: string): Save
     dsvBytes: 12,
     serverBytes: 13,
     completedAt: '2026-08-30T12:01:00.000Z',
+    restoreExecuted: false,
+    reused: false
+  }
+}
+
+function promotionPlanFixture(): SavePairPromotionPlan {
+  return {
+    format: 'dyson-control-save-promotion-plan',
+    schemaVersion: 1,
+    mode: 'dry-run',
+    requestId: promotionRequestId,
+    importRequestId,
+    inboxId: `import-${importRequestId}`,
+    backupId: `tx-${promotionRequestId}`,
+    saveName: 'fictional-cluster',
+    sourceArchiveSha256: 'ab'.repeat(32),
+    dsvBytes: 12,
+    serverBytes: 13,
+    requiredBytes: 16_409,
+    availableBytes: 1_000_000,
+    allowed: true,
+    blockers: [],
+    reused: false,
+    requiredConfirmation: SAVE_PAIR_PROMOTION_CONFIRMATION,
+    effects: {
+      quarantinePreserved: true,
+      verifiedBackupCreated: true,
+      liveSaveChanged: false,
+      restoreExecuted: false
+    },
+    executionEnabled: true
+  }
+}
+
+function promotionReceiptFixture(): SavePairPromotionReceipt {
+  return {
+    format: 'dyson-control-save-promotion-receipt',
+    schemaVersion: 1,
+    operation: 'promote-import',
+    requestId: promotionRequestId,
+    importRequestId,
+    inboxId: `import-${importRequestId}`,
+    backupId: `tx-${promotionRequestId}`,
+    saveName: 'fictional-cluster',
+    sourceArchiveSha256: 'ab'.repeat(32),
+    manifestSha256: 'cd'.repeat(32),
+    dsvBytes: 12,
+    serverBytes: 13,
+    completedAt: '2026-09-01T00:00:00.000Z',
     restoreExecuted: false,
     reused: false
   }

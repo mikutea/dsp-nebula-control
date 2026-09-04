@@ -35,8 +35,22 @@ export interface CoreCpuUsage {
   percent: number
 }
 
+export const OBSERVABILITY_STORAGE_DEPENDENCY_KINDS = [
+  'none', 'smb-global-mapping', 'unknown'
+] as const
+
+export type ObservabilityStorageDependencyKind =
+  (typeof OBSERVABILITY_STORAGE_DEPENDENCY_KINDS)[number]
+
+export const OBSERVABILITY_TASK_STATES = [
+  'running', 'ready', 'disabled', 'queued', 'unknown'
+] as const
+
+export type ObservabilityTaskState = (typeof OBSERVABILITY_TASK_STATES)[number]
+
 export const OBSERVABILITY_METRIC_PATHS = [
   'runtime.processId',
+  'runtime.startedAt',
   'runtime.gamePort.port',
   'runtime.gamePort.listening',
   'host.cpu.logicalProcessorCount',
@@ -64,7 +78,11 @@ export const OBSERVABILITY_METRIC_PATHS = [
   'process.threadCount',
   'simulation.ups',
   'simulation.tps',
-  'simulation.targetUps'
+  'simulation.targetUps',
+  'automation.projectRootAvailable',
+  'automation.globalMappingAvailable',
+  'automation.storageTask.state',
+  'automation.storageTask.lastResult'
 ] as const
 
 export type ObservabilityMetricPath = (typeof OBSERVABILITY_METRIC_PATHS)[number]
@@ -88,7 +106,11 @@ export const OBSERVABILITY_HINT_CODES = [
   'SIMULATION_BELOW_TARGET',
   'SIMULATION_TELEMETRY_UNAVAILABLE',
   'RUNTIME_STATE_UNKNOWN',
-  'OBSERVABILITY_INCOMPLETE'
+  'OBSERVABILITY_INCOMPLETE',
+  'PROJECT_ROOT_UNAVAILABLE',
+  'SMB_GLOBAL_MAPPING_UNAVAILABLE',
+  'STORAGE_RECOVERY_TASK_FAILED',
+  'STORAGE_DEPENDENCY_UNCLASSIFIED'
 ] as const
 
 export type ObservabilityHintCode = (typeof OBSERVABILITY_HINT_CODES)[number]
@@ -116,6 +138,7 @@ export interface ServerObservabilityReadings {
   runtime: {
     state: ObservabilityRuntimeState
     processId: ObservabilityMetric<number>
+    startedAt: ObservabilityMetric<string>
     gamePort: {
       port: ObservabilityMetric<number>
       listening: ObservabilityMetric<boolean>
@@ -154,6 +177,15 @@ export interface ServerObservabilityReadings {
     ups: ObservabilityMetric<number>
     tps: ObservabilityMetric<number>
     targetUps: ObservabilityMetric<number>
+  }
+  automation: {
+    storageDependencyKind: ObservabilityStorageDependencyKind
+    projectRootAvailable: ObservabilityMetric<boolean>
+    globalMappingAvailable: ObservabilityMetric<boolean>
+    storageTask: {
+      state: ObservabilityMetric<ObservabilityTaskState>
+      lastResult: ObservabilityMetric<number>
+    }
   }
 }
 

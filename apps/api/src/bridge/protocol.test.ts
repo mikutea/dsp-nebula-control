@@ -3,10 +3,15 @@ import {
   buildBridgeHeartbeat,
   buildBridgeRequest,
   buildBridgeReceipt,
+  buildBridgeRuntimeSession,
+  buildBridgeSimulationTelemetry,
   computeBridgeSaveGenerationId,
+  actualSimulationRates,
   parseBridgeHeartbeat,
   parseBridgeReceipt,
   parseBridgeRequest,
+  parseBridgeRuntimeSession,
+  parseBridgeSimulationTelemetry,
   type BridgeReceiptV2Input
 } from './protocol.js'
 
@@ -107,6 +112,37 @@ const heartbeatPayload = [
   'writtenAtUnixMs=1788081004000',
   'state=ready',
   'hmac=272dea72a7446db521b006f22718777f0cb4443a05022a76d4fffe2c1a06f6f2',
+  ''
+].join('\n')
+const runtimeSessionPayload = [
+  'protocol=DYSON_CONTROL_RUNTIME_SESSION_V1',
+  'sessionId=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+  'pluginVersion=0.1.0',
+  'processId=4242',
+  'processStartedAtUnixMs=1788080000000',
+  'bridgeStartedAtUnixMs=1788081000000',
+  'issuedAtUnixMs=1788081000000',
+  'hmac=95fd6dfd32fca0deed984c68cdcd475d65a842004f596c5e5874a938c75e4b28',
+  ''
+].join('\n')
+const simulationTelemetryPayload = [
+  'protocol=DYSON_CONTROL_SIMULATION_TELEMETRY_V1',
+  'sessionId=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+  'processId=4242',
+  'processStartedAtUnixMs=1788080000000',
+  'bridgeStartedAtUnixMs=1788081000000',
+  'sequence=7',
+  'sampleStartedAtUnixMs=1788081001000',
+  'sampleFinishedAtUnixMs=1788081003000',
+  'writtenAtUnixMs=1788081003000',
+  'windowDurationMs=2000',
+  'tickStarted=1000',
+  'tickFinished=1120',
+  'upsMilli=59875',
+  'tpsMilli=60000',
+  'upsSource=fpscontroller-stopwatch',
+  'tpsSource=gamemain-tick-wallclock',
+  'hmac=1142702c6adc9c87e93de149922017b4d26465e7923a5aab109035f104d75a95',
   ''
 ].join('\n')
 
@@ -297,5 +333,51 @@ describe('bridge request V1 and receipt V2 cross-runtime vectors', () => {
     expect(parseBridgeHeartbeat(heartbeatPayload, secret)).toMatchObject({
       pluginVersion: '0.1.0', processId: 4242, state: 'ready'
     })
+  })
+
+  it('shares signed runtime-session and actual telemetry vectors across C# and TypeScript', () => {
+    const session = buildBridgeRuntimeSession({
+      sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+      pluginVersion: '0.1.0', processId: 4242,
+      processStartedAtUnixMs: 1788080000000,
+      bridgeStartedAtUnixMs: 1788081000000,
+      issuedAtUnixMs: 1788081000000
+    }, secret)
+    expect(session.payload).toBe(runtimeSessionPayload)
+    expect(parseBridgeRuntimeSession(runtimeSessionPayload, secret)).toMatchObject({
+      sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', processId: 4242
+    })
+
+    const telemetry = buildBridgeSimulationTelemetry({
+      sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', processId: 4242,
+      processStartedAtUnixMs: 1788080000000, bridgeStartedAtUnixMs: 1788081000000,
+      sequence: 7, sampleStartedAtUnixMs: 1788081001000,
+      sampleFinishedAtUnixMs: 1788081003000, writtenAtUnixMs: 1788081003000,
+      windowDurationMs: 2000, tickStarted: 1000, tickFinished: 1120,
+      upsMilli: 59875, tpsMilli: 60000
+    }, secret)
+    expect(telemetry.payload).toBe(simulationTelemetryPayload)
+    const parsed = parseBridgeSimulationTelemetry(simulationTelemetryPayload, secret)
+    expect(actualSimulationRates(parsed)).toEqual({ ups: 59.875, tps: 60 })
+  })
+
+  it('rejects telemetry tampering, wrong measurement sources, and tick/wall inconsistencies', () => {
+    expect(() => parseBridgeRuntimeSession(
+      runtimeSessionPayload.replace('processId=4242', 'processId=4243'), secret
+    )).toThrow('BRIDGE_SIGNATURE_INVALID')
+    expect(() => parseBridgeSimulationTelemetry(
+      simulationTelemetryPayload.replace('upsMilli=59875', 'upsMilli=59876'), secret
+    )).toThrow('BRIDGE_SIGNATURE_INVALID')
+    expect(() => parseBridgeSimulationTelemetry(
+      simulationTelemetryPayload.replace('upsSource=fpscontroller-stopwatch', 'upsSource=config-target'), secret
+    )).toThrow('BRIDGE_LITERAL_INVALID')
+    expect(() => buildBridgeSimulationTelemetry({
+      sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', processId: 4242,
+      processStartedAtUnixMs: 1788080000000, bridgeStartedAtUnixMs: 1788081000000,
+      sequence: 7, sampleStartedAtUnixMs: 1788081001000,
+      sampleFinishedAtUnixMs: 1788081003000, writtenAtUnixMs: 1788081003000,
+      windowDurationMs: 2000, tickStarted: 1000, tickFinished: 1120,
+      upsMilli: 60000, tpsMilli: 59990
+    }, secret)).toThrow('BRIDGE_TELEMETRY_INCONSISTENT')
   })
 })

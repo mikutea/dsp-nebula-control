@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory)][ValidateSet('bridge', 'control')][string]$Component
 )
 
-# DYSON_CONTROL_MANAGED_PLUGIN_VERSION_V1: read one fixed managed DLL version only.
+# DYSON_CONTROL_MANAGED_PLUGIN_VERSION_V1: read one fixed managed DLL informational release version only.
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
@@ -12,11 +12,13 @@ $fixedPlugins = @{
     bridge = [ordered]@{
         directoryName = 'dyson-control-bridge'
         fileName = 'DysonControlBridge.dll'
+        assemblyName = 'DysonControlBridge'
         relativePath = 'plugins/dyson-control-bridge/DysonControlBridge.dll'
     }
     control = [ordered]@{
         directoryName = 'dyson-control'
         fileName = 'DysonControl.dll'
+        assemblyName = 'DysonControl'
         relativePath = 'plugins/dyson-control/DysonControl.dll'
     }
 }
@@ -49,6 +51,7 @@ $pluginsRoot = Get-NormalDirectory -Parent $bepInExRoot -Child 'plugins'
 $identity = $fixedPlugins[$Component]
 $directoryName = [string]$identity.directoryName
 $fileName = [string]$identity.fileName
+$assemblyName = [string]$identity.assemblyName
 $relativePath = [string]$identity.relativePath
 $pluginDirectory = [System.IO.Path]::GetFullPath((Join-Path $pluginsRoot $directoryName))
 if (-not [System.IO.Path]::GetDirectoryName($pluginDirectory).Equals(
@@ -116,11 +119,17 @@ if (-not $pluginItem.Directory.FullName.Equals($pluginDirectory, [System.StringC
     throw 'The fixed managed plugin identity is invalid.'
 }
 
-try { $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($pluginItem.FullName) }
+try {
+    $managedIdentity = [System.Reflection.AssemblyName]::GetAssemblyName($pluginItem.FullName)
+    $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($pluginItem.FullName)
+}
 catch { throw 'The fixed managed plugin version is unavailable.' }
-$version = [string]$versionInfo.FileVersion
+if ([string]$managedIdentity.Name -cne $assemblyName) {
+    throw 'The fixed managed plugin assembly identity is invalid.'
+}
+$version = [string]$versionInfo.ProductVersion
 if ([string]::IsNullOrWhiteSpace($version) -or $version.Length -gt 64 -or
-    $version -notmatch '^(?:[vV])?\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
+    $version -notmatch '^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.(?:0|[1-9][0-9]*))?$') {
     throw 'The fixed managed plugin version is invalid.'
 }
 

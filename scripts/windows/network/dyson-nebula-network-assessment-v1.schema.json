@@ -1,0 +1,361 @@
+{
+  "$id": "urn:dyson-control:schema:nebula-network-assessment:v1",
+  "title": "Dyson Nebula network assessment v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "schemaVersion",
+    "mode",
+    "generatedAt",
+    "productionChanged",
+    "remoteProbeEnabled",
+    "mutationImplemented",
+    "mutationAuthorized",
+    "privacy",
+    "nebulaClientSemantics",
+    "localListener",
+    "planes",
+    "passWallBypassEvidence",
+    "decision",
+    "findings"
+  ],
+  "properties": {
+    "protocol": { "const": "DYSON_NEBULA_NETWORK_ASSESSMENT_V1" },
+    "schemaVersion": { "const": 1 },
+    "mode": { "enum": ["local-read-only", "remote-read-only", "shadow"] },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "productionChanged": { "const": false },
+    "remoteProbeEnabled": { "type": "boolean" },
+    "mutationImplemented": { "const": false },
+    "mutationAuthorized": { "const": false },
+    "privacy": { "$ref": "#/$defs/privacy" },
+    "nebulaClientSemantics": { "$ref": "#/$defs/nebulaClientSemantics" },
+    "localListener": { "$ref": "#/$defs/localListener" },
+    "planes": { "$ref": "#/$defs/planes" },
+    "passWallBypassEvidence": { "$ref": "#/$defs/passWallEvidence" },
+    "decision": { "$ref": "#/$defs/decision" },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    }
+  },
+  "$defs": {
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "targetValuesEmitted",
+        "addressesEmitted",
+        "pathsEmitted",
+        "credentialsAccepted",
+        "processIdsEmitted",
+        "executablePathsEmitted"
+      ],
+      "properties": {
+        "targetValuesEmitted": { "const": false },
+        "addressesEmitted": { "const": false },
+        "pathsEmitted": { "const": false },
+        "credentialsAccepted": { "const": false },
+        "processIdsEmitted": { "const": false },
+        "executablePathsEmitted": { "const": false }
+      }
+    },
+    "nebulaClientSemantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceContract",
+        "protocolWithoutPrefix",
+        "recognizedPrefixes",
+        "missingPortUsesConfiguredHostPort",
+        "hostnameResolution",
+        "websocketAuthority",
+        "websocketPath",
+        "wssHostnameRouteReadyByPrefixOnly"
+      ],
+      "properties": {
+        "sourceContract": { "const": "current-official-source" },
+        "protocolWithoutPrefix": { "const": "ws" },
+        "recognizedPrefixes": {
+          "type": "array",
+          "prefixItems": [{ "const": "ws" }, { "const": "wss" }],
+          "minItems": 2,
+          "maxItems": 2,
+          "items": false
+        },
+        "missingPortUsesConfiguredHostPort": { "const": true },
+        "hostnameResolution": { "const": "dns-first-address-only" },
+        "websocketAuthority": { "const": "resolved-ip-endpoint" },
+        "websocketPath": { "const": "/socket" },
+        "wssHostnameRouteReadyByPrefixOnly": { "const": false }
+      }
+    },
+    "addressClassCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "loopback",
+        "private",
+        "documentation",
+        "link-local",
+        "public",
+        "unspecified",
+        "multicast",
+        "unknown"
+      ],
+      "properties": {
+        "loopback": { "type": "integer", "minimum": 0 },
+        "private": { "type": "integer", "minimum": 0 },
+        "documentation": { "type": "integer", "minimum": 0 },
+        "link-local": { "type": "integer", "minimum": 0 },
+        "public": { "type": "integer", "minimum": 0 },
+        "unspecified": { "type": "integer", "minimum": 0 },
+        "multicast": { "type": "integer", "minimum": 0 },
+        "unknown": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "processIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "observedProcessCount",
+        "observedProcessNames",
+        "expectedNameMatched",
+        "singleOwner",
+        "executablePathsEmitted",
+        "processIdsEmitted"
+      ],
+      "properties": {
+        "state": { "enum": ["matched", "mismatched", "ambiguous", "query-unavailable", "not-listening"] },
+        "observedProcessCount": { "type": "integer", "minimum": 0 },
+        "observedProcessNames": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" }
+        },
+        "expectedNameMatched": { "type": "boolean" },
+        "singleOwner": { "type": "boolean" },
+        "executablePathsEmitted": { "const": false },
+        "processIdsEmitted": { "const": false }
+      }
+    },
+    "localListener": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "bindingCount", "bindingClassCounts", "processIdentity"],
+      "properties": {
+        "state": { "enum": ["listening", "not-listening", "query-unavailable"] },
+        "bindingCount": { "type": "integer", "minimum": 0 },
+        "bindingClassCounts": { "$ref": "#/$defs/addressClassCounts" },
+        "processIdentity": { "$ref": "#/$defs/processIdentity" }
+      }
+    },
+    "dns": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "addressCount",
+        "ipv4Count",
+        "ipv6Count",
+        "addressClassCounts",
+        "clientSelectionSemantics",
+        "selectedFirstClass",
+        "selectedFirstFamily",
+        "rawAnswersEmitted"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "not-configured",
+            "remote-probes-disabled",
+            "resolved",
+            "literal-address",
+            "no-address",
+            "nxdomain",
+            "temporary-failure",
+            "timeout",
+            "error"
+          ]
+        },
+        "addressCount": { "type": "integer", "minimum": 0 },
+        "ipv4Count": { "type": "integer", "minimum": 0 },
+        "ipv6Count": { "type": "integer", "minimum": 0 },
+        "addressClassCounts": { "$ref": "#/$defs/addressClassCounts" },
+        "clientSelectionSemantics": { "const": "first-address-only" },
+        "selectedFirstClass": {
+          "enum": ["none", "loopback", "private", "documentation", "link-local", "public", "unspecified", "multicast", "unknown"]
+        },
+        "selectedFirstFamily": { "enum": ["none", "ipv4", "ipv6", "unknown"] },
+        "rawAnswersEmitted": { "const": false }
+      }
+    },
+    "tcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "endpointEmitted"],
+      "properties": {
+        "outcome": {
+          "enum": [
+            "not-configured",
+            "remote-probes-disabled",
+            "dns-unavailable",
+            "reachable",
+            "connection-refused",
+            "timeout",
+            "network-unreachable",
+            "address-unreachable",
+            "error"
+          ]
+        },
+        "endpointEmitted": { "const": false }
+      }
+    },
+    "websocket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "outcome",
+        "statusCode",
+        "upgradeHeaderPresent",
+        "connectionHeaderUpgrade",
+        "acceptHeaderPresent",
+        "acceptHeaderValid",
+        "tlsCertificateValidated",
+        "authoritySemantics",
+        "responseHeadersEmitted"
+      ],
+      "properties": {
+        "path": { "const": "/socket" },
+        "outcome": {
+          "enum": [
+            "not-applicable",
+            "remote-probes-disabled",
+            "dns-unavailable",
+            "upgrade-accepted",
+            "plaintext-on-tls-port",
+            "tls-failure",
+            "non-101",
+            "auth-required",
+            "wrong-path",
+            "invalid-upgrade",
+            "protocol-error",
+            "connection-refused",
+            "timeout",
+            "network-unreachable",
+            "address-unreachable",
+            "error"
+          ]
+        },
+        "statusCode": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+        "upgradeHeaderPresent": { "type": "boolean" },
+        "connectionHeaderUpgrade": { "type": "boolean" },
+        "acceptHeaderPresent": { "type": "boolean" },
+        "acceptHeaderValid": { "type": "boolean" },
+        "tlsCertificateValidated": { "type": "boolean" },
+        "authoritySemantics": { "const": "resolved-ip-endpoint" },
+        "responseHeadersEmitted": { "const": false }
+      }
+    },
+    "plane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "configured",
+        "targetRef",
+        "targetKind",
+        "targetValueEmitted",
+        "port",
+        "transport",
+        "dns",
+        "tcp",
+        "websocket"
+      ],
+      "properties": {
+        "role": { "enum": ["game-data", "management"] },
+        "configured": { "type": "boolean" },
+        "targetRef": { "enum": ["game-data-plane", "management-plane"] },
+        "targetKind": { "enum": ["none", "hostname", "ip-literal"] },
+        "targetValueEmitted": { "const": false },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "transport": { "enum": ["tcp", "ws", "wss", "http", "https"] },
+        "dns": { "$ref": "#/$defs/dns" },
+        "tcp": { "$ref": "#/$defs/tcp" },
+        "websocket": { "$ref": "#/$defs/websocket" }
+      }
+    },
+    "planes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logicalRolesSeparated", "sameAuthority", "management", "gameData"],
+      "properties": {
+        "logicalRolesSeparated": { "const": true },
+        "sameAuthority": { "type": "boolean" },
+        "management": { "$ref": "#/$defs/plane" },
+        "gameData": { "$ref": "#/$defs/plane" }
+      }
+    },
+    "passWallEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requiredForAcceptance",
+        "expectedRoute",
+        "ruleRendered",
+        "ruleValidated",
+        "ruleActive",
+        "realFlowCounterDelta",
+        "selectedDestinationClass",
+        "actualIngressInterfaceClass",
+        "actualRouteClass",
+        "externalPathWitness",
+        "rawRuleTextEmitted",
+        "rawInterfaceNameEmitted",
+        "decision"
+      ],
+      "properties": {
+        "requiredForAcceptance": { "type": "boolean" },
+        "expectedRoute": { "enum": ["direct", "proxy", "block", "unknown"] },
+        "ruleRendered": { "$ref": "#/$defs/evidenceState" },
+        "ruleValidated": { "$ref": "#/$defs/evidenceState" },
+        "ruleActive": { "$ref": "#/$defs/evidenceState" },
+        "realFlowCounterDelta": { "$ref": "#/$defs/evidenceState" },
+        "selectedDestinationClass": {
+          "enum": ["loopback", "private", "documentation", "link-local", "public", "unspecified", "multicast", "unknown"]
+        },
+        "actualIngressInterfaceClass": { "enum": ["lan", "wan", "tunnel", "loopback", "unknown"] },
+        "actualRouteClass": { "enum": ["direct", "proxy", "block", "unknown"] },
+        "externalPathWitness": { "$ref": "#/$defs/evidenceState" },
+        "rawRuleTextEmitted": { "const": false },
+        "rawInterfaceNameEmitted": { "const": false },
+        "decision": { "enum": ["verified", "contradicted", "insufficient-evidence"] }
+      }
+    },
+    "evidenceState": { "enum": ["verified", "failed", "not-observed"] },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "ready", "blockerCount", "findingCount"],
+      "properties": {
+        "state": { "enum": ["ready", "blocked", "incomplete"] },
+        "ready": { "type": "boolean" },
+        "blockerCount": { "type": "integer", "minimum": 0 },
+        "findingCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "plane"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z0-9_]{1,128}$" },
+        "severity": { "enum": ["blocker", "warning", "info"] },
+        "plane": { "enum": ["local-listener", "game-data", "management", "passwall", "tool"] }
+      }
+    }
+  }
+}

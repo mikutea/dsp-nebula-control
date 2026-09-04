@@ -13,6 +13,7 @@ namespace DysonControl.Bridge
         public const string PluginGuid = "io.github.mikutea.dyson-control-bridge";
         public const string PluginName = "Dyson Control Bridge";
         public const string PluginVersion = "0.1.0";
+        public const string ReleaseVersion = "0.1.0-rc.1";
 
         private ConfigEntry<bool> bridgeEnabled;
         private ConfigEntry<string> controlRoot;
@@ -25,11 +26,16 @@ namespace DysonControl.Bridge
         private BridgeFileStore store;
         private GameSaveAdapter adapter;
         private PlayerRosterPublisher playerRoster;
+        private SimulationTelemetrySampler simulationTelemetry;
+        private LoadedSaveEvidencePublisher loadedSaveEvidence;
         private PendingSave pending;
         private bool operational;
         private long nextPollMonotonicTicks;
         private long lastSaveStartedMonotonicTicks = -1;
         private long startedAtUnixMs;
+        private long processStartedAtUnixMs;
+        private int processId;
+        private string bridgeSessionId;
         private long nextHeartbeatMonotonicTicks;
 
         private void Awake()
@@ -63,12 +69,52 @@ namespace DysonControl.Bridge
                     Logger.LogError("Dyson Control Bridge is fail-closed: " + compatibilityError);
                     return;
                 }
+                using (var currentProcess = Process.GetCurrentProcess())
+                {
+                    processId = currentProcess.Id;
+                    processStartedAtUnixMs = new DateTimeOffset(
+                        currentProcess.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds();
+                }
+                startedAtUnixMs = Math.Max(
+                    processStartedAtUnixMs,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                bridgeSessionId = Guid.NewGuid().ToString("D").ToLowerInvariant();
+                store.WriteRuntimeSession(new BridgeRuntimeSession
+                {
+                    SessionId = bridgeSessionId,
+                    PluginVersion = ReleaseVersion,
+                    ProcessId = processId,
+                    ProcessStartedAtUnixMs = processStartedAtUnixMs,
+                    BridgeStartedAtUnixMs = startedAtUnixMs,
+                    IssuedAtUnixMs = startedAtUnixMs
+                });
+                loadedSaveEvidence = new LoadedSaveEvidencePublisher(
+                    adapter.TryObserveLoadedSave,
+                    store.WriteLoadedSaveEvidence,
+                    store.RemoveLoadedSaveEvidence,
+                    bridgeSessionId,
+                    ReleaseVersion,
+                    processId,
+                    processStartedAtUnixMs,
+                    startedAtUnixMs);
+                simulationTelemetry = new SimulationTelemetrySampler(
+                    bridgeSessionId,
+                    processId,
+                    processStartedAtUnixMs,
+                    startedAtUnixMs,
+                    Stopwatch.Frequency);
                 operational = true;
-                startedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 WriteHeartbeat(startedAtUnixMs, BridgeMonotonicTime.NowTicks());
                 try
                 {
-                    playerRoster = new PlayerRosterPublisher(store);
+                    var noticeRuntimeState = NebulaNoticeRuntimeCompatibility.VerifyLoadedRuntime();
+                    if (!NebulaNoticeRuntimeCompatibility.ActionsEnabled(noticeRuntimeState))
+                    {
+                        Logger.LogWarning(
+                            "Nebula targeted player notices are disabled: " +
+                            NebulaNoticeRuntimeCompatibility.UnverifiedReasonCode + ".");
+                    }
+                    playerRoster = new PlayerRosterPublisher(store, noticeRuntimeState);
                     playerRoster.Tick(startedAtUnixMs);
                 }
                 catch (Exception exception)
@@ -77,7 +123,7 @@ namespace DysonControl.Bridge
                     playerRoster = null;
                     Logger.LogWarning("Player roster bridge is unavailable: " + exception.GetType().Name);
                 }
-                Logger.LogInfo("Dyson Control Bridge receipt V2 is enabled for signed local save requests and read-only player snapshots.");
+                Logger.LogInfo("Dyson Control Bridge receipt V2 is enabled with signed local save, roster, and actual simulation telemetry snapshots.");
             }
             catch (Exception exception)
             {
@@ -96,6 +142,42 @@ namespace DysonControl.Bridge
             var nowMonotonicTicks = BridgeMonotonicTime.NowTicks();
             try
             {
+                if (loadedSaveEvidence != null)
+                {
+                    try
+                    {
+                        if (loadedSaveEvidence.Tick(Math.Max(startedAtUnixMs, nowUnixMs)))
+                        {
+                            Logger.LogInfo("Published signed authoritative loaded-save pair evidence.");
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        try
+                        {
+                            loadedSaveEvidence.FailClosed();
+                        }
+                        catch
+                        {
+                            // Runtime session binding still makes any surviving
+                            // prior-generation evidence unusable to a strict reader.
+                        }
+                        loadedSaveEvidence = null;
+                        Logger.LogWarning("Loaded-save evidence failed closed: " + exception.GetType().Name);
+                    }
+                }
+                if (simulationTelemetry != null)
+                {
+                    try
+                    {
+                        PublishSimulationTelemetry(nowUnixMs, nowMonotonicTicks);
+                    }
+                    catch (Exception exception)
+                    {
+                        simulationTelemetry = null;
+                        Logger.LogWarning("Actual simulation telemetry failed closed: " + exception.GetType().Name);
+                    }
+                }
                 if (nowMonotonicTicks >= nextHeartbeatMonotonicTicks)
                 {
                     WriteHeartbeat(nowUnixMs, nowMonotonicTicks);
@@ -127,6 +209,12 @@ namespace DysonControl.Bridge
                 if (claim != null)
                 {
                     ProcessClaim(claim, nowUnixMs, nowMonotonicTicks);
+                    return;
+                }
+                var noticeClaim = store.TryClaimNextPlayerNotice();
+                if (noticeClaim != null)
+                {
+                    ProcessPlayerNoticeClaim(noticeClaim, nowUnixMs);
                 }
             }
             catch (Exception exception)
@@ -143,18 +231,36 @@ namespace DysonControl.Bridge
         {
             playerRoster?.Dispose();
             playerRoster = null;
+            loadedSaveEvidence?.Dispose();
+            loadedSaveEvidence = null;
+            simulationTelemetry = null;
         }
 
         private void WriteHeartbeat(long nowUnixMs, long nowMonotonicTicks)
         {
             store.WriteHeartbeat(
-                PluginVersion,
-                Process.GetCurrentProcess().Id,
+                ReleaseVersion,
+                processId,
                 startedAtUnixMs,
                 Math.Max(startedAtUnixMs, nowUnixMs));
             nextHeartbeatMonotonicTicks = BridgeMonotonicTime.DeadlineAfter(
                 nowMonotonicTicks,
                 BridgeMonotonicTime.DurationTicks(2000));
+        }
+
+        private void PublishSimulationTelemetry(long nowUnixMs, long nowMonotonicTicks)
+        {
+            var ready = GameMain.data != null && GameMain.isRunning && !GameMain.isPaused;
+            var telemetry = simulationTelemetry.Observe(
+                ready,
+                GameMain.gameTick,
+                FPSController.currentUPS,
+                Math.Max(startedAtUnixMs, nowUnixMs),
+                nowMonotonicTicks);
+            if (telemetry != null)
+            {
+                store.WriteSimulationTelemetry(telemetry);
+            }
         }
 
         private void ProcessClaim(BridgeClaim claim, long nowUnixMs, long nowMonotonicTicks)
@@ -232,6 +338,92 @@ namespace DysonControl.Bridge
                     capturedAtMonotonicTicks)
             };
             Logger.LogInfo("Accepted signed save request " + request.RequestId + ".");
+        }
+
+        private void ProcessPlayerNoticeClaim(BridgeClaim claim, long nowUnixMs)
+        {
+            if (!store.TryReadPlayerNoticeRequest(claim, out var request, out var parseError))
+            {
+                store.RejectPlayerNotice(claim);
+                Logger.LogWarning("Rejected a player notice request: " + parseError);
+                return;
+            }
+            if (store.PlayerNoticeReceiptExists(request.RequestId))
+            {
+                store.ArchiveCompletedPlayerNoticeDuplicate(claim);
+                return;
+            }
+            if (claim.Recovered)
+            {
+                CompletePlayerNotice(
+                    claim, request, "uncertain", true, true, "INTERRUPTED_UNCERTAIN", nowUnixMs, nowUnixMs);
+                return;
+            }
+            if (nowUnixMs < request.CreatedAtUnixMs - 5000 || nowUnixMs > request.ExpiresAtUnixMs)
+            {
+                CompletePlayerNotice(
+                    claim, request, "rejected", false, false, "REQUEST_EXPIRED", nowUnixMs, nowUnixMs);
+                return;
+            }
+            if (playerRoster == null)
+            {
+                CompletePlayerNotice(
+                    claim, request, "failed", false, false, "PLAYER_ROSTER_UNAVAILABLE", nowUnixMs, nowUnixMs);
+                return;
+            }
+
+            if (playerRoster.TryDispatchNotice(request, out var dispatchError))
+            {
+                CompletePlayerNotice(
+                    claim,
+                    request,
+                    "transport-dispatched",
+                    true,
+                    false,
+                    "NONE",
+                    nowUnixMs,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                Logger.LogInfo("Dispatched fixed player notice request " + request.RequestId + ".");
+                return;
+            }
+
+            var uncertain = dispatchError == "NOTICE_DISPATCH_UNCERTAIN";
+            CompletePlayerNotice(
+                claim,
+                request,
+                uncertain ? "uncertain" : "rejected",
+                uncertain,
+                uncertain,
+                dispatchError,
+                nowUnixMs,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        }
+
+        private void CompletePlayerNotice(
+            BridgeClaim claim,
+            PlayerNoticeRequest request,
+            string state,
+            bool mutationMayHaveOccurred,
+            bool recoveryRequired,
+            string errorCode,
+            long startedAtUnixMs,
+            long finishedAtUnixMs)
+        {
+            store.CompletePlayerNotice(claim, new PlayerNoticeReceipt
+            {
+                RequestId = request.RequestId,
+                State = state,
+                StartedAtUnixMs = startedAtUnixMs,
+                FinishedAtUnixMs = NormalizeFinishedAt(startedAtUnixMs, finishedAtUnixMs),
+                RosterSessionId = request.RosterSessionId,
+                RosterSequence = request.RosterSequence,
+                SessionPlayerId = request.SessionPlayerId,
+                TargetJoinedAtUnixMs = request.TargetJoinedAtUnixMs,
+                TemplateId = request.TemplateId,
+                MutationMayHaveOccurred = mutationMayHaveOccurred,
+                RecoveryRequired = recoveryRequired,
+                ErrorCode = errorCode
+            });
         }
 
         private void ObservePendingSave(long nowUnixMs, long nowMonotonicTicks)

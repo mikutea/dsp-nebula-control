@@ -2,15 +2,17 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { SaveTransferWorkspace } from './SaveTransferWorkspace'
-import { api, ApiError } from './api'
+import { api, ApiError, SAVE_PAIR_PROMOTION_CONFIRMATION } from './api'
 import type {
-  BackupCatalogItem, SavePairExportReceipt, SavePairImportReceipt, SessionUser
+  BackupCatalogItem, SavePairExportReceipt, SavePairImportReceipt,
+  SavePairPromotionPlan, SavePairPromotionReceipt, SessionUser
 } from './model'
 
 const originalCrypto = globalThis.crypto
 const originalCreateObjectUrl = URL.createObjectURL
 const originalRevokeObjectUrl = URL.revokeObjectURL
 const fixedRequestId = '11111111-2222-4333-8444-555555555555'
+const importedRequestId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 const fixedSha256 = 'ab'.repeat(32)
 
 afterEach(() => {
@@ -103,7 +105,141 @@ describe('save transfer workspace', () => {
     expect(screen.getByText(`import-${fixedRequestId}`)).toBeTruthy()
     expect(screen.getByText(/已进入 quarantine\/inbox/)).toBeTruthy()
     expect(screen.getByText(/restoreExecuted=false/)).toBeTruthy()
+    expect((screen.getByLabelText('隔离导入 request UUID') as HTMLInputElement).value).toBe(fixedRequestId)
     expect(screen.queryByRole('button', { name: /恢复/ })).toBeNull()
+  })
+
+  it('promotes a selected quarantine UUID only after preview, exact confirmation, and unchanged re-preview', async () => {
+    const randomUuid = installDeterministicCrypto()
+    const preview = vi.spyOn(api, 'previewSavePairPromotion').mockImplementation(async (requestId, importId) => ({
+      data: promotionPlanFixture(requestId, importId)
+    }))
+    const execute = vi.spyOn(api, 'executeSavePairPromotion').mockImplementation(
+      async (requestId, importId, confirmation) => {
+        expect(confirmation).toBe(SAVE_PAIR_PROMOTION_CONFIRMATION)
+        return { data: promotionReceiptFixture(requestId, importId) }
+      }
+    )
+    render(<SaveTransferWorkspace backups={backupFixtures()} user={administrator()} />)
+    const uuidCallsBeforePreview = randomUuid.mock.calls.length
+
+    fireEvent.change(screen.getByLabelText('隔离导入 request UUID'), {
+      target: { value: importedRequestId }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '生成零写入晋升预演' }))
+
+    expect(await screen.findByText('DRY-RUN · ZERO WRITE')).toBeTruthy()
+    expect(randomUuid.mock.calls.length).toBeGreaterThan(uuidCallsBeforePreview)
+    expect(preview).toHaveBeenCalledWith(fixedRequestId, importedRequestId, expect.any(AbortSignal))
+    expect(screen.getByText(`tx-${fixedRequestId}`)).toBeTruthy()
+    expect(screen.getByText(/canonical manifest/)).toBeTruthy()
+    expect(screen.getAllByText(/LIVE SAVE 不变/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/INBOX 保留/).length).toBeGreaterThan(0)
+
+    const executeButton = screen.getByRole('button', { name: '确认晋升为已验证保护点' }) as HTMLButtonElement
+    expect(executeButton.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('输入存档晋升确认词'), {
+      target: { value: SAVE_PAIR_PROMOTION_CONFIRMATION }
+    })
+    fireEvent.click(executeButton)
+
+    expect(await screen.findByText('VERIFIED BACKUP RECEIPT')).toBeTruthy()
+    expect(preview).toHaveBeenCalledTimes(2)
+    expect(preview.mock.calls[1]?.slice(0, 2)).toEqual([fixedRequestId, importedRequestId])
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('cd'.repeat(32))).toBeTruthy()
+    expect(screen.getByText(/live save 未选择、未写入/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: '准备下一次晋升' })).toBeTruthy()
+  })
+
+  it('clears confirmation and refuses execution when the required re-preview drifts', async () => {
+    installDeterministicCrypto()
+    const preview = vi.spyOn(api, 'previewSavePairPromotion')
+      .mockImplementationOnce(async (requestId, importId) => ({
+        data: promotionPlanFixture(requestId, importId)
+      }))
+      .mockImplementationOnce(async (requestId, importId) => ({
+        data: promotionPlanFixture(requestId, importId, { availableBytes: 999_999 })
+      }))
+    const execute = vi.spyOn(api, 'executeSavePairPromotion')
+    render(<SaveTransferWorkspace backups={backupFixtures()} user={administrator()} />)
+
+    fireEvent.change(screen.getByLabelText('隔离导入 request UUID'), {
+      target: { value: importedRequestId }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '生成零写入晋升预演' }))
+    await screen.findByText('DRY-RUN · ZERO WRITE')
+    const confirmation = screen.getByLabelText('输入存档晋升确认词') as HTMLInputElement
+    fireEvent.change(confirmation, { target: { value: SAVE_PAIR_PROMOTION_CONFIRMATION } })
+    fireEvent.click(screen.getByRole('button', { name: '确认晋升为已验证保护点' }))
+
+    expect(await screen.findByText(/预演证据已变化/)).toBeTruthy()
+    expect(preview).toHaveBeenCalledTimes(2)
+    expect(execute).not.toHaveBeenCalled()
+    expect(confirmation.value).toBe('')
+  })
+
+  it('shows preview-only effects when execution is default-off', async () => {
+    installDeterministicCrypto()
+    vi.spyOn(api, 'previewSavePairPromotion').mockImplementation(async (requestId, importId) => ({
+      data: promotionPlanFixture(requestId, importId, { executionEnabled: false })
+    }))
+    render(<SaveTransferWorkspace backups={backupFixtures()} user={administrator()} />)
+
+    fireEvent.change(screen.getByLabelText('隔离导入 request UUID'), {
+      target: { value: importedRequestId }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '生成零写入晋升预演' }))
+
+    expect(await screen.findByText('DEFAULT OFF')).toBeTruthy()
+    expect(screen.getByText('执行默认关闭')).toBeTruthy()
+    expect((screen.getByLabelText('输入存档晋升确认词') as HTMLInputElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: '确认晋升为已验证保护点' }) as HTMLButtonElement).disabled)
+      .toBe(true)
+    expect(screen.getByText('quarantinePreserved=true')).toBeTruthy()
+    expect(screen.getByText('liveSaveChanged=false')).toBeTruthy()
+  })
+
+  it.each([
+    [403, 'AUTHORIZATION_DENIED'],
+    [423, 'SAVE_PROMOTION_HOST_MUTATION_BLOCKED']
+  ])('locks promotion after status %i without exposing another mutation path', async (status, code) => {
+    installDeterministicCrypto()
+    vi.spyOn(api, 'previewSavePairPromotion').mockRejectedValue(
+      new ApiError(status, '服务端门禁拒绝晋升。', code)
+    )
+    render(<SaveTransferWorkspace backups={backupFixtures()} user={administrator()} />)
+
+    fireEvent.change(screen.getByLabelText('隔离导入 request UUID'), {
+      target: { value: importedRequestId }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '生成零写入晋升预演' }))
+
+    expect((await screen.findAllByText('FAIL-CLOSED')).length).toBeGreaterThan(0)
+    expect(screen.getByRole('alert').textContent).toContain(code)
+    expect((screen.getByRole('button', { name: '生成零写入晋升预演' }) as HTMLButtonElement).disabled)
+      .toBe(true)
+    expect(screen.getByText(/不会修改配置或绕过主机变更租约/)).toBeTruthy()
+  })
+
+  it('suppresses duplicate promotion previews before React commits the busy state', async () => {
+    installDeterministicCrypto()
+    let resolvePreview!: (value: { data: SavePairPromotionPlan }) => void
+    const preview = vi.spyOn(api, 'previewSavePairPromotion').mockImplementation(
+      (requestId, importId) => new Promise((resolve) => {
+        resolvePreview = () => resolve({ data: promotionPlanFixture(requestId, importId) })
+      })
+    )
+    render(<SaveTransferWorkspace backups={backupFixtures()} user={administrator()} />)
+    fireEvent.change(screen.getByLabelText('隔离导入 request UUID'), {
+      target: { value: importedRequestId }
+    })
+    const button = screen.getByRole('button', { name: '生成零写入晋升预演' })
+    fireEvent.click(button)
+    fireEvent.click(button)
+    expect(preview).toHaveBeenCalledTimes(1)
+    resolvePreview({ data: promotionPlanFixture(fixedRequestId, importedRequestId) })
+    expect(await screen.findByText('DRY-RUN · ZERO WRITE')).toBeTruthy()
   })
 
   it.each([
@@ -129,7 +265,7 @@ describe('save transfer workspace', () => {
     render(<SaveTransferWorkspace backups={backupFixtures()} user={administrator()} />)
 
     fireEvent.click(await screen.findByRole('button', { name: '创建已验证导出' }))
-    expect(await screen.findByText('FAIL-CLOSED')).toBeTruthy()
+    expect((await screen.findAllByText('FAIL-CLOSED')).length).toBeGreaterThan(0)
     expect(screen.getByRole('alert').textContent).toContain(code)
     expect((screen.getByRole('button', { name: '创建已验证导出' }) as HTMLButtonElement).disabled)
       .toBe(true)
@@ -181,17 +317,19 @@ describe('save transfer workspace', () => {
   })
 })
 
-function installDeterministicCrypto(): void {
+function installDeterministicCrypto() {
+  const randomUUID = vi.fn(() => fixedRequestId)
   Object.defineProperty(globalThis, 'crypto', {
     configurable: true,
     value: {
-      randomUUID: vi.fn(() => fixedRequestId),
+      randomUUID,
       getRandomValues: vi.fn((bytes: Uint8Array) => bytes),
       subtle: {
         digest: vi.fn(async () => new Uint8Array(32).fill(0xab).buffer)
       }
     }
   })
+  return randomUUID
 }
 
 function administrator(): SessionUser {
@@ -266,6 +404,63 @@ function importReceiptFixture(requestId: string, archiveBytes: number, archiveSh
     dsvBytes: 12,
     serverBytes: 13,
     completedAt: '2026-08-30T12:11:00.000Z',
+    restoreExecuted: false,
+    reused: false
+  }
+}
+
+function promotionPlanFixture(
+  requestId: string,
+  importRequestId: string,
+  overrides: Partial<SavePairPromotionPlan> = {}
+): SavePairPromotionPlan {
+  return {
+    format: 'dyson-control-save-promotion-plan',
+    schemaVersion: 1,
+    mode: 'dry-run',
+    requestId,
+    importRequestId,
+    inboxId: `import-${importRequestId}`,
+    backupId: `tx-${requestId}`,
+    saveName: 'fictional-cluster',
+    sourceArchiveSha256: fixedSha256,
+    dsvBytes: 12,
+    serverBytes: 13,
+    requiredBytes: 16_409,
+    availableBytes: 1_000_000,
+    allowed: true,
+    blockers: [],
+    reused: false,
+    requiredConfirmation: SAVE_PAIR_PROMOTION_CONFIRMATION,
+    effects: {
+      quarantinePreserved: true,
+      verifiedBackupCreated: true,
+      liveSaveChanged: false,
+      restoreExecuted: false
+    },
+    executionEnabled: true,
+    ...overrides
+  }
+}
+
+function promotionReceiptFixture(
+  requestId: string,
+  importRequestId: string
+): SavePairPromotionReceipt {
+  return {
+    format: 'dyson-control-save-promotion-receipt',
+    schemaVersion: 1,
+    operation: 'promote-import',
+    requestId,
+    importRequestId,
+    inboxId: `import-${importRequestId}`,
+    backupId: `tx-${requestId}`,
+    saveName: 'fictional-cluster',
+    sourceArchiveSha256: fixedSha256,
+    manifestSha256: 'cd'.repeat(32),
+    dsvBytes: 12,
+    serverBytes: 13,
+    completedAt: '2026-09-01T00:00:00.000Z',
     restoreExecuted: false,
     reused: false
   }

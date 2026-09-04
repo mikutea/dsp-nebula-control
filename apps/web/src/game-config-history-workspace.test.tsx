@@ -20,6 +20,17 @@ afterEach(() => {
 })
 
 describe('configuration history workspace', () => {
+  it('keeps demo history honest without requesting a production-only controller', () => {
+    const list = vi.spyOn(api, 'gameConfigHistory')
+
+    render(<ConfigHistoryWorkspace canManage demo onConfigurationChanged={() => undefined} />)
+
+    expect(screen.getByText('DEMO READ-ONLY')).toBeTruthy()
+    expect(screen.getByText('演示环境未装载持久化配置历史控制器')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '刷新历史' })).toBeNull()
+    expect(list).not.toHaveBeenCalled()
+  })
+
   it('loads the list first and keeps Viewer/Operator on a redacted read-only surface', async () => {
     const mutations = installHistoryReads()
     render(<ConfigHistoryWorkspace canManage={false} onConfigurationChanged={() => undefined} />)

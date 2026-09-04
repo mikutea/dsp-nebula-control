@@ -371,7 +371,8 @@ test('public evidence indexes cannot be reached through a symlink or reparse-poi
   try {
     await symlink(outside, path.join(root, 'acceptance', 'evidence'), process.platform === 'win32' ? 'junction' : 'dir')
   } catch (error) {
-    if (error?.code === 'EPERM' || error?.code === 'EACCES') {
+    if (error?.code === 'EPERM' || error?.code === 'EACCES' ||
+        (process.platform === 'win32' && error?.code === 'UNKNOWN')) {
       context.skip('this host does not permit creating a symlink or junction fixture')
       return
     }
@@ -444,7 +445,11 @@ async function writeEvidenceIndex(root, proof, requirementIds, value = evidenceI
 }
 
 function git(root, ...argumentsList) {
-  const result = spawnSync('git', argumentsList, { cwd: root, encoding: 'utf8', windowsHide: true })
+  const result = spawnSync('git', ['-c', `safe.directory=${root}`, ...argumentsList], {
+    cwd: root,
+    encoding: 'utf8',
+    windowsHide: true
+  })
   assert.equal(result.status, 0, result.stderr || `git ${argumentsList.join(' ')} failed`)
   return result
 }

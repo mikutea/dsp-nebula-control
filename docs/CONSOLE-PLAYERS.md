@@ -1,14 +1,16 @@
 # Console and player management boundaries
 
 The console provides bounded logs plus four typed lifecycle actions; it is not
-a terminal or generic file reader. The player workspace remains observation-
-only because the pinned Nebula interface does not verify the requested
-moderation mutations.
+a terminal or generic file reader. The player workspace exposes the minimized
+roster and one narrowly typed mutation: a fixed-template notice to one currently
+bound player session. Kick, ban, allow/deny-list, disconnect, permission and
+free-text chat controls remain unavailable.
 
 The repository includes API and browser implementations with deterministic
-tests. The Dyson Control bridge, console collector, browser reconnect behavior,
-and retention policy have not yet been verified on the target VM, so the
-corresponding acceptance requirements remain `implemented`, not `verified`.
+tests. The Dyson Control bridge, its runtime Nebula assembly-identity check,
+console collector, browser reconnect behavior, and retention policy have not
+yet been verified on the target VM, so the corresponding acceptance
+requirements remain `implemented`, not `verified`.
 
 ## Structured console
 
@@ -178,26 +180,59 @@ roster; window omissions are not converted into leave/join events.
 ### Signed capability proof and exclusions
 
 `GET /api/v1/players/capabilities` projects a fresh signed proof tied to the
-pinned Nebula repository/tag/commit and observed runtime file version. It marks
-roster observation available/read-only, while disconnect, kick, ban, whitelist
-and permission mutation are unavailable with fixed reason codes. HMACs, bridge
-session IDs and local paths are not returned. If the proof is missing, stale or
-invalid, every player action remains disabled even when the last roster remains
-displayable.
+pinned Nebula repository/tag/commit and observed runtime assembly identity. A
+proof whose runtime identity is not verified uses
+`source-contract-only-runtime-unverified`, sets `actionsEnabled=false`, and
+marks notice unavailable with `NEBULA_NOTICE_RUNTIME_UNVERIFIED`. Only an exact
+runtime identity match may use `runtime-assembly-identity-verified`, set
+`actionsEnabled=true`, and mark `notice` available with
+`UPSTREAM_TARGETED_NOTICE_PRIMITIVES_VERIFIED`. The parser cross-checks all
+three fields and rejects mixed states. HMACs, bridge session IDs and local paths
+are not returned. If the proof is missing, stale or invalid, every player
+action remains disabled even when the last roster remains displayable.
 
-The bridge has no verified kick, ban, whitelist, blacklist, notice, permission,
-or connection-close request. Those controls stay disabled rather than being
-simulated. A future implementation requires a fixed upstream operation,
-Administrator permission, explicit confirmation, audit records, timeout
-handling, and a documented recovery path. `PLY-002` is repository-implemented
-as an explicit fail-closed capability contract, not as working moderation.
+The canonical capability order is `observe-roster`, `disconnect`, `kick`,
+`ban`, `whitelist`, `blacklist`, `notice`, `permission`: exactly eight entries,
+with only roster observation and, after runtime identity verification, notice
+available. The remaining six mutations are always unavailable.
+
+The bridge has no verified kick, ban, whitelist, blacklist, permission, or safe
+connection-close request. Those controls stay disabled rather than being
+simulated. Notice is separate from moderation: callers select exactly one of
+`maintenance-5m`, `maintenance-now`, or `reconnect-required`; the Bridge owns
+the corresponding text and accepts no caller-supplied message. The request is
+HMAC-signed and binds the current roster session, roster sequence, opaque player
+session ID, join timestamp, short expiry and idempotency key.
+
+The notice workflow uses these Administrator-only APIs:
+
+- `POST /api/v1/players/notice/preview` performs a dry run;
+- `POST /api/v1/players/notice` requires literal `EXECUTE`, the independent
+  `DYSON_PLAYER_NOTICE_MUTATIONS_ENABLED=true` gate, a fresh runtime-verified
+  capability proof, and a still-matching signed roster target;
+- `GET /api/v1/players/notice/receipts/:requestId` performs read-only
+  reconciliation. It never creates a request or repeats dispatch.
+
+`transport-dispatched` means only that Nebula's target connection accepted the
+packet-dispatch call. Nebula v0.9.22 has no display or delivery acknowledgement,
+so neither the API nor UI may label that state “delivered” or “seen”. Notice has
+no rollback. If the API publishes a request but times out before reading a
+signed receipt, it returns `PLAYER_NOTICE_OUTCOME_UNKNOWN` with
+`mutationMayHaveOccurred=true` and `recoveryRequired=true`. The same request
+must be reconciled through the GET receipt route; automatic or operator-blind
+POST retry is forbidden. A reused request ID with different bound target or
+template evidence fails with `PLAYER_NOTICE_IDEMPOTENCY_CONFLICT`.
+
+`PLY-002` is repository-implemented as a fail-closed contract with only the
+fixed notice primitive enabled after runtime identity verification. It is not
+target-runtime verified and it does not claim general player moderation.
 
 Viewer, Operator and Administrator all receive the same minimized public roster
 because no privileged raw identity projection exists; no player export route is
-defined. Mutation would additionally require the Administrator-only
-`players.moderate` permission, but no mutation route is registered while every
-upstream capability remains unavailable. `PLY-003` is still only `implemented`
-until target-host evidence exists.
+defined. Notice additionally requires the Administrator-only
+`players.moderate` permission. Viewer and Operator cannot preview, execute, or
+reconcile it. `PLY-003` is still only `implemented` until target-host evidence
+exists.
 
 ## Target-host verification still required
 
@@ -206,10 +241,16 @@ Before either workspace is declared verified:
 1. install the exact bridge build against the pinned licensed DSP/Nebula tree;
 2. prove signed player snapshots for join, disconnect, session restart,
    unavailable collection, stale file, and HMAC tamper cases;
-3. reconnect a browser after log append, rotation, and truncation and verify no
+3. prove the fail-closed runtime assembly-identity transition and verify that a
+   mismatch, unreadable assembly, or stale proof keeps notice disabled;
+4. dispatch every fixed notice template to a disposable target session, prove
+   stale-session rejection, HMAC tamper rejection, idempotency conflict, signed
+   receipt reconciliation, timeout outcome-unknown handling, and no duplicate
+   dispatch; record `transport-dispatched` only, not client delivery;
+5. reconnect a browser after log append, rotation, and truncation and verify no
    duplicate or skipped structured records within the documented cursor model;
-4. inspect browser state and downloaded artifacts for secret, endpoint, path,
+6. inspect browser state and downloaded artifacts for secret, endpoint, path,
    Steam, and player-identity leakage;
-5. define and test the operational retention/export policy;
-6. retain private, non-sensitive evidence references without committing real
+7. define and test the operational retention/export policy;
+8. retain private, non-sensitive evidence references without committing real
    players or production logs.

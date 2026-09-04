@@ -193,6 +193,153 @@ describe('component update activation transaction', () => {
     expect(await pathExists(path.join(fixture.liveRoot, '.doorstop_version'))).toBe(false)
   })
 
+  it('binds rollback to config, mod-lock, protection manifest and exact save then restores and rereads each surface', async () => {
+    const fixture = await createFixture()
+    const old = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-rollback-old', targetVersion: '0.9.1'
+    }))
+    const candidate = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-rollback-new', targetVersion: '0.9.2',
+      payloads: [{
+        name: 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll',
+        bytes: Buffer.from('candidate-nebula')
+      }]
+    }))
+    const controlled = createAdapters({
+      smoke: async (request) => smokeResult(
+        request,
+        !(request.phase === 'candidate' && request.expectedVersion === '0.9.2')
+      )
+    })
+    const service = createService(fixture, controlled.adapters)
+    const installed = await service.execute(makeRequest(
+      'nebula', '0.9.1', old, initialComponentUpdateRevision
+    ))
+    const rolledBack = await service.execute(makeRequest(
+      'nebula', '0.9.2', candidate, installed.resultingRevision,
+      baseInventory({ nebula: '0.9.1' })
+    ))
+
+    expect(rolledBack).toMatchObject({
+      status: 'rolled-back', rollbackVerified: true, recoveryRequired: false,
+      rollbackBindingSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      rollbackSteps: {
+        component: 'verified', configuration: 'verified', serverModLock: 'verified',
+        pairedSave: 'verified', previousSaveLoad: 'verified'
+      }
+    })
+    expect(controlled.rollbackCalls.slice(-6)).toEqual([
+      'configuration', 'readback', 'server-mod-lock', 'readback', 'paired-save', 'readback'
+    ])
+    const journal = JSON.parse(await readFile(path.join(
+      fixture.projectRoot, '.dyson-control-updates', 'transactions', `${rolledBack.requestId}.json`
+    ), 'utf8')) as { transaction: { rollback: Record<string, unknown> } }
+    expect(journal.transaction.rollback).toMatchObject({
+      configurationSnapshotId: 'config-snapshot-fixture',
+      configurationRevision: '1'.repeat(64),
+      serverModLockSha256: '2'.repeat(64),
+      serverModLockRevision: '3'.repeat(64),
+      protectionManifestSha256: 'd'.repeat(64),
+      previousLoadedSaveIdentity: 'c'.repeat(64),
+      bindingSha256: rolledBack.rollbackBindingSha256
+    })
+  })
+
+  it('fails rollback closed when any non-component restoration cannot be executed or reread', async () => {
+    const fixture = await createFixture()
+    const old = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-config-old', targetVersion: '0.9.1'
+    }))
+    const candidate = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-config-new', targetVersion: '0.9.2'
+    }))
+    const controlled = createAdapters({
+      smoke: async (request) => smokeResult(
+        request,
+        !(request.phase === 'candidate' && request.expectedVersion === '0.9.2')
+      ),
+      restoreConfiguration: async () => { throw new Error('fixture restore unavailable') }
+    })
+    const service = createService(fixture, controlled.adapters)
+    const installed = await service.execute(makeRequest(
+      'nebula', '0.9.1', old, initialComponentUpdateRevision
+    ))
+    const failed = await service.execute(makeRequest(
+      'nebula', '0.9.2', candidate, installed.resultingRevision,
+      baseInventory({ nebula: '0.9.1' })
+    ))
+
+    expect(failed).toMatchObject({
+      status: 'rollback-failed', rollbackVerified: false, recoveryRequired: true,
+      failureCode: 'UPDATE_ROLLBACK_CONFIGURATION_FAILED',
+      rollbackSteps: {
+        component: 'verified', configuration: 'failed', serverModLock: 'pending',
+        pairedSave: 'pending', previousSaveLoad: 'pending'
+      }
+    })
+    expect((await service.getState()).recoveryRequired).toBe(true)
+    expect(controlled.rollbackCalls.slice(-1)).toEqual(['configuration'])
+  })
+
+  it('rejects old-version process/port health when the current startup generation lacks the exact previous save load', async () => {
+    const fixture = await createFixture()
+    const old = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-save-old', targetVersion: '0.9.1'
+    }))
+    const candidate = await stageComponent(fixture.stagingRoot, defaultStage({
+      artifactId: 'nebula-artifact-save-new', targetVersion: '0.9.2'
+    }))
+    const controlled = createAdapters({
+      smoke: async (request) => {
+        const healthy = smokeResult(request, true)
+        if (request.phase === 'candidate' && request.expectedVersion === '0.9.2') {
+          return smokeResult(request, false)
+        }
+        if (request.phase === 'rollback') {
+          return { ...healthy, loadedSaveIdentity: 'f'.repeat(64) }
+        }
+        return healthy
+      }
+    })
+    const service = createService(fixture, controlled.adapters)
+    const installed = await service.execute(makeRequest(
+      'nebula', '0.9.1', old, initialComponentUpdateRevision
+    ))
+    const failed = await service.execute(makeRequest(
+      'nebula', '0.9.2', candidate, installed.resultingRevision,
+      baseInventory({ nebula: '0.9.1' })
+    ))
+
+    expect(failed).toMatchObject({
+      status: 'rollback-failed', rollbackVerified: false, recoveryRequired: true,
+      failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackSteps: { previousSaveLoad: 'failed' }
+    })
+  })
+
+  it('rejects execution before protection or publication when rollback adapters are not wired', async () => {
+    const fixture = await createFixture()
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage())
+    const controlled = createAdapters()
+    const {
+      captureRollbackBaseline: _capture,
+      restoreRollbackConfiguration: _config,
+      restoreRollbackServerModLock: _lock,
+      restoreRollbackPairedSave: _save,
+      inspectRollbackReadback: _readback,
+      ...legacyAdapters
+    } = controlled.adapters
+    const service = createService(fixture, legacyAdapters)
+
+    await expect(service.execute(makeRequest(
+      'nebula', '0.9.1', staged, initialComponentUpdateRevision
+    ))).rejects.toMatchObject({ code: 'UPDATE_ROLLBACK_CAPABILITY_UNAVAILABLE' })
+    expect(controlled.protectionCalls).toBe(0)
+    expect(await pathExists(path.join(
+      fixture.liveRoot, 'plugins', 'nebula-NebulaMultiplayerMod', 'Nebula.dll'
+    ))).toBe(false)
+  })
+
   it('keeps DSP as an explicit manual Steam-client operation and invokes no adapter', async () => {
     const fixture = await createFixture()
     const controlled = createAdapters()
@@ -366,6 +513,8 @@ describe('component update activation transaction', () => {
           requestId: request.requestId,
           status: 'succeeded',
           backupId: `backup-${request.requestId}`,
+          manifestSha256: 'd'.repeat(64),
+          saveIdentity: 'c'.repeat(64),
           pairProtected: true,
           durable: true
         }
@@ -1358,10 +1507,16 @@ function createAdapters(options: {
   protectionValid?: boolean
   stoppedVerifier?: ComponentUpdateActivationAdapters['verifyStoppedState']
   protection?: ComponentUpdateActivationAdapters['createSaveProtectionPoint']
+  baseline?: NonNullable<ComponentUpdateActivationAdapters['captureRollbackBaseline']>
+  restoreConfiguration?: NonNullable<ComponentUpdateActivationAdapters['restoreRollbackConfiguration']>
+  restoreServerModLock?: NonNullable<ComponentUpdateActivationAdapters['restoreRollbackServerModLock']>
+  restorePairedSave?: NonNullable<ComponentUpdateActivationAdapters['restoreRollbackPairedSave']>
+  readback?: NonNullable<ComponentUpdateActivationAdapters['inspectRollbackReadback']>
   smoke?: ComponentUpdateActivationAdapters['smoke']
 } = {}) {
   const stopPhases: string[] = []
   const smokeCalls: string[] = []
+  const rollbackCalls: string[] = []
   let protectionCalls = 0
   const adapters: ComponentUpdateActivationAdapters = {
     verifyStoppedState: async (request, hostMutation) => {
@@ -1377,8 +1532,47 @@ function createAdapters(options: {
         requestId: request.requestId,
         status: 'succeeded',
         backupId: `backup-${request.requestId}`,
+        manifestSha256: 'd'.repeat(64),
+        saveIdentity: 'c'.repeat(64),
         pairProtected: true,
         durable: true
+      }
+    },
+    captureRollbackBaseline: async (request, hostMutation) => options.baseline === undefined ? ({
+      configurationSnapshotId: 'config-snapshot-fixture',
+      configurationRevision: '1'.repeat(64),
+      serverModLockSha256: '2'.repeat(64),
+      serverModLockRevision: '3'.repeat(64),
+      previousLoadedSaveIdentity: 'c'.repeat(64)
+    }) : await options.baseline(request, hostMutation),
+    restoreRollbackConfiguration: async (request, hostMutation) => {
+      rollbackCalls.push('configuration')
+      return options.restoreConfiguration === undefined
+        ? { restored: true, rereadVerified: true }
+        : await options.restoreConfiguration(request, hostMutation)
+    },
+    restoreRollbackServerModLock: async (request, hostMutation) => {
+      rollbackCalls.push('server-mod-lock')
+      return options.restoreServerModLock === undefined
+        ? { restored: true, rereadVerified: true }
+        : await options.restoreServerModLock(request, hostMutation)
+    },
+    restoreRollbackPairedSave: async (request, hostMutation) => {
+      rollbackCalls.push('paired-save')
+      return options.restorePairedSave === undefined
+        ? { restored: true, rereadVerified: true }
+        : await options.restorePairedSave(request, hostMutation)
+    },
+    inspectRollbackReadback: async (request, hostMutation) => {
+      rollbackCalls.push('readback')
+      if (options.readback !== undefined) return await options.readback(request, hostMutation)
+      return {
+      configurationSnapshotId: 'config-snapshot-fixture',
+      configurationRevision: '1'.repeat(64),
+      serverModLockSha256: '2'.repeat(64),
+      serverModLockRevision: '3'.repeat(64),
+      protectionManifestSha256: 'd'.repeat(64),
+      loadedSaveIdentity: 'c'.repeat(64)
       }
     },
     smoke: async (request, hostMutation) => {
@@ -1390,11 +1584,13 @@ function createAdapters(options: {
     adapters,
     stopPhases,
     smokeCalls,
+    rollbackCalls,
     get protectionCalls() { return protectionCalls }
   }
 }
 
 function smokeResult(request: FixedUpdateSmokeRequest, healthy: boolean) {
+  const generation = 'e'.repeat(64)
   return {
     component: request.component,
     observedVersion: request.expectedVersion,
@@ -1402,7 +1598,11 @@ function smokeResult(request: FixedUpdateSmokeRequest, healthy: boolean) {
     bepInExLoaded: healthy,
     nebulaLoaded: healthy,
     processHealthy: healthy,
-    portHealthy: healthy
+    portHealthy: healthy,
+    startupGenerationId: healthy ? generation : null,
+    bridgeHeartbeatGenerationId: healthy ? generation : null,
+    loadedSaveLogGenerationId: healthy ? generation : null,
+    loadedSaveIdentity: healthy ? request.expectedLoadedSaveIdentity : null
   }
 }
 

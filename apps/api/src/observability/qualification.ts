@@ -1,5 +1,6 @@
 import { parseServerObservabilitySnapshot } from './snapshot.js'
 import type { ObservabilityMetric, ServerObservabilitySnapshot } from './types.js'
+import { WINDOWS_BRIDGE_OBSERVABILITY_SOURCE } from './windows-bridge.js'
 
 export const LATE_GAME_QUALIFICATION_PROFILE = Object.freeze({
   id: 'late-game-6h-v1',
@@ -10,6 +11,8 @@ export const LATE_GAME_QUALIFICATION_PROFILE = Object.freeze({
   minimumMetricCoverage: 0.95,
   minimumUps: 55,
   minimumUpsComplianceRatio: 0.95,
+  minimumTps: 55,
+  minimumTpsComplianceRatio: 0.95,
   maximumHostCpuP95: 90,
   hottestCoreSaturationPercent: 97,
   maximumHottestCoreSaturationRatio: 0.1,
@@ -87,7 +90,13 @@ export function evaluateLateGameQualification(
     'Critical health samples remained within the allowed ratio.'
   ))
 
-  const ups = availableValues(running, (snapshot) => snapshot.simulation.ups)
+  // Only the Windows provider path that joined a signed, fresh, generation-
+  // bound bridge sample may contribute actual simulation rates. A fixture or
+  // targetUps value cannot satisfy either coverage gate.
+  const actualProviderRunning = running.filter(
+    (snapshot) => snapshot.source === WINDOWS_BRIDGE_OBSERVABILITY_SOURCE
+  )
+  const ups = availableValues(actualProviderRunning, (snapshot) => snapshot.simulation.ups)
   checks.push(coverageCheck('simulation.ups-coverage', ups.length, running.length))
   const upsCompliant = ups.filter((value) => value >= LATE_GAME_QUALIFICATION_PROFILE.minimumUps).length
   checks.push(ratioMinimumCheck(
@@ -96,6 +105,17 @@ export function evaluateLateGameQualification(
     'At least 95% of available running samples sustained 55 UPS or more.',
     { p05: percentile(ups, 0.05), median: percentile(ups, 0.5) },
     { minimumUps: LATE_GAME_QUALIFICATION_PROFILE.minimumUps }
+  ))
+
+  const tps = availableValues(actualProviderRunning, (snapshot) => snapshot.simulation.tps)
+  checks.push(coverageCheck('simulation.tps-coverage', tps.length, running.length))
+  const tpsCompliant = tps.filter((value) => value >= LATE_GAME_QUALIFICATION_PROFILE.minimumTps).length
+  checks.push(ratioMinimumCheck(
+    'simulation.tps-floor', ratio(tpsCompliant, tps.length),
+    LATE_GAME_QUALIFICATION_PROFILE.minimumTpsComplianceRatio,
+    'At least 95% of available running samples sustained 55 actual TPS or more.',
+    { p05: percentile(tps, 0.05), median: percentile(tps, 0.5) },
+    { minimumTps: LATE_GAME_QUALIFICATION_PROFILE.minimumTps }
   ))
 
   const hostCpu = availableValues(running, (snapshot) => snapshot.host.cpu.totalPercent)
@@ -164,6 +184,94 @@ export function evaluateLateGameQualification(
     ))
   }
 
+
+  const classifiedDependencies = ordered.filter(
+    (snapshot) => snapshot.automation.storageDependencyKind !== 'unknown'
+  )
+  checks.push(exactCoverageCheck(
+    'storage.dependency-classification',
+    classifiedDependencies.length,
+    ordered.length,
+    'Every retained sample classified the project storage dependency.'
+  ))
+
+  const projectRoot = availableBooleanValues(
+    ordered,
+    (snapshot) => snapshot.automation.projectRootAvailable
+  )
+  checks.push(exactCoverageCheck(
+    'storage.project-root-coverage',
+    projectRoot.length,
+    ordered.length,
+    'Project-root availability was observed in every retained sample.'
+  ))
+  checks.push(ratioMinimumCheck(
+    'storage.project-root-available',
+    ratio(projectRoot.filter(Boolean).length, projectRoot.length),
+    1,
+    'The configured project root remained continuously available.'
+  ))
+
+  const smbSamples = ordered.filter(
+    (snapshot) => snapshot.automation.storageDependencyKind === 'smb-global-mapping'
+  )
+  if (smbSamples.length > 0) {
+    const mappings = availableBooleanValues(
+      smbSamples,
+      (snapshot) => snapshot.automation.globalMappingAvailable
+    )
+    checks.push(exactCoverageCheck(
+      'storage.smb-mapping-coverage',
+      mappings.length,
+      smbSamples.length,
+      'SMB global-mapping availability was observed in every applicable sample.'
+    ))
+    checks.push(ratioMinimumCheck(
+      'storage.smb-mapping-available',
+      ratio(mappings.filter(Boolean).length, mappings.length),
+      1,
+      'The configured SMB global mapping remained continuously available.'
+    ))
+
+    const taskObservations = smbSamples.flatMap((snapshot) => {
+      const state = snapshot.automation.storageTask.state
+      const result = snapshot.automation.storageTask.lastResult
+      return state.status === 'available' && result.status === 'available'
+        ? [{ state: state.value, result: result.value }]
+        : []
+    })
+    checks.push(exactCoverageCheck(
+      'storage.recovery-task-coverage',
+      taskObservations.length,
+      smbSamples.length,
+      'Storage recovery-task state and result were observed in every applicable sample.'
+    ))
+    checks.push(ratioMinimumCheck(
+      'storage.recovery-task-healthy',
+      ratio(taskObservations.filter(({ state, result }) =>
+        (state === 'ready' || state === 'running') && result === 0).length, taskObservations.length),
+      1,
+      'The storage recovery task remained enabled and failure-free.'
+    ))
+  } else {
+    checks.push(notApplicableCheck(
+      'storage.smb-mapping-coverage',
+      'No retained sample declared an SMB global-mapping dependency.'
+    ))
+    checks.push(notApplicableCheck(
+      'storage.smb-mapping-available',
+      'No retained sample declared an SMB global-mapping dependency.'
+    ))
+    checks.push(notApplicableCheck(
+      'storage.recovery-task-coverage',
+      'No retained sample declared an SMB global-mapping dependency.'
+    ))
+    checks.push(notApplicableCheck(
+      'storage.recovery-task-healthy',
+      'No retained sample declared an SMB global-mapping dependency.'
+    ))
+  }
+
   const result: QualificationStatus = checks.some((check) => check.status === 'insufficient')
     ? 'insufficient'
     : checks.some((check) => check.status === 'fail')
@@ -203,6 +311,16 @@ function availableValues(
   return snapshots.flatMap((snapshot) => {
     const value = metricValue(select(snapshot))
     return value === null ? [] : [value]
+  })
+}
+
+function availableBooleanValues(
+  snapshots: readonly ServerObservabilitySnapshot[],
+  select: (snapshot: ServerObservabilitySnapshot) => ObservabilityMetric<boolean>
+): boolean[] {
+  return snapshots.flatMap((snapshot) => {
+    const metric = select(snapshot)
+    return metric.status === 'available' ? [metric.value] : []
   })
 }
 
@@ -262,6 +380,32 @@ function coverageCheck(id: string, observedSamples: number, totalSamples: number
     message: 'The metric was available for enough running samples.',
     observed: { value: observedRatio, observedSamples, totalSamples },
     required: { minimumRatio: required }
+  }
+}
+
+function exactCoverageCheck(
+  id: string,
+  observedSamples: number,
+  totalSamples: number,
+  message: string
+): QualificationCheck {
+  const observedRatio = ratio(observedSamples, totalSamples)
+  return {
+    id,
+    status: observedRatio !== null && observedRatio === 1 ? 'pass' : 'insufficient',
+    message,
+    observed: { value: observedRatio, observedSamples, totalSamples },
+    required: { minimumRatio: 1 }
+  }
+}
+
+function notApplicableCheck(id: string, message: string): QualificationCheck {
+  return {
+    id,
+    status: 'pass',
+    message,
+    observed: { mode: 'not-applicable' },
+    required: { storageDependencyKind: 'smb-global-mapping' }
   }
 }
 

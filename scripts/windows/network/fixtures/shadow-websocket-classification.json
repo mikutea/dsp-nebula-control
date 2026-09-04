@@ -1,0 +1,47 @@
+{
+  "protocol": "DYSON_NEBULA_WEBSOCKET_SHADOW_FIXTURE_V1",
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "upgrade-accepted",
+      "response": "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: fixture-value\r\n\r\n",
+      "expectedOutcome": "upgrade-accepted"
+    },
+    {
+      "name": "auth-required",
+      "response": "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+      "expectedOutcome": "auth-required"
+    },
+    {
+      "name": "wrong-path",
+      "response": "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+      "expectedOutcome": "wrong-path"
+    },
+    {
+      "name": "non-101",
+      "response": "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+      "expectedOutcome": "non-101"
+    },
+    {
+      "name": "invalid-upgrade",
+      "response": "HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive\r\n\r\n",
+      "expectedOutcome": "invalid-upgrade"
+    },
+    {
+      "name": "mismatched-accept",
+      "response": "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: mismatched-value\r\n\r\n",
+      "expectedOutcome": "invalid-upgrade"
+    },
+    {
+      "name": "protocol-error",
+      "response": "not-http\r\n\r\n",
+      "expectedOutcome": "protocol-error"
+    }
+  ],
+  "passthroughOutcomes": [
+    "plaintext-on-tls-port",
+    "tls-failure",
+    "connection-refused",
+    "timeout"
+  ]
+}

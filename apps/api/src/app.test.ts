@@ -1,14 +1,26 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import fs from 'node:fs'
+import { request as httpRequest } from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { buildApplication, type BuiltApplication } from './app.js'
 import { loadConfig } from './config.js'
 import type {
   LifecycleAction,
+  LifecycleBlockerCode,
   LifecycleMutationAdapter,
   LifecycleOperationContext,
   LifecyclePhaseResult,
   LifecyclePreview,
+  LifecyclePreviewContext,
+  ServerStatus,
   StatusProvider
 } from './domain.js'
+import { DemoProvider } from './providers/demo.js'
+import type {
+  LifecycleBrokerStatusEvidence,
+  WindowsLifecycleBrokerClient
+} from './providers/windows-lifecycle-broker.js'
 import type {
   LifecycleCoordinatorOutcome,
   LifecycleCoordinatorRequest,
@@ -17,7 +29,12 @@ import type {
 } from './host-mutation/lifecycle-coordinator.js'
 
 let application: BuiltApplication | null = null
-afterEach(async () => { if (application) await application.close(); application = null })
+const temporaryRoots: string[] = []
+afterEach(async () => {
+  if (application) await application.close()
+  application = null
+  for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
+})
 
 describe('control API', () => {
   it('echoes the immutable deployment release through the health contract', async () => {
@@ -31,7 +48,7 @@ describe('control API', () => {
     expect(health.statusCode).toBe(200)
     expect(health.headers['x-dyson-control-release']).toBe('v0.1.0-fixture.1')
     expect(health.json()).toMatchObject({
-      status: 'ok', version: '0.1.0', deploymentVersion: 'v0.1.0-fixture.1'
+      status: 'ok', version: '0.1.0-rc.1', deploymentVersion: 'v0.1.0-fixture.1'
     })
 
     const readiness = await application.app.inject({ method: 'GET', url: '/readyz' })
@@ -41,7 +58,7 @@ describe('control API', () => {
     expect(readiness.json()).toMatchObject({
       status: 'ready',
       provider: 'demo',
-      version: '0.1.0',
+      version: '0.1.0-rc.1',
       deploymentVersion: 'v0.1.0-fixture.1',
       checks: {
         deploymentVersion: 'not-applicable',
@@ -50,6 +67,52 @@ describe('control API', () => {
         activationRecovery: 'not-applicable'
       }
     })
+  })
+
+  it('fails closed before creating database or polling side effects when the lifecycle broker profile is unavailable', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fictional-dyson-broker-startup-'))
+    const dataDir = path.join(root, 'fictional-data')
+    const statusProvider = {
+      name: 'windows' as const,
+      collectStatus: vi.fn(async () => { throw new Error('UNEXPECTED_FIXTURE_STATUS_POLL') }),
+      previewLifecycle: vi.fn(async () => { throw new Error('UNEXPECTED_FIXTURE_LIFECYCLE_PREVIEW') })
+    } satisfies StatusProvider
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+
+    try {
+      const config = loadConfig({
+        NODE_ENV: 'test',
+        DYSON_PROVIDER: 'windows',
+        DYSON_PUBLIC_ORIGIN: 'http://127.0.0.1:13010',
+        DYSON_DEV_ADMIN_PASSWORD: 'fictional-administrator-password',
+        DYSON_DATA_DIR: dataDir,
+        DYSON_PROJECT_ROOT: path.join(root, 'fictional-project'),
+        DYSON_SCRIPT_ROOT: path.join(root, 'fictional-installed', 'scripts', 'windows'),
+        DYSON_RUNTIME_BOOTSTRAP_ROOT: path.join(root, 'fictional-runtime-bootstrap'),
+        DYSON_LIFECYCLE_ENABLED: 'true',
+        DYSON_LIFECYCLE_BROKER_PROFILE_FILE:
+          path.join(dataDir, 'lifecycle-broker', 'broker-profile.json'),
+        DYSON_RUNTIME_SERVICE_USER: '.\\FictionalDyson',
+        DYSON_BRIDGE_CONTROL_ROOT: path.join(root, 'fictional-bridge-control'),
+        DYSON_BRIDGE_SECRET_FILE: path.join(root, 'fictional-private', 'bridge.secret'),
+        DYSON_OBSERVABILITY_INTERVAL_MS: '1000'
+      })
+
+      await expect(buildApplication(config, { statusProvider })).rejects.toMatchObject({
+        code: 'LIFECYCLE_BROKER_PROFILE_UNAVAILABLE',
+        message: 'LIFECYCLE_BROKER_PROFILE_UNAVAILABLE'
+      })
+
+      expect(fs.existsSync(dataDir)).toBe(false)
+      expect(fs.existsSync(path.join(dataDir, 'control.db'))).toBe(false)
+      expect(setIntervalSpy).not.toHaveBeenCalled()
+      expect(statusProvider.collectStatus).not.toHaveBeenCalled()
+      expect(statusProvider.previewLifecycle).not.toHaveBeenCalled()
+      expect(fs.readdirSync(root)).toEqual([])
+    } finally {
+      setIntervalSpy.mockRestore()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
 
   it('reports bounded not-ready evidence when the configured status provider cannot inspect its root', async () => {
@@ -78,6 +141,181 @@ describe('control API', () => {
       }
     })
     expect(readiness.body).not.toContain('sensitive-host-path')
+  })
+
+  it('checks the lifecycle broker independently and rejects failed or semantically untrusted status evidence', async () => {
+    const config = createWindowsLifecycleConfig()
+    const status = await createWindowsStatus('running')
+    const trusted = trustedBrokerStatus(config.gamePort, 'running')
+    let current: LifecycleBrokerStatusEvidence | Error = trusted
+    const broker = createLifecycleBrokerClient(async () => {
+      if (current instanceof Error) throw current
+      return current
+    })
+    application = await buildApplication(config, {
+      statusProvider: createWindowsStatusProvider(status),
+      lifecycleAdapter: new ApiLifecycleAdapter(),
+      lifecycleBrokerClient: broker
+    })
+
+    const unknownRuntime: LifecycleBrokerStatusEvidence = {
+      ...trusted,
+      lifecycleState: 'unknown_unverifiable',
+      runtime: {
+        ...trusted.runtime,
+        lifecycleState: 'unknown_unverifiable',
+        process: { status: 'unverifiable', pid: null, owner: null, sessionId: null },
+        port: { port: config.gamePort, listenerCount: 0 },
+        pidFile: { present: false, valid: false }
+      }
+    }
+    const cases: Array<[string, LifecycleBrokerStatusEvidence | Error]> = [
+      ['broker call failed', new Error('C:\\fictional-private\\broker-status-failure')],
+      ['task binding invalid', { ...trusted, task: { ...trusted.task, valid: false } }],
+      ['runtime unverifiable', unknownRuntime],
+      ['profile port drift', {
+        ...trusted,
+        runtime: {
+          ...trusted.runtime,
+          port: { ...trusted.runtime.port, port: config.gamePort + 1 }
+        }
+      }]
+    ]
+
+    for (const [label, evidence] of cases) {
+      current = evidence
+      const readiness = await application.app.inject({ method: 'GET', url: '/readyz' })
+      expect(readiness.statusCode, label).toBe(503)
+      expect(readiness.json().checks.lifecycleBroker, label).toBe('fail')
+      expect(readiness.body, label).not.toContain('fictional-private')
+    }
+
+    current = trusted
+    const readiness = await application.app.inject({ method: 'GET', url: '/readyz' })
+    expect(readiness.statusCode).toBe(200)
+    expect(readiness.json()).toMatchObject({
+      status: 'ready',
+      checks: { statusProvider: 'pass', projectRoot: 'pass', lifecycleBroker: 'pass' }
+    })
+    expect(broker.status).toHaveBeenCalledTimes(cases.length + 1)
+  })
+
+  it('keeps start capability false when authoritative session or Steam preflight blocks execution', async () => {
+    const config = createWindowsLifecycleConfig()
+    const status = await createWindowsStatus('stopped')
+    let blocker: LifecycleBlockerCode = 'interactive-session-missing'
+    const adapter = new ConfigurablePreviewLifecycleAdapter((action) =>
+      blockedLifecyclePreview(action, blocker))
+    application = await buildApplication(config, {
+      statusProvider: createWindowsStatusProvider(status),
+      lifecycleAdapter: adapter,
+      lifecycleBrokerClient: createLifecycleBrokerClient(async () => trustedBrokerStatus(config.gamePort, 'stopped'))
+    })
+    const cookie = await loginAdministrator(application)
+
+    for (const expectedBlocker of ['interactive-session-missing', 'steam-session-missing'] as const) {
+      blocker = expectedBlocker
+      const response = await application.app.inject({
+        method: 'GET', url: '/api/v1/status', cookies: { dyson_session: cookie }
+      })
+      expect(response.statusCode).toBe(200)
+      expect(response.json().data.capabilities).toMatchObject({
+        start: false, save: false, gracefulStop: false, restart: false
+      })
+    }
+    expect(adapter.calls).toEqual(['preflight:start', 'preflight:start'])
+  })
+
+  it('keeps running lifecycle capabilities false when the signed save bridge preflight is blocked', async () => {
+    const config = createWindowsLifecycleConfig()
+    const status = await createWindowsStatus('running')
+    const adapter = new ConfigurablePreviewLifecycleAdapter((action) =>
+      blockedLifecyclePreview(action, 'save-trigger-unverified'))
+    application = await buildApplication(config, {
+      statusProvider: createWindowsStatusProvider(status),
+      lifecycleAdapter: adapter,
+      lifecycleBrokerClient: createLifecycleBrokerClient(async () => trustedBrokerStatus(config.gamePort, 'running'))
+    })
+    const cookie = await loginAdministrator(application)
+
+    const response = await application.app.inject({
+      method: 'GET', url: '/api/v1/status', cookies: { dyson_session: cookie }
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json().data.capabilities).toMatchObject({
+      start: false, save: false, gracefulStop: false, restart: false
+    })
+    expect(adapter.calls).toEqual(expect.arrayContaining([
+      'preflight:save', 'preflight:graceful-stop', 'preflight:restart'
+    ]))
+  })
+
+  it('applies one total deadline to a public lifecycle preview and aborts its adapter signal', async () => {
+    const config = {
+      ...loadConfig({
+        NODE_ENV: 'test', DYSON_PROVIDER: 'demo', DYSON_DEV_ADMIN_PASSWORD: 'test-password-long-enough',
+        DYSON_PUBLIC_ORIGIN: 'http://127.0.0.1:13010'
+      }),
+      lifecycleTimeoutMs: 25
+    }
+    const adapter = new DeferredPreviewLifecycleAdapter()
+    application = await buildApplication(config, { lifecycleAdapter: adapter })
+    const cookie = await loginAdministrator(application)
+    const startedAt = Date.now()
+
+    const response = await application.app.inject({
+      method: 'POST', url: '/api/v1/actions/lifecycle/preview',
+      headers: { origin: 'http://127.0.0.1:13010' }, cookies: { dyson_session: cookie },
+      payload: { action: 'save' }
+    })
+
+    expect(response.statusCode).toBe(503)
+    expect(response.json().error.code).toBe('LIFECYCLE_PREVIEW_FAILED')
+    expect(Date.now() - startedAt).toBeLessThan(1_000)
+    expect(adapter.signal?.aborted).toBe(true)
+    expect(adapter.signal?.reason).toBe('lifecycle-preview-timeout')
+  })
+
+  it('propagates a disconnected HTTP client to the public lifecycle preview signal', async () => {
+    const config = {
+      ...loadConfig({
+        NODE_ENV: 'test', DYSON_PROVIDER: 'demo', DYSON_DEV_ADMIN_PASSWORD: 'test-password-long-enough',
+        DYSON_PUBLIC_ORIGIN: 'http://127.0.0.1:13010'
+      }),
+      lifecycleTimeoutMs: 5_000
+    }
+    const adapter = new DeferredPreviewLifecycleAdapter()
+    application = await buildApplication(config, { lifecycleAdapter: adapter })
+    const address = await application.app.listen({ host: '127.0.0.1', port: 0 })
+    const cookie = await loginAdministrator(application)
+    const body = JSON.stringify({ action: 'save' })
+    let client: ReturnType<typeof httpRequest> | null = null
+    const clientClosed = new Promise<void>((resolve) => {
+      client = httpRequest(new URL('/api/v1/actions/lifecycle/preview', address), {
+        method: 'POST',
+        headers: {
+          origin: 'http://127.0.0.1:13010',
+          cookie: `dyson_session=${cookie}`,
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(body))
+        }
+      }, (response) => {
+        response.resume()
+        response.once('end', resolve)
+      })
+      client.once('error', () => resolve())
+      client.once('close', () => resolve())
+      client.end(body)
+    })
+
+    await withTimeout(adapter.started.promise, 1_000)
+    client!.destroy()
+    await withTimeout(adapter.aborted.promise, 1_000)
+    await withTimeout(clientClosed, 1_000)
+
+    expect(adapter.signal?.aborted).toBe(true)
+    expect(['http-request-aborted', 'http-client-disconnected']).toContain(adapter.signal?.reason)
   })
 
   it('protects status and supports authenticated refresh and lifecycle-preview jobs', async () => {
@@ -124,6 +362,12 @@ describe('control API', () => {
       action: 'graceful-stop', mode: 'dry-run', allowed: false, executionEnabled: false
     })
     expect(preview.json().data.preview.blockers).toContain('execution-disabled')
+    expect(preview.json().data.preview.blockers).toContain('lifecycle-broker-unavailable')
+    expect(preview.json().data.preview.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'interactive-session', status: 'pass' }),
+      expect.objectContaining({ id: 'steam-session', status: 'not-applicable' }),
+      expect.objectContaining({ id: 'lifecycle-broker', status: 'block' })
+    ]))
 
     const demoStartPreview = await application.app.inject({
       method: 'POST', url: '/api/v1/actions/lifecycle/preview',
@@ -326,7 +570,15 @@ class ApiLifecycleCoordinator implements LifecycleMutationCoordinator {
     ) => Promise<LifecycleCoordinatorOutcome<T>> | LifecycleCoordinatorOutcome<T>
   ): Promise<T> {
     this.requests.push(request)
-    const outcome = await operation({ signal: this.#controller.signal })
+    const outcome = await operation({
+      signal: this.#controller.signal,
+      assertActive: () => undefined,
+      toPowerShellBorrowArguments: () => [
+        '-DataRoot', 'C:\\fixture\\data',
+        '-LeaseInstanceId', '00000000-0000-4000-8000-000000000301',
+        '-LeaseToken', 'A'.repeat(43)
+      ]
+    })
     this.dispositions.push(outcome.disposition)
     return outcome.value
   }
@@ -336,20 +588,9 @@ class ApiLifecycleAdapter implements LifecycleMutationAdapter {
   readonly mutationEnabled = true
   readonly calls: string[] = []
 
-  async previewLifecycle(action: LifecycleAction): Promise<LifecyclePreview> {
+  async previewLifecycle(action: LifecycleAction, _context?: LifecyclePreviewContext): Promise<LifecyclePreview> {
     this.calls.push(`preflight:${action}`)
-    return {
-      collectedAt: new Date().toISOString(),
-      action,
-      mode: 'dry-run',
-      allowed: true,
-      executionEnabled: true,
-      checks: [{ id: 'execution-lock', status: 'pass', message: 'API fixture is ready' }],
-      blockers: [],
-      rollback: action === 'start'
-        ? { strategy: 'no-op', ready: true, summary: 'API fixture start changes no save files' }
-        : { strategy: 'paired-save-backup', ready: true, summary: 'API fixture rollback is ready' }
-    }
+    return allowedLifecyclePreview(action)
   }
 
   async createProtectionPoint(_context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
@@ -386,6 +627,191 @@ class ApiLifecycleAdapter implements LifecycleMutationAdapter {
 
   #unexpected(phase: string): Promise<never> {
     return Promise.reject(new Error(`Unexpected API fixture phase: ${phase}`))
+  }
+}
+
+type LifecyclePreviewFactory = (
+  action: LifecycleAction,
+  context?: LifecyclePreviewContext
+) => LifecyclePreview | Promise<LifecyclePreview>
+
+class ConfigurablePreviewLifecycleAdapter extends ApiLifecycleAdapter {
+  readonly #previewFor: LifecyclePreviewFactory
+
+  constructor(previewFor: LifecyclePreviewFactory) {
+    super()
+    this.#previewFor = previewFor
+  }
+
+  override async previewLifecycle(
+    action: LifecycleAction,
+    context?: LifecyclePreviewContext
+  ): Promise<LifecyclePreview> {
+    this.calls.push(`preflight:${action}`)
+    return await this.#previewFor(action, context)
+  }
+}
+
+class DeferredPreviewLifecycleAdapter extends ApiLifecycleAdapter {
+  readonly started = deferred<void>()
+  readonly aborted = deferred<void>()
+  signal: AbortSignal | null = null
+
+  override async previewLifecycle(
+    action: LifecycleAction,
+    context?: LifecyclePreviewContext
+  ): Promise<LifecyclePreview> {
+    this.calls.push(`preflight:${action}`)
+    if (!context?.signal) throw new Error('FIXTURE_PREVIEW_SIGNAL_MISSING')
+    this.signal = context.signal
+    this.started.resolve()
+    return await new Promise<LifecyclePreview>((_resolve, reject) => {
+      const onAbort = () => {
+        context.signal?.removeEventListener('abort', onAbort)
+        this.aborted.resolve()
+        reject(new Error('FIXTURE_PREVIEW_ABORTED'))
+      }
+      if (context.signal!.aborted) onAbort()
+      else context.signal!.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+}
+
+function allowedLifecyclePreview(action: LifecycleAction): LifecyclePreview {
+  return {
+    collectedAt: new Date().toISOString(),
+    action,
+    mode: 'dry-run',
+    allowed: true,
+    executionEnabled: true,
+    checks: [{ id: 'execution-lock', status: 'pass', message: 'API fixture is ready' }],
+    blockers: [],
+    rollback: action === 'start'
+      ? { strategy: 'no-op', ready: true, summary: 'API fixture start changes no save files' }
+      : { strategy: 'paired-save-backup', ready: true, summary: 'API fixture rollback is ready' }
+  }
+}
+
+function blockedLifecyclePreview(
+  action: LifecycleAction,
+  blocker: LifecycleBlockerCode
+): LifecyclePreview {
+  const preview = allowedLifecyclePreview(action)
+  return {
+    ...preview,
+    allowed: false,
+    checks: [{ id: 'execution-lock', status: 'block', message: 'Authoritative fixture preflight blocked.' }],
+    blockers: [blocker]
+  }
+}
+
+function createWindowsLifecycleConfig() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fictional-dyson-lifecycle-app-'))
+  temporaryRoots.push(root)
+  return loadConfig({
+    NODE_ENV: 'test',
+    DYSON_PROVIDER: 'windows',
+    DYSON_PUBLIC_ORIGIN: 'http://127.0.0.1:13010',
+    DYSON_DEV_ADMIN_PASSWORD: 'test-password-long-enough',
+    DYSON_DATA_DIR: path.join(root, 'fictional-data'),
+    DYSON_PROJECT_ROOT: path.join(root, 'fictional-project'),
+    DYSON_SCRIPT_ROOT: path.join(root, 'fictional-installed', 'scripts', 'windows'),
+    DYSON_RUNTIME_BOOTSTRAP_ROOT: path.join(root, 'fictional-runtime-bootstrap'),
+    DYSON_LIFECYCLE_ENABLED: 'true',
+    DYSON_LIFECYCLE_BROKER_PROFILE_FILE:
+      path.join(root, 'fictional-data', 'lifecycle-broker', 'broker-profile.json'),
+    DYSON_RUNTIME_SERVICE_USER: '.\\FictionalDyson',
+    DYSON_BRIDGE_CONTROL_ROOT: path.join(root, 'fictional-bridge-control'),
+    DYSON_BRIDGE_SECRET_FILE: path.join(root, 'fictional-private', 'bridge.secret'),
+    DYSON_OBSERVABILITY_INTERVAL_MS: '0'
+  })
+}
+
+async function createWindowsStatus(state: 'running' | 'stopped'): Promise<ServerStatus> {
+  const status = await new DemoProvider().collectStatus()
+  return {
+    ...status,
+    state,
+    automation: { ...status.automation, projectRootAvailable: true }
+  }
+}
+
+function createWindowsStatusProvider(status: ServerStatus): StatusProvider {
+  return {
+    name: 'windows',
+    collectStatus: vi.fn(async () => status),
+    previewLifecycle: vi.fn(async () => { throw new Error('UNEXPECTED_STATUS_PROVIDER_PREVIEW') })
+  }
+}
+
+function trustedBrokerStatus(
+  gamePort: number,
+  state: 'running' | 'stopped'
+): LifecycleBrokerStatusEvidence {
+  const running = state === 'running'
+  const lifecycleState = running ? 'running_verified' as const : 'stopped_verified' as const
+  return {
+    lifecycleState,
+    task: {
+      valid: true,
+      server: { name: 'Dyson-Nebula-Server', path: '\\', state: running ? 'Running' : 'Ready' },
+      stop: { name: 'Dyson-Nebula-Stop', path: '\\', state: 'Ready' }
+    },
+    runtime: {
+      lifecycleState,
+      session: { status: 'verified', id: 7, count: 1 },
+      steam: { status: 'verified', pid: 1101, sessionId: 7 },
+      process: running
+        ? { status: 'verified', pid: 2202, owner: '.\\FictionalDyson', sessionId: 7 }
+        : { status: 'absent', pid: null, owner: null, sessionId: null },
+      port: { port: gamePort, listenerCount: running ? 1 : 0 },
+      pidFile: { present: running, valid: running }
+    }
+  }
+}
+
+function createLifecycleBrokerClient(status: WindowsLifecycleBrokerClient['status']) {
+  return {
+    preflight: vi.fn(async () => { throw new Error('UNEXPECTED_BROKER_PREFLIGHT') }),
+    dispatch: vi.fn(async () => { throw new Error('UNEXPECTED_BROKER_DISPATCH') }),
+    verify: vi.fn(async () => { throw new Error('UNEXPECTED_BROKER_VERIFY') }),
+    status: vi.fn(status)
+  } satisfies WindowsLifecycleBrokerClient
+}
+
+async function loginAdministrator(target: BuiltApplication): Promise<string> {
+  const response = await target.app.inject({
+    method: 'POST', url: '/api/v1/auth/login',
+    headers: { origin: 'http://127.0.0.1:13010' },
+    payload: { role: 'administrator', password: 'test-password-long-enough' }
+  })
+  expect(response.statusCode).toBe(200)
+  const cookie = response.cookies[0]?.value
+  expect(cookie).toBeTruthy()
+  return cookie!
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('FIXTURE_TIMEOUT')), timeoutMs)
+      })
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 

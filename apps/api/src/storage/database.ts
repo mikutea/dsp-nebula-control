@@ -67,6 +67,23 @@ interface JobRow {
   error_code: string | null
 }
 
+export interface JobPageCursor {
+  createdAt: string
+  id: string
+}
+
+export interface JobPageQuery {
+  limit: number
+  cursor: JobPageCursor | null
+  kind: JobKind | null
+  state: JobState | null
+}
+
+export interface StoredJobPage {
+  items: JobRecord[]
+  nextCursor: JobPageCursor | null
+}
+
 interface LifecycleRunRow {
   job_id: string
   action: LifecycleAction
@@ -193,6 +210,7 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
         error_code TEXT
       );
       CREATE INDEX IF NOT EXISTS jobs_created_at_idx ON jobs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS jobs_created_at_id_idx ON jobs(created_at DESC, id DESC);
       CREATE TABLE IF NOT EXISTS lifecycle_runs (
         job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
         action TEXT NOT NULL,
@@ -285,6 +303,13 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
       );
       CREATE INDEX IF NOT EXISTS observability_samples_sequence_idx
         ON observability_samples(sequence DESC);
+      CREATE TABLE IF NOT EXISTS observability_long_samples (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        observed_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL CHECK(length(payload_json) BETWEEN 2 AND 65536)
+      );
+      CREATE INDEX IF NOT EXISTS observability_long_samples_sequence_idx
+        ON observability_long_samples(sequence DESC);
       CREATE TABLE IF NOT EXISTS observability_alert_state (
         singleton_id INTEGER PRIMARY KEY NOT NULL CHECK(singleton_id = 1),
         schema_version INTEGER NOT NULL CHECK(schema_version = 1),
@@ -390,10 +415,46 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
       ).run(observedAt, payloadJson)
       this.#database.prepare(`
         DELETE FROM observability_samples
-        WHERE sequence NOT IN (
-          SELECT sequence FROM observability_samples ORDER BY sequence DESC LIMIT ?
-        )
+        WHERE sequence <= COALESCE((
+          SELECT sequence FROM observability_samples ORDER BY sequence DESC LIMIT 1 OFFSET ?
+        ), -1)
       `).run(capacity)
+    })
+  }
+
+  appendObservabilitySampleWithLongWindow(
+    observedAt: string,
+    payloadJson: string,
+    capacity: number,
+    longPayloadJson: string,
+    longCapacity: number
+  ): void {
+    this.#validateObservabilityWrite(observedAt, payloadJson, capacity)
+    if (!Number.isInteger(longCapacity) || longCapacity < 1 || longCapacity > 86_400
+        || typeof longPayloadJson !== 'string' || longPayloadJson.includes('\0')
+        || Buffer.byteLength(longPayloadJson, 'utf8') < 2
+        || Buffer.byteLength(longPayloadJson, 'utf8') > 64 * 1_024) {
+      throw new Error('Observability long-window payload is invalid')
+    }
+    this.#transaction(() => {
+      this.#database.prepare(
+        'INSERT INTO observability_samples(observed_at, payload_json) VALUES (?, ?)'
+      ).run(observedAt, payloadJson)
+      this.#database.prepare(`
+        DELETE FROM observability_samples
+        WHERE sequence <= COALESCE((
+          SELECT sequence FROM observability_samples ORDER BY sequence DESC LIMIT 1 OFFSET ?
+        ), -1)
+      `).run(capacity)
+      this.#database.prepare(
+        'INSERT INTO observability_long_samples(observed_at, payload_json) VALUES (?, ?)'
+      ).run(observedAt, longPayloadJson)
+      this.#database.prepare(`
+        DELETE FROM observability_long_samples
+        WHERE sequence <= COALESCE((
+          SELECT sequence FROM observability_long_samples ORDER BY sequence DESC LIMIT 1 OFFSET ?
+        ), -1)
+      `).run(longCapacity)
     })
   }
 
@@ -405,6 +466,22 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
       SELECT payload_json FROM (
         SELECT sequence, payload_json
         FROM observability_samples
+        ORDER BY sequence DESC
+        LIMIT ?
+      )
+      ORDER BY sequence ASC
+    `).all(capacity) as unknown as Array<{ payload_json: string }>
+    return rows.map((row) => row.payload_json)
+  }
+
+  listObservabilityLongSamples(capacity: number): string[] {
+    if (!Number.isInteger(capacity) || capacity < 1 || capacity > 86_400) {
+      throw new Error('Observability long-window capacity is invalid')
+    }
+    const rows = this.#database.prepare(`
+      SELECT payload_json FROM (
+        SELECT sequence, payload_json
+        FROM observability_long_samples
         ORDER BY sequence DESC
         LIMIT ?
       )
@@ -601,8 +678,41 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
   }
 
   listJobs(limit = 20): JobRecord[] {
-    const rows = this.#database.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit) as unknown as JobRow[]
+    const rows = this.#database.prepare(
+      'SELECT * FROM jobs ORDER BY created_at DESC, id DESC LIMIT ?'
+    ).all(limit) as unknown as JobRow[]
     return rows.map((row) => this.#toJob(row))
+  }
+
+  listJobPage(query: JobPageQuery): StoredJobPage {
+    if (!Number.isSafeInteger(query.limit) || query.limit < 1 || query.limit > 5_000) {
+      throw new Error('Invalid job page limit')
+    }
+    const conditions: string[] = []
+    const values: Array<string | number> = []
+    if (query.cursor !== null) {
+      conditions.push('(created_at < ? OR (created_at = ? AND id < ?))')
+      values.push(query.cursor.createdAt, query.cursor.createdAt, query.cursor.id)
+    }
+    if (query.kind !== null) {
+      conditions.push('kind = ?')
+      values.push(query.kind)
+    }
+    if (query.state !== null) {
+      conditions.push('state = ?')
+      values.push(query.state)
+    }
+    const where = conditions.length === 0 ? '' : ` WHERE ${conditions.join(' AND ')}`
+    const rows = this.#database.prepare(
+      `SELECT * FROM jobs${where} ORDER BY created_at DESC, id DESC LIMIT ?`
+    ).all(...values, query.limit + 1) as unknown as JobRow[]
+    const hasMore = rows.length > query.limit
+    const pageRows = hasMore ? rows.slice(0, query.limit) : rows
+    const last = pageRows.at(-1)
+    return {
+      items: pageRows.map((row) => this.#toJob(row)),
+      nextCursor: hasMore && last ? { createdAt: last.created_at, id: last.id } : null
+    }
   }
 
   createSaveJob(
@@ -1655,6 +1765,20 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
         typeof player.location !== 'string' ||
         !/^(?:deep-space|planet:[1-9][0-9]{0,9}|star:[1-9][0-9]{0,9})$/.test(player.location)) {
       throw new PlayerSnapshotError('PLAYER_HISTORY_PERSISTENCE_INVALID')
+    }
+  }
+
+  #validateObservabilityWrite(observedAt: string, payloadJson: string, capacity: number): void {
+    if (!Number.isInteger(capacity) || capacity < 1 || capacity > 4_096) {
+      throw new Error('Observability capacity is invalid')
+    }
+    if (typeof observedAt !== 'string' || Number.isNaN(Date.parse(observedAt)) || observedAt.length > 64) {
+      throw new Error('Observability timestamp is invalid')
+    }
+    if (typeof payloadJson !== 'string' || payloadJson.includes('\0')
+        || Buffer.byteLength(payloadJson, 'utf8') < 2
+        || Buffer.byteLength(payloadJson, 'utf8') > 256 * 1_024) {
+      throw new Error('Observability payload is invalid')
     }
   }
 

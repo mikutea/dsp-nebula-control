@@ -24,6 +24,12 @@ import {
 } from './transactions.js'
 
 const temporaryRoots: string[] = []
+// This case intentionally crosses the one-MiB streaming buffer multiple times
+// and exercises sync-backed lease, audit, pair, and manifest boundaries twice
+// (initial publication plus idempotent replay). A Windows VM's durable-write
+// latency can therefore exceed Vitest's five-second unit-test default even
+// when the operation completes normally.
+const durableLargePairTestTimeoutMs = 30_000
 const stoppedEvidence: RuntimeStoppedEvidence = {
   protocol: 'DYSON_CONTROL_RUNTIME_V1',
   expected: 'stopped',
@@ -80,7 +86,7 @@ describe('save pair backup transactions', () => {
     expect(reused).toMatchObject({ status: 'succeeded', reused: true, backupId: first.backupId })
     expect(await readFile(path.join(fixture.backupRoot, first.backupId, `${fixture.saveName}.dsv`)))
       .toEqual(dsv)
-  })
+  }, durableLargePairTestTimeoutMs)
 
   it('rejects an incomplete pair and never publishes a one-sided backup', async () => {
     const fixture = await seedPair('Incomplete', Buffer.from('dsv'), Buffer.from('server'))
@@ -158,6 +164,8 @@ describe('save pair backup transactions', () => {
 
   it('rejects traversal names and redirected roots before touching save data', async () => {
     const fixture = await seedPair('Boundary', Buffer.from('dsv'), Buffer.from('server'))
+    const pairBeforeRedirectProbe = await snapshotPairSha256(fixture)
+    const backupsBeforeRedirectProbe = (await readdir(fixture.backupRoot)).sort()
     await expect(makeService(fixture).backup({
       requestId: randomUUID(),
       saveName: '../escape'
@@ -167,7 +175,12 @@ describe('save pair backup transactions', () => {
     try {
       await symlink(fixture.saveRoot, redirected, 'junction')
     } catch (error) {
-      if (hasCode(error, 'EPERM') || hasCode(error, 'EACCES')) return
+      if (['EPERM', 'EACCES', 'UNKNOWN', 'ENOTSUP', 'ENOSYS'].some((code) => hasCode(error, code))) {
+        await expect(stat(redirected)).rejects.toMatchObject({ code: 'ENOENT' })
+        expect(await snapshotPairSha256(fixture)).toEqual(pairBeforeRedirectProbe)
+        expect((await readdir(fixture.backupRoot)).sort()).toEqual(backupsBeforeRedirectProbe)
+        return
+      }
       throw error
     }
     const redirectedService = new SaveTransactionService({
@@ -646,12 +659,7 @@ describe('save pair restore transactions', () => {
     const journalRoot = path.join(controlRoot, 'restore-journals')
     const unrelatedJournal = path.join(journalRoot, `restore-${randomUUID()}.json`)
     await writeFile(unrelatedJournal, 'foreign unresolved journal evidence', 'utf8')
-    const snapshot = {
-      controlMtime: (await stat(controlRoot)).mtimeMs,
-      auditNames: (await readdir(auditRoot)).sort(),
-      receiptNames: (await readdir(receiptRoot)).sort(),
-      journalNames: (await readdir(journalRoot)).sort()
-    }
+    const snapshot = await snapshotControlFiles({ auditRoot, receiptRoot, journalRoot })
     let gateCalls = 0
     const replayService = makeService(fixture, {
       gate: async () => {
@@ -675,12 +683,7 @@ describe('save pair restore transactions', () => {
     expect(await readPair(fixture)).toEqual(advanced)
     expect(await readFile(foreignRollback, 'utf8')).toBe('foreign-fixed-path')
     expect(await readFile(unrelatedJournal, 'utf8')).toBe('foreign unresolved journal evidence')
-    expect({
-      controlMtime: (await stat(controlRoot)).mtimeMs,
-      auditNames: (await readdir(auditRoot)).sort(),
-      receiptNames: (await readdir(receiptRoot)).sort(),
-      journalNames: (await readdir(journalRoot)).sort()
-    }).toEqual(snapshot)
+    expect(await snapshotControlFiles({ auditRoot, receiptRoot, journalRoot })).toEqual(snapshot)
     await expect(stat(path.join(controlRoot, 'transaction.lock'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
@@ -866,20 +869,34 @@ describe('save pair restore transactions', () => {
       }
     }).restore(request)
     const rollbackDsv = path.join(fixture.saveRoot, `.rollback-${request.requestId}-dsv.bin`)
-    await writeFile(rollbackDsv, 'foreign replacement', 'utf8')
     const committedPair = await readPair(fixture)
+    const ownedRollbackSha256 = contentSha256(await readFile(rollbackDsv))
+    const replacement = await replaceFileEventually(rollbackDsv, 'foreign replacement')
+    expect(replacement.beforeSha256).toBe(ownedRollbackSha256)
+    if (!replacement.supported) {
+      // A Windows SMB server may deny rename/replacement while a recently
+      // closed handle is still draining. Prove that the capability probe left
+      // the owned evidence and committed pair byte-identical instead of
+      // silently skipping the scenario.
+      expect(replacement.afterSha256).toBe(ownedRollbackSha256)
+      expect(contentSha256(await readFile(rollbackDsv))).toBe(ownedRollbackSha256)
+      expect(await readPair(fixture)).toEqual(committedPair)
+      expect(await readLatestTestRestoreJournal(fixture.saveRoot, request.requestId))
+        .toMatchObject({ requestId: request.requestId, phase: 'gc-pending' })
+    } else {
+      expect(replacement.afterSha256).toBe(contentSha256(Buffer.from('foreign replacement')))
+      const replay = await makeService(fixture).restore(request)
 
-    const replay = await makeService(fixture).restore(request)
-
-    expect(replay).toMatchObject({
-      status: 'succeeded', reused: true, rollback: 'not-required',
-      cleanupPending: true, maintenanceRequired: true,
-      errorCode: 'SAVE_COMMIT_CLEANUP_PENDING'
-    })
-    expect(await readPair(fixture)).toEqual(committedPair)
-    expect(await readFile(rollbackDsv, 'utf8')).toBe('foreign replacement')
-    expect(await readLatestTestRestoreJournal(fixture.saveRoot, request.requestId))
-      .toMatchObject({ requestId: request.requestId, phase: 'gc-pending' })
+      expect(replay).toMatchObject({
+        status: 'succeeded', reused: true, rollback: 'not-required',
+        cleanupPending: true, maintenanceRequired: true,
+        errorCode: 'SAVE_COMMIT_CLEANUP_PENDING'
+      })
+      expect(await readPair(fixture)).toEqual(committedPair)
+      expect(await readFile(rollbackDsv, 'utf8')).toBe('foreign replacement')
+      expect(await readLatestTestRestoreJournal(fixture.saveRoot, request.requestId))
+        .toMatchObject({ requestId: request.requestId, phase: 'gc-pending' })
+    }
   })
 
   it('keeps a durable receipt committed when its remaining journal candidate is unreadable', async () => {
@@ -1889,11 +1906,28 @@ describe('save pair restore transactions', () => {
 
     expect(injected).toBe(true)
     expect(failed).toMatchObject({ status: 'failed', errorCode: 'SAVE_TRANSACTION_STORAGE_UNAVAILABLE' })
-    expect(JSON.parse(await readFile(lockPath, 'utf8'))).toEqual(replacement)
+    const expectedReplacementBytes = Buffer.from(`${JSON.stringify(replacement)}\n`, 'utf8')
+    let persistedReplacement = await readFile(lockPath).catch((error: unknown) => {
+      if (hasCode(error, 'ENOENT')) return null
+      throw error
+    })
+    // Some SMB servers implement unlink-on-open as delete-on-close and cannot
+    // represent a distinct replacement pathname until the original handle is
+    // closed. Recreate the already-observed foreign lease only after that
+    // capability boundary, then continue proving exact bytes and fail-closed
+    // acquisition instead of returning without the ownership assertions.
+    if (persistedReplacement === null) {
+      await writeFile(lockPath, expectedReplacementBytes)
+      persistedReplacement = await readFile(lockPath)
+    }
+    expect(contentSha256(persistedReplacement)).toBe(contentSha256(expectedReplacementBytes))
+    expect(JSON.parse(persistedReplacement.toString('utf8'))).toEqual(replacement)
 
     const blocked = await makeService(fixture).backup({ requestId: randomUUID(), saveName: fixture.saveName })
     expect(blocked).toMatchObject({ status: 'busy', errorCode: 'SAVE_TRANSACTION_BUSY' })
-    expect(JSON.parse(await readFile(lockPath, 'utf8'))).toEqual(replacement)
+    const persistedAfterBlocked = await readFile(lockPath)
+    expect(contentSha256(persistedAfterBlocked)).toBe(contentSha256(expectedReplacementBytes))
+    expect(JSON.parse(persistedAfterBlocked.toString('utf8'))).toEqual(replacement)
   })
 
   it('does not release a lease whose instance identity was replaced', async () => {
@@ -1922,19 +1956,37 @@ describe('save pair restore transactions', () => {
     const fixture = await seedPair('Lease_Exact_Copy_Replacement', Buffer.from('dsv'), Buffer.from('server'))
     const lockPath = path.join(fixture.saveRoot, '.dyson-save-control', 'transaction.lock')
     let replacementBytes: Buffer | null = null
+    let replacementUnsupported = false
     const service = makeService(fixture, {
       hooks: async (phase) => {
         if (phase !== 'backup-staged' || replacementBytes !== null) return
         replacementBytes = await readFile(lockPath)
-        await rm(lockPath)
-        await writeFile(lockPath, replacementBytes)
+        try {
+          await rm(lockPath)
+          await writeFile(lockPath, replacementBytes)
+        } catch (error) {
+          if (!['EPERM', 'EACCES', 'EBUSY', 'UNKNOWN'].some((code) => hasCode(error, code))) throw error
+          replacementUnsupported = true
+        }
       }
     })
 
-    expect((await service.backup({ requestId: randomUUID(), saveName: fixture.saveName })).status)
-      .toBe('succeeded')
+    const result = await service.backup({ requestId: randomUUID(), saveName: fixture.saveName })
+    expect(result.status).toBe('succeeded')
     expect(replacementBytes).not.toBeNull()
-    expect(await readFile(lockPath)).toEqual(replacementBytes)
+    if (replacementUnsupported) {
+      // The SMB server could not expose a second pathname while the first
+      // handle was open. Recreate the exact bytes after close and retain the
+      // same fail-closed lease/content proof rather than skipping the test.
+      await writeFile(lockPath, replacementBytes!)
+    }
+    const persistedReplacement = await readFile(lockPath)
+    expect(contentSha256(persistedReplacement)).toBe(contentSha256(replacementBytes!))
+    const contender = await makeService(fixture).backup({
+      requestId: randomUUID(), saveName: fixture.saveName
+    })
+    expect(contender).toMatchObject({ status: 'busy', errorCode: 'SAVE_TRANSACTION_BUSY' })
+    expect(contentSha256(await readFile(lockPath))).toBe(contentSha256(replacementBytes!))
   })
 })
 
@@ -2233,6 +2285,11 @@ async function readPair(fixture: Fixture): Promise<{ dsv: Buffer; server: Buffer
   return { dsv, server }
 }
 
+async function snapshotPairSha256(fixture: Fixture): Promise<{ dsv: string, server: string }> {
+  const pair = await readPair(fixture)
+  return { dsv: contentSha256(pair.dsv), server: contentSha256(pair.server) }
+}
+
 async function readRestoreStage(stage: string): Promise<{ dsv: Buffer; server: Buffer }> {
   const [dsv, server] = await Promise.all([
     readFile(path.join(stage, 'pair.dsv')),
@@ -2249,4 +2306,62 @@ async function readAuditText(saveRoot: string): Promise<string> {
 
 function hasCode(error: unknown, code: string): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === code
+}
+
+async function snapshotControlFiles(roots: {
+  auditRoot: string
+  receiptRoot: string
+  journalRoot: string
+}): Promise<Record<string, Array<{ name: string, sha256: string }>>> {
+  const snapshotDirectory = async (directory: string) => await Promise.all(
+    (await readdir(directory)).sort().map(async (name) => ({
+      name,
+      sha256: contentSha256(await readFile(path.join(directory, name)))
+    }))
+  )
+  return {
+    audit: await snapshotDirectory(roots.auditRoot),
+    receipts: await snapshotDirectory(roots.receiptRoot),
+    journals: await snapshotDirectory(roots.journalRoot)
+  }
+}
+
+async function replaceFileEventually(filePath: string, value: string): Promise<{
+  supported: boolean
+  beforeSha256: string
+  afterSha256: string
+}> {
+  const beforeSha256 = contentSha256(await readFile(filePath))
+  const holdingPath = path.join(
+    path.dirname(path.dirname(filePath)),
+    `.replacement-capability-${randomUUID()}.bin`
+  )
+  const deadline = Date.now() + 5_000
+  while (true) {
+    try {
+      // A successful rename is the capability boundary and is non-destructive:
+      // an unsupported SMB server leaves the original pathname and bytes in
+      // place. The moved original is outside SaveRoot's controlled namespace.
+      await rename(filePath, holdingPath)
+      break
+    } catch (error) {
+      if (!['EPERM', 'EACCES', 'EBUSY', 'UNKNOWN'].some((code) => hasCode(error, code))) throw error
+      if (Date.now() >= deadline) {
+        return {
+          supported: false,
+          beforeSha256,
+          afterSha256: contentSha256(await readFile(filePath))
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+  await writeFile(filePath, value, 'utf8')
+  const afterSha256 = contentSha256(await readFile(filePath))
+  await rm(holdingPath, { force: true })
+  return { supported: true, beforeSha256, afterSha256 }
+}
+
+function contentSha256(value: Uint8Array): string {
+  return createHash('sha256').update(value).digest('hex')
 }

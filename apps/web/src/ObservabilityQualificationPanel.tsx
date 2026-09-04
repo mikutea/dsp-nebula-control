@@ -6,7 +6,7 @@ import {
 import { relativeTime } from './format'
 import type {
   LateGameQualificationReport, ObservabilityQualificationEnvelope, QualificationCheck,
-  QualificationCheckId, QualificationRemainingEvidence, QualificationStatus
+  OperationLatencySummary, QualificationCheckId, QualificationRemainingEvidence, QualificationStatus
 } from './model'
 
 export function ObservabilityQualificationPanel({ report, meta, stale, error, busy }: {
@@ -43,6 +43,31 @@ export function ObservabilityQualificationPanel({ report, meta, stale, error, bu
       <QualificationWindowCell label="RETAINED CAPACITY" value={meta ? meta.capacity.toLocaleString('zh-CN') : '—'} detail={report ? `${report.checks.length} 项固定检查` : '报告合同未建立'} />
     </div>
 
+    {report ? <section className="qualification-group wide" aria-labelledby="qualification-continuity-title">
+      <header><div><Clock3 size={16} /><span><strong id="qualification-continuity-title">72H CONTINUITY &amp; TRUSTED LATENCY</strong><small>长窗连续性与服务端持久化回执；不会移除生产演练 blocker</small></span></div><b>READ ONLY</b></header>
+      <div className="qualification-window-deck">
+        <QualificationWindowCell
+          label="72H SAMPLE COVERAGE"
+          value={`${report.continuity72h.sampleCount.toLocaleString('zh-CN')} / 17,281`}
+          detail={`${formatDuration(report.continuity72h.spanMs)} · ${qualificationStatusLabel(report.continuity72h.result)}`}
+          progress={Math.min(100, report.continuity72h.sampleCount / 17_281 * 100)}
+          status={report.continuity72h.result}
+        />
+        <QualificationWindowCell
+          label="CHAIN INTEGRITY"
+          value={report.continuity72h.chainIntegrity === 'verified' ? 'VERIFIED' : 'UNKNOWN'}
+          detail={report.continuity72h.chainIntegrity === 'verified'
+            ? '保留链已通过摘要与前驱连续性验证'
+            : '没有可验证的持久化链；NOT QUALIFIED'}
+          status={report.continuity72h.chainIntegrity === 'verified' ? 'pass' : 'insufficient'}
+        />
+        <LatencyWindowCell label="SAVE RECEIPT LATENCY" summary={report.latency.save}
+          truncated={report.latency.truncated} scannedJobs={report.latency.scannedJobs} />
+        <LatencyWindowCell label="BACKUP RECEIPT LATENCY" summary={report.latency.backup}
+          truncated={report.latency.truncated} scannedJobs={report.latency.scannedJobs} />
+      </div>
+    </section> : null}
+
     {report ? <div className="qualification-groups">
       {qualificationGroups.map((group) => {
         const Icon = group.icon
@@ -61,6 +86,30 @@ export function ObservabilityQualificationPanel({ report, meta, stale, error, bu
       <footer><ShieldCheck size={14} /><strong>边界声明</strong><span>即使本报告显示“通过”，也只证明 `late-game-6h-v1` 所列遥测阈值；没有真实存档延迟、重启恢复、崩溃恢复和外部玩家入服浸泡证据时，不得提升为生产已验收。</span></footer>
     </section>
   </section>
+}
+
+function LatencyWindowCell({ label, summary, truncated, scannedJobs }: {
+  label: string
+  summary: OperationLatencySummary
+  truncated: boolean
+  scannedJobs: number
+}) {
+  const hasLatency = !truncated && summary.successfulReceipts > 0 && summary.p50Ms !== null
+    && summary.p95Ms !== null && summary.maximumMs !== null
+  return <QualificationWindowCell
+    label={label}
+    value={truncated
+      ? 'TRUNCATED · NOT QUALIFIED'
+      : hasLatency
+      ? `P50 ${formatMilliseconds(summary.p50Ms!)} · P95 ${formatMilliseconds(summary.p95Ms!)} · MAX ${formatMilliseconds(summary.maximumMs!)}`
+      : 'UNKNOWN · NOT QUALIFIED'}
+    detail={truncated
+      ? `仅扫描最新 ${scannedJobs.toLocaleString('zh-CN')} 个任务；不把不完整百分位作为证据`
+      : summary.totalReceipts === 0
+      ? '没有可信服务端回执；不会显示 0 ms'
+      : `成功 ${summary.successfulReceipts} · 失败 ${summary.failedReceipts} · 未完成 ${summary.incompleteReceipts} · NOT QUALIFIED`}
+    status={truncated || summary.failedReceipts + summary.incompleteReceipts > 0 ? 'fail' : 'insufficient'}
+  />
 }
 
 function QualificationWindowCell({ label, value, detail, progress, status = 'insufficient' }: {
@@ -105,6 +154,7 @@ function qualificationStatusLabel(status: QualificationStatus): string {
 }
 
 function formatCheckObserved(check: QualificationCheck): string {
+  if (check.observed.mode === 'not-applicable') return 'NOT APPLICABLE · 非 SMB'
   const value = numeric(check.observed.value)
   if (value === null) return 'UNAVAILABLE · 证据不足'
   if (check.id === 'window.samples') return `${value.toLocaleString('zh-CN')} 个独立样本`
@@ -117,6 +167,9 @@ function formatCheckObserved(check: QualificationCheck): string {
   if (check.id === 'simulation.ups-floor') {
     return `${formatRatio(value)} 合规 · P05 ${formatUps(check.observed.p05)} · 中位 ${formatUps(check.observed.median)}`
   }
+  if (check.id === 'simulation.tps-floor') {
+    return `${formatRatio(value)} 合规 · P05 ${formatTps(check.observed.p05)} · 中位 ${formatTps(check.observed.median)}`
+  }
   if (ratioCheckIds.has(check.id)) return `${formatRatio(value)} 时间占比`
   if (percentValueCheckIds.has(check.id)) return `${value.toFixed(1)}%`
   if (byteCheckIds.has(check.id)) return formatBytes(value)
@@ -125,10 +178,12 @@ function formatCheckObserved(check: QualificationCheck): string {
 
 function formatCheckRequirement(check: QualificationCheck): string {
   const required = check.required
+  if (check.observed.mode === 'not-applicable') return '仅 SMB global mapping 项目需要'
   if (check.id === 'window.samples') return `要求 ≥ ${required.minimum} 个样本`
   if (check.id === 'window.duration') return `要求 ≥ ${formatDuration(numeric(required.minimum) ?? 0)}`
   if (coverageCheckIds.has(check.id)) return `可用覆盖率要求 ≥ ${formatRatio(numeric(required.minimumRatio))}`
   if (check.id === 'simulation.ups-floor') return `至少 ${formatRatio(numeric(required.minimumRatio))} 的实测样本达到 ${required.minimumUps} UPS`
+  if (check.id === 'simulation.tps-floor') return `至少 ${formatRatio(numeric(required.minimumRatio))} 的实测样本达到 ${required.minimumTps} TPS`
   if (check.id === 'runtime.running-coverage') return `运行态覆盖率要求 ≥ ${formatRatio(numeric(required.minimumRatio))}`
   if (check.id === 'health.critical-ratio') return `critical 样本占比要求 ≤ ${formatRatio(numeric(required.maximumRatio))}`
   if (check.id === 'host.hottest-core-saturation') return `最热核心 ≥97% 的样本占比要求 ≤ ${formatRatio(numeric(required.maximumRatio))}`
@@ -167,12 +222,22 @@ function formatUps(value: number | string | null | undefined): string {
   return number === null ? '不可用' : `${number.toFixed(1)} UPS`
 }
 
+function formatTps(value: number | string | null | undefined): string {
+  const number = numeric(value)
+  return number === null ? '不可用' : `${number.toFixed(1)} TPS`
+}
+
 function formatDuration(milliseconds: number): string {
   if (!Number.isFinite(milliseconds) || milliseconds < 0) return '不可用'
   const totalMinutes = Math.floor(milliseconds / 60_000)
   const hours = Math.floor(totalMinutes / 60)
   const minutes = totalMinutes % 60
   return `${hours} 小时 ${minutes} 分`
+}
+
+function formatMilliseconds(milliseconds: number): string {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return 'UNKNOWN'
+  return milliseconds < 1_000 ? `${milliseconds} ms` : `${(milliseconds / 1_000).toFixed(1)} s`
 }
 
 function formatClock(value: string): string {
@@ -193,13 +258,18 @@ function clampPercent(value: number): number {
 
 const ratioCheckIds = new Set<QualificationCheckId>([
   'runtime.running-coverage', 'health.critical-ratio',
-  'host.hottest-core-saturation', 'process.single-core-bottleneck'
+  'host.hottest-core-saturation', 'process.single-core-bottleneck',
+  'storage.project-root-available', 'storage.smb-mapping-available',
+  'storage.recovery-task-healthy'
 ])
 
 const coverageCheckIds = new Set<QualificationCheckId>([
-  'simulation.ups-coverage', 'host.cpu-coverage', 'host.per-core-coverage',
+  'simulation.ups-coverage', 'simulation.tps-coverage',
+  'host.cpu-coverage', 'host.per-core-coverage',
   'process.multicore-coverage', 'host.memory-coverage',
-  'storage.project-coverage', 'storage.save-coverage'
+  'storage.project-coverage', 'storage.save-coverage',
+  'storage.dependency-classification', 'storage.project-root-coverage',
+  'storage.smb-mapping-coverage', 'storage.recovery-task-coverage'
 ])
 
 const percentValueCheckIds = new Set<QualificationCheckId>([
@@ -237,6 +307,11 @@ const qualificationGroups: Array<{
     ids: ['simulation.ups-coverage', 'simulation.ups-floor']
   },
   {
+    id: 'tps', title: '实测 TPS 资格', icon: Gauge,
+    description: '只使用签名桥接的游戏 tick 速率，不用目标值或墙钟推测代替',
+    ids: ['simulation.tps-coverage', 'simulation.tps-floor']
+  },
+  {
     id: 'cpu', title: '主机 CPU 与最热核心', icon: Cpu,
     description: '主机总量 P95、按核覆盖与持续饱和占比',
     ids: ['host.cpu-coverage', 'host.cpu-p95', 'host.per-core-coverage', 'host.hottest-core-saturation']
@@ -260,6 +335,17 @@ const qualificationGroups: Array<{
     id: 'save-volume', title: '存档卷容量', icon: HardDrive,
     description: '存档所在卷覆盖、峰值使用率与最低可用空间',
     ids: ['storage.save-coverage', 'storage.save-peak-used', 'storage.save-minimum-free']
+  },
+  {
+    id: 'storage-automation', title: '项目根与 SMB 自动恢复', icon: ShieldCheck,
+    description: '依赖分类、项目根、全局映射与恢复任务必须提供连续可信证据',
+    ids: [
+      'storage.dependency-classification',
+      'storage.project-root-coverage', 'storage.project-root-available',
+      'storage.smb-mapping-coverage', 'storage.smb-mapping-available',
+      'storage.recovery-task-coverage', 'storage.recovery-task-healthy'
+    ],
+    className: 'wide'
   }
 ]
 
@@ -273,6 +359,8 @@ const qualificationCheckPresentation: Record<QualificationCheckId, {
   'health.critical-ratio': { label: 'critical 健康占比', icon: ShieldCheck },
   'simulation.ups-coverage': { label: '实际 UPS 覆盖率', icon: Gauge },
   'simulation.ups-floor': { label: 'UPS ≥55 合规率', icon: Gauge },
+  'simulation.tps-coverage': { label: '实际 TPS 覆盖率', icon: Gauge },
+  'simulation.tps-floor': { label: 'TPS ≥55 合规率', icon: Gauge },
   'host.cpu-coverage': { label: '主机 CPU 覆盖率', icon: Cpu },
   'host.cpu-p95': { label: '主机 CPU P95', icon: Cpu },
   'host.per-core-coverage': { label: '按核 CPU 覆盖率', icon: Cpu },
@@ -286,7 +374,14 @@ const qualificationCheckPresentation: Record<QualificationCheckId, {
   'storage.project-minimum-free': { label: '项目卷最低空闲', icon: HardDrive },
   'storage.save-coverage': { label: '存档卷指标覆盖', icon: HardDrive },
   'storage.save-peak-used': { label: '存档卷使用峰值', icon: HardDrive },
-  'storage.save-minimum-free': { label: '存档卷最低空闲', icon: HardDrive }
+  'storage.save-minimum-free': { label: '存档卷最低空闲', icon: HardDrive },
+  'storage.dependency-classification': { label: '存储依赖分类覆盖', icon: ShieldCheck },
+  'storage.project-root-coverage': { label: '项目根状态覆盖', icon: HardDrive },
+  'storage.project-root-available': { label: '项目根持续可用', icon: HardDrive },
+  'storage.smb-mapping-coverage': { label: 'SMB 映射状态覆盖', icon: ShieldCheck },
+  'storage.smb-mapping-available': { label: 'SMB 映射持续可用', icon: ShieldCheck },
+  'storage.recovery-task-coverage': { label: '存储恢复任务覆盖', icon: RotateCw },
+  'storage.recovery-task-healthy': { label: '存储恢复任务健康', icon: RotateCw }
 }
 
 const remainingEvidencePresentation: Record<QualificationRemainingEvidence, {

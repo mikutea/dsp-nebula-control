@@ -286,8 +286,8 @@ try {
     Assert-Fixture ((Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Disable-DysonInteractiveSession.ps1') -Raw).Contains('SupportsShouldProcess')) 'Disable does not support WhatIf.'
 
     $parameterContracts = [ordered]@{
-        'Configure-DysonInteractiveSession.ps1' = @('Credential')
-        'Test-DysonInteractiveSession.ps1' = @('Credential')
+        'Configure-DysonInteractiveSession.ps1' = @('Credential', 'RuntimeBootstrapRoot')
+        'Test-DysonInteractiveSession.ps1' = @('Credential', 'RuntimeBootstrapRoot')
         'Disable-DysonInteractiveSession.ps1' = @()
     }
     foreach ($entry in $parameterContracts.GetEnumerator()) {

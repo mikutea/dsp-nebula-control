@@ -12,6 +12,7 @@ apps/web/vite.config.d.ts
 data/
 runtime/
 *.log
+*.binlog
 *.dsv
 *.server
 *.zip

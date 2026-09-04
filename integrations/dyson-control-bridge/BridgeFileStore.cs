@@ -13,6 +13,11 @@ namespace DysonControl.Bridge
         private readonly string receiptsRoot;
         private readonly string processedRoot;
         private readonly string rejectedRoot;
+        private readonly string playerNoticeRequestsRoot;
+        private readonly string playerNoticeProcessingRoot;
+        private readonly string playerNoticeReceiptsRoot;
+        private readonly string playerNoticeProcessedRoot;
+        private readonly string playerNoticeRejectedRoot;
         private readonly string controlRoot;
 
         internal BridgeFileStore(string controlRoot, string secretFile)
@@ -45,6 +50,11 @@ namespace DysonControl.Bridge
             receiptsRoot = CreateSafeDirectory(normalizedRoot, "receipts");
             processedRoot = CreateSafeDirectory(normalizedRoot, "processed");
             rejectedRoot = CreateSafeDirectory(normalizedRoot, "rejected");
+            playerNoticeRequestsRoot = CreateSafeDirectory(normalizedRoot, "player-notice-requests");
+            playerNoticeProcessingRoot = CreateSafeDirectory(normalizedRoot, "player-notice-processing");
+            playerNoticeReceiptsRoot = CreateSafeDirectory(normalizedRoot, "player-notice-receipts");
+            playerNoticeProcessedRoot = CreateSafeDirectory(normalizedRoot, "player-notice-processed");
+            playerNoticeRejectedRoot = CreateSafeDirectory(normalizedRoot, "player-notice-rejected");
             AssertNotReparsePoint(new DirectoryInfo(normalizedRoot));
         }
 
@@ -59,6 +69,34 @@ namespace DysonControl.Bridge
                 StartedAtUnixMs = startedAtUnixMs,
                 WrittenAtUnixMs = writtenAtUnixMs
             }, Secret));
+        }
+
+        internal void WriteRuntimeSession(BridgeRuntimeSession session)
+        {
+            WriteAtomicFile("runtime-session", BridgeProtocol.SerializeRuntimeSession(session, Secret));
+        }
+
+        internal void WriteLoadedSaveEvidence(BridgeLoadedSaveEvidence evidence)
+        {
+            WriteAtomicFile(
+                "loaded-save-evidence",
+                BridgeProtocol.SerializeLoadedSaveEvidence(evidence, Secret));
+        }
+
+        internal void RemoveLoadedSaveEvidence()
+        {
+            var path = Path.Combine(controlRoot, "loaded-save-evidence");
+            if (!File.Exists(path))
+            {
+                return;
+            }
+            AssertNotReparsePoint(new FileInfo(path));
+            File.Delete(path);
+        }
+
+        internal void WriteSimulationTelemetry(BridgeSimulationTelemetry telemetry)
+        {
+            WriteAtomicFile("simulation-telemetry", BridgeProtocol.SerializeSimulationTelemetry(telemetry, Secret));
         }
 
         internal void WritePlayerSnapshot(BridgePlayerSnapshot snapshot)
@@ -99,6 +137,48 @@ namespace DysonControl.Bridge
                 catch (IOException)
                 {
                     // Another bridge instance or a duplicate claim won this file.
+                }
+            }
+            return null;
+        }
+
+        internal BridgeClaim TryClaimNextPlayerNotice()
+        {
+            return TryClaimNext(playerNoticeRequestsRoot, playerNoticeProcessingRoot, RejectPlayerNotice);
+        }
+
+        private static BridgeClaim TryClaimNext(
+            string sourceRoot,
+            string claimedRoot,
+            Action<BridgeClaim> reject)
+        {
+            var recovered = Directory.GetFiles(claimedRoot, "*.request", SearchOption.TopDirectoryOnly)
+                .OrderBy(path => File.GetCreationTimeUtc(path))
+                .FirstOrDefault();
+            if (recovered != null)
+            {
+                return new BridgeClaim(recovered, true);
+            }
+
+            foreach (var source in Directory.GetFiles(sourceRoot, "*.request", SearchOption.TopDirectoryOnly)
+                         .OrderBy(path => File.GetCreationTimeUtc(path)).Take(8))
+            {
+                var sourceInfo = new FileInfo(source);
+                if ((sourceInfo.Attributes & FileAttributes.ReparsePoint) != 0 ||
+                    sourceInfo.Length > PlayerNoticeProtocol.MaximumPayloadBytes)
+                {
+                    reject(new BridgeClaim(source, false));
+                    continue;
+                }
+                var destination = Path.Combine(claimedRoot, sourceInfo.Name);
+                try
+                {
+                    File.Move(source, destination);
+                    return new BridgeClaim(destination, false);
+                }
+                catch (IOException)
+                {
+                    // Another bridge instance or duplicate claim won this file.
                 }
             }
             return null;
@@ -150,6 +230,56 @@ namespace DysonControl.Bridge
             }
         }
 
+        internal bool TryReadPlayerNoticeRequest(
+            BridgeClaim claim,
+            out PlayerNoticeRequest request,
+            out string errorCode)
+        {
+            request = null;
+            errorCode = "INVALID_REQUEST";
+            try
+            {
+                var info = new FileInfo(claim.Path);
+                if (!info.Exists || info.Length > PlayerNoticeProtocol.MaximumPayloadBytes ||
+                    (info.Attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    return false;
+                }
+                var payloadBytes = File.ReadAllBytes(claim.Path);
+                if (payloadBytes.Length == 0 || payloadBytes.Length > PlayerNoticeProtocol.MaximumPayloadBytes ||
+                    HasUtf8Bom(payloadBytes))
+                {
+                    return false;
+                }
+                string payload;
+                try
+                {
+                    payload = Utf8WithoutBom.GetString(payloadBytes);
+                }
+                catch (DecoderFallbackException)
+                {
+                    return false;
+                }
+                if (!PlayerNoticeProtocol.TryParseRequest(payload, Secret, out request, out errorCode))
+                {
+                    return false;
+                }
+                if (!string.Equals(info.Name, request.RequestId + ".request", StringComparison.OrdinalIgnoreCase))
+                {
+                    request = null;
+                    errorCode = "INVALID_REQUEST";
+                    return false;
+                }
+                return true;
+            }
+            catch
+            {
+                request = null;
+                errorCode = "REQUEST_IO_ERROR";
+                return false;
+            }
+        }
+
         private static bool HasUtf8Bom(byte[] value)
         {
             return value.Length >= 3 && value[0] == 0xEF && value[1] == 0xBB && value[2] == 0xBF;
@@ -158,6 +288,11 @@ namespace DysonControl.Bridge
         internal bool ReceiptExists(string requestId)
         {
             return File.Exists(GetReceiptPath(requestId));
+        }
+
+        internal bool PlayerNoticeReceiptExists(string requestId)
+        {
+            return File.Exists(GetReceiptPath(playerNoticeReceiptsRoot, requestId));
         }
 
         internal void Complete(BridgeClaim claim, BridgeReceipt receipt)
@@ -182,9 +317,41 @@ namespace DysonControl.Bridge
             Archive(claim, processedRoot);
         }
 
+        internal void CompletePlayerNotice(BridgeClaim claim, PlayerNoticeReceipt receipt)
+        {
+            var finalPath = GetReceiptPath(playerNoticeReceiptsRoot, receipt.RequestId);
+            if (!File.Exists(finalPath))
+            {
+                var temporaryPath = Path.Combine(
+                    playerNoticeReceiptsRoot,
+                    ".partial-" + receipt.RequestId + "-" + Guid.NewGuid().ToString("N"));
+                try
+                {
+                    File.WriteAllText(
+                        temporaryPath,
+                        PlayerNoticeProtocol.SerializeReceipt(receipt, Secret),
+                        Utf8WithoutBom);
+                    File.Move(temporaryPath, finalPath);
+                }
+                finally
+                {
+                    if (File.Exists(temporaryPath))
+                    {
+                        File.Delete(temporaryPath);
+                    }
+                }
+            }
+            Archive(claim, playerNoticeProcessedRoot);
+        }
+
         internal void Reject(BridgeClaim claim)
         {
             Archive(claim, rejectedRoot);
+        }
+
+        internal void RejectPlayerNotice(BridgeClaim claim)
+        {
+            Archive(claim, playerNoticeRejectedRoot);
         }
 
         internal void ArchiveCompletedDuplicate(BridgeClaim claim)
@@ -192,13 +359,23 @@ namespace DysonControl.Bridge
             Archive(claim, processedRoot);
         }
 
+        internal void ArchiveCompletedPlayerNoticeDuplicate(BridgeClaim claim)
+        {
+            Archive(claim, playerNoticeProcessedRoot);
+        }
+
         private string GetReceiptPath(string requestId)
+        {
+            return GetReceiptPath(receiptsRoot, requestId);
+        }
+
+        private static string GetReceiptPath(string root, string requestId)
         {
             if (!Guid.TryParseExact(requestId, "D", out var parsed))
             {
                 throw new InvalidOperationException("Receipt request ID is invalid.");
             }
-            return Path.Combine(receiptsRoot, parsed.ToString("D").ToLowerInvariant() + ".receipt");
+            return Path.Combine(root, parsed.ToString("D").ToLowerInvariant() + ".receipt");
         }
 
         private static string CreateSafeDirectory(string root, string name)

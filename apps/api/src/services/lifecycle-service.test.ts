@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -7,7 +7,8 @@ import type {
   LifecycleMutationAdapter,
   LifecycleOperationContext,
   LifecyclePhaseResult,
-  LifecyclePreview
+  LifecyclePreview,
+  LifecyclePreviewContext
 } from '../domain.js'
 import {
   LifecycleCoordinatorError,
@@ -194,6 +195,14 @@ describe('durable lifecycle service', () => {
     expect(coordinator.scopeSignals).toHaveLength(1)
     expect(adapter.phaseSignals).toHaveLength(6)
     expect(adapter.phaseSignals.every((signal) => signal.aborted)).toBe(true)
+    expect(adapter.previewLeaseArguments).toEqual([
+      '-DataRoot', 'C:\\fixture\\data',
+      '-LeaseInstanceId', '00000000-0000-4000-8000-000000000302',
+      '-LeaseToken', 'B'.repeat(43)
+    ])
+    expect(adapter.phaseLeaseArguments).toHaveLength(6)
+    expect(adapter.phaseLeaseArguments.every((arguments_) =>
+      arguments_?.join('\0') === adapter.previewLeaseArguments?.join('\0'))).toBe(true)
 
     const replay = await service.execute('restart', 'restart:fixture:lease-0001', 'Administrator')
     expect(replay).toMatchObject({ reused: true, job: { id: first.job.id, state: 'succeeded' } })
@@ -357,12 +366,37 @@ describe('durable lifecycle service', () => {
     expect(adapter.saveAbortObserved).toBe(true)
     database.close()
   })
+
+  it('propagates and observes the caller cancellation signal across a public preview', async () => {
+    const database = new ControlDatabase('unused', true)
+    const adapter = new FakeLifecycleAdapter()
+    const previewStarted = deferred<void>()
+    adapter.previewGate = new Promise<never>(() => undefined)
+    adapter.onPreviewStarted = () => previewStarted.resolve()
+    const service = new LifecycleService(database, adapter, new EventHub(), 1_000)
+    const controller = new AbortController()
+    const removeListener = vi.spyOn(controller.signal, 'removeEventListener')
+
+    const pending = service.preview('save', controller.signal)
+    await previewStarted.promise
+    controller.abort('fixture-http-disconnect')
+
+    await expect(pending).rejects.toThrow('LIFECYCLE_PREVIEW_ABORTED')
+    expect(adapter.previewSignals).toEqual([controller.signal])
+    expect(removeListener).toHaveBeenCalledWith('abort', expect.any(Function))
+    database.close()
+  })
 })
 
 class FakeLifecycleAdapter implements LifecycleMutationAdapter {
   mutationEnabled = true
   readonly calls: string[] = []
   readonly phaseSignals: AbortSignal[] = []
+  readonly previewSignals: AbortSignal[] = []
+  readonly phaseLeaseArguments: Array<readonly string[] | null> = []
+  previewLeaseArguments: readonly string[] | null = null
+  previewGate: Promise<never> | null = null
+  onPreviewStarted: (() => void) | null = null
   saveGate: Promise<void> | null = null
   onSaveStarted: (() => void) | null = null
   onSaveCompleted: (() => void) | null = null
@@ -374,14 +408,19 @@ class FakeLifecycleAdapter implements LifecycleMutationAdapter {
   stopAbortObserved = false
   #runningVerificationCount = 0
 
-  async previewLifecycle(action: LifecycleAction): Promise<LifecyclePreview> {
+  async previewLifecycle(action: LifecycleAction, context: LifecyclePreviewContext): Promise<LifecyclePreview> {
     this.calls.push(`preflight:${action}`)
+    if (context.signal) this.previewSignals.push(context.signal)
+    context.hostMutation?.assertActive()
+    this.previewLeaseArguments = context.hostMutation?.toPowerShellBorrowArguments() ?? null
+    this.onPreviewStarted?.()
+    if (this.previewGate) await this.previewGate
     return allowedPreview(action)
   }
 
   async createProtectionPoint(context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
     this.calls.push('protection-point')
-    this.phaseSignals.push(context.signal)
+    this.#recordContext(context)
     return {
       summary: 'paired backup verified',
       protectionPointId: 'backup:fixture-0001',
@@ -391,7 +430,7 @@ class FakeLifecycleAdapter implements LifecycleMutationAdapter {
 
   async requestSave(context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
     this.calls.push('save')
-    this.phaseSignals.push(context.signal)
+    this.#recordContext(context)
     this.onSaveStarted?.()
     if (this.hangSaveUntilAbort) {
       await new Promise<void>((_resolve, reject) => {
@@ -410,7 +449,7 @@ class FakeLifecycleAdapter implements LifecycleMutationAdapter {
 
   async requestGracefulStop(context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
     this.calls.push('stop')
-    this.phaseSignals.push(context.signal)
+    this.#recordContext(context)
     this.onStopStarted?.()
     if (this.hangStopUntilAbort) {
       await new Promise<void>((_resolve, reject) => {
@@ -427,19 +466,19 @@ class FakeLifecycleAdapter implements LifecycleMutationAdapter {
 
   async verifyStopped(context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
     this.calls.push('verify-stopped')
-    this.phaseSignals.push(context.signal)
+    this.#recordContext(context)
     return { summary: 'managed process is stopped', evidence: { stopped: true } }
   }
 
   async requestStart(context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
     this.calls.push('start')
-    this.phaseSignals.push(context.signal)
+    this.#recordContext(context)
     return { summary: 'start task receipt verified' }
   }
 
   async verifyRunning(context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
     this.calls.push('verify-running')
-    this.phaseSignals.push(context.signal)
+    this.#recordContext(context)
     this.#runningVerificationCount += 1
     if (this.failFirstRunningVerification && this.#runningVerificationCount === 1) {
       throw new LifecycleExecutionError('TEST_VERIFY_FAILED')
@@ -449,8 +488,14 @@ class FakeLifecycleAdapter implements LifecycleMutationAdapter {
 
   async requestRollbackStart(context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
     this.calls.push('rollback-start')
-    this.phaseSignals.push(context.signal)
+    this.#recordContext(context)
     return { summary: 'previous runtime restarted' }
+  }
+
+  #recordContext(context: LifecycleOperationContext): void {
+    this.phaseSignals.push(context.signal)
+    context.hostMutation?.assertActive()
+    this.phaseLeaseArguments.push(context.hostMutation?.toPowerShellBorrowArguments() ?? null)
   }
 }
 
@@ -479,7 +524,19 @@ class FakeLifecycleCoordinator implements LifecycleMutationCoordinator {
     this.#controller = controller
     this.scopeSignals.push(controller.signal)
     try {
-      const outcome = await operation({ signal: controller.signal })
+      const outcome = await operation({
+        signal: controller.signal,
+        assertActive: () => {
+          if (controller.signal.aborted) {
+            throw new LifecycleCoordinatorError('LIFECYCLE_HOST_LEASE_UNAVAILABLE')
+          }
+        },
+        toPowerShellBorrowArguments: () => [
+          '-DataRoot', 'C:\\fixture\\data',
+          '-LeaseInstanceId', '00000000-0000-4000-8000-000000000302',
+          '-LeaseToken', 'B'.repeat(43)
+        ]
+      })
       this.dispositions.push(outcome.disposition)
       return outcome.value
     } finally {

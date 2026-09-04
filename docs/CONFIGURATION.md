@@ -67,9 +67,66 @@ Inspection and diff results return only `{ "configured": true|false }`. A
 changed non-empty secret can therefore have `changed: true` while both the
 before and after display values say only `configured: true`.
 
-The catalog is not yet a complete mod-configuration or arbitrary plugin
-configuration system. Unknown plugin keys remain untouched and cannot be
-written through the API.
+## Managed mod and plugin configuration
+
+The catalog also contains a deliberately closed, reusable registry for a
+managed mod or plugin's BepInEx configuration. It is not a generic INI editor:
+a registry entry is reviewed source code with one exact package identity, one
+fixed direct filename below the trusted `BepInEx/config` root, and a typed list
+of section/key fields. The browser sends only the selected registry ID, package
+identity, two revisions, and typed field values. It never sends a host path,
+filename, INI section, key, command, script, archive, or executable payload.
+
+The reviewed registry currently contains exact, version-pinned schemas for:
+
+- Nebula Multiplayer Mod `0.9.22`;
+- BepInEx `5.4.17`;
+- NebulaCompatibilityAssist `0.5.0`;
+- BulletTime `1.5.13`;
+- ErrorAnalyzer `1.3.3`.
+
+Field names and types come from the corresponding upstream configuration
+contracts and were cross-checked against a read-only target inventory of file
+names and package versions. No target path or configuration value is embedded
+in the registry or this documentation.
+
+Package ownership is checked before every inspection, preview, and commit.
+Ordinary mods must have the exact dependency ID and version present and enabled
+in the authoritative mod-deployment state. Nebula and BepInEx are deliberately
+owned by the platform update pipeline instead, so their schemas require the
+trusted runtime inventory to report the exact reviewed assembly versions
+`0.9.22.2` and `5.4.17.0`; they are never copied into the ordinary-mod tree.
+Missing inventory, an unavailable package, or any version drift fails closed.
+A plugin with no reviewed schema, or a different version of a listed plugin,
+remains unavailable rather than exposing arbitrary configuration keys.
+
+`GET /api/v1/mods/configuration/schemas` returns only the public field shape.
+The Mod workspace then reads a selected installed/enabled package through
+`POST /api/v1/mods/configuration/inspect`, previews a redacted dry-run through
+`POST /api/v1/mods/configuration/preview`, and requires the exact literal
+`CONFIGURE_MANAGED_MOD` before `POST /api/v1/mods/configuration/execute`.
+Receipt lookup and bounded newest-first history use:
+
+- `GET /api/v1/mods/configuration/receipts/:requestId`;
+- `GET /api/v1/mods/configuration/history`.
+
+Execution is separately gated by `DYSON_MOD_DEPLOYMENT_ENABLED` and
+`mods.mutate`, obtains the shared host mutation lease, independently proves
+that the managed process is stopped and port 8469 is closed, and rechecks the
+ordinary-mod deployment revision, the selected package authority, and the
+configuration revision. The service rejects unknown or
+duplicate fields, out-of-schema values, reparse points, non-regular files, and
+anything outside the fixed root. It writes a protection copy and terminal
+receipt under a fixed private control directory, atomically replaces only the
+registered configuration file, verifies its digest, and restores the original
+bytes on a failure. API/UI diffs and receipts redact secret values to a
+`configured` boolean.
+
+This is repository implementation evidence only. The fixed schemas implement
+the control-plane contract for the listed versions; they do not imply support
+for arbitrary plugins or later versions. Each additional package/version needs
+a reviewed source change, and the listed schemas still require target-host
+acceptance evidence before the feature can become `verified`.
 
 ## API workflow
 
@@ -185,3 +242,50 @@ Before production enablement, test on a disposable Windows/Nebula installation:
    idempotent replay, partial-write rollback, and interrupted-journal recovery;
 7. record target-host evidence before changing `CFG-001` or `CFG-002` to
    `verified`.
+
+## Qualified client V2 deployment inputs
+
+Hostname-preserving Nebula/WSS client issuance is a separate Windows-only
+capability. It stays disabled with
+`DYSON_QUALIFIED_CLIENT_PROFILE_ENABLED=false`. Enabling it, or setting any of
+its seven bindings, requires the complete set below in the protected production
+environment file:
+
+| Variable | Fixed deployment role |
+| --- | --- |
+| `DYSON_QUALIFIED_CLIENT_PROFILE_ENABLED` | Independent `true`/`false` feature gate |
+| `DYSON_CLIENT_QUALIFICATION_EVIDENCE_ROOT` | Protected server-collected qualification evidence |
+| `DYSON_CLIENT_QUALIFICATION_BUILD_HARVEST_ROOT_A` | Read-only deterministic build harvest A |
+| `DYSON_CLIENT_QUALIFICATION_BUILD_HARVEST_ROOT_B` | Read-only deterministic build harvest B |
+| `DYSON_CLIENT_QUALIFICATION_KEY_RING_ROOT` | Protected 32-byte HMAC key files selected by server-side key ID |
+| `DYSON_CLIENT_QUALIFICATION_REPLAY_ROOT` | Protected acceptance and replay-claim state |
+| `DYSON_QUALIFIED_CLIENT_ISSUE_ROOT` | Durable immutable issued metadata and opaque downloads |
+| `DYSON_CLIENT_QUALIFICATION_AUTHORITY` | Canonical lowercase public DNS hostname only; schemes, ports, paths, and IP literals are rejected |
+
+The six roots must be absolute and must exactly equal the fixed sibling
+directories `evidence`, `build-harvest-a`, `build-harvest-b`, `key-ring`,
+`replay`, and `issued` below
+`<DataRoot>\data\qualified-client` (equivalently
+`<DYSON_DATA_DIR>\qualified-client` after launcher bindings are applied). The
+installer creates the replay children
+`acceptances`, `claims\receipt-id`, and `claims\nonce`, plus issued-result
+children `objects`, `by-qualification`, and `locks`. Evidence, key-ring, and
+every fixed replay directory receive a protected DACL owned by Local Service
+with Full Control only for Local Service, SYSTEM, and Administrators. Build
+harvests grant Local Service read/execute only; the issued-result tree grants
+Local Service Modify. Existing populated directories with a different ACL are
+not adopted automatically.
+
+Install and upgrade capture the exact directory/ACL preimage, recheck it while
+holding the deployment lock, apply and read back the fixed ACLs, and restore the
+preimage if a later installation step fails. Ordinary uninstall preserves this
+entire durable tree. The separately confirmed `-RemoveData` path removes it only
+as part of the already verified whole-DataRoot removal transaction. Status and
+installer receipts expose only configured/enabled/ready state, counts, and a
+layout digest; they do not expose roots, HMAC material, raw receipts, or client
+payload bytes.
+
+These deployment guarantees provision storage only. They do not qualify a
+client, create signing keys, or promote preview evidence. Production-qualified
+issuance still requires the protected Windows verifier's six-field projection,
+server-side HMAC and byte revalidation, and an atomic accepted qualification.

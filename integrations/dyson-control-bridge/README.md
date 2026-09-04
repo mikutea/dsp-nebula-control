@@ -41,6 +41,84 @@ plugin version, DSP process ID, plugin start time, current write time, and ready
 state. The control plane rejects missing, stale, malformed, incorrectly signed,
 or version-incompatible heartbeats before a lifecycle save can begin.
 
+The Bridge intentionally has two compatible version representations. The full
+`ReleaseVersion` (for example `0.1.0-rc.1`) is written to signed runtime evidence,
+candidate manifests, and `AssemblyInformationalVersion`/ProductVersion. The
+`BepInPlugin` attribute uses only the numeric `PluginVersion` core (`0.1.0`), and
+Assembly/File versions use `0.1.0.0`, because those consumers require numeric
+`System.Version` values. Activation compares the full ProductVersion exactly and
+never treats the numeric Assembly/File version as equivalent to an RC release.
+
+## Authoritative loaded-save evidence
+
+The bridge maintains one atomically replaced signed file named
+`loaded-save-evidence` using `DYSON_CONTROL_LOADED_SAVE_EVIDENCE_V1`. It does
+not scan the save directory, sort by timestamp, infer a `latest` `.dsv`, or use
+the bridge save-request target as the observation source. The runtime name is
+read from DSP's public `GameMain.gameName` property after Nebula reports that
+the dedicated server game is loaded and this process is the host.
+
+This API contract was verified against the local `Assembly-CSharp.dll` used by
+the private bridge build: `GameMain.gameName` returns
+`GameMain.data.gameName`, and a successful `GameSave.LoadCurrentGame(string)`
+overwrites that field with the sanitized load argument after import. DSP's Save
+As flow also updates the same property before writing. Nebula writes
+`<saveName>.server` from the same `SaveCurrentGame(saveName)` argument. The
+managed lifecycle contract is intentionally narrower: evidence is published
+only when the *observed* runtime value is exactly `_lastexit_` and both
+`_lastexit_.dsv` and `_lastexit_.server` are present, ordinary files, and stable
+across complete SHA-256 reads.
+
+The payload binds the random per-plugin-start session ID, plugin version, OS
+process ID and process start time, bridge start time, a strictly increasing
+per-session observation generation, observation/write times, the observed save
+name, and each paired file's byte length, UTC write-time ticks,
+and lowercase SHA-256 digest. Hashing runs off Unity's main thread. The fixed
+evidence file is removed before the initial hash and whenever the authoritative
+name is unknown or not `_lastexit_`, either file is missing, the name or file
+metadata changes, or an in-flight hash no longer matches the current runtime
+observation. A strict reader must also match the active `runtime-session` tuple
+and reject stale or non-increasing observation generations.
+
+A normal plugin shutdown preserves the last complete HMAC evidence so a
+stopped-baseline reader can bind it to the process generation that just exited.
+The next plugin generation deletes that old file in its constructor before it
+starts hashing. An in-process publisher fault explicitly deletes the file before
+disabling the publisher. A crash before atomic publication therefore leaves no
+partial file; a crash after publication leaves only a complete signed payload,
+whose PID/process-start/bridge-session tuple prevents it from masquerading as a
+new running generation.
+
+This evidence says only which concrete paired save content the running game
+currently identifies under the managed lifecycle slot. Compatibility policy,
+release approval, migration safety, and update eligibility are control-plane
+decisions and are deliberately absent from the bridge protocol.
+
+## Actual simulation telemetry
+
+The bridge also publishes two independent, atomically replaced signed files:
+`runtime-session` (`DYSON_CONTROL_RUNTIME_SESSION_V1`) and
+`simulation-telemetry` (`DYSON_CONTROL_SIMULATION_TELEMETRY_V1`). The session
+contains a random per-plugin-start UUID and binds the DSP process ID, operating
+system process start time, bridge start time, and plugin version. Each telemetry
+sample repeats that identity, adds a strictly increasing per-session sequence,
+and contains a bounded sampling window.
+
+Actual UPS comes from DSP's stopwatch-backed `FPSController.currentUPS`.
+Actual TPS is independently calculated from the change in `GameMain.gameTick`
+over a monotonic `Stopwatch` window. The configured command-line `-ups` target
+is not an input to either calculation and is not present in the telemetry
+protocol. Samples are emitted only while a game is running and unpaused;
+missing, malformed, out-of-range, stale, replayed, differently signed, or
+session/PID/process-generation-mismatched samples are unavailable rather than
+being replaced with the target UPS.
+
+`Get-DysonBridgeSimulationTelemetry.ps1` provides the same bounded,
+fail-closed verification for a PowerShell 5.1 provider. A caller that uses the
+script directly passes its last accepted session and sequence to enforce replay
+protection across polls. The long-lived TypeScript bridge reader maintains that
+guard in memory for each active session.
+
 ## Read-only player snapshot
 
 The independent `DYSON_CONTROL_PLAYERS_V1` file is refreshed through the same
@@ -62,67 +140,81 @@ credentials, `player.key`, filesystem paths, mecha data, or coordinates. A
 collection compatibility failure emits an empty signed `unavailable` snapshot
 instead of stale player rows.
 
-## Verified player-management capabilities
+## Runtime-gated player-management capabilities
 
 The bridge atomically refreshes a separate signed
 `DYSON_CONTROL_PLAYER_CAPABILITIES_V1` file named `player-capabilities` beside
 the roster. Its strict contract binds the roster session ID, write time,
-official upstream repository, tag, release runtime file version and commit, a
-source-only verification scope, `actionsEnabled=false`, and this fixed
-capability set:
+official upstream repository, tag, release runtime file version and commit, and
+one internally coherent runtime-verification state. The protocol never permits
+an enabled action to be combined with an unverified scope.
 
-| Capability | Result | Verified reason |
-| --- | --- | --- |
-| `observe-roster` | `available` / `read-only` | `UPSTREAM_ROSTER_API_VERIFIED` |
-| `disconnect` | `unavailable` / `mutation` | `UPSTREAM_CONNECTED_DISCONNECT_UNSAFE` |
-| `kick` | `unavailable` / `mutation` | `UPSTREAM_KICK_API_ABSENT` |
-| `ban` | `unavailable` / `mutation` | `UPSTREAM_BAN_API_ABSENT` |
-| `whitelist` | `unavailable` / `mutation` | `UPSTREAM_WHITELIST_API_ABSENT` |
-| `permission` | `unavailable` / `mutation` | `UPSTREAM_PERMISSION_API_ABSENT` |
+At plugin startup, `NebulaNoticeRuntimeCompatibility` inspects the actual loaded
+assemblies. The reviewed identity is `NebulaAPI, Version=2.1.0.0` with file
+version `2.1.0.7` and product version `2.1.0.7+924606f`, plus
+`NebulaModel, Version=0.9.22.0` with file version `0.9.22.2` and product version
+`0.9.22.2+3cdf95c`. Reflection must also find the reviewed multiplayer network,
+server player collection, connected-player dictionary, player connection/data,
+connection liveness, generic `INebulaPlayer.SendPacket<T>`, fixed chat packet
+constructor, and `SystemWarnMessage` enum member. A missing, duplicated,
+unreadable, changed, or structurally incompatible assembly fails closed.
+
+The two signed states are:
+
+| Runtime state | Scope | `actionsEnabled` | Notice result |
+| --- | --- | --- | --- |
+| unverified | `source-contract-only-runtime-unverified` | `false` | `unavailable` / `NEBULA_NOTICE_RUNTIME_UNVERIFIED` |
+| exact identity and primitives verified | `runtime-assembly-identity-verified` | `true` | `available` / `UPSTREAM_TARGETED_NOTICE_PRIMITIVES_VERIFIED` |
+
+The read-only roster is independent of this mutation gate. It remains
+displayable when notice verification fails, while every notice request is
+rejected before target resolution or packet dispatch. The fixed capability
+order remains `observe-roster`, `disconnect`, `kick`, `ban`, `whitelist`,
+`blacklist`, `notice`, `permission`; only roster observation and, in the exact
+verified state, notice are available. Disconnect, kick, ban, whitelist,
+blacklist and permission remain unavailable with their fixed upstream reason
+codes.
+
+The protocol self-test fixes both complete states in independently decoded,
+unpadded Base64URL and HMAC vectors, rejects unknown state values, and checks
+that a source-only scope can never claim an enabled notice. These are repository
+tests only: target-VM runtime verification and an actual disposable-player drill
+are still required before `PLY-002` can become `verified`.
 
 The source lock is the official `v0.9.22` tag at commit
-`3cdf95c594a2f8010b0e87a43be828e6ba2f657f`. Its official GitHub release asset
-contains `NebulaPatcher.dll` with file version `0.9.22.2` and product version
-`0.9.22.2+3cdf95c`; the capability contract records that runtime file version
-separately from the tag. The file deliberately says
-`source-contract-only-runtime-unverified`: this proves the upstream mapping,
-not which DLL is currently loaded on a real VM. A deployment still needs an
-exact assembly/runtime compatibility check before even the read-only roster is
-considered operational.
+`3cdf95c594a2f8010b0e87a43be828e6ba2f657f`. Upstream evidence includes:
 
-Upstream evidence:
-
+- [`INebulaPlayer.SendPacket<T>`](https://github.com/NebulaModTeam/nebula/blob/3cdf95c594a2f8010b0e87a43be828e6ba2f657f/NebulaAPI/GameState/INebulaPlayer.cs)
+- [`NewChatMessagePacket`](https://github.com/NebulaModTeam/nebula/blob/3cdf95c594a2f8010b0e87a43be828e6ba2f657f/NebulaModel/Packets/Chat/NewChatMessagePacket.cs)
 - [`IServer.Players` and `IServer.Disconnect`](https://github.com/NebulaModTeam/nebula/blob/3cdf95c594a2f8010b0e87a43be828e6ba2f657f/NebulaModel/Networking/IServer.cs)
 - [`ConcurrentPlayerCollection` roster API](https://github.com/NebulaModTeam/nebula/blob/3cdf95c594a2f8010b0e87a43be828e6ba2f657f/NebulaAPI/DataStructures/ConcurrentPlayerCollection.cs)
-- [`DisconnectionReason` enum](https://github.com/NebulaModTeam/nebula/blob/3cdf95c594a2f8010b0e87a43be828e6ba2f657f/NebulaAPI/Networking/DisconnectionReason.cs)
-- [`Server.Disconnect` removes before closing the socket](https://github.com/NebulaModTeam/nebula/blob/3cdf95c594a2f8010b0e87a43be828e6ba2f657f/NebulaNetwork/Server.cs#L324-L335)
-- [the later socket-close path expects to remove and clean up that same player](https://github.com/NebulaModTeam/nebula/blob/3cdf95c594a2f8010b0e87a43be828e6ba2f657f/NebulaNetwork/Server.cs#L111-L170)
 - [official `v0.9.22` release/tag](https://github.com/NebulaModTeam/nebula/releases/tag/v0.9.22)
 
-Although `IServer.Disconnect` is public, the locked source uses it for
-connection rejection while a player is pending/syncing. Calling it for an
-already connected player removes the collection entry before the socket-close
-callback can perform the authoritative leave broadcast and cleanup. Treating it
-as kick would therefore invent unsupported semantics. The enum also has no kick
-reason, and the locked source exposes no player ban, whitelist, or per-player
-permission operation.
+`IServer.Disconnect` is not exposed as kick: the locked implementation removes
+the connected entry before the later socket-close path performs authoritative
+leave cleanup. The locked source also exposes no supported active-session ban,
+whitelist, blacklist or permission primitive. The host-side `/playerdata
+remove` command targets persistent certificate/display-name data rather than
+this bridge's opaque connected-session identity and is outside this contract.
 
-Nebula does contain a host-side [`/playerdata remove`
-command](https://github.com/NebulaModTeam/nebula/blob/3cdf95c594a2f8010b0e87a43be828e6ba2f657f/NebulaWorld/Chat/Commands/PlayerDataCommandHandler.cs#L64-L91),
-but that operation targets a long-lived client-certificate hash or display name
-inside the `.server` data set. It is not an active-session moderation action,
-cannot be addressed solely by this bridge's opaque session player ID, and has
-no crash-safe rollback receipt. It is therefore deliberately outside this
-contract rather than being mislabeled as a safe player action.
+Notice is a distinct, narrow mutation. A signed
+`DYSON_CONTROL_PLAYER_NOTICE_REQUEST_V1` selects only `maintenance-5m`,
+`maintenance-now`, or `reconnect-required`; the bridge owns the text and accepts
+no free text, raw connection identifier, command, path, or caller-supplied
+reason. The request binds UUID idempotency, short expiry, current roster session
+and sequence, opaque session player ID, and exact join time. The Unity update
+thread re-resolves that binding against the live connected collection directly
+before dispatch.
 
-Because there is no verified mutation, this bridge intentionally defines no
-player-action request or receipt protocol at all. That is stricter than
-accepting signed requests only to reject them: there is no dormant execution
-surface, arbitrary command, caller-supplied reason/chat text, target path, or
-raw Nebula player/connection identifier. UUID idempotency, expiry, replay
-blocking, durable mutation receipts, timeouts, and rollback are required gates
-for a future *supported* action, but are not falsely claimed for this
-observation-only contract.
+The signed `DYSON_CONTROL_PLAYER_NOTICE_RECEIPT_V1` reports
+`transport-dispatched` only after the target player's `SendPacket` call returns;
+this is not a delivery or display acknowledgement and notice has no rollback.
+If processing is recovered after interruption, or packet dispatch throws after
+mutation may have occurred, the receipt is `uncertain` with
+`recoveryRequired=true`. The control plane must query the original request ID's
+receipt through the read-only reconciliation route. That GET neither creates a
+request nor dispatches a packet, and an unknown outcome must never trigger an
+automatic POST retry.
 
 An interrupted `processing/` request is never silently replayed. On the next
 plugin start it receives an `INTERRUPTED_UNCERTAIN` terminal receipt, allowing
@@ -163,22 +255,29 @@ BepInEx installation, create a private candidate without copying references out
 of the game tree:
 
 ```powershell
-$artifact = 'C:\Packages\DysonControl-v0.1.0'
+$artifact = 'C:\Packages\DysonControl-v0.1.0-rc.1'
 $server = 'C:\GameServers\DSP\server'
-$candidate = 'C:\Private\DysonControlBridge-0.1.0'
+$candidate = 'C:\Private\DysonControlBridge-0.1.0-rc.1'
 
 & "$artifact\scripts\windows\bridge\Build-DysonControlBridgeCandidate.ps1" `
   -SourcePath "$artifact\integrations\dyson-control-bridge" `
   -DysonServerRoot $server `
   -OutputPath $candidate `
-  -ExpectedVersion '0.1.0' `
+  -ExpectedVersion '0.1.0-rc.1' `
   -Confirm:$false
 
 & "$artifact\scripts\windows\bridge\Test-DysonControlBridgeCandidate.ps1" `
   -CandidatePath $candidate `
   -DysonServerRoot $server `
-  -ExpectedVersion '0.1.0'
+  -ExpectedVersion '0.1.0-rc.1'
 ```
+
+The same controlled entry points are available from the release artifact as
+`npm run bridge:target-build -- <arguments>` and
+`npm run bridge:target-verify -- <arguments>`. They are intentionally separate
+from the repository-safe root check: public CI must not receive proprietary game
+assemblies, while production acceptance must not substitute fictional-reference
+self-tests for this target-host build and verification receipt.
 
 The builder accepts only the fixed reference paths declared by the project,
 rejects redirected or abnormal assemblies, records their managed names,
@@ -194,20 +293,27 @@ the dry run first, then install disabled-by-default:
 
 ```powershell
 $installer = "$artifact\scripts\windows\bridge\Install-DysonControlBridge.ps1"
-& $installer -CandidatePath $candidate -DysonServerRoot $server -WhatIf
-& $installer -CandidatePath $candidate -DysonServerRoot $server -Confirm:$false
+$controlServiceSid = 'S-1-5-19' # Local Service used by Dyson Control
+$gameServiceSid = '<SID of the dedicated interactive DSP account>'
+& $installer -CandidatePath $candidate -DysonServerRoot $server `
+  -ControlServiceSid $controlServiceSid -GameServiceSid $gameServiceSid -WhatIf
+& $installer -CandidatePath $candidate -DysonServerRoot $server `
+  -ControlServiceSid $controlServiceSid -GameServiceSid $gameServiceSid -Confirm:$false
 
 & "$artifact\scripts\windows\bridge\Test-DysonControlBridgeInstallation.ps1" `
   -DysonServerRoot $server
 ```
 
-If the game and control plane run under different Windows identities, pass
-their exact SID strings with `-SecretReaderSid`. The installer creates at least
-48 cryptographically random secret bytes, never prints them or records them in
-a manifest, disables ACL inheritance, and rejects broad readers. It snapshots
-the old plugin/config/state, publishes the DLL and config using same-directory
-atomic replacement, rolls back on failure, leaves `Enabled = false`, and never
-starts the game.
+The two exact, distinct, non-privileged SIDs are mandatory. The secret grants
+both identities read access. The control tree gives the game account Modify,
+while the control service gets Modify only in `requests`, Read/Execute on the
+root and `receipts`, and no access to `processing`, `processed`, or `rejected`.
+SYSTEM, Administrators, and the installer retain FullControl. Every ACL is
+protected and exact; broad readers and extra ACEs fail verification. The
+installer creates at least 48 cryptographically random secret bytes, never
+prints them or records them in a manifest, snapshots any prior DACLs, and
+restores them on failure. It publishes the DLL and config using same-directory
+atomic replacement, leaves `Enabled = false`, and never starts the game.
 
 Uninstall is also dry-run capable and recoverable. It snapshots the installed
 DLL/config/state and preserves the secret and all control data. The returned

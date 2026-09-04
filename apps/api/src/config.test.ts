@@ -1,6 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import { loadConfig } from './config.js'
 
+const lifecycleBrokerEnvironment = {
+  DYSON_LIFECYCLE_BROKER_PROFILE_FILE:
+    'C:\\ProgramData\\DysonControl\\data\\lifecycle-broker\\broker-profile.json',
+  DYSON_RUNTIME_SERVICE_USER: '.\\DysonServer'
+} as const
+const lifecycleExecutionEnvironment = {
+  DYSON_LIFECYCLE_ENABLED: 'true',
+  DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
+  DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
+  DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+  ...lifecycleBrokerEnvironment
+} as const
+const invalidConsoleCursorSecret = ['too', 'short'].join('-')
+
 describe('production configuration', () => {
   it('fails closed on misspelled DYSON variables while ignoring unrelated host variables', () => {
     expect(() => loadConfig({
@@ -47,9 +61,15 @@ describe('production configuration', () => {
     })).toThrow()
   })
 
+  it('defaults the expected Bridge heartbeat to the full repository release version', () => {
+    expect(loadConfig({ NODE_ENV: 'test' }).bridgePluginVersion).toBe('0.1.0-rc.1')
+  })
+
   it('keeps the console disabled without its independent signed-cursor secret', () => {
     expect(loadConfig({ NODE_ENV: 'test' }).consoleCursorSecret).toBeNull()
-    expect(() => loadConfig({ NODE_ENV: 'test', DYSON_CONSOLE_CURSOR_SECRET: 'too-short' })).toThrow()
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_CONSOLE_CURSOR_SECRET: invalidConsoleCursorSecret
+    })).toThrow()
     expect(loadConfig({
       NODE_ENV: 'test', DYSON_CONSOLE_CURSOR_SECRET: 'console-fixture-secret-at-least-32-bytes'
     }).consoleCursorSecret).toBe('console-fixture-secret-at-least-32-bytes')
@@ -148,13 +168,17 @@ describe('production configuration', () => {
       NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
       DYSON_UPDATE_ACTIVATION_ENABLED: 'true', DYSON_LIFECYCLE_ENABLED: 'true',
       DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
-      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret'
+      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
+      DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+      ...lifecycleBrokerEnvironment
     })).toThrow(/requires offline update staging/)
     expect(() => loadConfig({
       NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
       DYSON_UPDATE_ACTIVATION_ENABLED: 'true', DYSON_LIFECYCLE_ENABLED: 'true',
       DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
       DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
+      DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+      ...lifecycleBrokerEnvironment,
       DYSON_UPDATE_STAGING_ENABLED: 'true',
       DYSON_UPDATE_INBOX_ROOT: 'C:\\ProgramData\\DysonControl\\update-inbox',
       DYSON_UPDATE_STAGING_ROOT: 'C:\\ProgramData\\DysonControl\\staging'
@@ -164,6 +188,8 @@ describe('production configuration', () => {
       DYSON_UPDATE_ACTIVATION_ENABLED: 'true', DYSON_LIFECYCLE_ENABLED: 'true',
       DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
       DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
+      DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+      ...lifecycleBrokerEnvironment,
       DYSON_UPDATE_STAGING_ENABLED: 'true',
       DYSON_UPDATE_INBOX_ROOT: 'C:\\ProgramData\\DysonControl\\update-inbox',
       DYSON_UPDATE_STAGING_ROOT: 'C:\\ProgramData\\DysonControl\\staging',
@@ -172,6 +198,39 @@ describe('production configuration', () => {
     expect(() => loadConfig({
       NODE_ENV: 'test', DYSON_UPDATE_COMPATIBILITY_POLICY_FILE: 'relative\\policy.json'
     })).toThrow(/must be an absolute path/)
+  })
+
+  it('keeps the Steam manual handoff disabled and requires the fixed Windows lifecycle and policy chain', () => {
+    expect(loadConfig({ NODE_ENV: 'test' }).steamManualHandoffEnabled).toBe(false)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_STEAM_MANUAL_HANDOFF_ENABLED: 'true'
+    })).toThrow(/DYSON_STEAM_MANUAL_HANDOFF_ENABLED requires the Windows provider/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_STEAM_MANUAL_HANDOFF_ENABLED: 'true'
+    })).toThrow(/DYSON_STEAM_MANUAL_HANDOFF_ENABLED requires lifecycle execution/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      ...lifecycleExecutionEnvironment,
+      DYSON_STEAM_MANUAL_HANDOFF_ENABLED: 'true'
+    })).toThrow(/DYSON_STEAM_MANUAL_HANDOFF_ENABLED requires a trusted compatibility policy file/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      ...lifecycleExecutionEnvironment,
+      DYSON_STEAM_MANUAL_HANDOFF_ENABLED: 'true',
+      DYSON_UPDATE_COMPATIBILITY_POLICY_FILE: 'relative\\compatibility-policy.json'
+    })).toThrow(/DYSON_UPDATE_COMPATIBILITY_POLICY_FILE must be an absolute path/)
+
+    expect(loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      ...lifecycleExecutionEnvironment,
+      DYSON_STEAM_MANUAL_HANDOFF_ENABLED: 'true',
+      DYSON_UPDATE_COMPATIBILITY_POLICY_FILE: 'C:\\ProgramData\\DysonControl\\compatibility-policy.json'
+    })).toMatchObject({
+      steamManualHandoffEnabled: true,
+      updateStagingEnabled: false,
+      updateActivationEnabled: false
+    })
   })
 
   it('keeps explicit component recovery independently disabled and validates its complete host chain', () => {
@@ -188,6 +247,8 @@ describe('production configuration', () => {
       DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED: 'true', DYSON_LIFECYCLE_ENABLED: 'true',
       DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
       DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
+      DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+      ...lifecycleBrokerEnvironment,
       DYSON_UPDATE_STAGING_ENABLED: 'true',
       DYSON_UPDATE_INBOX_ROOT: 'C:\\ProgramData\\DysonControl\\update-inbox',
       DYSON_UPDATE_STAGING_ROOT: 'C:\\ProgramData\\DysonControl\\staging',
@@ -197,6 +258,142 @@ describe('production configuration', () => {
       updateActivationEnabled: false,
       updateActivationRecoveryEnabled: true
     })
+  })
+
+  it('keeps cutover and explicit recovery independently closed behind the complete fixed Windows chain', () => {
+    expect(loadConfig({ NODE_ENV: 'test' })).toMatchObject({
+      cutoverEnabled: false,
+      cutoverRecoveryEnabled: false,
+      cutoverProfileFile: null,
+      cutoverServiceUser: null,
+      cutoverTaskTransactionRoot: null,
+      cutoverDataDirectory: expect.stringMatching(/[\\/]data[\\/]cutover$/)
+    })
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_CUTOVER_ENABLED: 'true'
+    })).toThrow(/Windows provider/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_CUTOVER_ENABLED: 'true'
+    })).toThrow(/lifecycle execution/)
+
+    const lifecycle = {
+      NODE_ENV: 'test',
+      DYSON_PROVIDER: 'windows',
+      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_LIFECYCLE_ENABLED: 'true',
+      DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
+      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
+      DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+      ...lifecycleBrokerEnvironment
+    } as const
+    expect(() => loadConfig({ ...lifecycle, DYSON_CUTOVER_ENABLED: 'true' }))
+      .toThrow(/DYSON_CUTOVER_PROFILE_FILE/)
+    expect(() => loadConfig({
+      ...lifecycle,
+      DYSON_CUTOVER_ENABLED: 'true',
+      DYSON_CUTOVER_PROFILE_FILE: 'C:\\ProgramData\\DysonControl\\authority-profile.json'
+    })).toThrow(/DYSON_CUTOVER_SERVICE_USER/)
+    expect(() => loadConfig({
+      ...lifecycle,
+      DYSON_CUTOVER_ENABLED: 'true',
+      DYSON_CUTOVER_PROFILE_FILE: 'C:\\ProgramData\\DysonControl\\authority-profile.json',
+      DYSON_CUTOVER_SERVICE_USER: '.\\DysonServer'
+    })).toThrow(/DYSON_CUTOVER_TASK_TRANSACTION_ROOT/)
+    expect(() => loadConfig({
+      ...lifecycle,
+      DYSON_CUTOVER_ENABLED: 'true',
+      DYSON_CUTOVER_PROFILE_FILE: 'C:\\ProgramData\\DysonControl\\authority-profile.json',
+      DYSON_CUTOVER_SERVICE_USER: '.\\DysonServer',
+      DYSON_CUTOVER_TASK_TRANSACTION_ROOT: 'C:\\ProgramData\\DysonControl\\runtime-task-transactions'
+    })).toThrow(/absolute DYSON_DATA_DIR/)
+
+    const configured = loadConfig({
+      ...lifecycle,
+      DYSON_CUTOVER_ENABLED: 'false',
+      DYSON_CUTOVER_RECOVERY_ENABLED: 'true',
+      DYSON_CUTOVER_PROFILE_FILE: 'C:\\ProgramData\\DysonControl\\authority-profile.json',
+      DYSON_CUTOVER_SERVICE_USER: '.\\DysonServer',
+      DYSON_CUTOVER_TASK_TRANSACTION_ROOT: 'C:\\ProgramData\\DysonControl\\runtime-task-transactions',
+      DYSON_DATA_DIR: 'C:\\ProgramData\\DysonControl\\data'
+    })
+    expect(configured).toMatchObject({
+      cutoverEnabled: false,
+      cutoverRecoveryEnabled: true,
+      cutoverProfileFile: 'C:\\ProgramData\\DysonControl\\authority-profile.json',
+      cutoverServiceUser: '.\\DysonServer',
+      cutoverTaskTransactionRoot: 'C:\\ProgramData\\DysonControl\\runtime-task-transactions',
+      dataDir: 'C:\\ProgramData\\DysonControl\\data'
+    })
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_CUTOVER_PROFILE_FILE: 'relative\\authority-profile.json'
+    })).toThrow(/must be an absolute path/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_CUTOVER_TASK_TRANSACTION_ROOT: 'relative\\transactions'
+    })).toThrow(/must be an absolute path/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_CUTOVER_SERVICE_USER: 'bad"account'
+    })).toThrow()
+  })
+
+  it('keeps qualified client issuance closed behind complete disjoint protected Windows roots', () => {
+    expect(loadConfig({ NODE_ENV: 'test' })).toMatchObject({
+      qualifiedClientProfileEnabled: false,
+      clientQualificationEvidenceRoot: null,
+      clientQualificationBuildHarvestRootA: null,
+      clientQualificationBuildHarvestRootB: null,
+      clientQualificationKeyRingRoot: null,
+      clientQualificationReplayRoot: null,
+      qualifiedClientIssueRoot: null,
+      clientQualificationAuthority: null
+    })
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_QUALIFIED_CLIENT_PROFILE_ENABLED: 'true'
+    })).toThrow(/Windows provider/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_QUALIFIED_CLIENT_PROFILE_ENABLED: 'true'
+    })).toThrow(/every protected root and authority/)
+
+    const complete = {
+      NODE_ENV: 'test',
+      DYSON_PROVIDER: 'windows',
+      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_QUALIFIED_CLIENT_PROFILE_ENABLED: 'true',
+      DYSON_CLIENT_QUALIFICATION_EVIDENCE_ROOT: 'C:\\Fictional\\QualificationEvidence',
+      DYSON_CLIENT_QUALIFICATION_BUILD_HARVEST_ROOT_A: 'D:\\Fictional\\BuildA',
+      DYSON_CLIENT_QUALIFICATION_BUILD_HARVEST_ROOT_B: 'E:\\Fictional\\BuildB',
+      DYSON_CLIENT_QUALIFICATION_KEY_RING_ROOT: 'F:\\Fictional\\Keys',
+      DYSON_CLIENT_QUALIFICATION_REPLAY_ROOT: 'G:\\Fictional\\Replay',
+      DYSON_QUALIFIED_CLIENT_ISSUE_ROOT: 'H:\\Fictional\\IssuedProfiles',
+      DYSON_CLIENT_QUALIFICATION_AUTHORITY: 'game.example.com'
+    } as const
+    expect(loadConfig(complete)).toMatchObject({
+      qualifiedClientProfileEnabled: true,
+      clientQualificationEvidenceRoot: 'C:\\Fictional\\QualificationEvidence',
+      clientQualificationBuildHarvestRootA: 'D:\\Fictional\\BuildA',
+      clientQualificationBuildHarvestRootB: 'E:\\Fictional\\BuildB',
+      clientQualificationKeyRingRoot: 'F:\\Fictional\\Keys',
+      clientQualificationReplayRoot: 'G:\\Fictional\\Replay',
+      qualifiedClientIssueRoot: 'H:\\Fictional\\IssuedProfiles',
+      clientQualificationAuthority: 'game.example.com'
+    })
+    expect(() => loadConfig({
+      ...complete,
+      DYSON_CLIENT_QUALIFICATION_BUILD_HARVEST_ROOT_A: 'relative\\BuildA'
+    })).toThrow(/absolute paths below a filesystem root/)
+    expect(() => loadConfig({
+      ...complete,
+      DYSON_CLIENT_QUALIFICATION_KEY_RING_ROOT: 'C:\\Fictional\\QualificationEvidence\\keys'
+    })).toThrow(/pairwise disjoint/)
+    expect(() => loadConfig({
+      ...complete,
+      DYSON_CLIENT_QUALIFICATION_AUTHORITY: '192.0.2.10'
+    })).toThrow(/canonical public DNS hostname/)
+    expect(() => loadConfig({
+      ...complete,
+      DYSON_CLIENT_QUALIFICATION_AUTHORITY: 'Game.Example.com'
+    })).toThrow(/canonical public DNS hostname/)
   })
 
   it('keeps mod deployment independently disabled and binds activation to fixed Windows roots', () => {
@@ -233,6 +430,7 @@ describe('production configuration', () => {
     })).toThrow(/fixed dyson-managed-mods subtree/)
     expect(loadConfig({
       NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      ...lifecycleExecutionEnvironment,
       DYSON_MOD_IMPORT_ENABLED: 'true',
       DYSON_MOD_DEPLOYMENT_ENABLED: 'true',
       DYSON_UPDATE_STAGING_ENABLED: 'true',
@@ -256,6 +454,7 @@ describe('production configuration', () => {
     })).toThrow(/requires the Windows provider/)
     const config = loadConfig({
       NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      ...lifecycleExecutionEnvironment,
       DYSON_MOD_DEPLOYMENT_ENABLED: 'false',
       DYSON_MOD_DEPLOYMENT_RECOVERY_ENABLED: 'true',
       DYSON_MOD_STAGING_ROOT: 'C:\\Fictional\\staged-mods',
@@ -279,7 +478,8 @@ describe('production configuration', () => {
     })).toThrow(/requires the Windows provider/)
     expect(loadConfig({
       NODE_ENV: 'test', DYSON_PROVIDER: 'windows',
-      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson', DYSON_SAVE_MUTATIONS_ENABLED: 'true'
+      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson', ...lifecycleExecutionEnvironment,
+      DYSON_SAVE_MUTATIONS_ENABLED: 'true'
     }).saveMutationsEnabled).toBe(true)
     expect(() => loadConfig({
       NODE_ENV: 'test', DYSON_PROVIDER: 'demo', DYSON_SAVE_RETENTION_MUTATIONS_ENABLED: 'true'
@@ -297,7 +497,8 @@ describe('production configuration', () => {
     })).toThrow(/requires the Windows provider/)
     expect(loadConfig({
       NODE_ENV: 'test', DYSON_PROVIDER: 'windows',
-      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson', DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED: 'true'
+      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson', ...lifecycleExecutionEnvironment,
+      DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED: 'true'
     }).configHistoryMutationsEnabled).toBe(true)
   })
 
@@ -335,15 +536,44 @@ describe('production configuration', () => {
       NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
       DYSON_LIFECYCLE_ENABLED: 'true'
     })).toThrow(/DYSON_BRIDGE_CONTROL_ROOT/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_LIFECYCLE_ENABLED: 'true',
+      DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
+      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret'
+    })).toThrow(/DYSON_RUNTIME_BOOTSTRAP_ROOT/)
+
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_LIFECYCLE_ENABLED: 'true',
+      DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
+      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
+      DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap'
+    })).toThrow(/DYSON_LIFECYCLE_BROKER_PROFILE_FILE/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_LIFECYCLE_ENABLED: 'true',
+      DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
+      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
+      DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+      DYSON_LIFECYCLE_BROKER_PROFILE_FILE:
+        'C:\\ProgramData\\DysonControl\\data\\lifecycle-broker\\broker-profile.json'
+    })).toThrow(/DYSON_RUNTIME_SERVICE_USER/)
 
     const enabled = loadConfig({
       NODE_ENV: 'test', DYSON_PROVIDER: 'windows', DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
       DYSON_LIFECYCLE_ENABLED: 'true',
       DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\Dyson\\run\\control-bridge',
-      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret'
+      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\DysonControl\\bridge.secret',
+      DYSON_RUNTIME_BOOTSTRAP_ROOT: 'C:\\Program Files\\DysonControl\\bootstrap',
+      ...lifecycleBrokerEnvironment
     })
     expect(enabled).toMatchObject({
       lifecycleEnabled: true, lifecycleTimeoutMs: 240_000, gamePort: 8469,
+      runtimeBootstrapRoot: 'C:\\Program Files\\DysonControl\\bootstrap',
+      lifecycleBrokerProfileFile:
+        'C:\\ProgramData\\DysonControl\\data\\lifecycle-broker\\broker-profile.json',
+      runtimeServiceUser: '.\\DysonServer',
       serverTaskName: 'Dyson-Nebula-Server', stopTaskName: 'Dyson-Nebula-Stop',
       playerSnapshotMaximumAgeMs: 10_000,
       playerHistoryCapacity: 512,
@@ -353,6 +583,40 @@ describe('production configuration', () => {
     expect(() => loadConfig({
       NODE_ENV: 'test', DYSON_BRIDGE_CONTROL_ROOT: 'C:\\Fictional\\control'
     })).toThrow(/configured together/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_RUNTIME_BOOTSTRAP_ROOT: 'relative\\bootstrap'
+    })).toThrow(/must be an absolute path/)
+  })
+
+  it('pins lifecycle execution to the two fixed scheduled tasks while preserving disabled compatibility', () => {
+    const lifecycle = {
+      NODE_ENV: 'test',
+      DYSON_PROVIDER: 'windows',
+      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      ...lifecycleExecutionEnvironment
+    } as const
+
+    expect(() => loadConfig({
+      ...lifecycle,
+      DYSON_SERVER_TASK: 'Legacy-Dyson-Server'
+    })).toThrow(/DYSON_SERVER_TASK.*Dyson-Nebula-Server/)
+    expect(() => loadConfig({
+      ...lifecycle,
+      DYSON_STOP_TASK: 'Legacy-Dyson-Stop'
+    })).toThrow(/DYSON_STOP_TASK.*Dyson-Nebula-Stop/)
+
+    expect(loadConfig({
+      NODE_ENV: 'test',
+      DYSON_PROVIDER: 'windows',
+      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson',
+      DYSON_LIFECYCLE_ENABLED: 'false',
+      DYSON_SERVER_TASK: 'Legacy-Dyson-Server',
+      DYSON_STOP_TASK: 'Legacy-Dyson-Stop'
+    })).toMatchObject({
+      lifecycleEnabled: false,
+      serverTaskName: 'Legacy-Dyson-Server',
+      stopTaskName: 'Legacy-Dyson-Stop'
+    })
   })
 
   it('bounds durable player history by both event count and retention time', () => {

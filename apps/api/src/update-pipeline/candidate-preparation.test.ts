@@ -343,8 +343,28 @@ function activationService(fixture: Fixture): ComponentUpdateActivationService {
       requestId: request.requestId,
       status: 'succeeded',
       backupId: `backup-${request.requestId}`,
+      manifestSha256: 'd'.repeat(64),
+      saveIdentity: 'c'.repeat(64),
       pairProtected: true,
       durable: true
+    }),
+    captureRollbackBaseline: async () => ({
+      configurationSnapshotId: 'config-snapshot-fixture',
+      configurationRevision: '1'.repeat(64),
+      serverModLockSha256: '2'.repeat(64),
+      serverModLockRevision: '3'.repeat(64),
+      previousLoadedSaveIdentity: 'c'.repeat(64)
+    }),
+    restoreRollbackConfiguration: async () => ({ restored: true, rereadVerified: true }),
+    restoreRollbackServerModLock: async () => ({ restored: true, rereadVerified: true }),
+    restoreRollbackPairedSave: async () => ({ restored: true, rereadVerified: true }),
+    inspectRollbackReadback: async () => ({
+      configurationSnapshotId: 'config-snapshot-fixture',
+      configurationRevision: '1'.repeat(64),
+      serverModLockSha256: '2'.repeat(64),
+      serverModLockRevision: '3'.repeat(64),
+      protectionManifestSha256: 'd'.repeat(64),
+      loadedSaveIdentity: 'c'.repeat(64)
     }),
     smoke: async (request) => ({
       component: request.component,
@@ -353,7 +373,11 @@ function activationService(fixture: Fixture): ComponentUpdateActivationService {
       bepInExLoaded: true,
       nebulaLoaded: true,
       processHealthy: true,
-      portHealthy: true
+      portHealthy: true,
+      startupGenerationId: 'e'.repeat(64),
+      bridgeHeartbeatGenerationId: 'e'.repeat(64),
+      loadedSaveLogGenerationId: 'e'.repeat(64),
+      loadedSaveIdentity: request.expectedLoadedSaveIdentity
     }),
     compatibilityVerifier: {
       assertCurrent: async (receiptId, candidateInput) => {

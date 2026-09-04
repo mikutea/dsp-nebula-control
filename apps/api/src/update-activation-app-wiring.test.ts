@@ -17,6 +17,7 @@ import {
   type HostMutationOperationOutcome
 } from './host-mutation/operation-coordinator.js'
 import { initialComponentUpdateRevision } from './update-pipeline/index.js'
+import type { WindowsLifecycleBrokerClient } from './providers/windows-lifecycle-broker.js'
 
 const publicOrigin = 'http://127.0.0.1:13010'
 const administratorPassword = 'fictional-administrator-password'
@@ -35,7 +36,8 @@ describe('application component update activation default wiring', () => {
     const fixture = await createFixture(false)
     application = await buildApplication(fixture.config, {
       statusProvider: fixture.statusProvider,
-      lifecycleAdapter: fixture.lifecycleAdapter
+      lifecycleAdapter: fixture.lifecycleAdapter,
+      lifecycleBrokerClient: unusedLifecycleBrokerClient
     })
     const cookie = await loginAdministrator()
 
@@ -108,6 +110,7 @@ describe('application component update activation default wiring', () => {
     application = await buildApplication(fixture.config, {
       statusProvider: fixture.statusProvider,
       lifecycleAdapter: fixture.lifecycleAdapter,
+      lifecycleBrokerClient: unusedLifecycleBrokerClient,
       hostMutationCoordinator: fixture.hostMutationCoordinator
     })
     const cookie = await loginAdministrator()
@@ -223,7 +226,11 @@ async function createFixture(updateActivationEnabled: boolean): Promise<Fixture>
       DYSON_DATA_DIR: path.join(root, 'fictional-data'),
       DYSON_PROJECT_ROOT: projectRoot,
       DYSON_SCRIPT_ROOT: scriptRoot,
+      DYSON_RUNTIME_BOOTSTRAP_ROOT: path.join(root, 'fictional-bootstrap'),
       DYSON_LIFECYCLE_ENABLED: 'true',
+      DYSON_LIFECYCLE_BROKER_PROFILE_FILE:
+        path.join(root, 'fictional-data', 'lifecycle-broker', 'broker-profile.json'),
+      DYSON_RUNTIME_SERVICE_USER: '.\\FictionalDyson',
       DYSON_BRIDGE_CONTROL_ROOT: bridgeRoot,
       DYSON_BRIDGE_SECRET_FILE: path.join(root, 'fictional-private', 'bridge.key'),
       DYSON_UPDATE_STAGING_ENABLED: 'true',
@@ -234,6 +241,13 @@ async function createFixture(updateActivationEnabled: boolean): Promise<Fixture>
     })
   }
 }
+
+const unusedLifecycleBrokerClient = {
+  preflight: async () => await unexpectedRuntimeCall('lifecycle-broker.preflight'),
+  dispatch: async () => await unexpectedRuntimeCall('lifecycle-broker.dispatch'),
+  verify: async () => await unexpectedRuntimeCall('lifecycle-broker.verify'),
+  status: async () => await unexpectedRuntimeCall('lifecycle-broker.status')
+} satisfies WindowsLifecycleBrokerClient
 
 class PassThroughHostMutationCoordinator implements HostMutationOperationCoordinator {
   async runExclusive<T>(

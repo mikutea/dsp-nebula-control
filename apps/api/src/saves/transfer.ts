@@ -7,6 +7,7 @@ import {
   mkdir,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   rmdir,
@@ -33,7 +34,12 @@ import {
   type SavePairTransportSourceEntry,
   type SavePairTransportWriteResult
 } from './transfer-format.js'
-import { backupIdSchema, backupManifestV1Schema, type BackupManifestV1 } from './schemas.js'
+import {
+  BACKUP_MANIFEST_PROTOCOL,
+  backupIdSchema,
+  backupManifestV1Schema,
+  type BackupManifestV1
+} from './schemas.js'
 
 const requestIdSchema = z.string().uuid()
 const sha256Schema = z.string().length(64).regex(/^[a-f0-9]{64}$/)
@@ -56,6 +62,14 @@ const importRequestSchema = z.strictObject({
   sha256: z.string().length(64).regex(/^[a-fA-F0-9]{64}$/)
 })
 const openExportRequestSchema = z.strictObject({ requestId: requestIdSchema })
+export const SAVE_PAIR_PROMOTION_CONFIRMATION = 'PROMOTE_IMPORTED_SAVE_PAIR' as const
+export const savePairPromotionPreviewRequestSchema = z.strictObject({
+  requestId: requestIdSchema,
+  importRequestId: requestIdSchema
+})
+export const savePairPromotionExecutionRequestSchema = savePairPromotionPreviewRequestSchema.extend({
+  confirmation: z.literal(SAVE_PAIR_PROMOTION_CONFIRMATION)
+}).strict()
 
 const exportReceiptSchema = z.strictObject({
   format: z.literal('dyson-control-save-transfer-receipt'),
@@ -98,9 +112,59 @@ const importEnvelopeSchema = z.strictObject({
   requestFingerprint: sha256Schema,
   receipt: importReceiptSchema
 })
+const promotionReceiptSchema = z.strictObject({
+  format: z.literal('dyson-control-save-promotion-receipt'),
+  schemaVersion: z.literal(1),
+  operation: z.literal('promote-import'),
+  requestId: requestIdSchema,
+  importRequestId: requestIdSchema,
+  inboxId: z.string().regex(/^import-[0-9a-f-]{36}$/),
+  backupId: z.string().regex(/^tx-[0-9a-f-]{36}$/),
+  saveName: z.string().min(1).max(120),
+  sourceArchiveSha256: sha256Schema,
+  manifestSha256: sha256Schema,
+  dsvBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  serverBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  completedAt: isoDateSchema,
+  restoreExecuted: z.literal(false),
+  reused: z.boolean()
+})
+const promotionEnvelopeSchema = z.strictObject({
+  format: z.literal('dyson-control-save-promotion-receipt-envelope'),
+  schemaVersion: z.literal(1),
+  requestFingerprint: sha256Schema,
+  receipt: promotionReceiptSchema
+})
+const promotionPlanSchema = z.strictObject({
+  format: z.literal('dyson-control-save-promotion-plan'),
+  schemaVersion: z.literal(1),
+  mode: z.literal('dry-run'),
+  requestId: requestIdSchema,
+  importRequestId: requestIdSchema,
+  inboxId: z.string().regex(/^import-[0-9a-f-]{36}$/),
+  backupId: z.string().regex(/^tx-[0-9a-f-]{36}$/),
+  saveName: z.string().min(1).max(120),
+  sourceArchiveSha256: sha256Schema,
+  dsvBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  serverBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  requiredBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  availableBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  allowed: z.boolean(),
+  blockers: z.array(z.enum(['space-insufficient', 'space-unavailable'])).max(2),
+  reused: z.boolean(),
+  requiredConfirmation: z.literal(SAVE_PAIR_PROMOTION_CONFIRMATION),
+  effects: z.strictObject({
+    quarantinePreserved: z.literal(true),
+    verifiedBackupCreated: z.boolean(),
+    liveSaveChanged: z.literal(false),
+    restoreExecuted: z.literal(false)
+  })
+})
 
 export type SavePairExportReceipt = z.infer<typeof exportReceiptSchema>
 export type SavePairImportReceipt = z.infer<typeof importReceiptSchema>
+export type SavePairPromotionReceipt = z.infer<typeof promotionReceiptSchema>
+export type SavePairPromotionPlan = z.infer<typeof promotionPlanSchema>
 
 export interface SavePairTransferServiceOptions {
   /** Fixed server-side roots. Request bodies never select filesystem paths. */
@@ -132,6 +196,14 @@ interface TrustedBackupSource {
   manifestSha256: string
   dsv: BackupManifestV1['files'][number]
   server: BackupManifestV1['files'][number]
+}
+
+interface TrustedImportSource {
+  directory: string
+  envelope: z.infer<typeof importEnvelopeSchema>
+  manifest: SavePairTransportManifest
+  dsv: SavePairTransportManifest['files'][number]
+  server: SavePairTransportManifest['files'][number]
 }
 
 interface ImportStage {
@@ -344,6 +416,144 @@ export class SavePairTransferService {
     })
   }
 
+  /**
+   * Read-only projection for moving one already verified quarantine pair into
+   * the fixed backup catalogue. It never acquires the transfer lock, creates a
+   * directory, writes a receipt, or touches the live save root.
+   */
+  async previewImportPromotion(input: unknown): Promise<SavePairPromotionPlan> {
+    const request = parsePromotionPreviewRequest(input)
+    const roots = await resolveExistingRoots(this.#backupRoot, this.#transportRoot)
+    const source = await readTrustedImportSource(roots, request.importRequestId, this.#limits)
+    const fingerprint = requestFingerprint('promote-import', request)
+    const existing = await readPromotionEnvelope(roots, request.requestId)
+    let reused = false
+    if (existing !== null) {
+      await verifyPromotionEnvelope(roots, fingerprint, request, existing, source)
+      reused = true
+    } else if (await pathExists(promotionBackupPath(roots, request.requestId))) {
+      await readExactPromotedBackup(roots, request, source)
+      reused = true
+    }
+
+    const requiredBytes = promotionRequiredBytes(source)
+    let availableBytes: number | null = null
+    const blockers: Array<'space-insufficient' | 'space-unavailable'> = []
+    if (!reused) {
+      try {
+        const candidate = await this.#availableBytes(roots.backupRoot)
+        if (!Number.isSafeInteger(candidate) || candidate < 0) blockers.push('space-unavailable')
+        else {
+          availableBytes = candidate
+          if (candidate < requiredBytes + this.#reserveFreeBytes) blockers.push('space-insufficient')
+        }
+      } catch {
+        blockers.push('space-unavailable')
+      }
+    }
+
+    return promotionPlanSchema.parse({
+      format: 'dyson-control-save-promotion-plan',
+      schemaVersion: 1,
+      mode: 'dry-run',
+      requestId: request.requestId,
+      importRequestId: request.importRequestId,
+      inboxId: source.envelope.receipt.inboxId,
+      backupId: `tx-${request.requestId}`,
+      saveName: source.manifest.saveName,
+      sourceArchiveSha256: source.envelope.receipt.archiveSha256,
+      dsvBytes: source.dsv.bytes,
+      serverBytes: source.server.bytes,
+      requiredBytes,
+      availableBytes,
+      allowed: reused || blockers.length === 0,
+      blockers,
+      reused,
+      requiredConfirmation: SAVE_PAIR_PROMOTION_CONFIRMATION,
+      effects: {
+        quarantinePreserved: true,
+        verifiedBackupCreated: !reused,
+        liveSaveChanged: false,
+        restoreExecuted: false
+      }
+    })
+  }
+
+  /**
+   * Copies one verified quarantine pair into a canonical backup directory.
+   * Publication is an atomic same-root directory rename; the quarantine source
+   * remains intact and no active save is ever selected or overwritten.
+   */
+  async promoteImport(input: unknown): Promise<SavePairPromotionReceipt> {
+    const execution = parsePromotionExecutionRequest(input)
+    const request = { requestId: execution.requestId, importRequestId: execution.importRequestId }
+    return await this.#serialize(async () => {
+      const roots = await prepareRoots(this.#backupRoot, this.#transportRoot)
+      return await withTransferLock(roots, async () => {
+        const fingerprint = requestFingerprint('promote-import', request)
+        const source = await readTrustedImportSource(roots, request.importRequestId, this.#limits)
+        const existing = await readPromotionEnvelope(roots, request.requestId)
+        if (existing !== null) {
+          await verifyPromotionEnvelope(roots, fingerprint, request, existing, source)
+          return { ...existing.receipt, reused: true }
+        }
+
+        const finalDirectory = promotionBackupPath(roots, request.requestId)
+        if (await pathExists(finalDirectory)) {
+          const recovered = promotionReceiptFromBackup(
+            request,
+            source,
+            await readExactPromotedBackup(roots, request, source)
+          )
+          await persistPromotionEnvelope(roots, fingerprint, recovered)
+          return { ...recovered, reused: true }
+        }
+
+        await this.#requireSpace(roots.backupRoot, promotionRequiredBytes(source))
+        await cleanupInterruptedPromotionStage(roots, request, source)
+        const stage = await createPromotionStage(roots, request.requestId)
+        let published = false
+        let publicationVerified = false
+        try {
+          for (const file of [source.dsv, source.server]) {
+            const destination = safeImmediateChild(stage.directory, file.name)
+            stage.ownedFiles.add(destination)
+            await copyStableFile(
+              safeImmediateChild(source.directory, file.name),
+              destination,
+              file,
+              this.#limits
+            )
+          }
+
+          const manifest = promotionBackupManifest(request.requestId, source, this.#timestamp())
+          const manifestPath = safeImmediateChild(stage.directory, 'manifest.json')
+          stage.ownedFiles.add(manifestPath)
+          await writeSmallOwnedFile(manifestPath, backupManifestBytes(manifest))
+          await verifyPromotionStage(stage.directory, manifest, this.#limits)
+
+          const after = await readTrustedImportSource(roots, request.importRequestId, this.#limits)
+          if (!sameTrustedImport(source, after)) throw new SaveTransferError('SAVE_TRANSFER_SOURCE_CHANGED')
+
+          await publishDirectoryWithoutOverwrite(stage.directory, finalDirectory)
+          published = true
+          const trustedBackup = await readExactPromotedBackup(roots, request, source)
+          publicationVerified = true
+          const receipt = promotionReceiptFromBackup(request, source, trustedBackup)
+          await persistPromotionEnvelope(roots, fingerprint, receipt)
+          return receipt
+        } catch (error) {
+          if (!published) {
+            await cleanupImportStage(stage).catch(() => undefined)
+          } else if (!publicationVerified) {
+            await cleanupPublishedPromotion(finalDirectory, source).catch(() => undefined)
+          }
+          throw normalizeTransferError(error)
+        }
+      })
+    })
+  }
+
   async #requireSpace(fixedRoot: string, neededBytes: number): Promise<void> {
     if (!Number.isSafeInteger(neededBytes) || neededBytes < 0 ||
         neededBytes > this.#limits.maximumArchiveBytes) {
@@ -407,6 +617,22 @@ function parseOpenExportRequest(input: unknown): z.infer<typeof openExportReques
   }
 }
 
+function parsePromotionPreviewRequest(input: unknown): z.infer<typeof savePairPromotionPreviewRequestSchema> {
+  try {
+    return savePairPromotionPreviewRequestSchema.parse(input)
+  } catch (error) {
+    throw new SaveTransferError('SAVE_TRANSFER_REQUEST_INVALID', { cause: error })
+  }
+}
+
+function parsePromotionExecutionRequest(input: unknown): z.infer<typeof savePairPromotionExecutionRequestSchema> {
+  try {
+    return savePairPromotionExecutionRequestSchema.parse(input)
+  } catch (error) {
+    throw new SaveTransferError('SAVE_TRANSFER_REQUEST_INVALID', { cause: error })
+  }
+}
+
 async function prepareRoots(backupRoot: string, transportRoot: string): Promise<PreparedTransferRoots> {
   let preparedBackup: string
   let preparedTransport: string
@@ -431,6 +657,30 @@ async function prepareRoots(backupRoot: string, transportRoot: string): Promise<
     inboxRoot,
     receiptRoot,
     stagingRoot
+  }
+}
+
+async function resolveExistingRoots(
+  backupRoot: string,
+  transportRoot: string
+): Promise<PreparedTransferRoots> {
+  try {
+    const preparedBackup = await resolveNormalDirectory(backupRoot)
+    const preparedTransport = await resolveNormalDirectory(transportRoot)
+    if (pathsOverlap(preparedBackup, preparedTransport)) {
+      throw new SaveTransferError('SAVE_TRANSFER_ROOT_COLLISION')
+    }
+    return {
+      backupRoot: preparedBackup,
+      transportRoot: preparedTransport,
+      exportRoot: await resolveNormalDirectory(safeImmediateChild(preparedTransport, rootChildNames.exports)),
+      inboxRoot: await resolveNormalDirectory(safeImmediateChild(preparedTransport, rootChildNames.inbox)),
+      receiptRoot: await resolveNormalDirectory(safeImmediateChild(preparedTransport, rootChildNames.receipts)),
+      stagingRoot: await resolveNormalDirectory(safeImmediateChild(preparedTransport, rootChildNames.staging))
+    }
+  } catch (error) {
+    if (error instanceof SaveTransferError) throw error
+    throw new SaveTransferError('SAVE_TRANSFER_ROOT_UNAVAILABLE', { cause: error })
   }
 }
 
@@ -621,7 +871,7 @@ async function verifyImportDirectory(
   fingerprint: string,
   receipt: SavePairImportReceipt,
   limits: SavePairTransportLimits
-): Promise<void> {
+): Promise<SavePairTransportManifest> {
   const resolved = await resolveNormalDirectory(directory)
   const manifestFile = await readStableSmallFile(safeImmediateChild(resolved, 'manifest.json'), limits.maximumManifestBytes)
   let manifest: SavePairTransportManifest
@@ -643,6 +893,261 @@ async function verifyImportDirectory(
   const metadata = await readImportMetadata(resolved)
   if (metadata.requestFingerprint !== fingerprint || JSON.stringify(metadata.receipt) !== JSON.stringify(receipt)) {
     throw new SaveTransferError('SAVE_TRANSFER_STATE_INVALID')
+  }
+  return manifest
+}
+
+async function readTrustedImportSource(
+  roots: PreparedTransferRoots,
+  importRequestId: string,
+  limits: SavePairTransportLimits
+): Promise<TrustedImportSource> {
+  const envelope = await readImportEnvelope(roots, importRequestId)
+  if (envelope === null) throw new SaveTransferError('SAVE_TRANSFER_IMPORT_NOT_FOUND')
+  const directory = importInboxPath(roots, importRequestId)
+  const manifest = await verifyImportDirectory(
+    directory,
+    envelope.requestFingerprint,
+    { ...envelope.receipt, reused: false },
+    limits
+  )
+  const dsv = manifest.files.find((file) => file.name === `${manifest.saveName}.dsv`)
+  const server = manifest.files.find((file) => file.name === `${manifest.saveName}.server`)
+  if (dsv === undefined || server === undefined || dsv.bytes <= 0 || server.bytes <= 0 ||
+      dsv.bytes !== envelope.receipt.dsvBytes || server.bytes !== envelope.receipt.serverBytes) {
+    throw new SaveTransferError('SAVE_TRANSFER_STATE_INVALID')
+  }
+  return { directory, envelope, manifest, dsv, server }
+}
+
+function sameTrustedImport(left: TrustedImportSource, right: TrustedImportSource): boolean {
+  return samePath(left.directory, right.directory) &&
+    JSON.stringify(left.envelope) === JSON.stringify(right.envelope) &&
+    JSON.stringify(left.manifest) === JSON.stringify(right.manifest)
+}
+
+function promotionRequiredBytes(source: TrustedImportSource): number {
+  const required = source.dsv.bytes + source.server.bytes + receiptMaximumBytes
+  if (!Number.isSafeInteger(required) || required <= 0) {
+    throw new SaveTransferError('SAVE_TRANSFER_PAIR_TOO_LARGE')
+  }
+  return required
+}
+
+function promotionBackupManifest(
+  requestId: string,
+  source: TrustedImportSource,
+  createdAt: string
+): BackupManifestV1 {
+  return backupManifestV1Schema.parse({
+    protocol: BACKUP_MANIFEST_PROTOCOL,
+    schemaVersion: 1,
+    requestId,
+    createdAt,
+    saveName: source.manifest.saveName,
+    files: [
+      {
+        name: source.dsv.name,
+        bytes: source.dsv.bytes,
+        sha256: source.dsv.sha256.toLowerCase()
+      },
+      {
+        name: source.server.name,
+        bytes: source.server.bytes,
+        sha256: source.server.sha256.toLowerCase()
+      }
+    ]
+  })
+}
+
+function backupManifestBytes(manifest: BackupManifestV1): Buffer {
+  const bytes = Buffer.from(JSON.stringify(backupManifestV1Schema.parse(manifest)), 'utf8')
+  if (bytes.byteLength < 1 || bytes.byteLength > receiptMaximumBytes) {
+    throw new SaveTransferError('SAVE_TRANSFER_METADATA_INVALID')
+  }
+  return bytes
+}
+
+async function createPromotionStage(
+  roots: PreparedTransferRoots,
+  requestId: string
+): Promise<ImportStage> {
+  const directory = promotionStagePath(roots, requestId)
+  try {
+    await mkdir(directory, { mode: 0o700 })
+  } catch (error) {
+    throw new SaveTransferError('SAVE_TRANSFER_STAGE_INVALID', { cause: error })
+  }
+  return { directory: await resolveNormalDirectory(directory), ownedFiles: new Set() }
+}
+
+async function cleanupInterruptedPromotionStage(
+  roots: PreparedTransferRoots,
+  request: z.infer<typeof savePairPromotionPreviewRequestSchema>,
+  source: TrustedImportSource
+): Promise<void> {
+  await cleanupOwnedPromotionDirectory(
+    promotionStagePath(roots, request.requestId),
+    new Set([source.dsv.name, source.server.name, 'manifest.json'])
+  )
+}
+
+async function cleanupPublishedPromotion(
+  directory: string,
+  source: TrustedImportSource
+): Promise<void> {
+  await cleanupOwnedPromotionDirectory(
+    directory,
+    new Set([source.dsv.name, source.server.name, 'manifest.json'])
+  )
+}
+
+async function cleanupOwnedPromotionDirectory(
+  directory: string,
+  allowedNames: ReadonlySet<string>
+): Promise<void> {
+  let information
+  try {
+    information = await lstat(directory)
+  } catch (error) {
+    if (isNodeError(error, 'ENOENT')) return
+    throw new SaveTransferError('SAVE_TRANSFER_STAGE_INVALID', { cause: error })
+  }
+  if (information.isSymbolicLink()) {
+    await unlink(directory)
+    return
+  }
+  if (!information.isDirectory() || !samePath(await realpath(directory), directory)) {
+    throw new SaveTransferError('SAVE_TRANSFER_STAGE_INVALID')
+  }
+  const entries = await readdir(directory)
+  if (entries.some((entry) => !allowedNames.has(entry))) {
+    throw new SaveTransferError('SAVE_TRANSFER_STAGE_INVALID')
+  }
+  for (const entry of entries) {
+    const filePath = safeImmediateChild(directory, entry)
+    await assertNormalFilePath(filePath)
+    await unlink(filePath)
+  }
+  await rmdir(directory)
+}
+
+async function copyStableFile(
+  sourcePath: string,
+  destinationPath: string,
+  expected: SavePairTransportManifest['files'][number],
+  limits: SavePairTransportLimits
+): Promise<void> {
+  const sink = await FileHandleSink.create(destinationPath)
+  try {
+    for await (const chunk of stableFileSource(
+      sourcePath,
+      { bytes: expected.bytes, sha256: expected.sha256.toLowerCase() },
+      limits.maximumInputChunkBytes
+    )) {
+      await sink.write(chunk)
+    }
+    await sink.close()
+    const evidence = await hashStableFile(destinationPath, limits.maximumFileBytes)
+    if (evidence.bytes !== expected.bytes || evidence.sha256 !== expected.sha256.toLowerCase()) {
+      throw new SaveTransferError('SAVE_TRANSFER_PAIR_MISMATCH')
+    }
+  } catch (error) {
+    await sink.abort().catch(() => undefined)
+    throw error
+  }
+}
+
+async function verifyPromotionStage(
+  directory: string,
+  manifest: BackupManifestV1,
+  limits: SavePairTransportLimits
+): Promise<void> {
+  const resolved = await resolveNormalDirectory(directory)
+  const expectedNames = new Set(['manifest.json', ...manifest.files.map((file) => file.name)])
+  const entries = await readdir(resolved)
+  if (entries.length !== expectedNames.size || entries.some((entry) => !expectedNames.has(entry))) {
+    throw new SaveTransferError('SAVE_TRANSFER_STATE_INVALID')
+  }
+  const raw = await readStableSmallFile(safeImmediateChild(resolved, 'manifest.json'), receiptMaximumBytes)
+  let parsed: BackupManifestV1
+  try {
+    parsed = backupManifestV1Schema.parse(JSON.parse(raw.bytes.toString('utf8')) as unknown)
+  } catch (error) {
+    throw new SaveTransferError('SAVE_TRANSFER_STATE_INVALID', { cause: error })
+  }
+  if (!raw.bytes.equals(backupManifestBytes(manifest)) || JSON.stringify(parsed) !== JSON.stringify(manifest)) {
+    throw new SaveTransferError('SAVE_TRANSFER_STATE_INVALID')
+  }
+  for (const file of manifest.files) {
+    const evidence = await hashStableFile(safeImmediateChild(resolved, file.name), limits.maximumFileBytes)
+    if (evidence.bytes !== file.bytes || evidence.sha256 !== file.sha256.toLowerCase()) {
+      throw new SaveTransferError('SAVE_TRANSFER_STATE_INVALID')
+    }
+  }
+}
+
+async function readExactPromotedBackup(
+  roots: PreparedTransferRoots,
+  request: z.infer<typeof savePairPromotionPreviewRequestSchema>,
+  source: TrustedImportSource
+): Promise<TrustedBackupSource> {
+  const backupId = `tx-${request.requestId}`
+  const trusted = await readTrustedBackupSource(roots.backupRoot, backupId)
+  if (trusted.manifest.requestId !== request.requestId ||
+      trusted.manifest.saveName !== source.manifest.saveName ||
+      trusted.dsv.name !== source.dsv.name || trusted.dsv.bytes !== source.dsv.bytes ||
+      trusted.dsv.sha256.toLowerCase() !== source.dsv.sha256.toLowerCase() ||
+      trusted.server.name !== source.server.name || trusted.server.bytes !== source.server.bytes ||
+      trusted.server.sha256.toLowerCase() !== source.server.sha256.toLowerCase()) {
+    throw new SaveTransferError('SAVE_TRANSFER_IDEMPOTENCY_CONFLICT')
+  }
+  return trusted
+}
+
+function promotionReceiptFromBackup(
+  request: z.infer<typeof savePairPromotionPreviewRequestSchema>,
+  source: TrustedImportSource,
+  backup: TrustedBackupSource
+): SavePairPromotionReceipt {
+  return promotionReceiptSchema.parse({
+    format: 'dyson-control-save-promotion-receipt',
+    schemaVersion: 1,
+    operation: 'promote-import',
+    requestId: request.requestId,
+    importRequestId: request.importRequestId,
+    inboxId: source.envelope.receipt.inboxId,
+    backupId: `tx-${request.requestId}`,
+    saveName: source.manifest.saveName,
+    sourceArchiveSha256: source.envelope.receipt.archiveSha256,
+    manifestSha256: backup.manifestSha256,
+    dsvBytes: source.dsv.bytes,
+    serverBytes: source.server.bytes,
+    completedAt: backup.manifest.createdAt,
+    restoreExecuted: false,
+    reused: false
+  })
+}
+
+async function verifyPromotionEnvelope(
+  roots: PreparedTransferRoots,
+  fingerprint: string,
+  request: z.infer<typeof savePairPromotionPreviewRequestSchema>,
+  envelope: z.infer<typeof promotionEnvelopeSchema>,
+  source: TrustedImportSource
+): Promise<void> {
+  if (envelope.requestFingerprint !== fingerprint ||
+      envelope.receipt.requestId !== request.requestId ||
+      envelope.receipt.importRequestId !== request.importRequestId) {
+    throw new SaveTransferError('SAVE_TRANSFER_IDEMPOTENCY_CONFLICT')
+  }
+  const expected = promotionReceiptFromBackup(
+    request,
+    source,
+    await readExactPromotedBackup(roots, request, source)
+  )
+  if (JSON.stringify({ ...envelope.receipt, reused: false }) !== JSON.stringify(expected)) {
+    throw new SaveTransferError('SAVE_TRANSFER_RECEIPT_INVALID')
   }
 }
 
@@ -745,6 +1250,13 @@ async function readImportEnvelope(
   return await readReceiptEnvelope(importReceiptPath(roots, requestId), importEnvelopeSchema)
 }
 
+async function readPromotionEnvelope(
+  roots: PreparedTransferRoots,
+  requestId: string
+): Promise<z.infer<typeof promotionEnvelopeSchema> | null> {
+  return await readReceiptEnvelope(promotionReceiptPath(roots, requestId), promotionEnvelopeSchema)
+}
+
 async function readReceiptEnvelope<T>(
   receiptPath: string,
   schema: z.ZodType<T>
@@ -778,6 +1290,19 @@ async function persistImportEnvelope(
 ): Promise<void> {
   await persistReceipt(importReceiptPath(roots, receipt.requestId), importEnvelopeSchema.parse({
     format: 'dyson-control-save-transfer-receipt-envelope',
+    schemaVersion: 1,
+    requestFingerprint: fingerprint,
+    receipt: { ...receipt, reused: false }
+  }))
+}
+
+async function persistPromotionEnvelope(
+  roots: PreparedTransferRoots,
+  fingerprint: string,
+  receipt: SavePairPromotionReceipt
+): Promise<void> {
+  await persistReceipt(promotionReceiptPath(roots, receipt.requestId), promotionEnvelopeSchema.parse({
+    format: 'dyson-control-save-promotion-receipt-envelope',
     schemaVersion: 1,
     requestFingerprint: fingerprint,
     receipt: { ...receipt, reused: false }
@@ -1051,7 +1576,22 @@ function importReceiptPath(roots: PreparedTransferRoots, requestId: string): str
   return safeImmediateChild(roots.receiptRoot, `import-${requestId}.json`)
 }
 
-function requestFingerprint(operation: 'export' | 'import', request: unknown): string {
+function promotionReceiptPath(roots: PreparedTransferRoots, requestId: string): string {
+  requestIdSchema.parse(requestId)
+  return safeImmediateChild(roots.receiptRoot, `promotion-${requestId}.json`)
+}
+
+function promotionBackupPath(roots: PreparedTransferRoots, requestId: string): string {
+  requestIdSchema.parse(requestId)
+  return safeImmediateChild(roots.backupRoot, `tx-${requestId}`)
+}
+
+function promotionStagePath(roots: PreparedTransferRoots, requestId: string): string {
+  requestIdSchema.parse(requestId)
+  return safeImmediateChild(roots.backupRoot, `.promotion-${requestId}.partial`)
+}
+
+function requestFingerprint(operation: 'export' | 'import' | 'promote-import', request: unknown): string {
   return createHash('sha256').update(JSON.stringify({ operation, request }), 'utf8').digest('hex')
 }
 

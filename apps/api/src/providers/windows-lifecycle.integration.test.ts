@@ -15,6 +15,7 @@ import { LifecycleService } from '../services/lifecycle-service.js'
 import { DemoProvider } from './demo.js'
 import { PowerShellLifecycleRunner } from './powershell-runner.js'
 import { WindowsLifecycleAdapter } from './windows-lifecycle.js'
+import type { WindowsLifecycleBrokerClient } from './windows-lifecycle-broker.js'
 
 const temporaryRoots: string[] = []
 const secret = 'fictional-integration-bridge-secret-0123456789'
@@ -36,8 +37,10 @@ describe('Windows save lifecycle integration', () => {
     })
     const adapter = new WindowsLifecycleAdapter({
       projectRoot: fixture.projectRoot,
+      runtimeBootstrapRoot: path.join(repositoryRoot, 'scripts', 'windows', 'bootstrap'),
       statusProvider: new DemoProvider(),
       scriptRunner: new PowerShellLifecycleRunner(path.join(repositoryRoot, 'scripts', 'windows'), 10_000),
+      brokerClient: integrationBrokerClient(),
       bridgeClient
     })
     const database = new ControlDatabase('unused', true)
@@ -55,6 +58,11 @@ describe('Windows save lifecycle integration', () => {
       ['lock', 'succeeded'], ['preflight', 'succeeded'],
       ['protection-point', 'succeeded'], ['save', 'succeeded']
     ])
+    expect(result.receipts.find((receipt) => receipt.phase === 'protection-point')?.evidence)
+      .toMatchObject({
+        sourcePairVerified: true, manifestVerified: true,
+        mutationPerformed: true, reused: false
+      })
     expect(result.receipts.at(-1)?.evidence).toMatchObject({
       generationId: expectedGenerationId,
       saveAdvanced: true,
@@ -83,6 +91,40 @@ interface Fixture {
   secretFile: string
 }
 
+function integrationBrokerClient(): WindowsLifecycleBrokerClient {
+  const runtime = {
+    lifecycleState: 'running_verified' as const,
+    session: { status: 'verified' as const, id: 3, count: 1 },
+    steam: { status: 'verified' as const, pid: 300, sessionId: 3 },
+    process: {
+      status: 'verified' as const,
+      pid: 4242,
+      owner: 'FICTIONAL\\DysonGame',
+      sessionId: 3
+    },
+    port: { port: 8469, listenerCount: 1 },
+    pidFile: { present: true, valid: true }
+  }
+  const task = {
+    valid: true,
+    server: { name: 'Dyson-Nebula-Server' as const, path: '\\' as const, state: 'Running' },
+    stop: { name: 'Dyson-Nebula-Stop' as const, path: '\\' as const, state: 'Ready' }
+  }
+  return {
+    preflight: async ({ action }) => ({
+      action,
+      allowed: true,
+      blockers: [],
+      task,
+      runtime,
+      dispatch: { attempted: false, taskName: null }
+    }),
+    dispatch: async () => { throw new Error('not used by save integration fixture') },
+    verify: async () => { throw new Error('not used by save integration fixture') },
+    status: async () => ({ lifecycleState: runtime.lifecycleState, task, runtime })
+  }
+}
+
 async function createFixture(): Promise<Fixture> {
   const projectRoot = await mkdtemp(path.join(tmpdir(), 'dyson-windows-lifecycle-integration-'))
   temporaryRoots.push(projectRoot)
@@ -103,7 +145,7 @@ async function createFixture(): Promise<Fixture> {
   ])
   const now = Date.now()
   const heartbeat = buildBridgeHeartbeat({
-    pluginVersion: '0.1.0', processId: 4242,
+    pluginVersion: '0.1.0-rc.1', processId: 4242,
     startedAtUnixMs: now - 60_000, writtenAtUnixMs: now
   }, secret)
   await writeFile(path.join(controlRoot, 'heartbeat'), heartbeat.payload, 'utf8')

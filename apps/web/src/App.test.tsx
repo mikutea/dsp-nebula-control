@@ -1,12 +1,30 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { OverviewLifecycleActions } from './App'
+import { Metric, OverviewLifecycleActions, SavePanel } from './App'
 import type { ServerStatus } from './model'
 
 afterEach(cleanup)
 
 describe('overview lifecycle actions', () => {
+  it('does not render a synthetic trend when only a current Windows snapshot is available', () => {
+    render(<Metric title="CPU" value="2.5 核" sub="进程平均占用" color="cyan" />)
+    expect(screen.getByLabelText('当前仅有单点快照')).not.toBeNull()
+    expect(screen.getByText('当前快照 · 暂无历史趋势')).not.toBeNull()
+  })
+
+  it('routes both save overview actions into the real save workspace and respects backup permission', () => {
+    const onOpenSaves = vi.fn()
+    const { rerender } = render(<SavePanel status={{ save: saveFixture }} onOpenSaves={onOpenSaves} canBackup={false} />)
+    fireEvent.click(screen.getByRole('button', { name: '管理存档' }))
+    expect(onOpenSaves).toHaveBeenCalledTimes(1)
+    expect((screen.getByRole('button', { name: '进入备份预演' }) as HTMLButtonElement).disabled).toBe(true)
+
+    rerender(<SavePanel status={{ save: saveFixture }} onOpenSaves={onOpenSaves} canBackup />)
+    fireEvent.click(screen.getByRole('button', { name: '进入备份预演' }))
+    expect(onOpenSaves).toHaveBeenCalledTimes(2)
+  })
+
   it('routes a stopped Windows instance to the unified start workflow', () => {
     const onLifecycleAction = vi.fn()
     render(<OverviewLifecycleActions
@@ -59,6 +77,12 @@ describe('overview lifecycle actions', () => {
     expect(onLifecycleAction).not.toHaveBeenCalled()
   })
 })
+
+const saveFixture: ServerStatus['save'] = {
+  name: 'FictionalSave', dsvPresent: true, serverPresent: true, consistent: true,
+  lastSavedAt: '2026-09-01T07:30:00.000Z', dsvSizeMiB: 8, serverSizeKiB: 64,
+  latestBackupAt: '2026-09-01T07:45:00.000Z', backupManifestPresent: true, backupPairPresent: true
+}
 
 function button(name: string): HTMLButtonElement {
   return screen.getByRole('button', { name }) as HTMLButtonElement

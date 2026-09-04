@@ -1,0 +1,89 @@
+diff --git a/NebulaNetwork/Client.cs b/NebulaNetwork/Client.cs
+--- a/NebulaNetwork/Client.cs
++++ b/NebulaNetwork/Client.cs
+@@ -40,6 +40,7 @@ public class Client : IClient
+         AccessTools.FieldRefAccess<WebSocket, MemoryStream>("_fragmentsBuffer");
+ 
+     private readonly string serverPassword;
++    private readonly string serverHostname;
+     private readonly string serverProtocol;
+ 
+     private WebSocket clientSocket;
+@@ -51,8 +52,9 @@ public class Client : IClient
+     private bool websocketAuthenticationFailure;
+ 
+     public Client(string url, int port, string protocol, string password = "")
+         : this(new IPEndPoint(Dns.GetHostEntry(url).AddressList[0], port), protocol, password)
+     {
++        serverHostname = url;
+     }
+ 
+     public Client(IPEndPoint endpoint, string protocol = "", string password = "")
+@@ -85,7 +87,8 @@ public class Client : IClient
+         PacketProcessor.SimulateLatency = true;
+ #endif
+ 
+-        clientSocket = new WebSocket($"{serverProtocol}://{ServerEndpoint}/socket");
++        var serverAuthority = serverHostname == null ? ServerEndpoint.ToString() : $"{serverHostname}:{ServerEndpoint.Port}";
++        clientSocket = new WebSocket($"{serverProtocol}://{serverAuthority}/socket");
+         clientSocket.Log.Level = LogLevel.Debug;
+         clientSocket.Log.Output = Log.SocketOutput;
+         clientSocket.OnOpen += ClientSocket_OnOpen;
+@@ -117,8 +120,8 @@ public class Client : IClient
+ 
+         if (Config.Options.RememberLastIP)
+         {
+-            // We've successfully connected, set connection as last ip, cutting out "ws://"(but not others, like wss) and "/socket"
+-            Config.Options.LastIP = serverProtocol == "ws" ? ServerEndpoint.ToString() : $"{serverProtocol}://{ServerEndpoint.ToString()}";
++            // Preserve WS for hostname:443 so remembered input is not re-promoted to WSS; otherwise retain the stock display.
++            Config.Options.LastIP = serverProtocol == "ws" && (serverHostname == null || ServerEndpoint.Port != 443) ? serverAuthority : $"{serverProtocol}://{serverAuthority}";
+             Config.SaveOptions();
+         }
+ 
+@@ -345,7 +348,9 @@ public class Client : IClient
+                             Multiplayer.ShouldReturnToJoinMenu = false;
+                             Multiplayer.LeaveGame();
+                             Multiplayer.ShouldReturnToJoinMenu = true;
+-                            Multiplayer.JoinGame(new Client(ServerEndpoint, password));
++                            Multiplayer.JoinGame(serverHostname == null
++                                ? new Client(ServerEndpoint, serverProtocol, password)
++                                : new Client(serverHostname, ServerEndpoint.Port, serverProtocol, password));
+                         },
+                         Multiplayer.LeaveGame
+                     );
+diff --git a/NebulaPatcher/Patches/Dynamic/UIMainMenu_Patch.cs b/NebulaPatcher/Patches/Dynamic/UIMainMenu_Patch.cs
+--- a/NebulaPatcher/Patches/Dynamic/UIMainMenu_Patch.cs
++++ b/NebulaPatcher/Patches/Dynamic/UIMainMenu_Patch.cs
+@@ -315,16 +315,18 @@ public static class UIMainMenu_Patch
+         var s = ip;
+ 
+         // Parse protocol if set
+         var protocol = "ws";
++        var protocolExplicit = false;
+         var firstColonPos = s.IndexOf("://");
+         if (firstColonPos > 0)
+         {
+             var candidate = s.Substring(0, firstColonPos);
+             switch (candidate)
+             {
+                 case "wss":
+                 case "ws":
++                    protocolExplicit = true;
+                     protocol = candidate;
+                     s = s.Substring(firstColonPos + 3);
+                     break;
+             }
+@@ -385,8 +387,13 @@ public static class UIMainMenu_Patch
+             }
+         }
+ 
+         p = p == 0 ? Config.Options.HostPort : p;
+ 
++        if (!isIP && !protocolExplicit && protocol == "ws" && p == 443)
++        {
++            protocol = "wss";
++        }
++
+         UIRoot.instance.StartCoroutine(TryConnectToServer(s, protocol, p, isIP, password));
+     }
+ 

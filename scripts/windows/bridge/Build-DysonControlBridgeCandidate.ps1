@@ -12,6 +12,14 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 . (Join-Path $PSScriptRoot 'DysonBridge.Common.ps1')
 
+function ConvertTo-DysonBridgeBuildDirectoryArgument {
+    param([Parameter(Mandatory)][string]$Path)
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    ) + [System.IO.Path]::AltDirectorySeparatorChar
+}
+
 $source = Get-DysonBridgeSourceContract -SourceRoot $SourcePath
 $serverRoot = Assert-DysonBridgePlainDirectory -Path $DysonServerRoot
 $references = @(Get-DysonBridgeReferenceReceipts -DysonServerRoot $serverRoot)
@@ -62,10 +70,10 @@ $published = $false
 try {
     [System.IO.Directory]::CreateDirectory($temporary) | Out-Null
     $buildRoot = Join-Path $temporary 'private-build'
-    $objRoot = Join-Path $buildRoot 'obj'
-    $binRoot = Join-Path $buildRoot 'bin'
+    $objRoot = ConvertTo-DysonBridgeBuildDirectoryArgument -Path (Join-Path $buildRoot 'obj')
+    $binRoot = ConvertTo-DysonBridgeBuildDirectoryArgument -Path (Join-Path $buildRoot 'bin')
     $cliHome = Join-Path $buildRoot 'dotnet-home'
-    $packagesRoot = Join-Path $buildRoot 'packages'
+    $packagesRoot = ConvertTo-DysonBridgeBuildDirectoryArgument -Path (Join-Path $buildRoot 'packages')
     foreach ($directory in @($buildRoot, $objRoot, $binRoot, $cliHome, $packagesRoot)) { [System.IO.Directory]::CreateDirectory($directory) | Out-Null }
     $arguments = @(
         'build', ('"{0}"' -f $source.projectPath), '--configuration', 'Release', '--nologo', '--verbosity', 'quiet', '--disable-build-servers',
@@ -75,7 +83,8 @@ try {
         ('--property:OutputPath="{0}"' -f $binRoot),
         ('--property:RestorePackagesPath="{0}"' -f $packagesRoot),
         '--property:ImportDirectoryBuildProps=false', '--property:ImportDirectoryBuildTargets=false',
-        '--property:UseSharedCompilation=false', '--property:ContinuousIntegrationBuild=true', '--property:Deterministic=true'
+        '--property:UseSharedCompilation=false', '--property:ContinuousIntegrationBuild=true', '--property:Deterministic=true',
+        '--property:IncludeSourceRevisionInInformationalVersion=false'
     ) -join ' '
     $environment = @{
         DOTNET_CLI_HOME = $cliHome
@@ -92,9 +101,11 @@ try {
     [System.IO.Directory]::CreateDirectory($candidateRoot) | Out-Null
     [System.IO.File]::Copy($builtDlls[0].FullName, (Join-Path $candidateRoot $script:DysonBridgeDllName), $false)
     $plugin = Get-DysonBridgeAssemblyMetadata -AssemblyPath (Join-Path $candidateRoot $script:DysonBridgeDllName) -DysonServerRoot $serverRoot
+    $expectedAssemblyVersion = Get-DysonBridgeAssemblyVersion -Version $source.version
     if ($plugin.guid -ne $script:DysonBridgeGuid -or $plugin.name -ne $script:DysonBridgeName -or
         $plugin.version -ne $source.version -or $plugin.assemblyName -ne $script:DysonBridgeAssemblyName -or
-        $plugin.assemblyVersion -ne ($source.version + '.0') -or $plugin.fileVersion -ne ($source.version + '.0')) {
+        $plugin.informationalVersion -ne $source.version -or
+        $plugin.assemblyVersion -ne $expectedAssemblyVersion -or $plugin.fileVersion -ne $expectedAssemblyVersion) {
         throw 'The compiled Bridge identity does not match its public source contract.'
     }
     [void](Write-DysonBridgeCandidateManifest -CandidateRoot $candidateRoot -Plugin $plugin -References $references -Sources $source.files)

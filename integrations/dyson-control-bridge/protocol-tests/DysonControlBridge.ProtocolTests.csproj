@@ -9,5 +9,9 @@
   <ItemGroup>
     <Compile Include="..\BridgeProtocol.cs" Link="BridgeProtocol.cs" />
     <Compile Include="..\BridgeFileStore.cs" Link="BridgeFileStore.cs" />
+    <Compile Include="..\PlayerNoticeProtocol.cs" Link="PlayerNoticeProtocol.cs" />
+    <Compile Include="..\NebulaNoticeRuntimeCompatibility.cs" Link="NebulaNoticeRuntimeCompatibility.cs" />
+    <Compile Include="..\LoadedSaveEvidencePublisher.cs" Link="LoadedSaveEvidencePublisher.cs" />
+    <Compile Include="..\SimulationTelemetrySampler.cs" Link="SimulationTelemetrySampler.cs" />
   </ItemGroup>
 </Project>

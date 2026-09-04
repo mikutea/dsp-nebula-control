@@ -1,5 +1,6 @@
 import path from 'node:path'
-import fs from 'node:fs'
+import fs, { type Stats } from 'node:fs'
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import { Readable } from 'node:stream'
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
 import cookie from '@fastify/cookie'
@@ -13,10 +14,47 @@ import { DemoProvider } from './providers/demo.js'
 import { WindowsProvider } from './providers/windows.js'
 import { DisabledLifecycleAdapter } from './providers/disabled-lifecycle.js'
 import { WindowsLifecycleAdapter } from './providers/windows-lifecycle.js'
-import { PowerShellLifecycleRunner } from './providers/powershell-runner.js'
-import { WindowsUpdateActivationAdapters } from './providers/windows-update-activation.js'
+import {
+  FixedWindowsLifecycleBrokerClient,
+  type LifecycleBrokerRuntimeEvidence,
+  type LifecycleBrokerStatusEvidence,
+  type WindowsLifecycleBrokerClient
+} from './providers/windows-lifecycle-broker.js'
+import { readLifecycleBrokerProfile } from './providers/windows-lifecycle-broker-profile.js'
+import {
+  PowerShellLifecycleRunner,
+  resolvePowerShellScriptPath
+} from './providers/powershell-runner.js'
+import {
+  FixedWindowsHostnameWssQualificationConsumer
+} from './providers/windows-hostname-wss-qualification.js'
+import {
+  WindowsNebulaPluginTransactionService,
+  type WindowsNebulaPluginTransactionPowerShellRunner
+} from './providers/windows-nebula-plugin-transaction.js'
+import {
+  WindowsUpdateActivationAdapters,
+  type WindowsSteamManualHandoffTransactionProvider,
+  type WindowsUpdateActivationTransactionProvider
+} from './providers/windows-update-activation.js'
+import {
+  WindowsUpdateActivationTransactionProvider as FixedWindowsUpdateTransactionProvider
+} from './providers/windows-update-transaction-provider.js'
+import { WindowsUpdateRuntimeEvidenceReader } from './providers/windows-update-runtime-evidence.js'
+import {
+  WindowsTrustedRuntimeCompatibilityInspector
+} from './providers/windows-runtime-compatibility.js'
+import {
+  WindowsCutoverAdapter,
+  type WindowsCutoverHostClient
+} from './providers/windows-cutover.js'
+import {
+  FixedWindowsCutoverHostClient,
+  windowsCutoverHostScriptNames
+} from './providers/windows-cutover-host.js'
 import { createWindowsManagedPluginVersionProbe } from './providers/windows-managed-plugin-version.js'
 import { FileBridgeClient } from './bridge/file-client.js'
+import { validateBridgeSecret } from './bridge/protocol.js'
 import { AuthService } from './security/auth.js'
 import {
   authenticatedUserFor,
@@ -28,6 +66,13 @@ import {
 import { ControlDatabase } from './storage/database.js'
 import { EventHub } from './services/event-hub.js'
 import { JobService } from './services/job-service.js'
+import {
+  JobAuditError,
+  JobAuditService,
+  jobAuditExportExecutionSchema,
+  jobAuditExportPreviewSchema,
+  jobListQuerySchema
+} from './jobs/audit.js'
 import { LifecycleExecutionError, LifecycleService } from './services/lifecycle-service.js'
 import { HostMutationLeaseManager } from './host-mutation/lease.js'
 import {
@@ -36,6 +81,9 @@ import {
 } from './host-mutation/lifecycle-coordinator.js'
 import {
   HostMutationCoordinator,
+  HostMutationOperationCoordinatorError,
+  hostMutationReturn,
+  hostMutationThrow,
   type HostMutationOperationCoordinator,
   type HostMutationRecoveryOperationCoordinator
 } from './host-mutation/operation-coordinator.js'
@@ -47,7 +95,9 @@ import {
 import {
   lifecycleActionRequestSchema,
   lifecycleExecutionRequestSchema,
+  type LifecycleAction,
   type LifecycleMutationAdapter,
+  type LifecyclePreview,
   type ServerStatus,
   type StatusProvider
 } from './domain.js'
@@ -61,9 +111,11 @@ import {
   MAX_CATALOG_PAGE_SIZE,
   SaveCatalogError,
   SavePairTransferService,
+  SAVE_PAIR_PROMOTION_CONFIRMATION,
   SaveTransferError,
   SaveTransactionService,
   saveNameSchema,
+  savePairPromotionExecutionRequestSchema,
   type SaveTransactionResult,
   type BackupRetentionRoutesController,
   registerBackupRetentionRoutes,
@@ -87,6 +139,10 @@ import type { GameConfigHistoryRoutesController } from './game-config/history-ro
 import { registerGameConfigHistoryRoutes } from './game-config/history-routes.js'
 import { WindowsConfigHistoryStopProofAuthorizer } from './providers/windows-config-history-stop-proof.js'
 import {
+  registerWindowsNebulaPluginTransactionRoutes,
+  type WindowsNebulaPluginTransactionRouteService
+} from './nebula-plugin-transaction-routes.js'
+import {
   ConsoleCommandError,
   ConsoleLogError,
   StructuredLogReader,
@@ -104,6 +160,9 @@ import {
 import {
   clientParityManifestSchema,
   DEFAULT_MOD_DEPLOYMENT_HISTORY_PAGE_SIZE,
+  ManagedModConfigurationError,
+  ManagedModConfigurationService,
+  managedModConfigurationRequestFingerprint,
   MAX_MOD_DEPLOYMENT_HISTORY_CURSOR_LENGTH,
   MAX_MOD_DEPLOYMENT_HISTORY_PAGE_SIZE,
   ModDeploymentError,
@@ -124,11 +183,19 @@ import {
 } from './mods/index.js'
 import {
   FilePlayerCapabilitySource,
+  FilePlayerNoticeClient,
   FilePlayerSnapshotSource,
   PersistentPlayerPresenceHistory,
   PlayerCapabilityError,
+  PlayerNoticeError,
   PlayerSnapshotError,
+  playerNoticeExecutionRequestSchema,
+  playerNoticePreviewRequestSchema,
   playerCapabilityReasonSummaries,
+  previewPlayerNotice,
+  publicRosterGeneration,
+  type PlayerNoticeClient,
+  type PlayerNoticeReceipt,
   type PlayerCapabilitySnapshot,
   type PlayerPresenceHistoryStore,
   type PlayerSnapshot
@@ -143,6 +210,8 @@ import {
   OfflineArtifactStager,
   ComponentUpdateActivationHttpController,
   ComponentUpdateActivationService,
+  SteamManualHandoffHttpController,
+  SteamManualHandoffService,
   TrustedCompatibilityHttpController,
   TrustedCompatibilityService,
   ThunderstoreReleaseClient,
@@ -164,20 +233,44 @@ import {
   ClientProfileGenerationError,
   ClientProfileZipError,
   CLIENT_PROFILE_ZIP_FILE_NAME,
+  FileSystemClientQualificationStore,
+  FileSystemIssuedQualifiedClientProfileStore,
   buildClientProfileZip,
   generateClientProfile,
+  qualifiedClientProfileRequestV2Schema,
   verifyClientProfileZip
 } from './client-profile/index.js'
+import {
+  FixedQualifiedClientProfileService,
+  type QualifiedClientProfileService
+} from './services/qualified-client-profile-service.js'
 import {
   ObservabilityAlertError,
   PersistentObservabilityHistory,
   PersistentObservabilityAlerts,
   PersistentObservabilityAlertError,
+  ControlDatabaseReceiptLatencySource,
   buildObservabilityFromServerStatus,
+  evaluateObservabilityLongWindow,
   evaluateLateGameQualification,
   type ObservabilityHistoryStore,
+  type ServerReceiptLatencyReportSource,
   type ServerObservabilitySnapshot
 } from './observability/index.js'
+import { collectWindowsBridgeObservability } from './observability/windows-bridge.js'
+import type { CutoverRoutesController } from './cutover/routes.js'
+import { registerCutoverRoutes } from './cutover/routes.js'
+import { CutoverService } from './cutover/service.js'
+import { CutoverHttpController } from './cutover/http.js'
+import { SqliteCutoverDurableStore } from './cutover/sqlite-store.js'
+import { SqliteCutoverAuditStore } from './cutover/audit.js'
+import { readCutoverAuthorityProfile } from './cutover/profile.js'
+import { readCutoverBrokerProfile } from './cutover/broker-profile.js'
+import {
+  FileGameRuntimeReceiptSource,
+  gameRuntimeReceiptListQuerySchema,
+  type GameRuntimeReceiptSource
+} from './lifecycle/game-runtime-receipts.js'
 
 const loginSchema = z.strictObject({
   role: z.enum(controlRoles).default('administrator'),
@@ -196,6 +289,9 @@ const configurationPreviewSchema = z.strictObject({
 })
 const configurationApplySchema = configurationPreviewSchema.extend({ confirmation: z.literal('APPLY_CONFIG') }).strict()
 const emptyObjectSchema = z.strictObject({})
+const qualifiedClientDownloadParamsSchema = z.strictObject({
+  downloadId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+})
 const thunderstoreDiscoveryRequestSchema = z.strictObject({
   namespace: z.string().min(1).max(64).regex(/^[A-Za-z0-9_]+$/),
   name: z.string().min(1).max(64).regex(/^[A-Za-z0-9_]+$/),
@@ -283,6 +379,20 @@ const modDeploymentRecoveryExecuteSchema = z.strictObject({
   desired: z.enum(['candidate', 'previous']),
   confirmation: z.literal('RECOVER_MOD_DEPLOYMENT')
 })
+const modConfigurationExecuteSchema = z.strictObject({
+  request: z.unknown(),
+  confirmation: z.strictObject({
+    action: z.literal('EXECUTE_MOD_CONFIGURATION'),
+    requestId: z.string().uuid(),
+    schemaId: z.string().min(3).max(81),
+    dependencyId: z.string().min(7).max(160),
+    version: z.string().min(1).max(64),
+    expectedDeploymentRevision: z.string().length(64).regex(/^[0-9a-f]{64}$/),
+    expectedConfigurationRevision: z.string().length(64).regex(/^[0-9a-f]{64}$/),
+    requestFingerprint: z.string().length(64).regex(/^[0-9a-f]{64}$/),
+    confirmation: z.literal('CONFIGURE_MANAGED_MOD')
+  })
+})
 const modDeploymentReceiptParamsSchema = z.strictObject({
   requestId: z.string().uuid().transform((value) => value.toLowerCase())
 })
@@ -309,18 +419,26 @@ export interface BuiltApplication {
 export interface ApplicationDependencies {
   statusProvider?: StatusProvider
   lifecycleAdapter?: LifecycleMutationAdapter
+  lifecycleBrokerClient?: WindowsLifecycleBrokerClient
+  gameRuntimeReceiptSource?: GameRuntimeReceiptSource
   lifecycleCoordinator?: LifecycleMutationCoordinator
   hostMutationCoordinator?: HostMutationOperationCoordinator
   hostMutationRecoveryCoordinator?: HostMutationRecoveryOperationCoordinator
+  nebulaPluginTransactionRunner?: WindowsNebulaPluginTransactionPowerShellRunner
+  nebulaPluginTransactionService?: WindowsNebulaPluginTransactionRouteService
   consoleReader?: StructuredLogReader
   playerSnapshotSource?: { read(signal?: AbortSignal): Promise<PlayerSnapshot> }
   playerPresenceHistory?: PlayerPresenceHistoryStore
   playerCapabilitySource?: { read(signal?: AbortSignal): Promise<PlayerCapabilitySnapshot> }
+  playerNoticeClient?: PlayerNoticeClient
   gameConfigTransactionService?: GameConfigTransactionService
   gameConfigHistoryController?: GameConfigHistoryRoutesController
   saveTransactionService?: Pick<SaveTransactionService, 'inspect' | 'backup' | 'restore'>
   backupRetentionController?: BackupRetentionRoutesController
+  cutoverController?: CutoverRoutesController
+  cutoverHostClient?: WindowsCutoverHostClient
   savePairTransferService?: Pick<SavePairTransferService, 'exportBackup' | 'openExport' | 'importArchive'>
+  savePairPromotionService?: Pick<SavePairTransferService, 'previewImportPromotion' | 'promoteImport'>
   thunderstoreReleaseClient?: {
     discoverLatest(input: unknown, signal?: AbortSignal): Promise<DiscoveredModRelease>
     discoverDependencyClosure?(
@@ -367,6 +485,16 @@ export interface ApplicationDependencies {
     ComponentUpdateActivationService,
     'preview' | 'execute' | 'reconcile' | 'recoverInterrupted' | 'getReceipt' | 'getState' | 'previewCleanup'
   >
+  windowsUpdateActivationTransactionProvider?: WindowsUpdateActivationTransactionProvider &
+    Partial<WindowsSteamManualHandoffTransactionProvider>
+  steamManualHandoffService?: Pick<
+    SteamManualHandoffService,
+    'preview' | 'begin' | 'confirm' | 'reconcile' | 'getReceipt' | 'getState'
+  >
+  steamManualHandoffController?: Pick<
+    SteamManualHandoffHttpController,
+    'initialize' | 'state' | 'recoveryStatus' | 'preview' | 'begin' | 'confirm' | 'getReceipt'
+  >
   trustedCompatibilityService?: Pick<
     TrustedCompatibilityService,
     'status' | 'prepare' | 'getReceipt' | 'assertCurrent'
@@ -380,7 +508,10 @@ export interface ApplicationDependencies {
     'inspect' | 'preview' | 'execute' | 'recoveryStatus' | 'recoverInterrupted' |
     'previewCleanup' | 'getReceipt' | 'history'
   >
+  modConfigurationService?: Pick<ManagedModConfigurationService, 'schemas' | 'inspect' | 'preview' | 'execute' | 'receipt' | 'history'>
+  qualifiedClientProfileService?: QualifiedClientProfileService
   observabilityHistory?: ObservabilityHistoryStore
+  observabilityLatencySource?: ServerReceiptLatencyReportSource
   observabilityAlerts?: Pick<
     PersistentObservabilityAlerts,
     'ingest' | 'project' | 'acknowledge' | 'recoveryRequired'
@@ -399,22 +530,99 @@ export async function buildApplication(
 ): Promise<BuiltApplication> {
   const app = Fastify({ logger: config.nodeEnv !== 'test', trustProxy: 'loopback' })
   app.addContentTypeParser(savePairTransportMediaType, (_request, payload, done) => done(null, payload))
+  const windowsScriptRunner = config.provider === 'windows'
+    ? new PowerShellLifecycleRunner(config.scriptRoot, config.lifecycleTimeoutMs)
+    : null
+  let qualifiedClientProfileService = dependencies.qualifiedClientProfileService ?? null
+  if (config.qualifiedClientProfileEnabled && !qualifiedClientProfileService) {
+    const qualificationStore = await FileSystemClientQualificationStore.open({
+      protectedRoot: config.clientQualificationEvidenceRoot!,
+      protectedKeyRingRoot: config.clientQualificationKeyRingRoot!
+    })
+    const issuedStore = await FileSystemIssuedQualifiedClientProfileStore.open({
+      protectedRoot: config.qualifiedClientIssueRoot!
+    })
+    const qualificationConsumer = new FixedWindowsHostnameWssQualificationConsumer({
+      evidenceRoot: config.clientQualificationEvidenceRoot!,
+      buildHarvestRootA: config.clientQualificationBuildHarvestRootA!,
+      buildHarvestRootB: config.clientQualificationBuildHarvestRootB!,
+      keyRingRoot: config.clientQualificationKeyRingRoot!,
+      replayRoot: config.clientQualificationReplayRoot!,
+      expectedAuthority: config.clientQualificationAuthority!,
+      runner: windowsScriptRunner!
+    })
+    qualifiedClientProfileService = new FixedQualifiedClientProfileService({
+      qualificationStore,
+      qualificationConsumer,
+      issuedStore
+    })
+  }
+  let lifecycleBrokerClient = dependencies.lifecycleBrokerClient ?? null
+  if (config.lifecycleEnabled && !lifecycleBrokerClient) {
+    readLifecycleBrokerProfile({
+      profileFile: config.lifecycleBrokerProfileFile!,
+      scriptRoot: config.scriptRoot,
+      projectRoot: config.projectRoot!,
+      dataRoot: config.dataDir,
+      runtimeBootstrapRoot: config.runtimeBootstrapRoot!,
+      serviceUser: config.runtimeServiceUser!,
+      gamePort: config.gamePort
+    })
+    lifecycleBrokerClient = new FixedWindowsLifecycleBrokerClient({
+      profileFile: config.lifecycleBrokerProfileFile!,
+      dataRoot: config.dataDir,
+      gamePort: config.gamePort,
+      timeoutSeconds: Math.ceil(config.lifecycleTimeoutMs / 1_000),
+      runner: windowsScriptRunner!
+    })
+  }
+  const verifyStoppedRuntime = async (signal?: AbortSignal) => {
+    if (!lifecycleBrokerClient) throw new Error('LIFECYCLE_BROKER_UNAVAILABLE')
+    const evidence = await lifecycleBrokerClient.verify({
+      expected: 'stopped',
+      outerRequestId: randomUUID(),
+      signal: signal ?? new AbortController().signal
+    })
+    if (evidence.expected !== 'stopped' || !evidence.matched || evidence.blockers.length > 0 ||
+        !isTrustedStoppedLifecycleRuntime(evidence.runtime, config.gamePort)) {
+      throw new Error('LIFECYCLE_BROKER_STOP_PROOF_INVALID')
+    }
+    return {
+      protocol: 'DYSON_CONTROL_RUNTIME_V1' as const,
+      expected: 'stopped' as const,
+      state: 'matched' as const,
+      processVerified: true as const,
+      gamePortListening: false as const
+    }
+  }
   const database = new ControlDatabase(config.dataDir, config.nodeEnv === 'test')
   const events = new EventHub()
   const provider = dependencies.statusProvider ?? (
     config.provider === 'windows'
       ? new WindowsProvider({
           projectRoot: config.projectRoot!, scriptRoot: config.scriptRoot,
+          runtimeBootstrapRoot: config.runtimeBootstrapRoot,
           timeoutMs: config.statusTimeoutMs, gamePort: config.gamePort,
-          serverTaskName: config.serverTaskName, stopTaskName: config.stopTaskName
+          serverTaskName: config.serverTaskName, stopTaskName: config.stopTaskName,
+          lifecycleBrokerClient
         })
       : new DemoProvider()
   )
+  const sharedBridgeClient = config.provider === 'windows' && config.bridgeControlRoot && config.bridgeSecretFile
+    ? new FileBridgeClient({
+        controlRoot: config.bridgeControlRoot,
+        secretFile: config.bridgeSecretFile,
+        timeoutMs: Math.min(config.lifecycleTimeoutMs, 180_000)
+      })
+    : null
   const jobs = new JobService(database, provider, events)
+  const jobAudit = new JobAuditService(database)
   const observabilityHistory = dependencies.observabilityHistory ?? new PersistentObservabilityHistory(
     database,
     config.observabilityHistoryCapacity
   )
+  const observabilityLatency = dependencies.observabilityLatencySource
+    ?? new ControlDatabaseReceiptLatencySource(database)
   const observabilityAlerts = dependencies.observabilityAlerts ?? new PersistentObservabilityAlerts({
     store: database,
     capacity: config.observabilityAlertCapacity,
@@ -423,23 +631,43 @@ export async function buildApplication(
   let lastObservedStatusAt = observabilityHistory.latest()?.observedAt ?? null
   let lastStatusAcquiredAtUnixMs = 0
   let statusCollectionInFlight: Promise<ServerStatus> | null = null
-  const recordObservability = (status: ServerStatus): ServerObservabilitySnapshot => {
+  let observabilityRecordQueue: Promise<void> = Promise.resolve()
+  const observabilityRecordInFlight = new Map<string, Promise<ServerObservabilitySnapshot>>()
+  const recordObservability = (status: ServerStatus): Promise<ServerObservabilitySnapshot> => {
     const latest = observabilityHistory.latest()
-    if (lastObservedStatusAt === status.collectedAt && latest) return latest
-    const snapshot = buildObservabilityFromServerStatus(status, {
-      source: `${provider.name}.server-status`,
-      gamePort: config.gamePort
+    if (lastObservedStatusAt === status.collectedAt && latest) return Promise.resolve(latest)
+    const duplicate = observabilityRecordInFlight.get(status.collectedAt)
+    if (duplicate) return duplicate
+
+    const pending = observabilityRecordQueue.then(async () => {
+      const current = observabilityHistory.latest()
+      if (lastObservedStatusAt === status.collectedAt && current) return current
+      const snapshot = sharedBridgeClient
+        ? (await collectWindowsBridgeObservability(status, sharedBridgeClient, {
+            gamePort: config.gamePort
+          })).snapshot
+        : buildObservabilityFromServerStatus(status, {
+            source: `${provider.name}.server-status`,
+            gamePort: config.gamePort
+          })
+      observabilityAlerts.ingest(snapshot)
+      const stored = observabilityHistory.ingest(snapshot)
+      lastObservedStatusAt = status.collectedAt
+      return stored
     })
-    observabilityAlerts.ingest(snapshot)
-    const stored = observabilityHistory.ingest(snapshot)
-    lastObservedStatusAt = status.collectedAt
-    return stored
+    observabilityRecordInFlight.set(status.collectedAt, pending)
+    observabilityRecordQueue = pending.then(() => undefined, () => undefined)
+    void pending.then(
+      () => { if (observabilityRecordInFlight.get(status.collectedAt) === pending) observabilityRecordInFlight.delete(status.collectedAt) },
+      () => { if (observabilityRecordInFlight.get(status.collectedAt) === pending) observabilityRecordInFlight.delete(status.collectedAt) }
+    )
+    return pending
   }
   const unsubscribeObservability = events.subscribe((event) => {
     if (event.type !== 'status.updated') return
     lastStatusAcquiredAtUnixMs = Date.now()
-    try { recordObservability(event.data) }
-    catch { /* Status refresh remains usable when an optional telemetry sample is invalid. */ }
+    void recordObservability(event.data)
+      .catch(() => undefined)
   })
   const collectObservabilityStatus = async (): Promise<ServerStatus> => {
     const latest = jobs.latestStatus()
@@ -459,24 +687,19 @@ export async function buildApplication(
   const observabilityTimer = config.observabilityIntervalMs > 0
     ? setInterval(() => {
         void collectObservabilityStatus()
-          .then((status) => { recordObservability(status) })
+          .then((status) => recordObservability(status))
           .catch(() => undefined)
       }, config.observabilityIntervalMs)
     : null
   observabilityTimer?.unref()
-  const windowsScriptRunner = config.provider === 'windows'
-    ? new PowerShellLifecycleRunner(config.scriptRoot, config.lifecycleTimeoutMs)
-    : null
   const configuredLifecycleAdapter = config.lifecycleEnabled
     ? new WindowsLifecycleAdapter({
         projectRoot: config.projectRoot!,
+        runtimeBootstrapRoot: config.runtimeBootstrapRoot!,
         statusProvider: provider,
         scriptRunner: windowsScriptRunner!,
-        bridgeClient: new FileBridgeClient({
-          controlRoot: config.bridgeControlRoot!,
-          secretFile: config.bridgeSecretFile!,
-          timeoutMs: Math.min(config.lifecycleTimeoutMs, 180_000)
-        }),
+        brokerClient: lifecycleBrokerClient!,
+        bridgeClient: sharedBridgeClient!,
         bridgePluginVersion: config.bridgePluginVersion,
         serverTaskName: config.serverTaskName,
         stopTaskName: config.stopTaskName,
@@ -495,6 +718,22 @@ export async function buildApplication(
   const hostMutationCoordinator = dependencies.hostMutationCoordinator ?? defaultHostMutationCoordinator
   const hostMutationRecoveryCoordinator = dependencies.hostMutationRecoveryCoordinator ??
     defaultHostMutationCoordinator
+  const configuredNebulaPluginTransactionService =
+    config.provider === 'windows' && config.nebulaPluginJobBase !== null &&
+    config.nebulaPluginGameRoot !== null && hostMutationCoordinator !== undefined &&
+    hostMutationRecoveryCoordinator !== undefined
+      ? new WindowsNebulaPluginTransactionService({
+          jobBase: config.nebulaPluginJobBase,
+          gameRoot: config.nebulaPluginGameRoot,
+          dataRoot: config.dataDir,
+          targetRole: 'Server',
+          runner: dependencies.nebulaPluginTransactionRunner ?? windowsScriptRunner!,
+          coordinator: hostMutationCoordinator,
+          recoveryCoordinator: hostMutationRecoveryCoordinator
+        })
+      : null
+  const nebulaPluginTransactionService = dependencies.nebulaPluginTransactionService ??
+    configuredNebulaPluginTransactionService
   const lifecycleCoordinator = dependencies.lifecycleCoordinator ?? (
     config.lifecycleEnabled && hostMutationLeaseManager
       ? new HostMutationLifecycleCoordinator(
@@ -513,6 +752,10 @@ export async function buildApplication(
   const auth = new AuthService(config, database)
   const protectedRoute = (permission: ControlPermission) => ({
     preHandler: [auth.authenticate, requirePermission(permission)]
+  })
+  const gameRuntimeReceipts = dependencies.gameRuntimeReceiptSource ?? new FileGameRuntimeReceiptSource({
+    dataRoot: config.dataDir,
+    projectRoot: config.projectRoot
   })
   const workspacePaths = dependencies.workspacePaths ?? (config.projectRoot ? {
     saveRoot: path.join(config.projectRoot, 'userdata', 'Save'),
@@ -546,6 +789,15 @@ export async function buildApplication(
         })
       : null
   )
+  const playerNoticeClient = dependencies.playerNoticeClient ?? (
+    config.bridgeControlRoot && config.bridgeSecretFile
+      ? new FilePlayerNoticeClient({
+          controlRoot: config.bridgeControlRoot,
+          secretFile: config.bridgeSecretFile,
+          timeoutMs: Math.min(config.lifecycleTimeoutMs, 120_000)
+        })
+      : null
+  )
   const playerHistory = dependencies.playerPresenceHistory ?? new PersistentPlayerPresenceHistory(database, {
     capacity: config.playerHistoryCapacity,
     retentionHours: config.playerHistoryRetentionHours
@@ -556,24 +808,22 @@ export async function buildApplication(
   const gameConfigTransactions = dependencies.gameConfigTransactionService ?? (
     workspacePaths ? new GameConfigTransactionService({ configRoot: workspacePaths.configRoot }) : null
   )
+  const gameConfigHistoryStopProof = lifecycleBrokerClient
+    ? new WindowsConfigHistoryStopProofAuthorizer({ brokerClient: lifecycleBrokerClient })
+    : null
   const gameConfigHistory = dependencies.gameConfigHistoryController ?? (
-    workspacePaths && config.projectRoot && windowsScriptRunner
-      ? (() => {
-          const stopProof = new WindowsConfigHistoryStopProofAuthorizer({
-            projectRoot: config.projectRoot!,
-            gamePort: config.gamePort,
-            runner: windowsScriptRunner
+    workspacePaths
+      ? new GameConfigHistoryHttpController({
+          service: new GameConfigHistoryService({
+            configRoot: workspacePaths.configRoot,
+            validateStopProof: gameConfigHistoryStopProof?.validate ?? (async () => false),
+            hostMutationCoordinator
+          }),
+          mutationGate: () => config.configHistoryMutationsEnabled,
+          stopProofTokenProvider: gameConfigHistoryStopProof?.issue ?? (async () => {
+            throw new Error('LIFECYCLE_BROKER_UNAVAILABLE')
           })
-          return new GameConfigHistoryHttpController({
-            service: new GameConfigHistoryService({
-              configRoot: workspacePaths.configRoot,
-              validateStopProof: stopProof.validate,
-              hostMutationCoordinator
-            }),
-            mutationGate: () => config.configHistoryMutationsEnabled,
-            stopProofTokenProvider: stopProof.issue
-          })
-        })()
+        })
       : null
   )
   const saveTransactions = dependencies.saveTransactionService ?? (
@@ -582,16 +832,7 @@ export async function buildApplication(
           saveRoot: workspacePaths.saveRoot,
           backupRoot: workspacePaths.backupRoot,
           verifyServiceStopped: async (signal) => {
-            const output = await windowsScriptRunner.run(
-              'Test-DysonRuntimeState.ps1',
-              [
-                '-ProjectRoot', config.projectRoot!,
-                '-Expected', 'stopped',
-                '-GamePort', String(config.gamePort)
-              ],
-              signal ?? new AbortController().signal
-            )
-            return JSON.parse(output) as unknown
+            return await verifyStoppedRuntime(signal)
           }
         })
       : null
@@ -621,7 +862,93 @@ export async function buildApplication(
     ? new SaveJobService(database, saveTransactions, events, { hostMutationCoordinator })
     : null
   if (saveJobs && config.saveMutationsEnabled) saveJobs.initialize()
-  const saveTransfers = dependencies.savePairTransferService ?? (
+  let ownedCutoverStore: SqliteCutoverDurableStore | null = null
+  let ownedCutoverAudit: SqliteCutoverAuditStore | null = null
+  let cutoverController: CutoverRoutesController | null = dependencies.cutoverController ?? null
+  if (cutoverController === null && (config.cutoverEnabled || config.cutoverRecoveryEnabled)) {
+    try {
+      if (config.provider !== 'windows' || !config.projectRoot || !config.runtimeBootstrapRoot ||
+          !config.cutoverProfileFile || !config.cutoverServiceUser ||
+          !config.cutoverTaskTransactionRoot || !windowsScriptRunner || !saveTransactions ||
+          !hostMutationCoordinator || !hostMutationRecoveryCoordinator) {
+        throw new Error('CUTOVER_RUNTIME_UNAVAILABLE')
+      }
+      const profile = readCutoverAuthorityProfile({
+        profileFile: config.cutoverProfileFile,
+        projectRoot: config.projectRoot,
+        dataRoot: config.dataDir,
+        runtimeBootstrapRoot: config.runtimeBootstrapRoot,
+        runtimeTaskTransactionRoot: config.cutoverTaskTransactionRoot,
+        serviceUser: config.cutoverServiceUser,
+        gamePort: config.gamePort
+      })
+      if (dependencies.cutoverHostClient === undefined) {
+        assertCutoverHostScriptsAvailable(config.scriptRoot)
+        readCutoverBrokerProfile({
+          profileFile: path.join(config.dataDir, 'cutover-broker', 'broker-profile.json'),
+          scriptRoot: config.scriptRoot,
+          projectRoot: config.projectRoot,
+          dataRoot: config.dataDir,
+          authorityProfileFile: config.cutoverProfileFile,
+          runtimeBootstrapRoot: config.runtimeBootstrapRoot,
+          runtimeTaskTransactionRoot: config.cutoverTaskTransactionRoot,
+          serviceUser: config.cutoverServiceUser,
+          gamePort: config.gamePort
+        })
+      }
+      ownedCutoverStore = new SqliteCutoverDurableStore(
+        config.cutoverDataDirectory,
+        profile.inventoryRevision
+      )
+      ownedCutoverAudit = new SqliteCutoverAuditStore(config.cutoverDataDirectory)
+      const hostClient = dependencies.cutoverHostClient ?? new FixedWindowsCutoverHostClient({
+          projectRoot: config.projectRoot,
+          profileFile: config.cutoverProfileFile,
+          cutoverScriptRoot: config.scriptRoot,
+          runtimeBootstrapRoot: config.runtimeBootstrapRoot,
+          runtimeTaskTransactionRoot: config.cutoverTaskTransactionRoot,
+          serviceUser: config.cutoverServiceUser,
+          gamePort: config.gamePort,
+          authorityInventoryRevision: profile.inventoryRevision,
+          runner: windowsScriptRunner
+        })
+      const service = new CutoverService({
+        authorityInventoryRevision: profile.inventoryRevision,
+        adapter: new WindowsCutoverAdapter({
+          authorityInventoryRevision: profile.inventoryRevision,
+          hostClient,
+          saves: saveTransactions
+        }),
+        store: ownedCutoverStore,
+        hostMutationCoordinator,
+        hostMutationRecoveryCoordinator
+      })
+      const controller = new CutoverHttpController({
+        service,
+        ordinaryMutationGate: () => config.cutoverEnabled,
+        recoveryMutationGate: () => config.cutoverRecoveryEnabled,
+        audit: ownedCutoverAudit
+      })
+      cutoverController = controller
+      app.addHook('onReady', async () => controller.initialize())
+    } catch (error) {
+      try { ownedCutoverAudit?.close() } catch { /* Preserve the construction failure. */ }
+      try { ownedCutoverStore?.close() } catch { /* Preserve the construction failure. */ }
+      ownedCutoverAudit = null
+      ownedCutoverStore = null
+      await closeFailedCutoverConstruction({
+        app,
+        database,
+        lifecycle,
+        saveJobs,
+        observabilityTimer,
+        stopPlayerHistoryRetention,
+        unsubscribeObservability
+      })
+      throw error
+    }
+  }
+  const defaultSaveTransferService = (
     workspacePaths && config.saveTransferRoot
       ? new SavePairTransferService({
           backupRoot: workspacePaths.backupRoot,
@@ -629,6 +956,8 @@ export async function buildApplication(
         })
       : null
   )
+  const saveTransfers = dependencies.savePairTransferService ?? defaultSaveTransferService
+  const savePromotions = dependencies.savePairPromotionService ?? defaultSaveTransferService
   const thunderstoreReleases = dependencies.thunderstoreReleaseClient ?? new ThunderstoreReleaseClient({ fetch })
   const nebulaReleases = dependencies.nebulaReleaseClient ?? new NebulaGithubReleaseClient({ fetch })
   const bepInExReleases = dependencies.bepInExReleaseClient ?? new BepInExGithubReleaseClient({ fetch })
@@ -680,13 +1009,28 @@ export async function buildApplication(
         scriptRunner: windowsScriptRunner
       })
     : null
+  const updateProviderRequested = config.updateActivationEnabled ||
+    config.updateActivationRecoveryEnabled || config.steamManualHandoffEnabled
+  const defaultUpdateProviderRequested = updateProviderRequested &&
+    dependencies.windowsUpdateActivationTransactionProvider === undefined
+  const defaultUpdateProviderConfigured = defaultUpdateProviderRequested &&
+    config.provider === 'windows' && config.lifecycleEnabled && config.projectRoot !== null &&
+    config.updateStagingRoot !== null && config.modStagingRoot !== null &&
+    config.modPluginsRoot !== null && config.bridgeControlRoot !== null &&
+    config.bridgeSecretFile !== null && config.updateCompatibilityPolicyFile !== null
+  const defaultTrustedCompatibilityServiceConfigured =
+    dependencies.trustedCompatibilityService === undefined && config.provider === 'windows' &&
+    config.projectRoot !== null && config.updateStagingRoot !== null && managedPluginVersionProbe !== null
+  const trustedCompatibilityPolicyAuthority = config.updateCompatibilityPolicyFile &&
+      (defaultTrustedCompatibilityServiceConfigured || defaultUpdateProviderConfigured)
+    ? await readTrustedCompatibilityPolicyAuthority(config.updateCompatibilityPolicyFile)
+    : null
+  const trustedCompatibilityPolicy = trustedCompatibilityPolicyAuthority?.policy ?? null
   const trustedCompatibilityService = dependencies.trustedCompatibilityService ?? (
     config.provider === 'windows' && config.projectRoot && config.updateStagingRoot && managedPluginVersionProbe
       ? new TrustedCompatibilityService({
           stateRoot: path.join(config.updateStagingRoot, 'compatibility'),
-          policy: config.updateCompatibilityPolicyFile
-            ? await readTrustedCompatibilityPolicy(config.updateCompatibilityPolicyFile)
-            : null,
+          policy: trustedCompatibilityPolicy,
           readRuntimeInventory: async () => {
             const status = await provider.collectStatus()
             if (status.versions.dsp === null || status.versions.nebula === null || status.versions.bepInEx === null) {
@@ -713,16 +1057,150 @@ export async function buildApplication(
   const trustedCompatibility = dependencies.trustedCompatibilityController ?? (
     trustedCompatibilityService ? new TrustedCompatibilityHttpController(trustedCompatibilityService) : null
   )
+  const modDeployments = dependencies.modDeploymentService ?? (
+    config.modStagingRoot && config.modPluginsRoot
+      ? new ModDeploymentService({
+          stagingRoot: config.modStagingRoot,
+          pluginsRoot: config.modPluginsRoot,
+          maxSnapshots: config.modSnapshotLimit,
+          hostMutationCoordinator,
+          hostMutationRecoveryCoordinator,
+          ...(trustedCompatibilityService
+            ? {
+                readPlatformInventory: async () => {
+                  const current = await trustedCompatibilityService.status()
+                  return {
+                    inventoryRevision: current.inventoryRevision,
+                    inventory: {
+                      nebula: current.inventory.nebula,
+                      bepInEx: current.inventory.bepInEx
+                    }
+                  }
+                }
+              }
+            : {}),
+          verifyStoppedState: async (signal) => {
+            const proof = runtimeStoppedResultSchema.parse(await verifyStoppedRuntime(signal))
+            return { processStopped: proof.processVerified, portClosed: !proof.gamePortListening }
+          }
+        })
+      : null
+  )
+  const modConfigurations = dependencies.modConfigurationService ?? (
+    config.projectRoot && modDeployments && hostMutationCoordinator
+      ? new ManagedModConfigurationService({
+          configRoot: path.join(config.projectRoot, 'server', 'BepInEx', 'config'),
+          readDeploymentState: async () => await modDeployments.inspect(),
+          ...(trustedCompatibilityService
+            ? {
+                readPlatformState: async () => {
+                  const current = await trustedCompatibilityService.status()
+                  return {
+                    nebula: current.inventory.nebula,
+                    bepInEx: current.inventory.bepInEx
+                  }
+                }
+              }
+            : {}),
+          hostMutationCoordinator,
+          verifyStoppedState: async () => {
+            const proof = runtimeStoppedResultSchema.parse(await verifyStoppedRuntime())
+            return { processStopped: proof.processVerified, portClosed: !proof.gamePortListening }
+          }
+        })
+      : null
+  )
+  let updateTransactionProvider = dependencies.windowsUpdateActivationTransactionProvider
+  let defaultUpdateProviderAuthorityRevision: string | null = null
+  const candidateUpdateProviderAuthority = defaultUpdateProviderConfigured &&
+      trustedCompatibilityPolicyAuthority !== null
+    ? await readWindowsUpdateProviderAuthorityRevision(
+        config,
+        trustedCompatibilityPolicyAuthority.fileSha256
+      )
+    : null
+  if (updateTransactionProvider === undefined && defaultUpdateProviderConfigured &&
+      config.provider === 'windows' && provider.name === 'windows' && config.lifecycleEnabled &&
+      config.projectRoot && config.bridgeControlRoot && config.bridgeSecretFile &&
+      gameConfigHistoryStopProof && modDeployments && sharedBridgeClient &&
+      trustedCompatibilityService && trustedCompatibilityPolicy !== null &&
+      trustedCompatibilityPolicyAuthority !== null &&
+      candidateUpdateProviderAuthority !== null) {
+    const authorityRevision = candidateUpdateProviderAuthority.revision
+    const assertAuthorityRevision = async (signal?: AbortSignal): Promise<void> => {
+      signal?.throwIfAborted()
+      const current = await readWindowsUpdateProviderAuthorityRevision(
+        config,
+        trustedCompatibilityPolicyAuthority.fileSha256
+      )
+      signal?.throwIfAborted()
+      if (current === null || !sameAuthorityRevision(authorityRevision, current.revision)) {
+        throw new Error('WINDOWS_UPDATE_TRANSACTION_AUTHORITY_DRIFT')
+      }
+    }
+    const runtimeEvidenceReader = new WindowsUpdateRuntimeEvidenceReader({
+      controlRoot: config.bridgeControlRoot,
+      secretFile: config.bridgeSecretFile,
+      expectedSecretSha256: candidateUpdateProviderAuthority.bridgeSecretSha256,
+      bridgeClient: sharedBridgeClient
+    })
+    const runtimeCompatibilityInspector = new WindowsTrustedRuntimeCompatibilityInspector({
+      projectRoot: config.projectRoot,
+      trustedCompatibilityService,
+      policy: trustedCompatibilityPolicy
+    })
+    const runtimeEvidenceSource = {
+      readCurrentRuntimeEvidence: async (signal?: AbortSignal) => {
+        await assertAuthorityRevision(signal)
+        const evidence = await runtimeEvidenceReader.readCurrentRuntimeEvidence(signal)
+        await assertAuthorityRevision(signal)
+        return evidence
+      },
+      readPersistedRuntimeEvidence: async (signal?: AbortSignal) => {
+        await assertAuthorityRevision(signal)
+        const evidence = await runtimeEvidenceReader.readPersistedRuntimeEvidence(signal)
+        await assertAuthorityRevision(signal)
+        return evidence
+      }
+    }
+    const runtimeCompatibilitySource = {
+      inspect: async (signal?: AbortSignal) => {
+        await assertAuthorityRevision(signal)
+        const compatibility = await runtimeCompatibilityInspector.inspect(signal)
+        await assertAuthorityRevision(signal)
+        return compatibility
+      }
+    }
+    updateTransactionProvider = new FixedWindowsUpdateTransactionProvider({
+      projectRoot: config.projectRoot,
+      configStopProof: {
+        issue: gameConfigHistoryStopProof.issue,
+        validate: gameConfigHistoryStopProof.validate
+      },
+      verifyServiceStopped: verifyStoppedRuntime,
+      modDeploymentService: modDeployments,
+      runtimeEvidenceSource,
+      runtimeCompatibilitySource,
+      gameRuntimeReceiptSource: gameRuntimeReceipts
+    })
+    defaultUpdateProviderAuthorityRevision = authorityRevision
+  }
+  const windowsUpdateActivationAdapters = (
+    config.provider === 'windows' && provider.name === 'windows' && config.lifecycleEnabled &&
+      managedPluginVersionProbe
+  )
+    ? new WindowsUpdateActivationAdapters({
+        lifecycleAdapter: activeLifecycleAdapter,
+        statusProvider: provider,
+        componentVersionProbe: managedPluginVersionProbe,
+        transactionProvider: updateTransactionProvider
+      })
+    : null
   const componentUpdateActivationService = dependencies.componentUpdateActivationService ?? (
     config.provider === 'windows' && provider.name === 'windows' && config.lifecycleEnabled &&
       config.updateStagingEnabled && config.projectRoot && config.updateStagingRoot && windowsScriptRunner &&
-        trustedCompatibilityService
+        trustedCompatibilityService && windowsUpdateActivationAdapters
       ? (() => {
-          const runtimeAdapters = new WindowsUpdateActivationAdapters({
-            lifecycleAdapter: activeLifecycleAdapter,
-            statusProvider: provider,
-            componentVersionProbe: managedPluginVersionProbe!
-          })
           const serverRoot = path.join(config.projectRoot!, 'server')
           const bepInExRoot = path.join(serverRoot, 'BepInEx')
           return new ComponentUpdateActivationService({
@@ -738,10 +1216,20 @@ export async function buildApplication(
             hostMutationCoordinator,
             hostMutationRecoveryCoordinator,
             verifyStoppedState: (request, hostMutation) =>
-              runtimeAdapters.verifyStoppedState(request, hostMutation),
+              windowsUpdateActivationAdapters.verifyStoppedState(request, hostMutation),
             createSaveProtectionPoint: (request, hostMutation) =>
-              runtimeAdapters.createSaveProtectionPoint(request, hostMutation),
-            smoke: (request, hostMutation) => runtimeAdapters.smoke(request, hostMutation)
+              windowsUpdateActivationAdapters.createSaveProtectionPoint(request, hostMutation),
+            captureRollbackBaseline: (request, hostMutation) =>
+              windowsUpdateActivationAdapters.captureRollbackBaseline(request, hostMutation),
+            restoreRollbackConfiguration: (request, hostMutation) =>
+              windowsUpdateActivationAdapters.restoreRollbackConfiguration(request, hostMutation),
+            restoreRollbackServerModLock: (request, hostMutation) =>
+              windowsUpdateActivationAdapters.restoreRollbackServerModLock(request, hostMutation),
+            restoreRollbackPairedSave: (request, hostMutation) =>
+              windowsUpdateActivationAdapters.restoreRollbackPairedSave(request, hostMutation),
+            inspectRollbackReadback: (request, hostMutation) =>
+              windowsUpdateActivationAdapters.inspectRollbackReadback(request, hostMutation),
+            smoke: (request, hostMutation) => windowsUpdateActivationAdapters.smoke(request, hostMutation)
           })
         })()
       : null
@@ -758,6 +1246,46 @@ export async function buildApplication(
   if (componentUpdateActivation) {
     app.addHook('onReady', async () => {
       await componentUpdateActivation.initialize()
+    })
+  }
+  const steamManualProviderReady = updateTransactionProvider !== undefined &&
+    typeof updateTransactionProvider.captureSteamManualBaseline === 'function' &&
+    typeof updateTransactionProvider.resampleSteamManualRuntime === 'function' &&
+    typeof updateTransactionProvider.probeSteamManualLoadEvidence === 'function'
+  const steamManualHandoffService = dependencies.steamManualHandoffService ?? (
+    config.provider === 'windows' && provider.name === 'windows' && config.lifecycleEnabled &&
+      windowsUpdateActivationAdapters && steamManualProviderReady && hostMutationCoordinator &&
+      hostMutationRecoveryCoordinator
+      ? new SteamManualHandoffService({
+          stateRoot: path.join(config.dataDir, 'steam-manual-handoff'),
+          hostMutationCoordinator,
+          hostMutationRecoveryCoordinator,
+          captureBaseline: (request, hostMutation) =>
+            windowsUpdateActivationAdapters.captureBaseline(request, hostMutation),
+          createProtectionPoint: (request, hostMutation) =>
+            windowsUpdateActivationAdapters.createProtectionPoint(request, hostMutation),
+          requestGracefulStop: (request, hostMutation) =>
+            windowsUpdateActivationAdapters.requestGracefulStop(request, hostMutation),
+          verifyStopped: (request, hostMutation) =>
+            windowsUpdateActivationAdapters.verifyStopped(request, hostMutation),
+          resampleUpdatedRuntime: (request, hostMutation) =>
+            windowsUpdateActivationAdapters.resampleUpdatedRuntime(request, hostMutation),
+          startAndVerifyExactSave: (request, hostMutation) =>
+            windowsUpdateActivationAdapters.startAndVerifyExactSave(request, hostMutation)
+        })
+      : null
+  )
+  const steamManualHandoff = dependencies.steamManualHandoffController ?? (
+    steamManualHandoffService
+      ? new SteamManualHandoffHttpController({
+          service: steamManualHandoffService,
+          mutationGate: () => config.steamManualHandoffEnabled
+        })
+      : null
+  )
+  if (steamManualHandoff) {
+    app.addHook('onReady', async () => {
+      await steamManualHandoff.initialize()
     })
   }
   const thunderstoreModImportService = dependencies.thunderstoreModImportService ?? (
@@ -799,48 +1327,6 @@ export async function buildApplication(
         })
       : null
   )
-  const modDeployments = dependencies.modDeploymentService ?? (
-    config.modStagingRoot && config.modPluginsRoot
-      ? new ModDeploymentService({
-          stagingRoot: config.modStagingRoot,
-          pluginsRoot: config.modPluginsRoot,
-          maxSnapshots: config.modSnapshotLimit,
-          hostMutationCoordinator,
-          hostMutationRecoveryCoordinator,
-          ...(trustedCompatibilityService
-            ? {
-                readPlatformInventory: async () => {
-                  const current = await trustedCompatibilityService.status()
-                  return {
-                    inventoryRevision: current.inventoryRevision,
-                    inventory: {
-                      nebula: current.inventory.nebula,
-                      bepInEx: current.inventory.bepInEx
-                    }
-                  }
-                }
-              }
-            : {}),
-          verifyStoppedState: async (signal) => {
-            if (!windowsScriptRunner || !config.projectRoot) {
-              return { processStopped: false, portClosed: false }
-            }
-            const output = await windowsScriptRunner.run(
-              'Test-DysonRuntimeState.ps1',
-              [
-                '-ProjectRoot', config.projectRoot,
-                '-Expected', 'stopped',
-                '-GamePort', String(config.gamePort)
-              ],
-              signal ?? new AbortController().signal
-            )
-            const proof = runtimeStoppedResultSchema.parse(JSON.parse(output) as unknown)
-            return { processStopped: proof.processVerified, portClosed: !proof.gamePortListening }
-          }
-        })
-      : null
-  )
-
   await app.register(cookie)
   await app.register(helmet, {
     contentSecurityPolicy: {
@@ -880,6 +1366,12 @@ export async function buildApplication(
       authenticate: auth.authenticate
     })
   }
+  if (cutoverController) {
+    registerCutoverRoutes(app, {
+      controller: cutoverController,
+      authenticate: auth.authenticate
+    })
+  }
 
   app.get('/healthz', async (_request, reply) => {
     if (config.deploymentVersion) {
@@ -901,13 +1393,20 @@ export async function buildApplication(
     }
     reply.header('Cache-Control', 'no-store')
 
+    const updateActivationCapabilityEnabled = config.updateActivationEnabled ||
+      config.updateActivationRecoveryEnabled
+    const activationRecoveryApplicable = updateActivationCapabilityEnabled ||
+      componentUpdateActivation !== null
     const checks: Record<string, 'pass' | 'fail' | 'not-applicable'> = {
       deploymentVersion: config.nodeEnv === 'production'
         ? (config.deploymentVersion ? 'pass' : 'fail')
         : 'not-applicable',
       statusProvider: 'fail',
       projectRoot: provider.name === 'windows' ? 'fail' : 'not-applicable',
-      activationRecovery: componentUpdateActivation ? 'fail' : 'not-applicable'
+      lifecycleBroker: config.lifecycleEnabled ? 'fail' : 'not-applicable',
+      activationRecovery: activationRecoveryApplicable ? 'fail' : 'not-applicable',
+      steamHandoffRecovery: config.steamManualHandoffEnabled ? 'fail' : 'not-applicable',
+      cutoverRecovery: cutoverController ? 'fail' : 'not-applicable'
     }
 
     try {
@@ -920,7 +1419,33 @@ export async function buildApplication(
       // Readiness is deliberately code-only and never reflects provider errors.
     }
 
-    if (componentUpdateActivation) {
+    if (config.lifecycleEnabled && lifecycleBrokerClient) {
+      try {
+        const evidence = await lifecycleBrokerClient.status({
+          signal: AbortSignal.timeout(config.statusTimeoutMs)
+        })
+        checks.lifecycleBroker = isTrustedLifecycleBrokerStatus(evidence, config) ? 'pass' : 'fail'
+      } catch {
+        checks.lifecycleBroker = 'fail'
+      }
+    }
+
+    const currentUpdateProviderAuthorityRevision = defaultUpdateProviderAuthorityRevision !== null &&
+        trustedCompatibilityPolicyAuthority !== null
+      ? await readWindowsUpdateProviderAuthorityRevision(
+          config,
+          trustedCompatibilityPolicyAuthority.fileSha256
+        )
+      : null
+    const updateProviderAuthoritiesReady = defaultUpdateProviderAuthorityRevision === null ||
+      (currentUpdateProviderAuthorityRevision !== null &&
+        sameAuthorityRevision(
+          defaultUpdateProviderAuthorityRevision,
+          currentUpdateProviderAuthorityRevision.revision
+        ))
+    if (activationRecoveryApplicable && componentUpdateActivation &&
+        (!updateActivationCapabilityEnabled || updateTransactionProvider) &&
+        updateProviderAuthoritiesReady) {
       try {
         const recovery = await componentUpdateActivation.recoveryStatus({})
         checks.activationRecovery = recovery.statusCode === 200 && recovery.body.ok
@@ -929,6 +1454,31 @@ export async function buildApplication(
           : 'fail'
       } catch {
         checks.activationRecovery = 'fail'
+      }
+    }
+
+    if (config.steamManualHandoffEnabled && steamManualHandoff && updateTransactionProvider &&
+        steamManualProviderReady && updateProviderAuthoritiesReady) {
+      try {
+        const recovery = await steamManualHandoff.recoveryStatus({})
+        checks.steamHandoffRecovery = recovery.statusCode === 200 && recovery.body.ok &&
+          ['ready', 'awaiting-steam-client-update'].includes(recovery.body.data.phase)
+          ? 'pass'
+          : 'fail'
+      } catch {
+        checks.steamHandoffRecovery = 'fail'
+      }
+    }
+
+    if (cutoverController) {
+      try {
+        const recovery = await cutoverController.recoveryStatus({})
+        checks.cutoverRecovery = recovery.statusCode === 200 && recovery.body.ok &&
+          recovery.body.data.phase === 'ready'
+          ? 'pass'
+          : 'fail'
+      } catch {
+        checks.cutoverRecovery = 'fail'
       }
     }
 
@@ -973,21 +1523,51 @@ export async function buildApplication(
       }
       catch { return reply.code(503).send({ error: { code: 'STATUS_UNAVAILABLE', message: '服务器状态暂不可用' } }) }
     }
-    try { recordObservability(status) }
+    try { await recordObservability(status) }
     catch { /* Preserve the existing status contract if observability normalization fails. */ }
     const lifecycleUiEnabled = config.lifecycleEnabled && provider.name === 'windows'
       && request.actorRole !== null && can(request.actorRole, 'lifecycle.execute')
     const refreshUiEnabled = request.actorRole !== null && can(request.actorRole, 'status.refresh')
     const running = status.state === 'running'
+    const lifecycleCapabilities = {
+      start: false,
+      save: false,
+      gracefulStop: false,
+      restart: false
+    }
+    if (lifecycleUiEnabled && (running || status.state === 'stopped')) {
+      const actions: LifecycleAction[] = running
+        ? ['save', 'graceful-stop', 'restart']
+        : ['start']
+      const controller = new AbortController()
+      const timeout = setTimeout(
+        () => controller.abort('lifecycle-capability-preflight-timeout'),
+        Math.min(config.statusTimeoutMs, config.lifecycleTimeoutMs)
+      )
+      timeout.unref()
+      try {
+        const results = await Promise.all(actions.map(async (action) => {
+          try {
+            const preview = await lifecycle.preview(action, controller.signal)
+            return [action, isExecutableLifecyclePreview(preview, action)] as const
+          } catch {
+            return [action, false] as const
+          }
+        }))
+        for (const [action, executable] of results) {
+          if (action === 'graceful-stop') lifecycleCapabilities.gracefulStop = executable
+          else lifecycleCapabilities[action] = executable
+        }
+      } finally {
+        clearTimeout(timeout)
+      }
+    }
     return {
       data: {
         ...status,
         capabilities: {
           refresh: refreshUiEnabled,
-          start: lifecycleUiEnabled && status.state === 'stopped',
-          save: lifecycleUiEnabled && running,
-          gracefulStop: lifecycleUiEnabled && running,
-          restart: lifecycleUiEnabled && running
+          ...lifecycleCapabilities
         }
       },
       meta: { provider: provider.name, environment: config.nodeEnv }
@@ -998,7 +1578,7 @@ export async function buildApplication(
     try {
       const status = await collectObservabilityStatus()
       return {
-        data: recordObservability(status),
+        data: await recordObservability(status),
         meta: {
           provider: provider.name,
           environment: config.nodeEnv,
@@ -1020,7 +1600,7 @@ export async function buildApplication(
     }
     try {
       const status = await collectObservabilityStatus()
-      recordObservability(status)
+      await recordObservability(status)
       return {
         data: observabilityHistory.downsample(parsed.data.points ?? 48),
         meta: {
@@ -1037,13 +1617,20 @@ export async function buildApplication(
   app.get('/api/v1/observability/qualification', protectedRoute('observability.read'), async (_request, reply) => {
     try {
       const status = await collectObservabilityStatus()
-      recordObservability(status)
+      await recordObservability(status)
+      const qualification = evaluateLateGameQualification(observabilityHistory.list())
       return {
-        data: evaluateLateGameQualification(observabilityHistory.list()),
+        data: {
+          ...qualification,
+          continuity72h: observabilityHistory.longWindowReport?.()
+            ?? evaluateObservabilityLongWindow([]),
+          latency: observabilityLatency.report()
+        },
         meta: {
           provider: provider.name,
           environment: config.nodeEnv,
-          capacity: observabilityHistory.capacity
+          capacity: observabilityHistory.capacity,
+          longWindowCapacity: observabilityHistory.longWindowCapacity ?? 0
         }
       }
     } catch {
@@ -1054,7 +1641,7 @@ export async function buildApplication(
   app.get('/api/v1/observability/alerts', protectedRoute('observability.read'), async (_request, reply) => {
     try {
       const status = await collectObservabilityStatus()
-      recordObservability(status)
+      await recordObservability(status)
       return {
         data: observabilityAlerts.project(),
         meta: { recoveryRequired: observabilityAlerts.recoveryRequired }
@@ -1093,11 +1680,58 @@ export async function buildApplication(
     }
   })
 
-  app.get('/api/v1/jobs', protectedRoute('jobs.read'), async () => ({ data: jobs.listJobs() }))
+  app.get('/api/v1/jobs', protectedRoute('jobs.read'), async (request, reply) => {
+    const parsed = jobListQuerySchema.safeParse(request.query)
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: { code: 'INVALID_JOB_QUERY', message: '任务历史查询无效' }
+      })
+    }
+    try {
+      const page = jobAudit.list(parsed.data)
+      return { data: page.items, page: { nextCursor: page.nextCursor } }
+    } catch (error) {
+      return jobAuditError(reply, error)
+    }
+  })
   app.get('/api/v1/jobs/:id', protectedRoute('jobs.read'), async (request, reply) => {
     const id = (request.params as { id: string }).id
     const job = jobs.getJob(id)
     return job ? { data: job } : reply.code(404).send({ error: { code: 'JOB_NOT_FOUND', message: '任务不存在' } })
+  })
+  app.post('/api/v1/jobs/audit/export/preview', protectedRoute('jobs.export'), async (request, reply) => {
+    const parsed = jobAuditExportPreviewSchema.safeParse(request.body)
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: { code: 'INVALID_JOB_AUDIT_EXPORT_REQUEST', message: '任务审计导出预演请求无效' }
+      })
+    }
+    try {
+      return { data: jobAudit.preview(parsed.data) }
+    } catch (error) {
+      return jobAuditError(reply, error)
+    }
+  })
+  app.post('/api/v1/jobs/audit/export', protectedRoute('jobs.export'), async (request, reply) => {
+    const parsed = jobAuditExportExecutionSchema.safeParse(request.body)
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: { code: 'INVALID_JOB_AUDIT_EXPORT_REQUEST', message: '任务审计导出请求无效' }
+      })
+    }
+    try {
+      const { confirmation: _confirmation, ...exportInput } = parsed.data
+      const artifact = jobAudit.export(exportInput)
+      jobs.recordAuditExport(request.actor ?? 'unknown', artifact.recordCount, artifact.format)
+      return reply
+        .header('cache-control', 'no-store')
+        .header('content-disposition', `attachment; filename="${artifact.fileName}"`)
+        .header('content-type', artifact.contentType)
+        .header('x-content-type-options', 'nosniff')
+        .send(artifact.bytes)
+    } catch (error) {
+      return jobAuditError(reply, error)
+    }
   })
 
   app.post('/api/v1/actions/refresh', protectedRoute('status.refresh'), async (request, reply) => {
@@ -1261,6 +1895,51 @@ export async function buildApplication(
       return reply.code(receipt.reused ? 200 : 201).send({ data: receipt })
     } catch (error) {
       return saveTransferError(reply, error)
+    }
+  })
+
+  app.post('/api/v1/saves/transfers/promotions/preview', protectedRoute('saves.transfer'), async (request, reply) => {
+    if (!savePromotions) return saveTransferUnavailable(reply)
+    try {
+      const plan = await savePromotions.previewImportPromotion(request.body)
+      return reply.code(200).send({
+        data: { ...plan, executionEnabled: config.saveTransferEnabled }
+      })
+    } catch (error) {
+      return saveTransferError(reply, error)
+    }
+  })
+
+  app.post('/api/v1/saves/transfers/promotions/execute', protectedRoute('saves.transfer'), async (request, reply) => {
+    if (!config.saveTransferEnabled) return saveTransferMutationsDisabled(reply)
+    if (!savePromotions) return saveTransferUnavailable(reply)
+    const parsed = savePairPromotionExecutionRequestSchema.safeParse(request.body)
+    if (!parsed.success || parsed.data.confirmation !== SAVE_PAIR_PROMOTION_CONFIRMATION) {
+      return saveTransferError(reply, new SaveTransferError('SAVE_TRANSFER_REQUEST_INVALID'))
+    }
+    try {
+      const execute = async () => await savePromotions.promoteImport(parsed.data)
+      const receipt = hostMutationCoordinator
+        ? await hostMutationCoordinator.runExclusive(
+            { operation: 'save-import-promotion', requestId: parsed.data.requestId },
+            async (scope) => {
+              try {
+                scope.assertActive()
+                const value = await execute()
+                scope.assertActive()
+                return hostMutationReturn(value)
+              } catch (error) {
+                // Promotion never overwrites a live save. Its fixed-root lock,
+                // deterministic stage cleanup, atomic publication and orphan
+                // receipt reconciliation make every failure safe to release.
+                return hostMutationThrow(error, 'release')
+              }
+            }
+          )
+        : await execute()
+      return reply.code(receipt.reused ? 200 : 201).send({ data: receipt })
+    } catch (error) {
+      return savePromotionError(reply, error)
     }
   })
 
@@ -1729,6 +2408,66 @@ export async function buildApplication(
     }
   })
 
+  app.get('/api/v1/mods/configuration/schemas', protectedRoute('mods.read'), async (_request, reply) => {
+    if (!modConfigurations) return modConfigurationUnavailable(reply)
+    return { data: modConfigurations.schemas(), meta: { executionEnabled: config.modDeploymentEnabled } }
+  })
+
+  app.post('/api/v1/mods/configuration/inspect', protectedRoute('mods.read'), async (request, reply) => {
+    if (!modConfigurations) return modConfigurationUnavailable(reply)
+    try {
+      return { data: await modConfigurations.inspect(request.body) }
+    } catch (error) {
+      return modConfigurationError(reply, error)
+    }
+  })
+
+  app.post('/api/v1/mods/configuration/preview', protectedRoute('mods.read'), async (request, reply) => {
+    if (!modConfigurations) return modConfigurationUnavailable(reply)
+    try {
+      return { data: await modConfigurations.preview(request.body), meta: { executionEnabled: config.modDeploymentEnabled } }
+    } catch (error) {
+      return modConfigurationError(reply, error)
+    }
+  })
+
+  app.post('/api/v1/mods/configuration/execute', protectedRoute('mods.mutate'), async (request, reply) => {
+    if (!config.modDeploymentEnabled) return modDeploymentMutationsDisabled(reply)
+    if (!modConfigurations) return modConfigurationUnavailable(reply)
+    const parsed = modConfigurationExecuteSchema.safeParse(request.body)
+    if (!parsed.success || !modConfigurationConfirmationMatches(parsed.data.request, parsed.data.confirmation)) {
+      return invalidModConfigurationRequest(reply)
+    }
+    try {
+      return { data: await modConfigurations.execute(parsed.data.request) }
+    } catch (error) {
+      return modConfigurationError(reply, error)
+    }
+  })
+
+  app.get('/api/v1/mods/configuration/receipts/:requestId', protectedRoute('mods.read'), async (request, reply) => {
+    if (!modConfigurations) return modConfigurationUnavailable(reply)
+    const parsed = modDeploymentReceiptParamsSchema.safeParse(request.params)
+    if (!parsed.success) return invalidModConfigurationRequest(reply)
+    try {
+      const receipt = await modConfigurations.receipt(parsed.data.requestId)
+      return receipt === null ? reply.code(404).send({ error: { code: 'MOD_CONFIGURATION_RECEIPT_NOT_FOUND' } }) : { data: receipt }
+    } catch (error) {
+      return modConfigurationError(reply, error)
+    }
+  })
+
+  app.get('/api/v1/mods/configuration/history', protectedRoute('mods.read'), async (request, reply) => {
+    if (!modConfigurations) return modConfigurationUnavailable(reply)
+    const parsed = modDeploymentHistoryQuerySchema.safeParse(request.query ?? {})
+    if (!parsed.success) return invalidModConfigurationRequest(reply)
+    try {
+      return { data: await modConfigurations.history(parsed.data) }
+    } catch (error) {
+      return modConfigurationError(reply, error)
+    }
+  })
+
   app.post('/api/v1/client-profile/generate', protectedRoute('client-profile.generate'), async (request, reply) => {
     try {
       return { data: generateClientProfile(request.body) }
@@ -1767,6 +2506,79 @@ export async function buildApplication(
         error: { code: 'CLIENT_PROFILE_ARCHIVE_NOT_GENERATED', message: '客户端 ZIP 未通过生成与独立完整性校验' }
       })
     }
+  })
+
+  app.post('/api/v2/client-profile/issue', protectedRoute('client-profile.generate'), async (request, reply) => {
+    if (!config.qualifiedClientProfileEnabled || !qualifiedClientProfileService) {
+      return qualifiedClientProfileUnavailable(reply)
+    }
+    const parsed = qualifiedClientProfileRequestV2Schema.safeParse(request.body)
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: {
+          code: 'QUALIFIED_CLIENT_PROFILE_REQUEST_INVALID',
+          message: '客户端签发请求必须只包含版本和资格标识'
+        }
+      })
+    }
+    try {
+      return { data: await qualifiedClientProfileService.issue(parsed.data) }
+    } catch {
+      return reply.code(422).send({
+        error: {
+          code: 'QUALIFIED_CLIENT_PROFILE_NOT_ISSUED',
+          message: '受保护资格、客户端制品或签发回执未通过完整验证'
+        }
+      })
+    }
+  })
+
+  app.get('/api/v2/client-profile/archive/:downloadId', protectedRoute('client-profile.generate'), async (request, reply) => {
+    if (!config.qualifiedClientProfileEnabled || !qualifiedClientProfileService) {
+      return qualifiedClientProfileUnavailable(reply)
+    }
+    const parsed = qualifiedClientDownloadParamsSchema.safeParse(request.params)
+    if (!parsed.success || !emptyObjectSchema.safeParse(request.query ?? {}).success) {
+      return qualifiedClientArtifactUnavailable(reply)
+    }
+    return await sendQualifiedClientArtifact(reply, {
+      downloadId: parsed.data.downloadId,
+      fileName: 'dyson-qualified-client-profile.zip',
+      mediaType: 'application/zip',
+      maximumBytes: 512 * 1024 * 1024
+    }, () => qualifiedClientProfileService!.readProfileArchive(parsed.data.downloadId))
+  })
+
+  app.get('/api/v2/client-profile/client/:downloadId', protectedRoute('client-profile.generate'), async (request, reply) => {
+    if (!config.qualifiedClientProfileEnabled || !qualifiedClientProfileService) {
+      return qualifiedClientProfileUnavailable(reply)
+    }
+    const parsed = qualifiedClientDownloadParamsSchema.safeParse(request.params)
+    if (!parsed.success || !emptyObjectSchema.safeParse(request.query ?? {}).success) {
+      return qualifiedClientArtifactUnavailable(reply)
+    }
+    return await sendQualifiedClientArtifact(reply, {
+      downloadId: parsed.data.downloadId,
+      fileName: 'dyson-qualified-nebula-client.zip',
+      mediaType: 'application/zip',
+      maximumBytes: 1024 * 1024 * 1024
+    }, () => qualifiedClientProfileService!.readClientPayload(parsed.data.downloadId))
+  })
+
+  app.get('/api/v2/client-profile/runtime/:downloadId', protectedRoute('client-profile.generate'), async (request, reply) => {
+    if (!config.qualifiedClientProfileEnabled || !qualifiedClientProfileService) {
+      return qualifiedClientProfileUnavailable(reply)
+    }
+    const parsed = qualifiedClientDownloadParamsSchema.safeParse(request.params)
+    if (!parsed.success || !emptyObjectSchema.safeParse(request.query ?? {}).success) {
+      return qualifiedClientArtifactUnavailable(reply)
+    }
+    return await sendQualifiedClientArtifact(reply, {
+      downloadId: parsed.data.downloadId,
+      fileName: 'qualified-client-runtime.json',
+      mediaType: 'application/json',
+      maximumBytes: 4 * 1024 * 1024
+    }, () => qualifiedClientProfileService!.readRuntimeArtifact(parsed.data.downloadId))
   })
 
   app.post('/api/v1/updates/acquisition/preview', protectedRoute('updates.read'), async (request, reply) => {
@@ -1911,6 +2723,51 @@ export async function buildApplication(
     return reply.code(result.statusCode).send(result.body)
   })
 
+  registerWindowsNebulaPluginTransactionRoutes(app, {
+    service: nebulaPluginTransactionService,
+    ordinaryMutationEnabled: config.nebulaPluginTransactionEnabled,
+    recoveryMutationEnabled: config.nebulaPluginTransactionRecoveryEnabled,
+    readAuthorization: protectedRoute('updates.read'),
+    mutationAuthorization: protectedRoute('updates.activate'),
+    recoveryAuthorization: protectedRoute('updates.activate')
+  })
+
+  app.get('/api/v1/updates/steam-handoff/state', protectedRoute('updates.read'), async (_request, reply) => {
+    if (!steamManualHandoff) return steamManualHandoffUnavailable(reply)
+    const result = await steamManualHandoff.state({})
+    return reply.code(result.statusCode).send(result.body)
+  })
+
+  app.get('/api/v1/updates/steam-handoff/recovery', protectedRoute('updates.read'), async (_request, reply) => {
+    if (!steamManualHandoff) return steamManualHandoffUnavailable(reply)
+    const result = await steamManualHandoff.recoveryStatus({})
+    return reply.code(result.statusCode).send(result.body)
+  })
+
+  app.get('/api/v1/updates/steam-handoff/receipts/:requestId', protectedRoute('updates.read'), async (request, reply) => {
+    if (!steamManualHandoff) return steamManualHandoffUnavailable(reply)
+    const result = await steamManualHandoff.getReceipt(request.params)
+    return reply.code(result.statusCode).send(result.body)
+  })
+
+  app.post('/api/v1/updates/steam-handoff/preview', protectedRoute('updates.read'), async (request, reply) => {
+    if (!steamManualHandoff) return steamManualHandoffUnavailable(reply)
+    const result = await steamManualHandoff.preview(request.body)
+    return reply.code(result.statusCode).send(result.body)
+  })
+
+  app.post('/api/v1/updates/steam-handoff/begin', protectedRoute('updates.activate'), async (request, reply) => {
+    if (!steamManualHandoff) return steamManualHandoffUnavailable(reply)
+    const result = await steamManualHandoff.begin(request.body)
+    return reply.code(result.statusCode).send(result.body)
+  })
+
+  app.post('/api/v1/updates/steam-handoff/confirm', protectedRoute('updates.activate'), async (request, reply) => {
+    if (!steamManualHandoff) return steamManualHandoffUnavailable(reply)
+    const result = await steamManualHandoff.confirm(request.body)
+    return reply.code(result.statusCode).send(result.body)
+  })
+
   app.get('/api/v1/players', protectedRoute('players.read'), async (_request, reply) => {
     if (!playerSnapshotSource) {
       return reply.code(503).send({
@@ -1931,6 +2788,7 @@ export async function buildApplication(
         state: responseSnapshot.state,
         authoritative,
         observedAt: new Date(responseSnapshot.writtenAtUnixMs).toISOString(),
+        rosterGeneration: publicRosterGeneration(responseSnapshot.sessionId),
         sequence: responseSnapshot.sequence,
         truncated: responseSnapshot.truncated,
         playerCount: accepted ? accepted.players.length : null,
@@ -1995,6 +2853,196 @@ export async function buildApplication(
     }
   })
 
+  app.get('/api/v1/players/notice/receipts/:requestId', protectedRoute('players.moderate'), async (request, reply) => {
+    const requestId = (request.params as { requestId?: unknown }).requestId
+    if (typeof requestId !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
+      return reply.code(400).send({
+        error: { code: 'PLAYER_NOTICE_REQUEST_ID_INVALID', message: '玩家通知 requestId 无效' }
+      })
+    }
+    if (!playerNoticeClient) {
+      return reply.code(503).send({
+        error: { code: 'PLAYER_NOTICE_NOT_CONFIGURED', message: '玩家通知执行链尚未配置' }
+      })
+    }
+    try {
+      const receipt = await playerNoticeClient.readReceipt(requestId)
+      if (receipt === null) {
+        return reply.code(404).send({
+          error: { code: 'PLAYER_NOTICE_RECEIPT_NOT_FOUND', message: '玩家通知回执不存在' }
+        })
+      }
+      return reply.code(200).send({ data: { receipt: publicPlayerNoticeReceipt(receipt) } })
+    } catch (error) {
+      if (error instanceof PlayerNoticeError) {
+        return reply.code(503).send({
+          error: { code: error.code, message: '玩家通知回执暂不可用；未发起任何新通知' }
+        })
+      }
+      throw error
+    }
+  })
+
+  app.post('/api/v1/players/notice/preview', protectedRoute('players.moderate'), async (request, reply) => {
+    const parsed = playerNoticePreviewRequestSchema.safeParse(request.body)
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: { code: 'PLAYER_NOTICE_REQUEST_INVALID', message: '玩家通知预演请求无效' }
+      })
+    }
+    if (!playerSnapshotSource || !playerCapabilitySource) {
+      return reply.code(503).send({
+        error: { code: 'PLAYER_NOTICE_EVIDENCE_NOT_CONFIGURED', message: '玩家通知证据源尚未配置' }
+      })
+    }
+    const startedAt = new Date()
+    let job = database.createJob(
+      'player.notice.preview', request.actor ?? 'authenticated-user',
+      `玩家通知预演：${parsed.data.sessionPlayerId} / ${parsed.data.templateId}`
+    )
+    events.publish({ type: 'job.updated', data: job })
+    job = database.updateJob(job.id, { state: 'running', startedAt: startedAt.toISOString() })
+    events.publish({ type: 'job.updated', data: job })
+    try {
+      const [roster, capabilities] = await Promise.all([
+        playerSnapshotSource.read(),
+        playerCapabilitySource.read()
+      ])
+      const plan = previewPlayerNotice(
+        parsed.data, roster, capabilities, config.playerNoticeMutationsEnabled
+      )
+      const finishedAt = new Date()
+      job = database.updateJob(job.id, {
+        state: 'succeeded',
+        finishedAt: finishedAt.toISOString(),
+        durationMs: finishedAt.getTime() - startedAt.getTime(),
+        summary: `玩家通知预演完成：${plan.blockers.length} 项阻断`
+      })
+      events.publish({ type: 'job.updated', data: job })
+      return { data: { job, plan } }
+    } catch (error) {
+      const finishedAt = new Date()
+      job = database.updateJob(job.id, {
+        state: 'failed',
+        finishedAt: finishedAt.toISOString(),
+        durationMs: finishedAt.getTime() - startedAt.getTime(),
+        summary: '玩家通知预演失败',
+        errorCode: 'PLAYER_NOTICE_EVIDENCE_UNAVAILABLE'
+      })
+      events.publish({ type: 'job.updated', data: job })
+      if (error instanceof PlayerSnapshotError || error instanceof PlayerCapabilityError) {
+        return reply.code(503).send({
+          error: { code: 'PLAYER_NOTICE_EVIDENCE_UNAVAILABLE', message: '玩家通知证据暂不可用' }
+        })
+      }
+      throw error
+    }
+  })
+
+  app.post('/api/v1/players/notice', protectedRoute('players.moderate'), async (request, reply) => {
+    const parsed = playerNoticeExecutionRequestSchema.safeParse(request.body)
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: { code: 'PLAYER_NOTICE_EXECUTION_INVALID', message: '玩家通知执行请求无效' }
+      })
+    }
+    if (!playerSnapshotSource || !playerCapabilitySource || !playerNoticeClient) {
+      return reply.code(503).send({
+        error: { code: 'PLAYER_NOTICE_NOT_CONFIGURED', message: '玩家通知执行链尚未配置' }
+      })
+    }
+    const startedAt = new Date()
+    let job = database.createJob(
+      'player.notice', request.actor ?? 'authenticated-user',
+      `玩家通知执行：${parsed.data.sessionPlayerId} / ${parsed.data.templateId} / ${parsed.data.requestId}`
+    )
+    events.publish({ type: 'job.updated', data: job })
+    job = database.updateJob(job.id, { state: 'running', startedAt: startedAt.toISOString() })
+    events.publish({ type: 'job.updated', data: job })
+    try {
+      const [roster, capabilities] = await Promise.all([
+        playerSnapshotSource.read(),
+        playerCapabilitySource.read()
+      ])
+      const plan = previewPlayerNotice(
+        parsed.data, roster, capabilities, config.playerNoticeMutationsEnabled
+      )
+      if (!plan.allowed || plan.targetJoinedAtUnixMs === null) {
+        const finishedAt = new Date()
+        job = database.updateJob(job.id, {
+          state: 'failed',
+          finishedAt: finishedAt.toISOString(),
+          durationMs: finishedAt.getTime() - startedAt.getTime(),
+          summary: `玩家通知被预检阻断：${plan.blockers.join(',')}`,
+          errorCode: 'PLAYER_NOTICE_PREFLIGHT_BLOCKED'
+        })
+        events.publish({ type: 'job.updated', data: job })
+        return reply.code(409).send({
+          error: {
+            code: 'PLAYER_NOTICE_PREFLIGHT_BLOCKED', message: '玩家通知未通过执行前预检',
+            details: { job, plan }
+          }
+        })
+      }
+
+      const receipt = await playerNoticeClient.execute({
+        ...parsed.data,
+        rosterSessionId: roster.sessionId,
+        targetJoinedAtUnixMs: plan.targetJoinedAtUnixMs
+      })
+      const finishedAt = new Date()
+      const dispatched = receipt.state === 'transport-dispatched'
+      job = database.updateJob(job.id, {
+        state: dispatched ? 'succeeded' : 'failed',
+        finishedAt: finishedAt.toISOString(),
+        durationMs: finishedAt.getTime() - startedAt.getTime(),
+        summary: dispatched ? '玩家系统通知已交给目标连接传输层' : `玩家通知终止：${receipt.state}`,
+        errorCode: dispatched ? null : receipt.errorCode
+      })
+      events.publish({ type: 'job.updated', data: job })
+      const body = { data: { job, receipt: publicPlayerNoticeReceipt(receipt) } }
+      if (dispatched) return reply.code(200).send(body)
+      return reply.code(receipt.state === 'uncertain' ? 503 : 409).send(body)
+    } catch (error) {
+      const finishedAt = new Date()
+      const outcomeUnknown = error instanceof PlayerNoticeError && error.requestPublished &&
+        error.mutationMayHaveOccurred && error.recoveryRequired
+      const code = outcomeUnknown
+        ? 'PLAYER_NOTICE_OUTCOME_UNKNOWN'
+        : error instanceof PlayerNoticeError ? error.code : 'PLAYER_NOTICE_EXECUTION_FAILED'
+      job = database.updateJob(job.id, {
+        state: 'failed',
+        finishedAt: finishedAt.toISOString(),
+        durationMs: finishedAt.getTime() - startedAt.getTime(),
+        summary: '玩家通知执行失败',
+        errorCode: code
+      })
+      events.publish({ type: 'job.updated', data: job })
+      if (error instanceof PlayerNoticeError || error instanceof PlayerSnapshotError ||
+          error instanceof PlayerCapabilityError) {
+        if (outcomeUnknown) {
+          return reply.code(503).send({
+            error: {
+              code,
+              message: '玩家通知结果未知；只能使用相同 requestId 进行只读对账',
+              details: {
+                job,
+                requestId: parsed.data.requestId,
+                mutationMayHaveOccurred: true,
+                recoveryRequired: true
+              }
+            }
+          })
+        }
+        return reply.code(503).send({
+          error: { code, message: '玩家通知执行链暂不可用；相同 requestId 可用于只读对账' }
+        })
+      }
+      throw error
+    }
+  })
+
   app.post('/api/v1/updates/plan/preview', protectedRoute('updates.read'), async (request, reply) => {
     try {
       return { data: { mode: 'dry-run', plan: createUpdatePlan(request.body) } }
@@ -2024,17 +3072,35 @@ export async function buildApplication(
     if (!parsed.success) {
       return reply.code(400).send({ error: { code: 'INVALID_LIFECYCLE_ACTION', message: '生命周期预检请求无效' } })
     }
+    const controller = new AbortController()
+    const timeout = setTimeout(
+      () => controller.abort('lifecycle-preview-timeout'),
+      config.lifecycleTimeoutMs
+    )
+    timeout.unref()
+    const abortRequest = () => controller.abort('http-request-aborted')
+    const abortDisconnectedResponse = () => {
+      if (!reply.raw.writableEnded) controller.abort('http-client-disconnected')
+    }
+    if (request.raw.aborted) abortRequest()
+    request.raw.once('aborted', abortRequest)
+    reply.raw.once('close', abortDisconnectedResponse)
     try {
       const result = await jobs.previewLifecycle(
         parsed.data.action,
         request.actor ?? 'unknown',
-        (action) => lifecycle.preview(action)
+        (action, signal) => lifecycle.preview(action, signal),
+        controller.signal
       )
       return reply.code(200).send({ data: result })
     } catch {
       return reply.code(503).send({
         error: { code: 'LIFECYCLE_PREVIEW_FAILED', message: '生命周期只读预检暂不可用' }
       })
+    } finally {
+      clearTimeout(timeout)
+      request.raw.off('aborted', abortRequest)
+      reply.raw.off('close', abortDisconnectedResponse)
     }
   })
 
@@ -2059,6 +3125,27 @@ export async function buildApplication(
         })
       }
       throw error
+    }
+  })
+
+  app.get('/api/v1/lifecycle/runtime-receipts', protectedRoute('lifecycle.read'), async (request, reply) => {
+    reply.header('cache-control', 'no-store')
+    const parsed = gameRuntimeReceiptListQuerySchema.safeParse(request.query ?? {})
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: { code: 'INVALID_GAME_RUNTIME_RECEIPT_QUERY', message: '游戏运行回执查询无效' }
+      })
+    }
+    try {
+      const page = await gameRuntimeReceipts.list({
+        limit: parsed.data.limit,
+        cursor: parsed.data.cursor ?? null
+      })
+      return { data: page.items, page: { nextCursor: page.nextCursor } }
+    } catch {
+      return reply.code(503).send({
+        error: { code: 'GAME_RUNTIME_RECEIPTS_UNAVAILABLE', message: '游戏运行回执暂不可用' }
+      })
     }
   })
 
@@ -2108,12 +3195,149 @@ export async function buildApplication(
       if (observabilityTimer) clearInterval(observabilityTimer)
       stopPlayerHistoryRetention()
       unsubscribeObservability()
+      await observabilityRecordQueue
       await app.close()
       await lifecycle.close()
       await saveJobs?.close()
-      database.close()
+      try {
+        try { ownedCutoverAudit?.close() } finally { ownedCutoverStore?.close() }
+      } finally {
+        database.close()
+      }
     }
   }
+}
+
+function isExecutableLifecyclePreview(preview: LifecyclePreview, action: LifecycleAction): boolean {
+  return preview.action === action && preview.mode === 'dry-run' && preview.allowed === true &&
+    preview.executionEnabled === true && Array.isArray(preview.blockers) && preview.blockers.length === 0 &&
+    preview.rollback?.ready === true && preview.checks.every((check) => check.status !== 'block')
+}
+
+function isTrustedLifecycleBrokerStatus(
+  evidence: LifecycleBrokerStatusEvidence,
+  config: Pick<AppConfig, 'gamePort' | 'serverTaskName' | 'stopTaskName'>
+): boolean {
+  if (evidence.task.valid !== true || evidence.task.server.name !== config.serverTaskName ||
+      evidence.task.server.path !== '\\' || evidence.task.stop.name !== config.stopTaskName ||
+      evidence.task.stop.path !== '\\' || evidence.lifecycleState !== evidence.runtime.lifecycleState) {
+    return false
+  }
+  if (evidence.lifecycleState === 'running_verified') {
+    return isTrustedRunningLifecycleRuntime(evidence.runtime, config.gamePort)
+  }
+  if (evidence.lifecycleState === 'stopped_verified') {
+    return isTrustedStoppedLifecycleRuntime(evidence.runtime, config.gamePort)
+  }
+  return false
+}
+
+function isTrustedRunningLifecycleRuntime(
+  runtime: LifecycleBrokerRuntimeEvidence,
+  gamePort: number
+): boolean {
+  return runtime.lifecycleState === 'running_verified' && runtime.session.status === 'verified' &&
+    runtime.session.id !== null && runtime.session.count === 1 && runtime.process.status === 'verified' &&
+    runtime.process.pid !== null && runtime.process.owner !== null &&
+    runtime.process.sessionId === runtime.session.id && runtime.port.port === gamePort &&
+    runtime.port.listenerCount === 1 && runtime.pidFile.present && runtime.pidFile.valid
+}
+
+function isTrustedStoppedLifecycleRuntime(
+  runtime: LifecycleBrokerRuntimeEvidence,
+  gamePort: number
+): boolean {
+  return runtime.lifecycleState === 'stopped_verified' && runtime.process.status === 'absent' &&
+    runtime.process.pid === null && runtime.process.owner === null && runtime.process.sessionId === null &&
+    runtime.port.port === gamePort && runtime.port.listenerCount === 0 &&
+    !runtime.pidFile.present && !runtime.pidFile.valid
+}
+
+function assertCutoverHostScriptsAvailable(scriptRoot: string): void {
+  try {
+    for (const scriptName of windowsCutoverHostScriptNames) {
+      const scriptPath = resolvePowerShellScriptPath(scriptRoot, scriptName)
+      const information = fs.lstatSync(scriptPath)
+      if (!information.isFile() || information.isSymbolicLink()) throw new Error('invalid host script')
+    }
+  } catch {
+    throw new Error('CUTOVER_HOST_SCRIPTS_UNAVAILABLE')
+  }
+}
+
+async function closeFailedCutoverConstruction(resources: {
+  app: FastifyInstance
+  database: ControlDatabase
+  lifecycle: Pick<LifecycleService, 'close'>
+  saveJobs: Pick<SaveJobService, 'close'> | null
+  observabilityTimer: NodeJS.Timeout | null
+  stopPlayerHistoryRetention: () => void
+  unsubscribeObservability: () => void
+}): Promise<void> {
+  if (resources.observabilityTimer) clearInterval(resources.observabilityTimer)
+  try { resources.stopPlayerHistoryRetention() } catch { /* Preserve the construction failure. */ }
+  try { resources.unsubscribeObservability() } catch { /* Preserve the construction failure. */ }
+  try { await resources.app.close() } catch { /* Preserve the construction failure. */ }
+  try { await resources.lifecycle.close() } catch { /* Preserve the construction failure. */ }
+  try { await resources.saveJobs?.close() } catch { /* Preserve the construction failure. */ }
+  try { resources.database.close() } catch { /* Preserve the construction failure. */ }
+}
+
+async function sendQualifiedClientArtifact(
+  reply: FastifyReply,
+  expected: {
+    downloadId: string
+    fileName: string
+    mediaType: 'application/zip' | 'application/json'
+    maximumBytes: number
+  },
+  read: () => Promise<{
+    downloadId: string
+    fileName: string
+    mediaType: string
+    sizeBytes: number
+    sha256: string
+    bytes: Uint8Array
+  }>
+) {
+  try {
+    const artifact = await read()
+    const bytes = Buffer.from(artifact.bytes)
+    const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+    if (artifact.downloadId !== expected.downloadId || artifact.fileName !== expected.fileName ||
+        artifact.mediaType !== expected.mediaType || !Number.isSafeInteger(artifact.sizeBytes) ||
+        artifact.sizeBytes < 1 || artifact.sizeBytes > expected.maximumBytes ||
+        artifact.sizeBytes !== bytes.byteLength || artifact.sha256 !== digest) {
+      throw new Error('QUALIFIED_CLIENT_ARTIFACT_BINDING_INVALID')
+    }
+    reply.header('Content-Type', expected.mediaType)
+    reply.header('Content-Disposition', `attachment; filename="${expected.fileName}"`)
+    reply.header('Content-Length', String(bytes.byteLength))
+    reply.header('X-Dyson-Content-SHA256', digest.slice('sha256:'.length))
+    reply.header('Cache-Control', 'no-store')
+    reply.header('X-Content-Type-Options', 'nosniff')
+    return reply.send(bytes)
+  } catch {
+    return qualifiedClientArtifactUnavailable(reply)
+  }
+}
+
+function qualifiedClientProfileUnavailable(reply: FastifyReply) {
+  return reply.code(423).send({
+    error: {
+      code: 'QUALIFIED_CLIENT_PROFILE_DISABLED',
+      message: '受保护客户端签发门禁尚未启用'
+    }
+  })
+}
+
+function qualifiedClientArtifactUnavailable(reply: FastifyReply) {
+  return reply.code(404).send({
+    error: {
+      code: 'QUALIFIED_CLIENT_ARTIFACT_UNAVAILABLE',
+      message: '客户端制品不存在或未通过下载时完整性校验'
+    }
+  })
 }
 
 function observabilityUnavailable(reply: FastifyReply) {
@@ -2148,6 +3372,30 @@ function observabilityAlertError(reply: FastifyReply, error: unknown) {
     })
   }
   return observabilityAlertUnavailable(reply)
+}
+
+function jobAuditError(reply: FastifyReply, error: unknown) {
+  if (!(error instanceof JobAuditError)) {
+    return reply.code(503).send({
+      error: { code: 'JOB_AUDIT_UNAVAILABLE', message: '任务审计历史暂不可用' }
+    })
+  }
+  if (error.code === 'JOB_AUDIT_REQUEST_INVALID' || error.code === 'JOB_AUDIT_CURSOR_INVALID') {
+    return reply.code(400).send({
+      error: {
+        code: error.code,
+        message: error.code === 'JOB_AUDIT_CURSOR_INVALID' ? '任务审计游标无效' : '任务审计请求无效'
+      }
+    })
+  }
+  if (error.code === 'JOB_AUDIT_EXPORT_TOO_LARGE') {
+    return reply.code(413).send({
+      error: { code: error.code, message: '任务审计导出超过固定大小限制' }
+    })
+  }
+  return reply.code(503).send({
+    error: { code: error.code, message: '任务审计记录未通过完整性校验' }
+  })
 }
 
 function workspaceUnavailable(reply: FastifyReply) {
@@ -2318,6 +3566,27 @@ function modDeploymentConfirmationMatches(
     && confirmation.expectedRevision === request.expectedRevision
 }
 
+function modConfigurationConfirmationMatches(
+  request: unknown,
+  confirmation: z.infer<typeof modConfigurationExecuteSchema>['confirmation']
+): boolean {
+  if (!request || typeof request !== 'object' || Array.isArray(request)) return false
+  const value = request as Record<string, unknown>
+  try {
+    return value.operation === 'configure' && value.requestId === confirmation.requestId &&
+      value.schemaId === confirmation.schemaId &&
+      typeof value.package === 'object' && value.package !== null && !Array.isArray(value.package) &&
+      (value.package as Record<string, unknown>).dependencyId === confirmation.dependencyId &&
+      (value.package as Record<string, unknown>).version === confirmation.version &&
+      value.expectedDeploymentRevision === confirmation.expectedDeploymentRevision &&
+      value.expectedConfigurationRevision === confirmation.expectedConfigurationRevision &&
+      managedModConfigurationRequestFingerprint(value) === confirmation.requestFingerprint &&
+      confirmation.confirmation === 'CONFIGURE_MANAGED_MOD'
+  } catch {
+    return false
+  }
+}
+
 function invalidModDeploymentRequest(reply: FastifyReply) {
   return reply.code(400).send({
     error: { code: 'INVALID_MOD_DEPLOYMENT_REQUEST', message: '模组部署请求不符合固定逻辑字段约束' }
@@ -2346,6 +3615,30 @@ function modDeploymentUnavailable(reply: FastifyReply) {
   return reply.code(503).send({
     error: { code: 'MOD_DEPLOYMENT_NOT_CONFIGURED', message: '模组部署服务尚未配置固定根目录' }
   })
+}
+
+function modConfigurationUnavailable(reply: FastifyReply) {
+  return reply.code(503).send({ error: { code: 'MOD_CONFIGURATION_NOT_CONFIGURED' } })
+}
+
+function invalidModConfigurationRequest(reply: FastifyReply) {
+  return reply.code(422).send({ error: { code: 'MOD_CONFIGURATION_REQUEST_INVALID' } })
+}
+
+function modConfigurationError(reply: FastifyReply, error: unknown) {
+  if (!(error instanceof ManagedModConfigurationError)) throw error
+  if (error.code.includes('REQUEST_INVALID') || error.code.includes('FIELD_UNAVAILABLE') ||
+      error.code.includes('VALUE_INVALID') || error.code.includes('SCHEMA_UNAVAILABLE') ||
+      error.code.includes('PACKAGE_UNAVAILABLE') || error.code.includes('DUPLICATE_FIELD')) {
+    return reply.code(422).send({ error: { code: error.code } })
+  }
+  if (error.code.includes('REVISION_CONFLICT') || error.code.includes('IDEMPOTENCY_CONFLICT')) {
+    return reply.code(409).send({ error: { code: error.code } })
+  }
+  if (error.code.includes('STOP_GATE') || error.code.includes('HOST_LEASE')) {
+    return reply.code(423).send({ error: { code: error.code } })
+  }
+  return reply.code(503).send({ error: { code: error.code } })
 }
 
 function modDeploymentMutationsDisabled(reply: FastifyReply) {
@@ -2632,6 +3925,12 @@ function updateActivationUnavailable(reply: FastifyReply) {
   })
 }
 
+function steamManualHandoffUnavailable(reply: FastifyReply) {
+  return reply.code(503).send({
+    error: { code: 'DSP_STEAM_HANDOFF_NOT_CONFIGURED', message: 'Steam 官方客户端手动更新接力尚未配置' }
+  })
+}
+
 function trustedCompatibilityUnavailable(reply: FastifyReply) {
   return reply.code(503).send({
     ok: false,
@@ -2639,18 +3938,212 @@ function trustedCompatibilityUnavailable(reply: FastifyReply) {
   })
 }
 
-async function readTrustedCompatibilityPolicy(filePath: string): Promise<unknown> {
+interface TrustedCompatibilityPolicyAuthority {
+  policy: unknown
+  fileSha256: string
+}
+
+interface WindowsUpdateProviderAuthoritySnapshot {
+  revision: string
+  bridgeSecretSha256: string
+}
+
+interface CanonicalAuthorityDirectory {
+  configuredPath: string
+  canonicalPath: string
+  information: Stats
+}
+
+interface CanonicalAuthorityFile extends CanonicalAuthorityDirectory {
+  bytes: Buffer
+}
+
+async function readTrustedCompatibilityPolicyAuthority(
+  filePath: string
+): Promise<TrustedCompatibilityPolicyAuthority> {
   try {
-    const info = await fs.promises.lstat(filePath)
-    if (!info.isFile() || info.isSymbolicLink() || info.size <= 0 || info.size > 1_024 * 1_024) {
-      throw new Error('invalid fixed policy file')
+    const evidence = await readCanonicalAuthorityFile(filePath, 1, 1_024 * 1_024)
+    return {
+      policy: JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(evidence.bytes)) as unknown,
+      fileSha256: createHash('sha256').update(evidence.bytes).digest('hex')
     }
-    return JSON.parse(await fs.promises.readFile(filePath, 'utf8')) as unknown
   } catch {
     // Startup must fail closed, but never include the configured host path or
     // file contents in the error surfaced by the process manager.
     throw new Error('UPDATE_COMPATIBILITY_POLICY_FILE_INVALID')
   }
+}
+
+async function readWindowsUpdateProviderAuthorityRevision(
+  config: AppConfig,
+  expectedPolicyFileSha256: string
+): Promise<WindowsUpdateProviderAuthoritySnapshot | null> {
+  if (config.provider !== 'windows' || !config.projectRoot || !config.updateStagingRoot ||
+      !config.modStagingRoot || !config.modPluginsRoot || !config.bridgeControlRoot ||
+      !config.bridgeSecretFile || !config.updateCompatibilityPolicyFile) {
+    return null
+  }
+  const mutableModPluginsParent = path.dirname(config.modPluginsRoot)
+  const directories = [
+    config.projectRoot,
+    path.join(config.projectRoot, 'server', 'BepInEx', 'config'),
+    path.join(config.projectRoot, 'userdata', 'Save'),
+    path.join(config.projectRoot, 'backups', 'saves'),
+    config.updateStagingRoot,
+    config.modStagingRoot,
+    mutableModPluginsParent,
+    config.bridgeControlRoot,
+    path.join(config.bridgeControlRoot, 'requests'),
+    path.join(config.bridgeControlRoot, 'receipts'),
+    path.join(config.dataDir, 'state', 'game-runtime-receipts')
+  ]
+  if (![...directories, config.modPluginsRoot, config.bridgeSecretFile, config.updateCompatibilityPolicyFile]
+      .every((entry) => path.isAbsolute(entry))) return null
+  try {
+    const [
+      directoryEvidence,
+      mutableModPluginsEvidence,
+      bridgeSecretEvidence,
+      compatibilityPolicyEvidence
+    ] = await Promise.all([
+      Promise.all(directories.map(async (directory) => await readCanonicalAuthorityDirectory(directory))),
+      readCanonicalAuthorityDirectory(config.modPluginsRoot),
+      readCanonicalAuthorityFile(config.bridgeSecretFile, 32, 1_024),
+      readCanonicalAuthorityFile(config.updateCompatibilityPolicyFile, 1, 1_024 * 1_024)
+    ])
+    const mutableModPluginsParentEvidence = directoryEvidence.find((evidence) =>
+      normalizeAuthorityPath(evidence.configuredPath) === normalizeAuthorityPath(mutableModPluginsParent)
+    )
+    if (!mutableModPluginsParentEvidence ||
+        normalizeAuthorityPath(path.dirname(mutableModPluginsEvidence.configuredPath)) !==
+          normalizeAuthorityPath(mutableModPluginsParentEvidence.configuredPath) ||
+        normalizeAuthorityPath(path.dirname(mutableModPluginsEvidence.canonicalPath)) !==
+          normalizeAuthorityPath(mutableModPluginsParentEvidence.canonicalPath)) {
+      return null
+    }
+    const policyFileSha256 = createHash('sha256')
+      .update(compatibilityPolicyEvidence.bytes)
+      .digest('hex')
+    if (!sameAuthorityRevision(policyFileSha256, expectedPolicyFileSha256)) return null
+    const normalizedSecret = validateBridgeSecret(
+      new TextDecoder('utf-8', { fatal: true }).decode(bridgeSecretEvidence.bytes)
+    )
+    const bridgeSecretSha256 = createHash('sha256').update(normalizedSecret, 'utf8').digest('hex')
+    const digest = createHash('sha256').update('dyson-update-provider-authority-v2\0', 'utf8')
+    for (const evidence of directoryEvidence) appendAuthorityIdentity(digest, evidence)
+    appendMutableAuthorityPath(digest, mutableModPluginsEvidence)
+    appendAuthorityIdentity(digest, bridgeSecretEvidence)
+    digest.update('\0secret-sha256\0', 'utf8').update(bridgeSecretSha256, 'ascii')
+    appendAuthorityIdentity(digest, compatibilityPolicyEvidence)
+    digest.update('\0policy\0', 'utf8').update(policyFileSha256, 'ascii')
+    return { revision: digest.digest('hex'), bridgeSecretSha256 }
+  } catch {
+    return null
+  }
+}
+
+async function readCanonicalAuthorityDirectory(
+  configuredPath: string
+): Promise<CanonicalAuthorityDirectory> {
+  const information = await fs.promises.lstat(configuredPath)
+  const canonicalPath = await fs.promises.realpath(configuredPath)
+  const after = await fs.promises.lstat(configuredPath)
+  if (!information.isDirectory() || information.isSymbolicLink() ||
+      !sameAuthorityNode(information, after) ||
+      !sameCanonicalAuthorityPath(configuredPath, canonicalPath)) {
+    throw new Error('WINDOWS_UPDATE_AUTHORITY_DIRECTORY_INVALID')
+  }
+  return { configuredPath, canonicalPath, information }
+}
+
+async function readCanonicalAuthorityFile(
+  configuredPath: string,
+  minimumBytes: number,
+  maximumBytes: number
+): Promise<CanonicalAuthorityFile> {
+  let handle: Awaited<ReturnType<typeof fs.promises.open>> | null = null
+  try {
+    const information = await fs.promises.lstat(configuredPath)
+    const canonicalPath = await fs.promises.realpath(configuredPath)
+    if (!information.isFile() || information.isSymbolicLink() ||
+        information.size < minimumBytes || information.size > maximumBytes ||
+        !sameCanonicalAuthorityPath(configuredPath, canonicalPath)) {
+      throw new Error('WINDOWS_UPDATE_AUTHORITY_FILE_INVALID')
+    }
+    handle = await fs.promises.open(configuredPath, 'r')
+    const handleBefore = await handle.stat()
+    if (!sameAuthorityFile(information, handleBefore)) {
+      throw new Error('WINDOWS_UPDATE_AUTHORITY_FILE_CHANGED')
+    }
+    const bytes = await handle.readFile()
+    const handleAfter = await handle.stat()
+    const [after, canonicalAfter] = await Promise.all([
+      fs.promises.lstat(configuredPath),
+      fs.promises.realpath(configuredPath)
+    ])
+    if (bytes.length < minimumBytes || bytes.length > maximumBytes ||
+        !sameAuthorityFile(handleBefore, handleAfter) ||
+        !sameAuthorityFile(handleAfter, after) ||
+        !sameCanonicalAuthorityPath(configuredPath, canonicalAfter) ||
+        !sameCanonicalAuthorityPath(canonicalPath, canonicalAfter)) {
+      throw new Error('WINDOWS_UPDATE_AUTHORITY_FILE_CHANGED')
+    }
+    return { configuredPath, canonicalPath, information: handleBefore, bytes }
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+function appendMutableAuthorityPath(
+  digest: ReturnType<typeof createHash>,
+  evidence: CanonicalAuthorityDirectory
+): void {
+  digest.update('\0mutable-path\0', 'utf8')
+    .update(normalizeAuthorityPath(evidence.configuredPath), 'utf8')
+    .update('\0mutable-real\0', 'utf8')
+    .update(normalizeAuthorityPath(evidence.canonicalPath), 'utf8')
+}
+
+function appendAuthorityIdentity(
+  digest: ReturnType<typeof createHash>,
+  evidence: CanonicalAuthorityDirectory
+): void {
+  const information = evidence.information
+  digest.update('\0path\0', 'utf8')
+    .update(normalizeAuthorityPath(evidence.configuredPath), 'utf8')
+    .update('\0real\0', 'utf8')
+    .update(normalizeAuthorityPath(evidence.canonicalPath), 'utf8')
+    .update('\0dev\0', 'utf8')
+    .update(String(information.dev), 'ascii')
+    .update('\0ino\0', 'utf8')
+    .update(String(information.ino), 'ascii')
+}
+
+function sameAuthorityNode(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino &&
+    left.isDirectory() === right.isDirectory() && left.isFile() === right.isFile()
+}
+
+function sameAuthorityFile(left: Stats, right: Stats): boolean {
+  return sameAuthorityNode(left, right) && left.size === right.size &&
+    left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs
+}
+
+function sameAuthorityRevision(left: string, right: string): boolean {
+  if (!/^[0-9a-f]{64}$/.test(left) || !/^[0-9a-f]{64}$/.test(right)) return false
+  try {
+    return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'))
+  } catch {
+    return false
+  }
+}
+
+function normalizeAuthorityPath(value: string): string {
+  return path.resolve(value).replace(/[\\/]+$/, '').toLowerCase()
+}
+
+function sameCanonicalAuthorityPath(configuredPath: string, canonicalPath: string): boolean {
+  return normalizeAuthorityPath(configuredPath) === normalizeAuthorityPath(canonicalPath)
 }
 
 function saveTransferMutationsDisabled(reply: FastifyReply) {
@@ -2690,6 +4183,24 @@ function saveTransferError(reply: FastifyReply, error: unknown) {
   return reply.code(422).send({ error: { code: error.code, message: '配对存档制品未通过完整性校验' } })
 }
 
+function savePromotionError(reply: FastifyReply, error: unknown) {
+  if (error instanceof SaveTransferError) return saveTransferError(reply, error)
+  if (error instanceof HostMutationOperationCoordinatorError) {
+    const blocked = error.code === 'HOST_MUTATION_LEASE_BUSY' ||
+      error.code === 'HOST_MUTATION_LEASE_DIRTY' ||
+      error.code === 'HOST_MUTATION_LEASE_RECOVERY_REQUIRED'
+    return reply.code(blocked ? 423 : 503).send({
+      error: {
+        code: blocked ? 'SAVE_PROMOTION_HOST_MUTATION_BLOCKED' : 'SAVE_PROMOTION_HOST_MUTATION_UNAVAILABLE',
+        message: blocked ? '另一项主机变更或恢复门禁正在占用' : '主机变更协调器暂不可用'
+      }
+    })
+  }
+  return reply.code(503).send({
+    error: { code: 'SAVE_PROMOTION_UNAVAILABLE', message: '隔离存档晋升服务暂不可用' }
+  })
+}
+
 function publicPlayer(player: {
   sessionPlayerId: string
   displayName: string
@@ -2703,6 +4214,28 @@ function publicPlayer(player: {
     online: player.online,
     joinedAt: new Date(player.joinedAtUnixMs).toISOString(),
     location: player.location
+  }
+}
+
+function publicPlayerNoticeReceipt(receipt: PlayerNoticeReceipt) {
+  return {
+    requestId: receipt.requestId,
+    action: receipt.action,
+    state: receipt.state,
+    startedAt: new Date(receipt.startedAtUnixMs).toISOString(),
+    finishedAt: new Date(receipt.finishedAtUnixMs).toISOString(),
+    rosterGeneration: publicRosterGeneration(receipt.rosterSessionId),
+    rosterSequence: receipt.rosterSequence,
+    sessionPlayerId: receipt.sessionPlayerId,
+    targetJoinedAt: new Date(receipt.targetJoinedAtUnixMs).toISOString(),
+    templateId: receipt.templateId,
+    mutationMayHaveOccurred: receipt.mutationMayHaveOccurred,
+    recoveryRequired: receipt.recoveryRequired,
+    rollback: {
+      strategy: receipt.rollback,
+      summary: '系统通知不可撤回；transport-dispatched 不等于客户端已显示。'
+    },
+    errorCode: receipt.errorCode
   }
 }
 

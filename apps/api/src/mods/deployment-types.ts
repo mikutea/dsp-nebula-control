@@ -15,7 +15,8 @@ export const MAX_MOD_DEPLOYMENT_HISTORY_PAGE_SIZE = 100
 export const MAX_MOD_DEPLOYMENT_RECEIPT_ENTRIES = 10_000
 export const MAX_MOD_DEPLOYMENT_HISTORY_CURSOR_LENGTH = 160
 
-export type ModDeploymentOperation = 'install' | 'update' | 'enable' | 'disable' | 'remove'
+/** `configure` is handled by the same mod-mutation gate through ManagedModConfigurationService. */
+export type ModDeploymentOperation = 'install' | 'update' | 'enable' | 'disable' | 'remove' | 'configure'
 
 export interface ModDeploymentRequest {
   requestId: string

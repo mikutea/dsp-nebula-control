@@ -13,6 +13,7 @@ import {
 import { ControlDatabase } from '../storage/database.js'
 import {
   LifecycleCoordinatorError,
+  type LifecycleCoordinatorScope,
   type LifecycleLeaseDisposition,
   type LifecycleMutationCoordinator
 } from '../host-mutation/lifecycle-coordinator.js'
@@ -73,10 +74,15 @@ export class LifecycleService {
     return { job, run, receipts: this.#database.listLifecycleReceipts(jobId), reused: true }
   }
 
-  preview(action: LifecycleAction) {
-    return this.#adapter.previewLifecycle(action, {
-      executionLockReady: this.#database.isLifecycleLockAvailable()
-    })
+  preview(action: LifecycleAction, signal: AbortSignal = new AbortController().signal) {
+    if (signal.aborted) return Promise.reject(abortReason(signal))
+    return waitForAbort(
+      Promise.resolve().then(async () => await this.#adapter.previewLifecycle(action, {
+        executionLockReady: this.#database.isLifecycleLockAvailable(),
+        signal
+      })),
+      signal
+    )
   }
 
   enqueue(action: LifecycleAction, idempotencyKey: string, actor: string): LifecycleExecutionResult {
@@ -157,7 +163,7 @@ export class LifecycleService {
             null,
             {}
           )
-          const transaction = await this.#executeTransaction(created, scope.signal)
+          const transaction = await this.#executeTransaction(created, scope)
           return { value: transaction, disposition: transaction.disposition }
         }
       )
@@ -189,9 +195,10 @@ export class LifecycleService {
 
   async #executeTransaction(
     created: ReturnType<ControlDatabase['createLifecycleJob']>,
-    leaseSignal?: AbortSignal
+    hostMutation?: LifecycleCoordinatorScope
   ): Promise<LifecycleTransactionOutcome> {
     const action = created.run.action
+    const leaseSignal = hostMutation?.signal
 
     let protectionPointId: string | null = null
     let stopMayHaveOccurred = false
@@ -202,11 +209,16 @@ export class LifecycleService {
     let recoveryRequired = false
 
     try {
-      await this.#phase(created.run, 'preflight', protectionPointId, async () => {
+      await this.#phase(created.run, 'preflight', protectionPointId, async (context) => {
         if (!this.#adapter.mutationEnabled) {
           throw new LifecycleExecutionError('LIFECYCLE_EXECUTION_DISABLED')
         }
-        const preview = await this.#adapter.previewLifecycle(action, { executionLockReady: true })
+        const preview = await this.#adapter.previewLifecycle(action, {
+          executionLockReady: true,
+          requestId: context.requestId,
+          signal: context.signal,
+          ...(context.hostMutation ? { hostMutation: context.hostMutation } : {})
+        })
         if (!preview.allowed || !preview.executionEnabled || preview.blockers.length > 0) {
           throw new LifecycleExecutionError('LIFECYCLE_PREFLIGHT_BLOCKED')
         }
@@ -214,7 +226,7 @@ export class LifecycleService {
           summary: '生命周期执行预检通过',
           evidence: { blockerCount: preview.blockers.length, rollbackReady: preview.rollback.ready }
         }
-      }, leaseSignal)
+      }, hostMutation)
 
       if (action !== 'start') {
         nativeMutationMayHaveOccurred = true
@@ -226,7 +238,7 @@ export class LifecycleService {
             const result = await this.#adapter.createProtectionPoint(context)
             return { ...result, protectionPointId: this.#validateProtectionPoint(result.protectionPointId) }
           },
-          leaseSignal
+          hostMutation
         )
         protectionPointId = protection.protectionPointId!
         this.#database.setLifecycleProtectionPoint(created.job.id, protectionPointId)
@@ -236,7 +248,7 @@ export class LifecycleService {
           'save',
           protectionPointId,
           (context) => this.#adapter.requestSave(context),
-          leaseSignal
+          hostMutation
         )
       }
 
@@ -248,14 +260,14 @@ export class LifecycleService {
           'stop',
           protectionPointId,
           (context) => this.#adapter.requestGracefulStop(context),
-          leaseSignal
+          hostMutation
         )
         await this.#phase(
           created.run,
           'verify-stopped',
           protectionPointId,
           (context) => this.#adapter.verifyStopped(context),
-          leaseSignal
+          hostMutation
         )
       }
 
@@ -267,14 +279,14 @@ export class LifecycleService {
           'start',
           protectionPointId,
           (context) => this.#adapter.requestStart(context),
-          leaseSignal
+          hostMutation
         )
         await this.#phase(
           created.run,
           'verify-running',
           protectionPointId,
           (context) => this.#adapter.verifyRunning(context),
-          leaseSignal
+          hostMutation
         )
       }
 
@@ -302,14 +314,14 @@ export class LifecycleService {
             'rollback-start',
             protectionPointId,
             (context) => this.#adapter.requestRollbackStart(context),
-            leaseSignal
+            hostMutation
           )
           await this.#phase(
             created.run,
             'verify-running',
             protectionPointId,
             (context) => this.#adapter.verifyRunning(context),
-            leaseSignal
+            hostMutation
           )
           recoveryRequired = false
         } catch (rollbackError) {
@@ -354,8 +366,9 @@ export class LifecycleService {
     phase: Exclude<LifecycleExecutionPhase, 'lock' | 'reconciliation'>,
     protectionPointId: string | null,
     operation: (context: LifecycleOperationContext) => Promise<LifecyclePhaseResult>,
-    leaseSignal?: AbortSignal
+    hostMutation?: LifecycleCoordinatorScope
   ): Promise<LifecyclePhaseResult> {
+    const leaseSignal = hostMutation?.signal
     const receipt = this.#database.startLifecyclePhase(run.jobId, phase, `${this.#phaseLabel(phase)}开始`)
     const controller = new AbortController()
     let timer: NodeJS.Timeout | null = null
@@ -371,13 +384,29 @@ export class LifecycleService {
         }, this.#phaseTimeoutMs)
       })
       const contenders: Array<Promise<LifecyclePhaseResult> | Promise<never>> = [
-        Promise.resolve().then(() => operation({
-          jobId: run.jobId,
-          requestId: run.requestId,
-          action: run.action,
-          protectionPointId,
-          signal: controller.signal
-        })),
+        Promise.resolve().then(async () => {
+          const borrowed = hostMutation
+            ? {
+                assertActive: () => this.#assertHostMutationActive(hostMutation),
+                toPowerShellBorrowArguments: () => {
+                  this.#assertHostMutationActive(hostMutation)
+                  try { return hostMutation.toPowerShellBorrowArguments() }
+                  catch { throw new LifecycleExecutionError('LIFECYCLE_HOST_LEASE_LOST') }
+                }
+              }
+            : undefined
+          this.#assertHostMutationActive(hostMutation)
+          const result = await operation({
+            jobId: run.jobId,
+            requestId: run.requestId,
+            action: run.action,
+            protectionPointId,
+            signal: controller.signal,
+            ...(borrowed ? { hostMutation: borrowed } : {})
+          })
+          this.#assertHostMutationActive(hostMutation)
+          return result
+        }),
         timeout
       ]
       if (leaseSignal) {
@@ -467,6 +496,12 @@ export class LifecycleService {
     return 'LIFECYCLE_PHASE_FAILED'
   }
 
+  #assertHostMutationActive(scope: LifecycleCoordinatorScope | undefined): void {
+    if (!scope) return
+    try { scope.assertActive() }
+    catch { throw new LifecycleExecutionError('LIFECYCLE_HOST_LEASE_LOST') }
+  }
+
   #coordinatorAcquireErrorCode(error: unknown): string {
     if (error instanceof LifecycleCoordinatorError) return error.code
     return 'LIFECYCLE_HOST_LEASE_UNAVAILABLE'
@@ -492,4 +527,29 @@ export class LifecycleService {
     }
     return labels[phase]
   }
+}
+
+function waitForAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortReason(signal))
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      callback()
+    }
+    const onAbort = () => finish(() => reject(abortReason(signal)))
+
+    signal.addEventListener('abort', onAbort, { once: true })
+    operation.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error))
+    )
+  })
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error('LIFECYCLE_PREVIEW_ABORTED')
 }

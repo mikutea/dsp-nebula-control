@@ -1,11 +1,12 @@
 Set-StrictMode -Version 2.0
 
 . (Join-Path $PSScriptRoot 'DysonDeployment.Common.ps1')
+. (Join-Path $PSScriptRoot 'DysonDeployment.Configuration.ps1')
 . (Join-Path $PSScriptRoot '..\DysonHostMutationLease.Common.ps1')
 . (Join-Path $PSScriptRoot '..\session\DysonSession.Common.ps1')
 
 $script:DysonRebootAcceptanceProtocol = 'DYSON_CONTROL_REBOOT_ACCEPTANCE_V1'
-$script:DysonRebootAcceptanceSchemaVersion = 1
+$script:DysonRebootAcceptanceSchemaVersion = 3
 $script:DysonRebootAcceptanceCheckpointState = 'awaiting-reboot'
 $script:DysonRebootAcceptanceCheckpointDirectory = 'acceptance\reboot-checkpoints'
 
@@ -102,6 +103,18 @@ function Get-DysonRebootAcceptanceCheckpointBody {
         controlPayloadSha256 = [string]$Record.controlPayloadSha256
         activePointerSha256 = [string]$Record.activePointerSha256
         controlTaskIdentity = [string]$Record.controlTaskIdentity
+        runtimeRootIdentity = [string]$Record.runtimeRootIdentity
+        nodeExecutableSha256 = [string]$Record.nodeExecutableSha256
+        nodeRuntimeProtected = [bool]$Record.nodeRuntimeProtected
+        configurationSha256 = [string]$Record.configurationSha256
+        configurationLength = [int64]$Record.configurationLength
+        configurationNamesSha256 = [string]$Record.configurationNamesSha256
+        configurationBindingsSha256 = [string]$Record.configurationBindingsSha256
+        configurationContractSha256 = [string]$Record.configurationContractSha256
+        configurationAclFingerprint = [string]$Record.configurationAclFingerprint
+        configurationParentAclFingerprint = [string]$Record.configurationParentAclFingerprint
+        lifecycleBrokerReady = [bool]$Record.lifecycleBrokerReady
+        readinessValidated = [bool]$Record.readinessValidated
         controlTaskLastRunAtBefore = [string]$Record.controlTaskLastRunAtBefore
         gamePort = [int]$Record.gamePort
         projectRootIdentity = [string]$Record.projectRootIdentity
@@ -135,7 +148,12 @@ function Assert-DysonRebootAcceptanceCheckpoint {
         'protocol', 'schemaVersion', 'state', 'checkpointId', 'createdAt', 'expiresAt',
         'hostIdentity', 'bootIdentityBefore', 'bootStartedAtBefore', 'controlTaskName',
         'controlVersion', 'controlPayloadSha256', 'activePointerSha256', 'controlTaskIdentity',
-        'controlTaskLastRunAtBefore', 'gamePort', 'projectRootIdentity', 'accountIdentity',
+        'runtimeRootIdentity', 'nodeExecutableSha256', 'nodeRuntimeProtected',
+        'configurationSha256', 'configurationLength', 'configurationNamesSha256',
+        'configurationBindingsSha256', 'configurationContractSha256',
+        'configurationAclFingerprint', 'configurationParentAclFingerprint',
+        'lifecycleBrokerReady', 'readinessValidated', 'controlTaskLastRunAtBefore',
+        'gamePort', 'projectRootIdentity', 'accountIdentity',
         'gameTaskLastRunAtBefore', 'checkpointSha256'
     )
     if ([string]$Record.protocol -cne $script:DysonRebootAcceptanceProtocol -or
@@ -167,11 +185,26 @@ function Assert-DysonRebootAcceptanceCheckpoint {
         throw 'The reboot-acceptance control task name is invalid.'
     }
     Assert-DysonVersion -Version ([string]$Record.controlVersion)
-    foreach ($digestName in @('controlPayloadSha256', 'activePointerSha256', 'checkpointSha256')) {
+    foreach ($digestName in @(
+        'controlPayloadSha256', 'activePointerSha256', 'nodeExecutableSha256',
+        'configurationSha256', 'configurationNamesSha256', 'configurationBindingsSha256',
+        'configurationContractSha256', 'configurationAclFingerprint',
+        'configurationParentAclFingerprint', 'checkpointSha256'
+    )) {
         Assert-DysonRebootAcceptanceHash -Value ([string]$Record.$digestName) -Name "Checkpoint $digestName"
     }
-    foreach ($identityName in @('controlTaskIdentity', 'projectRootIdentity', 'accountIdentity')) {
+    if ([int64]$Record.configurationLength -lt 1 -or [int64]$Record.configurationLength -gt 65536) {
+        throw 'The reboot-acceptance configuration length is invalid.'
+    }
+    foreach ($identityName in @(
+        'controlTaskIdentity', 'runtimeRootIdentity', 'projectRootIdentity', 'accountIdentity'
+    )) {
         Assert-DysonRebootAcceptanceIdentity -Value ([string]$Record.$identityName) -Name "Checkpoint $identityName"
+    }
+    if ($Record.nodeRuntimeProtected -isnot [bool] -or -not [bool]$Record.nodeRuntimeProtected -or
+        $Record.lifecycleBrokerReady -isnot [bool] -or -not [bool]$Record.lifecycleBrokerReady -or
+        $Record.readinessValidated -isnot [bool] -or -not [bool]$Record.readinessValidated) {
+        throw 'The reboot-acceptance checkpoint lacks lifecycle broker or deep-readiness evidence.'
     }
     if ([int]$Record.gamePort -lt 1 -or [int]$Record.gamePort -gt 65535) {
         throw 'The reboot-acceptance game port is invalid.'
@@ -349,16 +382,37 @@ function Assert-DysonRebootAcceptanceControlObservation {
     Assert-DysonRebootAcceptanceExactProperties -Value $Observation -Name 'Control observation' `
         -Expected @(
             'ready', 'version', 'payloadSha256', 'activePointerSha256', 'taskIdentity',
-            'taskState', 'taskLastRunAt'
+            'runtimeRootIdentity', 'nodeExecutableSha256', 'nodeRuntimeProtected',
+            'configurationSha256', 'configurationLength', 'configurationNamesSha256',
+            'configurationBindingsSha256', 'configurationContractSha256',
+            'configurationAclFingerprint', 'configurationParentAclFingerprint',
+            'taskState', 'taskLastRunAt', 'lifecycleBrokerReady', 'readinessValidated'
         )
     if ($Observation.ready -isnot [bool] -or -not [bool]$Observation.ready -or
+        $Observation.nodeRuntimeProtected -isnot [bool] -or -not [bool]$Observation.nodeRuntimeProtected -or
+        $Observation.lifecycleBrokerReady -isnot [bool] -or -not [bool]$Observation.lifecycleBrokerReady -or
+        $Observation.readinessValidated -isnot [bool] -or -not [bool]$Observation.readinessValidated -or
         [string]$Observation.taskState -cne 'Running') {
         throw 'The control-plane deployment is not ready for reboot acceptance.'
     }
     Assert-DysonVersion -Version ([string]$Observation.version)
     Assert-DysonRebootAcceptanceHash -Value ([string]$Observation.payloadSha256) -Name 'Control payload digest'
     Assert-DysonRebootAcceptanceHash -Value ([string]$Observation.activePointerSha256) -Name 'Active pointer digest'
+    Assert-DysonRebootAcceptanceHash -Value ([string]$Observation.nodeExecutableSha256) -Name 'Node executable digest'
+    foreach ($configurationDigestName in @(
+        'configurationSha256', 'configurationNamesSha256', 'configurationBindingsSha256',
+        'configurationContractSha256', 'configurationAclFingerprint',
+        'configurationParentAclFingerprint'
+    )) {
+        Assert-DysonRebootAcceptanceHash -Value ([string]$Observation.$configurationDigestName) `
+            -Name "Control $configurationDigestName"
+    }
+    if ([int64]$Observation.configurationLength -lt 1 -or
+        [int64]$Observation.configurationLength -gt 65536) {
+        throw 'The control configuration length is invalid.'
+    }
     Assert-DysonRebootAcceptanceIdentity -Value ([string]$Observation.taskIdentity) -Name 'Control task identity'
+    Assert-DysonRebootAcceptanceIdentity -Value ([string]$Observation.runtimeRootIdentity) -Name 'Node runtime-root identity'
     [void](ConvertTo-DysonRebootAcceptanceTimestamp `
         -Value ([string]$Observation.taskLastRunAt) -Name 'Control task last run')
 }
@@ -435,6 +489,18 @@ function New-DysonRebootAcceptanceCheckpointRecord {
         controlPayloadSha256 = [string]$control.payloadSha256
         activePointerSha256 = [string]$control.activePointerSha256
         controlTaskIdentity = [string]$control.taskIdentity
+        runtimeRootIdentity = [string]$control.runtimeRootIdentity
+        nodeExecutableSha256 = [string]$control.nodeExecutableSha256
+        nodeRuntimeProtected = [bool]$control.nodeRuntimeProtected
+        configurationSha256 = [string]$control.configurationSha256
+        configurationLength = [int64]$control.configurationLength
+        configurationNamesSha256 = [string]$control.configurationNamesSha256
+        configurationBindingsSha256 = [string]$control.configurationBindingsSha256
+        configurationContractSha256 = [string]$control.configurationContractSha256
+        configurationAclFingerprint = [string]$control.configurationAclFingerprint
+        configurationParentAclFingerprint = [string]$control.configurationParentAclFingerprint
+        lifecycleBrokerReady = [bool]$control.lifecycleBrokerReady
+        readinessValidated = [bool]$control.readinessValidated
         controlTaskLastRunAtBefore = [string]$control.taskLastRunAt
         gamePort = $GamePort
         projectRootIdentity = [string]$game.projectRootIdentity
@@ -465,7 +531,19 @@ function Invoke-DysonCreateRebootAcceptanceCheckpoint {
             state = 'preview'
             wouldCreateCheckpoint = $true
             baselineControlVersion = [string]$record.controlVersion
+            runtimeRootIdentity = [string]$record.runtimeRootIdentity
+            nodeExecutableSha256 = [string]$record.nodeExecutableSha256
+            nodeRuntimeProtected = [bool]$record.nodeRuntimeProtected
+            configurationSha256 = [string]$record.configurationSha256
+            configurationLength = [int64]$record.configurationLength
+            configurationNamesSha256 = [string]$record.configurationNamesSha256
+            configurationBindingsSha256 = [string]$record.configurationBindingsSha256
+            configurationContractSha256 = [string]$record.configurationContractSha256
+            configurationAclFingerprint = [string]$record.configurationAclFingerprint
+            configurationParentAclFingerprint = [string]$record.configurationParentAclFingerprint
             gamePort = [int]$record.gamePort
+            lifecycleBrokerReady = [bool]$record.lifecycleBrokerReady
+            readinessValidated = [bool]$record.readinessValidated
             rebootPerformed = $false
             realRebootObserved = $false
             automaticTaskTriggerProven = $false
@@ -479,8 +557,20 @@ function Invoke-DysonCreateRebootAcceptanceCheckpoint {
         state = 'checkpoint-created'
         checkpointId = [string]$record.checkpointId
         baselineControlVersion = [string]$record.controlVersion
+        runtimeRootIdentity = [string]$record.runtimeRootIdentity
+        nodeExecutableSha256 = [string]$record.nodeExecutableSha256
+        nodeRuntimeProtected = [bool]$record.nodeRuntimeProtected
+        configurationSha256 = [string]$record.configurationSha256
+        configurationLength = [int64]$record.configurationLength
+        configurationNamesSha256 = [string]$record.configurationNamesSha256
+        configurationBindingsSha256 = [string]$record.configurationBindingsSha256
+        configurationContractSha256 = [string]$record.configurationContractSha256
+        configurationAclFingerprint = [string]$record.configurationAclFingerprint
+        configurationParentAclFingerprint = [string]$record.configurationParentAclFingerprint
         gamePort = [int]$record.gamePort
         expiresAt = [string]$record.expiresAt
+        lifecycleBrokerReady = [bool]$record.lifecycleBrokerReady
+        readinessValidated = [bool]$record.readinessValidated
         rebootPerformed = $false
         realRebootObserved = $false
         automaticTaskTriggerProven = $false
@@ -527,7 +617,17 @@ function Invoke-DysonTestRebootAcceptanceResume {
     if ([string]$control.version -cne [string]$record.controlVersion -or
         [string]$control.payloadSha256 -cne [string]$record.controlPayloadSha256 -or
         [string]$control.activePointerSha256 -cne [string]$record.activePointerSha256 -or
-        [string]$control.taskIdentity -cne [string]$record.controlTaskIdentity) {
+        [string]$control.taskIdentity -cne [string]$record.controlTaskIdentity -or
+        [string]$control.runtimeRootIdentity -cne [string]$record.runtimeRootIdentity -or
+        [string]$control.nodeExecutableSha256 -cne [string]$record.nodeExecutableSha256 -or
+        [string]$control.configurationSha256 -cne [string]$record.configurationSha256 -or
+        [int64]$control.configurationLength -ne [int64]$record.configurationLength -or
+        [string]$control.configurationNamesSha256 -cne [string]$record.configurationNamesSha256 -or
+        [string]$control.configurationBindingsSha256 -cne [string]$record.configurationBindingsSha256 -or
+        [string]$control.configurationContractSha256 -cne [string]$record.configurationContractSha256 -or
+        [string]$control.configurationAclFingerprint -cne [string]$record.configurationAclFingerprint -or
+        [string]$control.configurationParentAclFingerprint -cne [string]$record.configurationParentAclFingerprint -or
+        -not [bool]$control.nodeRuntimeProtected) {
         throw 'DYSON_REBOOT_ACCEPTANCE_CONTROL_DRIFT'
     }
     $controlTaskLastRunAt = ConvertTo-DysonRebootAcceptanceTimestamp `
@@ -563,8 +663,20 @@ function Invoke-DysonTestRebootAcceptanceResume {
         state = if ($native) { 'post-reboot-runtime-observed' } else { 'fixture-resume-validated' }
         checkpointId = [string]$record.checkpointId
         controlVersion = [string]$record.controlVersion
+        runtimeRootIdentity = [string]$record.runtimeRootIdentity
+        nodeExecutableSha256 = [string]$record.nodeExecutableSha256
+        nodeRuntimeProtected = [bool]$control.nodeRuntimeProtected
+        configurationSha256 = [string]$record.configurationSha256
+        configurationLength = [int64]$record.configurationLength
+        configurationNamesSha256 = [string]$record.configurationNamesSha256
+        configurationBindingsSha256 = [string]$record.configurationBindingsSha256
+        configurationContractSha256 = [string]$record.configurationContractSha256
+        configurationAclFingerprint = [string]$record.configurationAclFingerprint
+        configurationParentAclFingerprint = [string]$record.configurationParentAclFingerprint
         controlTaskDefinitionValidated = $true
         controlTaskExecutionInNewBootValidated = $true
+        lifecycleBrokerReady = [bool]$control.lifecycleBrokerReady
+        readinessValidated = [bool]$control.readinessValidated
         loopbackReadinessValidated = $true
         interactiveSessionValidated = $true
         gameRuntimeValidated = $true
@@ -605,6 +717,9 @@ function Get-DysonRebootAcceptanceNativeControlObservation {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][string]$DataRoot,
+        [Parameter(Mandatory)][string]$RuntimeRoot,
+        [Parameter(Mandatory)][string]$NodeExecutable,
+        [Parameter(Mandatory)][string]$ExpectedNodeSha256,
         [Parameter(Mandatory)][uri]$ReadinessUri,
         [Parameter(Mandatory)][string]$TaskName
     )
@@ -615,67 +730,83 @@ function Get-DysonRebootAcceptanceNativeControlObservation {
     if ($tasks.Count -ne 1) { throw 'The control-plane task identity is not unique.' }
     $task = $tasks[0]
     $taskInfo = Get-ScheduledTaskInfo -InputObject $task -ErrorAction Stop
-    $actions = @($task.Actions | Where-Object { $null -ne $_ })
-    $triggers = @($task.Triggers | Where-Object { $null -ne $_ })
     $powerShellExecutable = [System.IO.Path]::GetFullPath(
         (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
     )
     $launcherPath = [System.IO.Path]::GetFullPath((Join-Path $InstallRoot 'bootstrap\Start-DysonControl.ps1'))
-    $argumentPattern = '(?i)^-NoLogo\s+-NoProfile\s+-NonInteractive\s+-ExecutionPolicy\s+Bypass\s+-File\s+"(?<launcher>[^"]+)"\s+-InstallRoot\s+"(?<install>[^"]+)"\s+-DataRoot\s+"(?<data>[^"]+)"\s+-NodeExecutable\s+"(?<node>[^"]+)"\s+-EnvironmentFile\s+"(?<environment>[^"]+)"$'
-    $definition = if ($actions.Count -eq 1) { [regex]::Match([string]$actions[0].Arguments, $argumentPattern) } else { $null }
-    $triggerClass = if ($triggers.Count -eq 1 -and $triggers[0].PSObject.Properties.Name -contains 'CimClass') {
-        [string]$triggers[0].CimClass.CimClassName
-    }
-    else { '' }
-    $taskValid = $task.PSObject.Properties.Name -contains 'TaskPath' -and
-        [string]$task.TaskPath -ceq $script:DysonControlTaskPath -and
-        [string]::Equals($task.State.ToString(), 'Running', [System.StringComparison]::Ordinal) -and
-        $task.Principal.LogonType.ToString() -eq 'ServiceAccount' -and
-        $actions.Count -eq 1 -and $definition -and $definition.Success -and
-        [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$actions[0].Execute)).Equals(
-            $powerShellExecutable,
-            [System.StringComparison]::OrdinalIgnoreCase
-        ) -and
-        [System.IO.Path]::GetFullPath($definition.Groups['launcher'].Value).Equals($launcherPath, [System.StringComparison]::OrdinalIgnoreCase) -and
-        [System.IO.Path]::GetFullPath($definition.Groups['install'].Value).Equals([System.IO.Path]::GetFullPath($InstallRoot), [System.StringComparison]::OrdinalIgnoreCase) -and
-        [System.IO.Path]::GetFullPath($definition.Groups['data'].Value).Equals([System.IO.Path]::GetFullPath($DataRoot), [System.StringComparison]::OrdinalIgnoreCase) -and
-        $triggers.Count -eq 1 -and $triggerClass -match 'TaskBootTrigger$' -and
-        $task.Settings.MultipleInstances.ToString() -eq 'IgnoreNew' -and
-        [int]$task.Settings.RestartCount -ge 1
-    if (-not $taskValid) { throw 'The fixed control-plane startup task failed reboot-acceptance validation.' }
+    $environmentPath = [System.IO.Path]::GetFullPath((Join-Path $DataRoot 'config\dyson-control.env'))
+    $expectedArguments = Get-DysonControlTaskActionArguments -LauncherPath $launcherPath `
+        -InstallRoot $InstallRoot -DataRoot $DataRoot -RuntimeRoot $RuntimeRoot `
+        -NodeExecutable $NodeExecutable -ExpectedNodeSha256 $ExpectedNodeSha256 `
+        -EnvironmentFile $environmentPath
+    $taskContract = Assert-DysonControlTaskContract -Task $task -TaskName $TaskName `
+        -ExpectedPowerShellExecutable $powerShellExecutable `
+        -ExpectedArguments $expectedArguments -AllowedStates @('Running')
+    $configurationModuleRoot = Get-DysonDeploymentConfigurationVerificationModuleRoot `
+        -InstallRoot $InstallRoot -DataRoot $DataRoot
+    $configurationEvidence = Invoke-DysonDeploymentConfigurationTest `
+        -DataRoot $DataRoot -ScriptRoot (Join-Path ([string]$active.releaseRoot) 'scripts\windows') `
+        -RuntimeBootstrapRoot (Join-Path $InstallRoot 'bootstrap') `
+        -DeploymentVersion ([string]$active.pointer.version) `
+        -ServiceAccount 'NT AUTHORITY\LOCAL SERVICE' -ConfigurationModuleRoot $configurationModuleRoot
+    $nodeProtection = Assert-DysonNodeRuntimeProtection -RuntimeRoot $RuntimeRoot `
+        -NodeExecutable $NodeExecutable -ExpectedNodeSha256 $ExpectedNodeSha256 `
+        -InstallRoot $InstallRoot -DataRoot $DataRoot
     $taskLastRunAt = ([datetimeoffset]([datetime]$taskInfo.LastRunTime)).ToUniversalTime().ToString(
         'o',
         [System.Globalization.CultureInfo]::InvariantCulture
     )
     [void](ConvertTo-DysonRebootAcceptanceTimestamp -Value $taskLastRunAt -Name 'Control task last run')
     foreach ($path in @(
-        $definition.Groups['node'].Value,
-        $definition.Groups['environment'].Value,
-        $definition.Groups['launcher'].Value
+        $NodeExecutable,
+        $environmentPath,
+        $launcherPath
     )) {
         $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
         if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
             throw 'A control-plane startup dependency is unavailable or redirected.'
         }
     }
+    $lifecycleBroker = Get-DysonLifecycleBrokerStaticStatus -InstallRoot $InstallRoot -DataRoot $DataRoot `
+        -ActiveRelease $active -EnvironmentFile $environmentPath
+    if (-not [bool]$lifecycleBroker.ready) {
+        throw 'The fixed lifecycle broker is not ready for reboot acceptance.'
+    }
     [void](Test-DysonLoopbackReadiness -ReadinessUri $ReadinessUri `
-        -ExpectedVersion ([string]$active.pointer.version) -TimeoutSeconds 10)
-    $taskIdentityText = [string]::Join('|', @(
-        $TaskName,
-        [string]$task.TaskPath,
-        ([string]$task.Principal.UserId).ToUpperInvariant(),
-        [string]$actions[0].Execute,
-        [string]$actions[0].Arguments,
-        $triggerClass,
-        $task.Settings.MultipleInstances.ToString(),
-        [string]$task.Settings.RestartCount
-    ))
+        -ExpectedVersion ([string]$active.pointer.version) `
+        -RequiredChecks @('lifecycleBroker', 'cutoverRecovery') -TimeoutSeconds 10)
+    $readinessNodeProtection = Assert-DysonNodeRuntimeProtection -RuntimeRoot $RuntimeRoot `
+        -NodeExecutable $NodeExecutable -ExpectedNodeSha256 $ExpectedNodeSha256 `
+        -InstallRoot $InstallRoot -DataRoot $DataRoot
+    if ([string]$readinessNodeProtection.runtimeRootIdentity -cne [string]$nodeProtection.runtimeRootIdentity -or
+        [string]$readinessNodeProtection.nodeExecutableSha256 -cne [string]$nodeProtection.nodeExecutableSha256) {
+        throw 'The Node.js runtime identity changed during reboot-acceptance readiness validation.'
+    }
+    $readinessConfiguration = Invoke-DysonDeploymentConfigurationTest `
+        -DataRoot $DataRoot -ScriptRoot (Join-Path ([string]$active.releaseRoot) 'scripts\windows') `
+        -RuntimeBootstrapRoot (Join-Path $InstallRoot 'bootstrap') `
+        -DeploymentVersion ([string]$active.pointer.version) `
+        -ServiceAccount 'NT AUTHORITY\LOCAL SERVICE' -ConfigurationModuleRoot $configurationModuleRoot
+    Assert-DysonDeploymentConfigurationEvidenceMatch `
+        -Expected $configurationEvidence -Actual $readinessConfiguration
     return [pscustomobject][ordered]@{
         ready = $true
         version = [string]$active.pointer.version
         payloadSha256 = [string]$active.pointer.payloadSha256
         activePointerSha256 = Get-DysonFileSha256 -Path ([string]$active.pointerPath)
-        taskIdentity = 'sha256:' + (Get-DysonTextSha256 -Value $taskIdentityText)
+        taskIdentity = [string]$taskContract.taskIdentity
+        runtimeRootIdentity = [string]$nodeProtection.runtimeRootIdentity
+        nodeExecutableSha256 = [string]$nodeProtection.nodeExecutableSha256
+        nodeRuntimeProtected = $true
+        configurationSha256 = [string]$configurationEvidence.configurationSha256
+        configurationLength = [int64]$configurationEvidence.configurationLength
+        configurationNamesSha256 = [string]$configurationEvidence.configurationNamesSha256
+        configurationBindingsSha256 = [string]$configurationEvidence.configurationBindingsSha256
+        configurationContractSha256 = [string]$configurationEvidence.configurationContractSha256
+        configurationAclFingerprint = [string]$configurationEvidence.configurationAclFingerprint
+        configurationParentAclFingerprint = [string]$configurationEvidence.configurationParentAclFingerprint
+        lifecycleBrokerReady = $true
+        readinessValidated = $true
         taskState = 'Running'
         taskLastRunAt = $taskLastRunAt
     }
@@ -741,11 +872,20 @@ function New-DysonNativeRebootAcceptanceContext {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][string]$DataRoot,
+        [Parameter(Mandatory)][string]$RuntimeRoot,
+        [Parameter(Mandatory)][string]$NodeExecutable,
+        [Parameter(Mandatory)][string]$ExpectedNodeSha256,
         [Parameter(Mandatory)][uri]$ReadinessUri
     )
 
     $installFull = Assert-DysonSafeRoot -Path $InstallRoot -Name 'InstallRoot'
     $dataFull = Assert-DysonSafeRoot -Path $DataRoot -Name 'DataRoot'
+    $nodeProtection = Assert-DysonNodeRuntimeProtection -RuntimeRoot $RuntimeRoot `
+        -NodeExecutable $NodeExecutable -ExpectedNodeSha256 $ExpectedNodeSha256 `
+        -InstallRoot $installFull -DataRoot $dataFull
+    $runtimeFull = [string]$nodeProtection.runtimeRoot
+    $nodeFull = [string]$nodeProtection.nodeExecutable
+    $nodeSha256 = [string]$nodeProtection.nodeExecutableSha256
     if ($ReadinessUri.Scheme -ne 'http' -or $ReadinessUri.AbsolutePath -ne '/readyz' -or
         $ReadinessUri.Host -notin @('127.0.0.1', 'localhost', '::1')) {
         throw 'ReadinessUri must be a loopback HTTP /readyz endpoint.'
@@ -761,7 +901,8 @@ function New-DysonNativeRebootAcceptanceContext {
         GetControlObservation = {
             param([string]$TaskName)
             Get-DysonRebootAcceptanceNativeControlObservation -InstallRoot $installFull `
-                -DataRoot $dataFull -ReadinessUri $readiness -TaskName $TaskName
+                -DataRoot $dataFull -RuntimeRoot $runtimeFull -NodeExecutable $nodeFull `
+                -ExpectedNodeSha256 $nodeSha256 -ReadinessUri $readiness -TaskName $TaskName
         }.GetNewClosure()
         GetGameObservation = {
             param([int]$GamePort)

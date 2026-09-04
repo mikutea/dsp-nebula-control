@@ -10,6 +10,8 @@ import type {
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+  Reflect.deleteProperty(URL, 'createObjectURL')
+  Reflect.deleteProperty(URL, 'revokeObjectURL')
 })
 
 describe('role-aware control surfaces', () => {
@@ -31,10 +33,12 @@ describe('role-aware control surfaces', () => {
   })
 
   it('shows the authenticated role in the top bar without treating the browser as the security boundary', () => {
-    render(<TopBar provider="demo" environment="test" user={user('operator', ['status.read'])}
+    render(<TopBar provider="windows" environment="test" status={{ serverName: 'Fictional Windows Instance' }} user={user('operator', ['status.read'])}
       onLogout={() => undefined} mobileNavOpen={false} onToggleMobileNav={() => undefined} />)
     expect(screen.getByText('Operator · 日常运维')).not.toBeNull()
     expect(screen.getByTitle('退出登录 · Operator · 日常运维')).not.toBeNull()
+    expect(screen.getByText('Fictional Windows Instance')).not.toBeNull()
+    expect(screen.queryByText('DSP 主服务器')).toBeNull()
   })
 
   it('keeps every fixed console action disabled for a Viewer and exposes no command textbox', () => {
@@ -74,21 +78,99 @@ describe('role-aware control surfaces', () => {
     expect(api.lifecycle).toHaveBeenCalledWith('job-fictional-console-start')
   })
 
+  it('applies source and local time filters to polling and downloads with the same normalized window', async () => {
+    vi.spyOn(api, 'consoleLogs').mockResolvedValue({ data: emptyLogPage() })
+    vi.spyOn(api, 'downloadConsole').mockResolvedValue({
+      blob: new Blob(['fictional']), fileName: 'dyson-console.ndjson', truncated: false
+    })
+    const createObjectUrl = vi.fn(() => 'blob:fictional-console')
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    render(<ConsoleWorkspace demo={false} user={user('operator', [
+      'console.read', 'console.export', 'console.command'
+    ])} />)
+
+    await waitFor(() => expect(api.consoleLogs).toHaveBeenCalled())
+    vi.mocked(api.consoleLogs).mockClear()
+    const fromLocal = '2026-08-30T10:15'
+    const toLocal = '2026-08-30T11:45'
+    fireEvent.change(screen.getByLabelText('日志来源'), { target: { value: 'Nebula' } })
+    fireEvent.change(screen.getByLabelText('日志开始时间'), { target: { value: fromLocal } })
+    fireEvent.change(screen.getByLabelText('日志结束时间'), { target: { value: toLocal } })
+
+    const expectedFilters = {
+      source: 'Nebula',
+      from: new Date(fromLocal).toISOString(),
+      to: new Date(toLocal).toISOString()
+    }
+    await waitFor(() => expect(api.consoleLogs).toHaveBeenLastCalledWith(expect.objectContaining({
+      start: 'tail', filters: expectedFilters
+    })))
+    fireEvent.click(screen.getByRole('button', { name: '导出' }))
+    await waitFor(() => expect(api.downloadConsole).toHaveBeenCalledWith(expectedFilters))
+    expect(createObjectUrl).toHaveBeenCalled()
+  })
+
+  it('applies the visible filters and clear action to the demo console stream', () => {
+    render(<ConsoleWorkspace demo user={user('administrator', [
+      'console.read', 'console.export', 'console.command'
+    ])} />)
+
+    fireEvent.change(screen.getByLabelText('搜索日志'), { target: { value: 'Nebula' } })
+    expect(screen.getByText('Nebula websocket started on port 8469')).not.toBeNull()
+    expect(screen.queryByText('Server started. Listening on 0.0.0.0:8469')).toBeNull()
+
+    fireEvent.change(screen.getByLabelText('搜索日志'), { target: { value: '' } })
+    fireEvent.change(screen.getByLabelText('日志级别'), { target: { value: 'warning' } })
+    expect(screen.getByText('Update preview available; activation is locked')).not.toBeNull()
+    expect(screen.queryByText('Nebula websocket started on port 8469')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: '清屏' }))
+    expect(screen.getByText('当前筛选条件暂无新事件。')).not.toBeNull()
+    expect(screen.queryByText('Update preview available; activation is locked')).toBeNull()
+  })
+
+  it('rejects an inverted console time window before polling or export', async () => {
+    vi.spyOn(api, 'consoleLogs').mockResolvedValue({ data: emptyLogPage() })
+    vi.spyOn(api, 'downloadConsole').mockResolvedValue({
+      blob: new Blob(['fictional']), fileName: 'dyson-console.ndjson', truncated: false
+    })
+    render(<ConsoleWorkspace demo={false} user={user('operator', [
+      'console.read', 'console.export', 'console.command'
+    ])} />)
+    await waitFor(() => expect(api.consoleLogs).toHaveBeenCalled())
+    vi.mocked(api.consoleLogs).mockClear()
+    fireEvent.change(screen.getByLabelText('日志开始时间'), { target: { value: '2026-08-30T12:00' } })
+    fireEvent.change(screen.getByLabelText('日志结束时间'), { target: { value: '2026-08-30T11:00' } })
+
+    expect((await screen.findByRole('alert')).textContent).toContain('开始时间不能晚于结束时间')
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    expect(api.consoleLogs).not.toHaveBeenCalled()
+    expect((screen.getByRole('button', { name: '导出' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(api.downloadConsole).not.toHaveBeenCalled()
+  })
+
   it('renders roster availability and fixed signed capability reasons while every player action stays disabled', async () => {
     vi.spyOn(api, 'players').mockResolvedValue({ data: rosterFixture })
     vi.spyOn(api, 'playerCapabilities').mockResolvedValue({ data: capabilityFixture })
-    render(<PlayerWorkspace demo={false} />)
+    render(<PlayerWorkspace demo={false} user={user('viewer', ['players.read'])} />)
 
     await screen.findByText('签名能力合同')
+    expect(screen.getByText('ACTIONS LOCKED')).not.toBeNull()
+    expect(screen.queryByText('ACTIONS ENABLED')).toBeNull()
     expect(screen.getByText('Roster 观察')).not.toBeNull()
-    for (const label of ['Disconnect 断开', 'Kick 踢出', 'Ban 封禁', 'Whitelist 白名单', 'Permission 权限']) {
+    for (const label of ['Disconnect 断开', 'Kick 踢出', 'Ban 封禁', 'Whitelist 白名单', 'Blacklist 黑名单', 'Notice 通知', 'Permission 权限']) {
       expect(screen.getByText(label)).not.toBeNull()
     }
     expect(screen.getByText('Fictional kick contract is absent.')).not.toBeNull()
     expect((screen.getByRole('button', { name: '只读能力' }) as HTMLButtonElement).disabled).toBe(true)
-    expect(screen.getAllByRole('button', { name: '不可用' })).toHaveLength(5)
+    expect(screen.getAllByRole('button', { name: '不可用' })).toHaveLength(7)
     expect(screen.getAllByRole('button', { name: '不可用' }).every((button) => (button as HTMLButtonElement).disabled)).toBe(true)
     expect(screen.getByText('FictionalPilot')).not.toBeNull()
+    expect(screen.getByText('持久玩家会话事件')).not.toBeNull()
+    expect(screen.getByText('SQLite 持久化 · 按服务端保留策略裁剪')).not.toBeNull()
+    expect(screen.queryByText(/仅内存保存/)).toBeNull()
   })
 
   it('keeps the roster visible and all actions fail-closed when the capability projection returns 503', async () => {
@@ -96,12 +178,12 @@ describe('role-aware control surfaces', () => {
     vi.spyOn(api, 'playerCapabilities').mockRejectedValue(
       new ApiError(503, '玩家能力快照暂不可用', 'PLAYER_CAPABILITIES_UNAVAILABLE')
     )
-    render(<PlayerWorkspace demo={false} />)
+    render(<PlayerWorkspace demo={false} user={user('viewer', ['players.read'])} />)
 
     await screen.findByText('FictionalPilot')
     expect(screen.getByText(/玩家能力快照暂不可用/)).not.toBeNull()
     expect(screen.getByText('能力状态不可用')).not.toBeNull()
-    expect(screen.getByText(/disconnect、kick、ban、whitelist、permission 全部保持禁用/)).not.toBeNull()
+    expect(screen.getByText(/disconnect、kick、ban、whitelist、blacklist、notice、permission 全部保持禁用/)).not.toBeNull()
   })
 })
 
@@ -160,7 +242,8 @@ const runningExecutionFixture: LifecycleExecutionResult = {
 
 const rosterFixture: PlayerRoster = {
   schemaVersion: 1, state: 'active', authoritative: true,
-  observedAt: '2026-08-30T12:00:00.000Z', sequence: 4, truncated: false, playerCount: 1,
+  observedAt: '2026-08-30T12:00:00.000Z', rosterGeneration: `roster-v1:${'a'.repeat(64)}`,
+  sequence: 4, truncated: false, playerCount: 1,
   players: [{
     sessionPlayerId: 'player-fictional-0001', displayName: 'FictionalPilot', online: true,
     joinedAt: '2026-08-30T11:55:00.000Z', location: 'deep-space'
@@ -170,7 +253,7 @@ const rosterFixture: PlayerRoster = {
 
 const capabilityFixture: PlayerCapabilitiesProjection = {
   repository: 'FictionalOrg/nebula', tag: 'v0.0.0-fictional', runtimeFileVersion: '0.0.0.0',
-  commit: 'f'.repeat(40), verificationScope: 'fictional-source-contract-only-runtime-unverified',
+  commit: 'f'.repeat(40), verificationScope: 'source-contract-only-runtime-unverified',
   actionsEnabled: false, observedAt: '2026-08-30T12:00:00.000Z',
   capabilities: [
     { capability: 'observe-roster', availability: 'available', mode: 'read-only', reasonCode: 'FICTIONAL_ROSTER_VERIFIED', reasonSummary: 'Fictional roster contract is verified.' },
@@ -178,6 +261,8 @@ const capabilityFixture: PlayerCapabilitiesProjection = {
     { capability: 'kick', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_KICK_ABSENT', reasonSummary: 'Fictional kick contract is absent.' },
     { capability: 'ban', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_BAN_ABSENT', reasonSummary: 'Fictional ban contract is absent.' },
     { capability: 'whitelist', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_WHITELIST_ABSENT', reasonSummary: 'Fictional whitelist contract is absent.' },
+    { capability: 'blacklist', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_BLACKLIST_ABSENT', reasonSummary: 'Fictional blacklist contract is absent.' },
+    { capability: 'notice', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_NOTICE_ABSENT', reasonSummary: 'Fictional notice contract is absent.' },
     { capability: 'permission', availability: 'unavailable', mode: 'mutation', reasonCode: 'FICTIONAL_PERMISSION_ABSENT', reasonSummary: 'Fictional permission contract is absent.' }
   ]
 }

@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ModWorkspace } from './App'
 import { api, ApiError } from './api'
 import type {
   ModDeploymentPreview,
   ModDeploymentReceipt,
+  ModDeploymentReceiptHistoryPage,
   ModDeploymentRequest,
   ModDeploymentStateSummary
 } from './model'
@@ -13,6 +14,11 @@ import type {
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+})
+
+beforeEach(() => {
+  vi.spyOn(api, 'modDeploymentHistory').mockResolvedValue({ data: historyPageFixture() })
+  vi.spyOn(api, 'modDeploymentReceipt').mockResolvedValue({ data: receiptFixture() })
 })
 
 describe('mod deployment workspace', () => {
@@ -176,6 +182,119 @@ describe('mod deployment workspace', () => {
     expect(recover).toHaveBeenCalledWith(requestId, 'previous')
     await waitFor(() => expect(screen.getByText('READY')).toBeTruthy())
   })
+
+  it('loads bounded durable history, appends the opaque next page, and revalidates an exact receipt', async () => {
+    vi.spyOn(api, 'modDeploymentState').mockResolvedValue({
+      data: stateFixture(), meta: { executionEnabled: false }
+    })
+    vi.spyOn(api, 'modDeploymentRecovery').mockResolvedValue({
+      data: { dryRun: true, irreversible: true, executeSupported: false, candidates: [] }
+    })
+    mockRecoveryReady(false)
+    const newest = receiptFixture()
+    const older: ModDeploymentReceipt = {
+      ...receiptFixture(),
+      requestId: '22222222-2222-4222-8222-222222222222',
+      operation: 'disable',
+      status: 'rolled-back',
+      newRevision: null,
+      rollback: 'succeeded',
+      errorCode: 'MOD_DEPLOYMENT_EXECUTION_FAILED'
+    }
+    const opaqueCursor = 'MjAyNi0wOC0zMFQxMDowMDowMC4wMDBaCjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMQ'
+    vi.mocked(api.modDeploymentHistory).mockReset()
+      .mockResolvedValueOnce({ data: historyPageFixture([newest], opaqueCursor, 2) })
+      .mockResolvedValueOnce({ data: historyPageFixture([older], null, 2) })
+    const exactReceipt = vi.mocked(api.modDeploymentReceipt).mockResolvedValue({ data: newest })
+    render(<ModWorkspace demo={false} />)
+
+    expect(await screen.findByText('2 RECEIPTS')).toBeTruthy()
+    expect(screen.getByText(new RegExp(newest.requestId))).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: `核验回执 ${newest.requestId}` }))
+    await waitFor(() => expect(exactReceipt).toHaveBeenCalledWith(newest.requestId))
+    expect(await screen.findByText('部署事务已提交')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: '加载更早回执' }))
+    await waitFor(() => expect(api.modDeploymentHistory).toHaveBeenLastCalledWith({
+      cursor: opaqueCursor,
+      pageSize: 8
+    }))
+    expect(await screen.findByText(new RegExp(older.requestId))).toBeTruthy()
+    expect(screen.getByRole('button', { name: '已到历史末端' })).toBeTruthy()
+  })
+
+  it('uses a declared managed schema only, renders a redacted diff, and requires exact configuration confirmation', async () => {
+    const managedState = {
+      ...stateFixture(),
+      packages: [{
+        dependencyId: 'nebula-NebulaMultiplayerMod-0.9.22', sourceId: 'thunderstore:nebula/NebulaMultiplayerMod', version: '0.9.22',
+        enabled: true, clientRequirement: 'required' as const
+      }]
+    }
+    vi.spyOn(api, 'modDeploymentState').mockResolvedValue({ data: managedState, meta: { executionEnabled: true } })
+    vi.spyOn(api, 'modDeploymentRecovery').mockResolvedValue({ data: { dryRun: true, irreversible: true, executeSupported: false, candidates: [] } })
+    mockRecoveryReady(true)
+    vi.spyOn(api, 'managedModConfigurationSchemas').mockResolvedValue({
+      data: [{ id: 'nebula-server-v0-9-22', package: { dependencyId: 'nebula-NebulaMultiplayerMod-0.9.22', version: '0.9.22' }, fields: [
+        { id: 'sync-ups', type: 'boolean', secret: false },
+        { id: 'host-port', type: 'integer', secret: false, minimum: 1, maximum: 65_535 },
+        { id: 'server-password', type: 'secret', secret: true, maximumLength: 128 }
+      ] }], meta: { executionEnabled: true }
+    })
+    vi.spyOn(api, 'inspectManagedModConfiguration').mockResolvedValue({ data: {
+      schemaId: 'nebula-server-v0-9-22', package: { dependencyId: 'nebula-NebulaMultiplayerMod-0.9.22', version: '0.9.22' },
+      deploymentRevision: managedState.revision, configurationRevision: 'a'.repeat(64), fields: [
+        { id: 'sync-ups', type: 'boolean', value: true }, { id: 'host-port', type: 'integer', value: 8469 },
+        { id: 'server-password', type: 'secret', value: { configured: true } }
+      ]
+    } })
+    vi.spyOn(api, 'previewManagedModConfiguration').mockImplementation(async (input) => ({ data: {
+      dryRun: true, operation: 'configure', requestId: input.requestId, schemaId: input.schemaId, package: input.package,
+      deploymentRevision: input.expectedDeploymentRevision, configurationRevision: input.expectedConfigurationRevision,
+      nextConfigurationRevision: 'b'.repeat(64), requestFingerprint: 'c'.repeat(64),
+      changes: [{ id: 'host-port', before: 8469, after: 9443, changed: true }],
+      stoppedStateRequiredForExecute: true, executionSupported: true
+    }, meta: { executionEnabled: true } }))
+    const execute = vi.spyOn(api, 'executeManagedModConfiguration').mockResolvedValue({ data: {
+      format: 'dyson-control-managed-mod-configuration-receipt', schemaVersion: 1,
+      requestId: '11111111-1111-4111-8111-111111111111', operation: 'configure', schemaId: 'nebula-server-v0-9-22',
+      package: { dependencyId: 'nebula-NebulaMultiplayerMod-0.9.22', version: '0.9.22' }, deploymentRevision: managedState.revision,
+      previousConfigurationRevision: 'a'.repeat(64), newConfigurationRevision: 'b'.repeat(64), status: 'applied', rollback: 'not-needed',
+      protectionPointCreated: true, changedFieldIds: ['host-port'], errorCode: null, completedAt: '2026-09-02T00:00:00.000Z', reused: false
+    } })
+    render(<ModWorkspace demo={false} />)
+
+    expect(await screen.findByText('受管模组配置')).toBeTruthy()
+    const password = await screen.findByLabelText('配置 server-password') as HTMLInputElement
+    expect(password.getAttribute('placeholder')).toContain('已配置')
+    expect(password.maxLength).toBe(128)
+    expect(screen.queryByText(/test-server-secret/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '清除 server-password' }))
+    expect(password.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('配置 host-port'), { target: { value: '9443' } })
+    fireEvent.click(screen.getByRole('button', { name: '生成配置预演' }))
+    expect(await screen.findByText('配置预演已建立')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('配置 host-port'), { target: { value: '9444' } })
+    await waitFor(() => expect(screen.queryByText('配置预演已建立')).toBeNull())
+    expect(screen.queryByLabelText('受管模组配置精确确认')).toBeNull()
+    fireEvent.change(screen.getByLabelText('配置 host-port'), { target: { value: '9443' } })
+    fireEvent.click(screen.getByRole('button', { name: '生成配置预演' }))
+    expect(await screen.findByText('配置预演已建立')).toBeTruthy()
+    const submit = screen.getByRole('button', { name: '提交受管配置' }) as HTMLButtonElement
+    expect(submit.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('受管模组配置精确确认'), { target: { value: 'CONFIGURE_MANAGED_MOD' } })
+    expect(submit.disabled).toBe(false)
+    fireEvent.click(submit)
+    expect(await screen.findByText('受管配置已提交')).toBeTruthy()
+    expect(execute).toHaveBeenCalledWith(
+      expect.objectContaining({ operation: 'configure', changes: [
+        { id: 'host-port', value: 9443 },
+        { id: 'server-password', value: '' }
+      ] }),
+      'c'.repeat(64)
+    )
+    expect(JSON.stringify(execute.mock.calls[0]?.[0])).not.toMatch(/(?:[A-Za-z]:\\|\\\\|\/tmp\/|command|script|path)/i)
+  })
 })
 
 function mockRecoveryReady(executionEnabled: boolean) {
@@ -286,6 +405,28 @@ function receiptFixture(): ModDeploymentReceipt {
     payloadSizeBytes: 4096,
     errorCode: null,
     reused: false
+  }
+}
+
+function historyPageFixture(
+  receipts: ModDeploymentReceipt[] = [receiptFixture()],
+  nextCursor: string | null = null,
+  totalReceipts = receipts.length
+): ModDeploymentReceiptHistoryPage {
+  return {
+    format: 'dyson-control-mod-deployment-receipt-history',
+    schemaVersion: 1,
+    order: 'persisted-at-descending',
+    items: receipts.map((receipt, index) => ({
+      persistedAt: `2026-08-30T10:0${index}:00.000Z`,
+      receipt
+    })),
+    page: {
+      limit: 8,
+      returned: receipts.length,
+      totalReceipts,
+      nextCursor
+    }
   }
 }
 

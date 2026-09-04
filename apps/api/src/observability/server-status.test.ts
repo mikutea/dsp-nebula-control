@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import type { ServerStatus } from '../domain.js'
+import type { AcceptedBridgeSimulationTelemetry } from '../bridge/file-client.js'
+import {
+  actualSimulationRates,
+  buildBridgeRuntimeSession,
+  buildBridgeSimulationTelemetry
+} from '../bridge/protocol.js'
 import { buildObservabilityFromServerStatus } from './server-status.js'
 
 const gibibyte = 1_024 ** 3
@@ -42,6 +48,9 @@ describe('ServerStatus observability adapter', () => {
     })
     expect(snapshot.process.cpuPercent).toEqual({ status: 'unavailable', reason: 'not-provided' })
     expect(snapshot.process.cpuCoresUsed).toEqual({ status: 'available', value: 2.75 })
+    expect(snapshot.runtime.startedAt).toEqual({
+      status: 'available', value: '2026-08-30T10:00:00.000Z'
+    })
     expect(snapshot.runtime.gamePort.listening).toEqual({ status: 'available', value: true })
     expect(snapshot.simulation).toEqual({
       ups: { status: 'unavailable', reason: 'not-provided' },
@@ -115,7 +124,63 @@ describe('ServerStatus observability adapter', () => {
       code: 'GAME_PORT_NOT_LISTENING', severity: 'critical'
     }))
   })
+
+  it('maps authenticated actual UPS/TPS independently from configured target UPS', () => {
+    const input = status()
+    const actual = actualTelemetry(input)
+    const snapshot = buildObservabilityFromServerStatus(input, {
+      source: 'windows.server-status.bridge-telemetry-v1',
+      gamePort: 8469,
+      actualSimulationTelemetry: actual
+    })
+
+    expect(snapshot.simulation).toEqual({
+      ups: { status: 'available', value: 58.75 },
+      tps: { status: 'available', value: 57.5 },
+      targetUps: { status: 'available', value: 60 }
+    })
+    input.runtime.processId = 4243
+    expect(() => buildObservabilityFromServerStatus(input, {
+      source: 'windows.server-status.bridge-telemetry-v1',
+      gamePort: 8469,
+      actualSimulationTelemetry: actual
+    })).toThrow('BRIDGE_TELEMETRY_STATUS_MISMATCH')
+  })
+
+  it('keeps rejected real telemetry explicitly unavailable without substituting targetUps', () => {
+    const snapshot = buildObservabilityFromServerStatus(status(), {
+      source: 'windows.server-status.bridge-telemetry-v1',
+      gamePort: 8469,
+      actualSimulationTelemetry: null
+    })
+    expect(snapshot.simulation).toEqual({
+      ups: { status: 'unavailable', reason: 'source-reported-unavailable' },
+      tps: { status: 'unavailable', reason: 'source-reported-unavailable' },
+      targetUps: { status: 'available', value: 60 }
+    })
+  })
 })
+
+function actualTelemetry(input: ServerStatus): AcceptedBridgeSimulationTelemetry {
+  const processStartedAtUnixMs = Date.parse(input.runtime.startedAt!)
+  const bridgeStartedAtUnixMs = processStartedAtUnixMs + 1_000
+  const session = buildBridgeRuntimeSession({
+    sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+    pluginVersion: '0.1.0', processId: input.runtime.processId!,
+    processStartedAtUnixMs, bridgeStartedAtUnixMs, issuedAtUnixMs: bridgeStartedAtUnixMs
+  }, 'fictional-cross-runtime-secret-0123456789').session
+  const telemetry = buildBridgeSimulationTelemetry({
+    sessionId: session.sessionId, processId: session.processId,
+    processStartedAtUnixMs, bridgeStartedAtUnixMs, sequence: 7,
+    sampleStartedAtUnixMs: bridgeStartedAtUnixMs + 1_000,
+    sampleFinishedAtUnixMs: bridgeStartedAtUnixMs + 3_000,
+    writtenAtUnixMs: bridgeStartedAtUnixMs + 3_000,
+    windowDurationMs: 2_000, tickStarted: 1_000, tickFinished: 1_115,
+    upsMilli: 58_750, tpsMilli: 57_500
+  }, 'fictional-cross-runtime-secret-0123456789').telemetry
+  const rates = actualSimulationRates(telemetry)
+  return { session, telemetry, actualUps: rates.ups, actualTps: rates.tps }
+}
 
 function status(): ServerStatus {
   return {

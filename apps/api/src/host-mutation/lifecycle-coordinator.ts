@@ -13,6 +13,8 @@ export interface LifecycleCoordinatorRequest {
 
 export interface LifecycleCoordinatorScope {
   readonly signal: AbortSignal
+  assertActive(): void
+  toPowerShellBorrowArguments(): readonly string[]
 }
 
 export interface LifecycleCoordinatorOutcome<T> {
@@ -99,7 +101,11 @@ export class HostMutationLifecycleCoordinator implements LifecycleMutationCoordi
             : { acquireTimeoutMs: this.#acquireTimeoutMs })
         },
         async (lease) => {
-          const outcome = await operation({ signal: lease.signal })
+          const outcome = await operation({
+            signal: lease.signal,
+            assertActive: () => { lease.assertActive() },
+            toPowerShellBorrowArguments: () => lease.toPowerShellBorrowArguments()
+          })
           if (outcome.disposition === 'abandon') {
             throw new AbandonLifecycleLease(outcome.value)
           }

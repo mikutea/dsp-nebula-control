@@ -212,6 +212,47 @@ export function evaluateObservabilityHealth(readings: ServerObservabilityReading
     )
   }
 
+  if (readings.automation.projectRootAvailable.status === 'available'
+      && !readings.automation.projectRootAvailable.value) {
+    addHint(
+      'PROJECT_ROOT_UNAVAILABLE',
+      'critical',
+      'The configured project root is unavailable to the managed service identity.',
+      ['automation.projectRootAvailable']
+    )
+  }
+
+  if (readings.automation.storageDependencyKind === 'unknown') {
+    addHint(
+      'STORAGE_DEPENDENCY_UNCLASSIFIED',
+      'info',
+      'The project storage dependency has not been classified; storage health is not asserted.',
+      []
+    )
+  } else if (readings.automation.storageDependencyKind === 'smb-global-mapping') {
+    if (readings.automation.globalMappingAvailable.status === 'available'
+        && !readings.automation.globalMappingAvailable.value) {
+      addHint(
+        'SMB_GLOBAL_MAPPING_UNAVAILABLE',
+        'critical',
+        'The configured SMB global mapping is unavailable to the managed service identity.',
+        ['automation.globalMappingAvailable']
+      )
+    }
+    const taskState = readings.automation.storageTask.state
+    const taskResult = readings.automation.storageTask.lastResult
+    if ((taskState.status === 'available'
+        && !['ready', 'running'].includes(taskState.value))
+        || (taskResult.status === 'available' && taskResult.value !== 0)) {
+      addHint(
+        'STORAGE_RECOVERY_TASK_FAILED',
+        'critical',
+        'The configured storage recovery task is disabled, unhealthy, or returned a failure.',
+        ['automation.storageTask.state', 'automation.storageTask.lastResult']
+      )
+    }
+  }
+
   const unavailableMetrics = listUnavailableMetrics(readings)
   const essentialUnavailable = listEssentialUnavailableMetrics(readings)
   if (essentialUnavailable.length > 0) {
@@ -238,6 +279,7 @@ export function evaluateObservabilityHealth(readings: ServerObservabilityReading
 function listUnavailableMetrics(readings: ServerObservabilityReadings): ObservabilityMetricPath[] {
   const metrics: Array<[ObservabilityMetricPath, MetricAvailability]> = [
     ['runtime.processId', readings.runtime.processId],
+    ['runtime.startedAt', readings.runtime.startedAt],
     ['runtime.gamePort.port', readings.runtime.gamePort.port],
     ['runtime.gamePort.listening', readings.runtime.gamePort.listening],
     ['host.cpu.logicalProcessorCount', readings.host.cpu.logicalProcessorCount],
@@ -265,7 +307,11 @@ function listUnavailableMetrics(readings: ServerObservabilityReadings): Observab
     ['process.threadCount', readings.process.threadCount],
     ['simulation.ups', readings.simulation.ups],
     ['simulation.tps', readings.simulation.tps],
-    ['simulation.targetUps', readings.simulation.targetUps]
+    ['simulation.targetUps', readings.simulation.targetUps],
+    ['automation.projectRootAvailable', readings.automation.projectRootAvailable],
+    ['automation.globalMappingAvailable', readings.automation.globalMappingAvailable],
+    ['automation.storageTask.state', readings.automation.storageTask.state],
+    ['automation.storageTask.lastResult', readings.automation.storageTask.lastResult]
   ]
   return metrics.filter(([, metric]) => metric.status === 'unavailable').map(([path]) => path)
 }
@@ -275,11 +321,22 @@ function listEssentialUnavailableMetrics(readings: ServerObservabilityReadings):
     ['host.cpu.totalPercent', readings.host.cpu.totalPercent],
     ['host.memory.usedPercent', readings.host.memory.usedPercent],
     ['runtime.gamePort.port', readings.runtime.gamePort.port],
-    ['runtime.gamePort.listening', readings.runtime.gamePort.listening]
+    ['runtime.gamePort.listening', readings.runtime.gamePort.listening],
+    ['automation.projectRootAvailable', readings.automation.projectRootAvailable]
   ]
+  if (readings.automation.storageDependencyKind === 'smb-global-mapping') {
+    metrics.push(
+      ['automation.globalMappingAvailable', readings.automation.globalMappingAvailable],
+      ['automation.storageTask.state', readings.automation.storageTask.state],
+      ['automation.storageTask.lastResult', readings.automation.storageTask.lastResult]
+    )
+  } else if (readings.automation.storageDependencyKind === 'unknown') {
+    metrics.push(['automation.globalMappingAvailable', readings.automation.globalMappingAvailable])
+  }
   if (readings.runtime.state === 'running') {
     metrics.push(
       ['runtime.processId', readings.runtime.processId],
+      ['runtime.startedAt', readings.runtime.startedAt],
       ['process.workingSetBytes', readings.process.workingSetBytes]
     )
   }

@@ -26,6 +26,8 @@ Authenticated operators can use:
 - `POST /api/v1/saves/transfers/exports`;
 - `GET /api/v1/saves/transfers/exports/:requestId`;
 - `POST /api/v1/saves/transfers/imports/:requestId`;
+- `POST /api/v1/saves/transfers/promotions/preview`;
+- `POST /api/v1/saves/transfers/promotions/execute`;
 - `GET /api/v1/backups/retention/annotations`;
 - `POST /api/v1/backups/retention/annotations`;
 - `POST /api/v1/backups/retention/preview`;
@@ -66,6 +68,17 @@ the protection directory atomically. An incomplete or continuously changing
 pair is never published. One cross-process save lock serializes backup and
 restore operations, and redacted durable audit records omit paths, hashes, and
 file contents.
+
+The Windows lifecycle protection script is also a `SupportsShouldProcess`
+boundary. `-WhatIf` returns one stable, redacted JSON preview and performs no
+directory creation, stale-staging cleanup, copy, manifest write, or rename.
+An existing `tx-<requestId>` is re-verified and reused before the script reads
+the current live save pair, so an exact replay remains valid after a later save
+changes or removes the live files. In a reuse receipt, `sourcePairVerified`
+means the immutable pair inside that protection point was re-verified against
+its manifest; it does not claim that the current live pair still matches it.
+Execution receipts are accepted only when request and protection IDs bind to
+the requested UUID and the state/dry-run/mutation/reuse fields are consistent.
 
 The fixed-root retention execution core is wired through authenticated,
 same-origin HTTP routes and the save-management browser workspace. All
@@ -159,6 +172,22 @@ published only to a fixed quarantine/inbox and returns
 save. Export and import both have cross-instance locks, idempotent file
 receipts, orphan-publication reconciliation and bounded free-space checks.
 
+An imported pair remains untrusted for restore until an Administrator requests
+the separate promotion transaction. Promotion accepts only a new UUID and an
+existing import UUID; it has no path, live-save name, destination, URL, or
+command field. The preview performs no writes and reports the fixed
+`tx-<requestId>` backup ID, exact pair sizes, bounded free-space evidence,
+whether the result is an idempotent reuse, and the required confirmation
+`PROMOTE_IMPORTED_SAVE_PAIR`. Execution re-verifies the quarantine manifest,
+metadata and both hashes under the cross-process transfer lock and the global
+host-mutation lease. It copies through stable handles into a deterministic
+same-volume partial directory, writes a canonical protection manifest,
+re-verifies both source and destination, and publishes the backup by one atomic
+directory rename. A hard interruption before publication is cleaned on exact
+retry; a verified publication without its final receipt is reconstructed from
+the immutable backup. The inbox source is preserved and every plan and receipt
+states `liveSaveChanged=false` and `restoreExecuted=false`.
+
 The Web workspace exposes transfer controls only to an authenticated
 Administrator with `saves.transfer`. Export selection is populated solely from
 healthy, manifest-verified catalogue entries; there is no free-form backup ID,
@@ -169,10 +198,12 @@ byte digest before offering the `.dyson-save-pair` file.
 Import accepts only one `.dyson-save-pair`, calculates its SHA-256 in the
 browser, and sends the fixed media type plus bounded length/digest metadata.
 The UI labels a successful result as quarantine/inbox publication and always
-shows `restoreExecuted=false`; it deliberately has no restore button. A 403,
-423, or 503 response locks the workspace fail-closed, while browser cancellation
-is described accurately as cancelling the wait rather than undoing a request
-that the server may already have completed.
+shows `restoreExecuted=false`. Its only follow-up mutation is the distinct
+previewed promotion into the verified backup catalogue; it never offers a
+direct restore from quarantine. Restore remains the independent stopped-host
+transaction below. A 403, 423, or 503 response locks the workspace fail-closed,
+while browser cancellation is described accurately as cancelling the wait
+rather than undoing a request that the server may already have completed.
 
 ## Restore transaction workflow
 
@@ -186,10 +217,14 @@ confirmation before execution. The restore service requires:
   is not listening;
 - a separate request ID for a fresh protection backup of the current live pair.
 
-On the Windows provider, that independent evidence comes only from the fixed
-`Test-DysonRuntimeState.ps1` adapter with server-configured project root,
-`Expected=stopped`, and the configured game port. The request cannot replace
-those arguments. Both exact process state and closed-port evidence must match.
+On the Windows provider, that independent evidence comes only from a fresh
+`LifecycleVerify(stopped)` request to the fixed SYSTEM lifecycle broker. The
+server generates a new request ID for issuance and for every subsequent token
+validation; a previously observed stopped result is never reused as current
+evidence. The protected broker profile, empty blocker list,
+`stopped_verified` lifecycle state, absent managed process, and zero game-port
+listeners must all match. The HTTP request cannot select a script, task, path,
+process, port, or prior receipt.
 
 Only then does the transaction stage and replace both files. The stopped-state
 gate is checked again before commit. A partial replacement failure triggers

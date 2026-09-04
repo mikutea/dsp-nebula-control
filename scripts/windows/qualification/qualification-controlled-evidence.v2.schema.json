@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dyson-control:schema:qualification-controlled-evidence:v2",
+  "title": "Dyson protected controlled qualification evidence v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "schemaVersion", "evidenceId", "runId", "requestId", "approvalId", "profileId", "profileSha256", "action", "actionTargetId", "targetIdentity", "subjectCommit", "runtimePayloadSha256", "adapterId", "verifierId", "nonce", "observedAtUtc", "expiresAtUtc", "artifacts", "assertions", "evidenceSha256", "protection"],
+  "properties": {
+    "protocol": { "const": "DYSON_QUALIFICATION_CONTROLLED_EVIDENCE_V2" },
+    "schemaVersion": { "const": 2 },
+    "evidenceId": { "$ref": "#/$defs/uuid" },
+    "runId": { "$ref": "#/$defs/uuid" },
+    "requestId": { "$ref": "#/$defs/uuid" },
+    "approvalId": { "$ref": "#/$defs/uuid" },
+    "profileId": { "$ref": "#/$defs/uuid" },
+    "profileSha256": { "$ref": "#/$defs/digest" },
+    "action": { "enum": ["paired-save-restore", "windows-reboot-recovery", "update-rollback", "side-by-side-deployment", "gsmanager-recoverable-switch", "gsmanager-removal", "six-hour-soak", "seventy-two-hour-soak", "authenticated-panel", "game-protocol-path", "external-client-e2e"] },
+    "actionTargetId": { "$ref": "#/$defs/identifier" },
+    "targetIdentity": { "$ref": "#/$defs/digest" },
+    "subjectCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "runtimePayloadSha256": { "$ref": "#/$defs/digest" },
+    "adapterId": { "$ref": "#/$defs/identifier" },
+    "verifierId": { "$ref": "#/$defs/identifier" },
+    "nonce": { "$ref": "#/$defs/uuid" },
+    "observedAtUtc": { "$ref": "#/$defs/utc" },
+    "expiresAtUtc": { "$ref": "#/$defs/utc" },
+    "artifacts": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "$ref": "#/$defs/artifact" } },
+    "assertions": { "$ref": "#/$defs/assertions" },
+    "evidenceSha256": { "$ref": "#/$defs/digest" },
+    "protection": { "$ref": "#/$defs/protection" }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "identifier": { "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[a-z0-9](?:[a-z0-9._-]{6,126}[a-z0-9])$" },
+    "relativePath": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)[^\\u0000-\\u001f]+$" },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "relativePath", "fileSha256", "protocol", "schemaVersion", "receiptId", "receiptSha256"],
+      "properties": {
+        "role": { "$ref": "#/$defs/identifier" },
+        "relativePath": { "$ref": "#/$defs/relativePath" },
+        "fileSha256": { "$ref": "#/$defs/digest" },
+        "protocol": { "type": "string", "minLength": 3, "maxLength": 96, "pattern": "^[A-Za-z0-9_-]+$" },
+        "schemaVersion": { "type": "integer", "minimum": 0, "maximum": 16 },
+        "receiptId": { "$ref": "#/$defs/uuid" },
+        "receiptSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "assertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "checkCodes", "startedAtUtc", "completedAtUtc", "clockClass", "elapsedMonotonicSeconds", "sampleCount", "maximumSampleGapSeconds", "protectionPointSha256", "rollbackReceiptSha256", "subjectBindingSha256", "initialJoinReceiptSha256", "reconnectReceiptSha256", "terminalReceiptSha256"],
+      "properties": {
+        "status": { "const": "verified" },
+        "checkCodes": { "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,95}$" } },
+        "startedAtUtc": { "$ref": "#/$defs/utc" },
+        "completedAtUtc": { "$ref": "#/$defs/utc" },
+        "clockClass": { "enum": ["bounded-monotonic", "real-monotonic"] },
+        "elapsedMonotonicSeconds": { "type": "integer", "minimum": 1, "maximum": 345600 },
+        "sampleCount": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "maximumSampleGapSeconds": { "type": "integer", "minimum": 0, "maximum": 3600 },
+        "protectionPointSha256": { "$ref": "#/$defs/digest" },
+        "rollbackReceiptSha256": { "$ref": "#/$defs/digest" },
+        "subjectBindingSha256": { "$ref": "#/$defs/digest" },
+        "initialJoinReceiptSha256": { "$ref": "#/$defs/digest" },
+        "reconnectReceiptSha256": { "$ref": "#/$defs/digest" },
+        "terminalReceiptSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "protection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyId", "hmacSha256"],
+      "properties": {
+        "keyId": { "$ref": "#/$defs/identifier" },
+        "hmacSha256": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

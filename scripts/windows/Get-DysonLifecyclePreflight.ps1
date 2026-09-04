@@ -4,6 +4,7 @@ param(
     [string]$ProjectRoot,
     [Parameter(Mandatory)]
     [string]$AllowedScriptRoot,
+    [string]$AllowedTaskScriptRoot,
     [Parameter(Mandatory)]
     [ValidateSet('start', 'save', 'graceful-stop', 'restart')]
     [string]$Action,
@@ -117,6 +118,19 @@ function Test-FixedTaskAction {
 $resolvedProjectRoot = $null
 try { $resolvedProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot -ErrorAction Stop).ProviderPath }
 catch { $resolvedProjectRoot = $null }
+$resolvedTaskScriptRoot = $null
+try {
+    if ([string]::IsNullOrWhiteSpace($AllowedTaskScriptRoot)) {
+        throw 'The stable runtime bootstrap root was not configured.'
+    }
+    $taskScriptRootItem = Get-Item -LiteralPath $AllowedTaskScriptRoot -Force -ErrorAction Stop
+    if (-not $taskScriptRootItem.PSIsContainer -or
+        ($taskScriptRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw 'The stable runtime bootstrap root is unavailable or redirected.'
+    }
+    $resolvedTaskScriptRoot = $taskScriptRootItem.FullName
+}
+catch { $resolvedTaskScriptRoot = $null }
 
 if ($resolvedProjectRoot) {
     Add-Check -Id 'project-root' -Status 'pass' -Message 'The configured project root is available.'
@@ -400,8 +414,8 @@ if ($needsStartTask -and $serverTask) {
 }
 else { Add-Check -Id 'server-task-principal' -Status 'not-applicable' -Message 'Start-task principal validation is not used by this preview.' }
 
-if ($needsStartTask -and $serverTask -and $resolvedProjectRoot -and
-    (Test-FixedTaskAction -Task $serverTask -ExpectedScriptName 'Start-DysonServer.ps1' -ExpectedProjectRoot $resolvedProjectRoot -ScriptRoot $AllowedScriptRoot)) {
+if ($needsStartTask -and $serverTask -and $resolvedProjectRoot -and $resolvedTaskScriptRoot -and
+    (Test-FixedTaskAction -Task $serverTask -ExpectedScriptName 'Start-DysonServer.ps1' -ExpectedProjectRoot $resolvedProjectRoot -ScriptRoot $resolvedTaskScriptRoot)) {
     Add-Check -Id 'server-task-action' -Status 'pass' -Message 'The server task invokes the exact allowlisted start script and project root.'
 }
 elseif ($needsStartTask) {
@@ -434,8 +448,8 @@ else { Add-Check -Id 'stop-task-principal' -Status 'not-applicable' -Message 'St
 
 $stopActionAllowlisted = $false
 if ($needsStopTask -and $stopTask) {
-    $stopActionAllowlisted = $resolvedProjectRoot -and
-        (Test-FixedTaskAction -Task $stopTask -ExpectedScriptName 'Stop-DysonServer.ps1' -ExpectedProjectRoot $resolvedProjectRoot -ScriptRoot $AllowedScriptRoot)
+    $stopActionAllowlisted = $resolvedProjectRoot -and $resolvedTaskScriptRoot -and
+        (Test-FixedTaskAction -Task $stopTask -ExpectedScriptName 'Stop-DysonServer.ps1' -ExpectedProjectRoot $resolvedProjectRoot -ScriptRoot $resolvedTaskScriptRoot)
 
     if ($stopActionAllowlisted) { Add-Check -Id 'stop-task-action' -Status 'pass' -Message 'The stop task invokes the exact allowlisted stop script and project root.' }
     else { Add-Check -Id 'stop-task-action' -Status 'block' -Message 'The stop task action does not match the fixed allowlisted stop definition.' -Blocker 'stop-task-action-unallowlisted' }

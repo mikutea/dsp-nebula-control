@@ -13,7 +13,7 @@ afterEach(async () => {
 })
 
 describe('file player capability source', () => {
-  it('reads a fresh signed declaration and preserves the fail-closed action flag', async () => {
+  it('reads a fresh signed declaration with only the fixed notice mutation available', async () => {
     const fixture = await createFixture(Date.now())
     const source = new FilePlayerCapabilitySource({
       controlRoot: fixture.controlRoot,
@@ -21,10 +21,30 @@ describe('file player capability source', () => {
       maximumAgeMs: 5_000
     })
     await expect(source.read()).resolves.toMatchObject({
+      actionsEnabled: true,
+      capabilities: expect.arrayContaining([
+        {
+          capability: 'notice', availability: 'available', mode: 'mutation',
+          verifiedReasonCode: 'UPSTREAM_TARGETED_NOTICE_PRIMITIVES_VERIFIED'
+        },
+        {
+          capability: 'ban', availability: 'unavailable', mode: 'mutation',
+          verifiedReasonCode: 'UPSTREAM_BAN_API_ABSENT'
+        }
+      ])
+    })
+
+    const unverifiedFixture = await createFixture(Date.now(), false)
+    await expect(new FilePlayerCapabilitySource({
+      controlRoot: unverifiedFixture.controlRoot,
+      secretFile: unverifiedFixture.secretFile,
+      maximumAgeMs: 5_000
+    }).read()).resolves.toMatchObject({
+      verificationScope: 'source-contract-only-runtime-unverified',
       actionsEnabled: false,
       capabilities: expect.arrayContaining([{
-        capability: 'ban', availability: 'unavailable', mode: 'mutation',
-        verifiedReasonCode: 'UPSTREAM_BAN_API_ABSENT'
+        capability: 'notice', availability: 'unavailable', mode: 'mutation',
+        verifiedReasonCode: 'NEBULA_NOTICE_RUNTIME_UNVERIFIED'
       }])
     })
   })
@@ -39,11 +59,11 @@ describe('file player capability source', () => {
     const capabilityFile = path.join(tampered.controlRoot, 'player-capabilities')
     await fs.writeFile(
       capabilityFile,
-      (await fs.readFile(capabilityFile, 'utf8')).replace('actionsEnabled=false', 'actionsEnabled=true')
+      (await fs.readFile(capabilityFile, 'utf8')).replace('actionsEnabled=true', 'actionsEnabled=false')
     )
     await expect(new FilePlayerCapabilitySource({
       controlRoot: tampered.controlRoot, secretFile: tampered.secretFile
-    }).read()).rejects.toThrow('PLAYER_CAPABILITY_ACTIONS_INVALID')
+    }).read()).rejects.toThrow('PLAYER_CAPABILITY_SCOPE_INVALID')
 
     const oversized = await createFixture(Date.now())
     await fs.writeFile(path.join(oversized.controlRoot, 'player-capabilities'), 'x'.repeat(8_193))
@@ -59,7 +79,7 @@ describe('file player capability source', () => {
   })
 })
 
-async function createFixture(writtenAtUnixMs: number) {
+async function createFixture(writtenAtUnixMs: number, runtimeVerified = true) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dyson-player-capability-source-'))
   temporaryRoots.push(root)
   const controlRoot = path.join(root, 'control')
@@ -68,7 +88,8 @@ async function createFixture(writtenAtUnixMs: number) {
   await fs.writeFile(secretFile, secret)
   const payload = buildPlayerCapabilitySnapshot({
     sessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
-    writtenAtUnixMs
+    writtenAtUnixMs,
+    runtimeVerified
   }, secret).payload
   await fs.writeFile(path.join(controlRoot, 'player-capabilities'), payload)
   return { controlRoot, secretFile }

@@ -173,7 +173,9 @@ function snapshot(index: number, hostCpuPercent: number) {
     schemaVersion: 1,
     observedAt: observedAt(index),
     source: 'fixture.persistent-alerts',
-    runtime: { state: 'running', processId: 4242 },
+    runtime: {
+      state: 'running', processId: 4242, startedAt: '2026-08-30T11:00:00.000Z'
+    },
     host: {
       cpu: {
         logicalProcessorCount: 2,
@@ -199,7 +201,8 @@ function snapshot(index: number, hostCpuPercent: number) {
       threadCount: 200
     },
     network: { gamePort: { port: 8469, listening: true } },
-    simulation: { ups: 60, tps: 60, targetUps: 60 }
+    simulation: { ups: 60, tps: 60, targetUps: 60 },
+    automation: { storageDependencyKind: 'none', projectRootAvailable: true }
   })
 }
 

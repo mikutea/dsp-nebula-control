@@ -28,6 +28,7 @@ $script:DysonBridgeManifestName = 'bridge-manifest.json'
 $script:DysonBridgeConfigName = 'io.github.mikutea.dyson-control-bridge.cfg'
 $script:DysonBridgeStateName = 'dyson-control-bridge.install.json'
 $script:DysonBridgeSecretName = 'dyson-control-bridge.secret'
+$script:DysonBridgeAclContract = 'DYSON_CONTROL_BRIDGE_ACL_V1'
 $script:DysonBridgeMaximumAssemblyBytes = [int64](64MB)
 
 function ConvertTo-DysonBridgeJsonLine {
@@ -150,9 +151,36 @@ function Get-DysonBridgeSha256 {
 
 function Assert-DysonBridgeVersion {
     param([Parameter(Mandatory)][string]$Version)
-    if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
-        throw 'The Bridge version must be canonical stable semantic version text.'
+    $match = [regex]::Match(
+        $Version,
+        '^(?<major>0|[1-9][0-9]{0,4})\.(?<minor>0|[1-9][0-9]{0,4})\.(?<patch>0|[1-9][0-9]{0,4})(?:-rc\.(?<rc>0|[1-9][0-9]{0,5}))?$',
+        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $match.Success -or
+        [int]$match.Groups['major'].Value -gt 65534 -or
+        [int]$match.Groups['minor'].Value -gt 65534 -or
+        [int]$match.Groups['patch'].Value -gt 65534 -or
+        ($match.Groups['rc'].Success -and [int]$match.Groups['rc'].Value -gt 999999)) {
+        throw 'The Bridge version must be canonical x.y.z or x.y.z-rc.N with CLR segments 0..65534 and RC number 0..999999.'
     }
+}
+
+function Get-DysonBridgeAssemblyVersion {
+    param([Parameter(Mandatory)][string]$Version)
+    return (Get-DysonBridgeBepInExVersion -Version $Version) + '.0'
+}
+
+function Get-DysonBridgeBepInExVersion {
+    param([Parameter(Mandatory)][string]$Version)
+    Assert-DysonBridgeVersion -Version $Version
+    $match = [regex]::Match(
+        $Version,
+        '^(?<major>0|[1-9][0-9]{0,4})\.(?<minor>0|[1-9][0-9]{0,4})\.(?<patch>0|[1-9][0-9]{0,4})(?:-rc\.(?:0|[1-9][0-9]{0,5}))?$',
+        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $match.Success) { throw 'The Bridge BepInEx version could not be derived.' }
+    return '{0}.{1}.{2}' -f `
+        $match.Groups['major'].Value, $match.Groups['minor'].Value, $match.Groups['patch'].Value
 }
 
 function Assert-DysonBridgeExactProperties {
@@ -172,6 +200,7 @@ function Get-DysonBridgeReferenceSpecifications {
         [ordered]@{ name = '0Harmony.dll'; relativePath = 'BepInEx\core\0Harmony.dll' },
         [ordered]@{ name = 'UnityEngine.dll'; relativePath = 'DSPGAME_Data\Managed\UnityEngine.dll' },
         [ordered]@{ name = 'UnityEngine.CoreModule.dll'; relativePath = 'DSPGAME_Data\Managed\UnityEngine.CoreModule.dll' },
+        [ordered]@{ name = 'netstandard.dll'; relativePath = 'DSPGAME_Data\Managed\netstandard.dll' },
         [ordered]@{ name = 'Assembly-CSharp.dll'; relativePath = 'DSPGAME_Data\Managed\Assembly-CSharp.dll' },
         [ordered]@{ name = 'NebulaAPI.dll'; relativePath = 'BepInEx\plugins\nebula-NebulaMultiplayerModApi\NebulaAPI.dll' },
         [ordered]@{ name = 'NebulaModel.dll'; relativePath = 'BepInEx\plugins\nebula-NebulaMultiplayerMod\NebulaModel.dll' }
@@ -208,7 +237,8 @@ function Get-DysonBridgeSourceContract {
     $root = Assert-DysonBridgePlainDirectory -Path $SourceRoot
     $required = @(
         'BridgeFileStore.cs', 'BridgeProtocol.cs', 'DysonControlBridgePlugin.cs',
-        'GameSaveAdapter.cs', 'PlayerRosterPublisher.cs', 'DysonControlBridge.csproj',
+        'GameSaveAdapter.cs', 'LoadedSaveEvidencePublisher.cs', 'PlayerRosterPublisher.cs',
+        'SimulationTelemetrySampler.cs', 'DysonControlBridge.csproj',
         'dyson-control-bridge.cfg.example', 'README.md'
     )
     $actual = @(Assert-DysonBridgeTreePlain -Root $root | ForEach-Object {
@@ -242,11 +272,20 @@ function Get-DysonBridgeSourceContract {
     }
     $propertyElements = @($projectChildren | Where-Object { $_.LocalName -eq 'PropertyGroup' } |
         ForEach-Object { $_.ChildNodes } | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element })
-    $expectedPropertyNames = @('AssemblyName', 'DysonServerRoot', 'LangVersion', 'Nullable', 'RootNamespace', 'TargetFramework', 'Version') | Sort-Object -CaseSensitive
+    $expectedPropertyNames = @(
+        'AssemblyName', 'AssemblyVersion', 'DysonServerRoot', 'FileVersion', 'InformationalVersion',
+        'IncludeSourceRevisionInInformationalVersion', 'LangVersion', 'Nullable', 'RootNamespace',
+        'TargetFramework', 'Version'
+    ) | Sort-Object -CaseSensitive
     $actualPropertyNames = @($propertyElements | ForEach-Object { $_.LocalName } | Sort-Object -CaseSensitive)
+    $expectedAssemblyVersion = Get-DysonBridgeAssemblyVersion -Version $version
     if ([string]::Join("`n", $actualPropertyNames) -ne [string]::Join("`n", $expectedPropertyNames) -or
         [string]$properties[0].LangVersion -ne '9.0' -or [string]$properties[0].Nullable -ne 'disable' -or
-        [string]$properties[0].RootNamespace -ne 'DysonControl.Bridge') {
+        [string]$properties[0].RootNamespace -ne 'DysonControl.Bridge' -or
+        [string]$properties[0].AssemblyVersion -ne $expectedAssemblyVersion -or
+        [string]$properties[0].FileVersion -ne $expectedAssemblyVersion -or
+        [string]$properties[0].InformationalVersion -ne $version -or
+        [string]$properties[0].IncludeSourceRevisionInInformationalVersion -cne 'false') {
         throw 'The Bridge project property set is not fixed.'
     }
     foreach ($property in $propertyElements) {
@@ -261,11 +300,14 @@ function Get-DysonBridgeSourceContract {
 
     $pluginText = [System.IO.File]::ReadAllText((Join-Path $root 'DysonControlBridgePlugin.cs'), [System.Text.Encoding]::UTF8)
     $guidMatch = [regex]::Match($pluginText, 'public\s+const\s+string\s+PluginGuid\s*=\s*"(?<value>[^"]+)"\s*;')
-    $versionMatch = [regex]::Match($pluginText, 'public\s+const\s+string\s+PluginVersion\s*=\s*"(?<value>[^"]+)"\s*;')
+    $pluginVersionMatch = [regex]::Match($pluginText, 'public\s+const\s+string\s+PluginVersion\s*=\s*"(?<value>[^"]+)"\s*;')
+    $releaseVersionMatch = [regex]::Match($pluginText, 'public\s+const\s+string\s+ReleaseVersion\s*=\s*"(?<value>[^"]+)"\s*;')
+    $expectedPluginVersion = Get-DysonBridgeBepInExVersion -Version $version
     if (-not $guidMatch.Success -or $guidMatch.Groups['value'].Value -ne $script:DysonBridgeGuid -or
-        -not $versionMatch.Success -or $versionMatch.Groups['value'].Value -ne $version -or
+        -not $releaseVersionMatch.Success -or $releaseVersionMatch.Groups['value'].Value -ne $version -or
+        -not $pluginVersionMatch.Success -or $pluginVersionMatch.Groups['value'].Value -ne $expectedPluginVersion -or
         $pluginText -notmatch '\[BepInPlugin\(PluginGuid,\s*PluginName,\s*PluginVersion\)\]') {
-        throw 'The Bridge source GUID, plugin attribute, project version, and PluginVersion are inconsistent.'
+        throw 'The Bridge source GUID, plugin attribute, project ReleaseVersion, and numeric PluginVersion are inconsistent.'
     }
 
     $expectedHints = @(Get-DysonBridgeReferenceSpecifications | ForEach-Object { '$(DysonServerRoot)\' + $_.relativePath })
@@ -305,7 +347,13 @@ function Get-DysonBridgeSourceContract {
             sha256 = Get-DysonBridgeSha256 -Path $item.FullName
         }
     }
-    return [ordered]@{ root = $root; projectPath = $projectPath; version = $version; files = $sourceReceipts }
+    return [ordered]@{
+        root = $root
+        projectPath = $projectPath
+        version = $version
+        pluginVersion = $expectedPluginVersion
+        files = $sourceReceipts
+    }
 }
 
 function Get-DysonBridgeAssemblyMetadata {
@@ -340,23 +388,35 @@ function Get-DysonBridgeAssemblyMetadata {
         $assembly = [System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($item.FullName))
         $pluginType = $assembly.GetType('DysonControl.Bridge.DysonControlBridgePlugin', $true, $false)
         $guidField = $pluginType.GetField('PluginGuid', [System.Reflection.BindingFlags]'Public, Static')
-        $versionField = $pluginType.GetField('PluginVersion', [System.Reflection.BindingFlags]'Public, Static')
+        $pluginVersionField = $pluginType.GetField('PluginVersion', [System.Reflection.BindingFlags]'Public, Static')
+        $releaseVersionField = $pluginType.GetField('ReleaseVersion', [System.Reflection.BindingFlags]'Public, Static')
         $nameField = $pluginType.GetField('PluginName', [System.Reflection.BindingFlags]'Public, Static')
-        if (-not $guidField.IsLiteral -or -not $versionField.IsLiteral -or -not $nameField.IsLiteral) {
+        if (-not $guidField.IsLiteral -or -not $pluginVersionField.IsLiteral -or
+            -not $releaseVersionField.IsLiteral -or -not $nameField.IsLiteral) {
             throw 'Bridge identity fields are not compile-time constants.'
         }
         $guid = [string]$guidField.GetRawConstantValue()
-        $version = [string]$versionField.GetRawConstantValue()
+        $pluginVersion = [string]$pluginVersionField.GetRawConstantValue()
+        $version = [string]$releaseVersionField.GetRawConstantValue()
         $pluginName = [string]$nameField.GetRawConstantValue()
     }
     catch { throw 'The Bridge candidate DLL metadata is invalid.' }
     finally { [System.AppDomain]::CurrentDomain.remove_AssemblyResolve($handler) }
     Assert-DysonBridgeVersion -Version $version
-    $fileVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($item.FullName).FileVersion
+    if ($pluginVersion -cne (Get-DysonBridgeBepInExVersion -Version $version)) {
+        throw 'The Bridge candidate BepInEx version does not match its release version core.'
+    }
+    $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($item.FullName)
+    $fileVersion = [string]$versionInfo.FileVersion
+    $informationalVersion = [string]$versionInfo.ProductVersion
+    if ($informationalVersion -cne $version) {
+        throw 'The Bridge candidate informational version does not match its release version.'
+    }
     return [ordered]@{
         guid = $guid
         name = $pluginName
         version = $version
+        informationalVersion = $informationalVersion
         assemblyName = [string]$assemblyName.Name
         assemblyVersion = [string]$assemblyName.Version
         fileVersion = [string]$fileVersion
@@ -419,7 +479,7 @@ function Test-DysonBridgeCandidateCore {
     }
     $manifest = Read-DysonBridgeCandidateManifest -CandidateRoot $root
     Assert-DysonBridgeExactProperties -Value $manifest -Expected @('protocol', 'schemaVersion', 'plugin', 'references', 'sources', 'build', 'files') -Name 'Bridge candidate manifest'
-    Assert-DysonBridgeExactProperties -Value $manifest.plugin -Expected @('guid', 'name', 'version', 'assemblyName', 'assemblyVersion', 'fileVersion', 'dllName', 'length', 'sha256') -Name 'Bridge plugin manifest'
+    Assert-DysonBridgeExactProperties -Value $manifest.plugin -Expected @('guid', 'name', 'version', 'informationalVersion', 'assemblyName', 'assemblyVersion', 'fileVersion', 'dllName', 'length', 'sha256') -Name 'Bridge plugin manifest'
     Assert-DysonBridgeExactProperties -Value $manifest.build -Expected @('configuration', 'targetFramework', 'deterministic') -Name 'Bridge build manifest'
     if ([string]$manifest.protocol -ne $script:DysonBridgeCandidateProtocol -or [int]$manifest.schemaVersion -ne 1 -or
         [string]$manifest.plugin.guid -ne $script:DysonBridgeGuid -or [string]$manifest.plugin.name -ne $script:DysonBridgeName -or
@@ -436,7 +496,7 @@ function Test-DysonBridgeCandidateCore {
     Assert-DysonBridgeExactProperties -Value $manifestFiles[0] -Expected @('path', 'length', 'sha256') -Name 'Bridge candidate file entry'
     $dll = Join-Path $root $script:DysonBridgeDllName
     $plugin = Get-DysonBridgeAssemblyMetadata -AssemblyPath $dll -DysonServerRoot $DysonServerRoot
-    foreach ($property in @('guid', 'name', 'version', 'assemblyName', 'assemblyVersion', 'fileVersion', 'dllName', 'sha256')) {
+    foreach ($property in @('guid', 'name', 'version', 'informationalVersion', 'assemblyName', 'assemblyVersion', 'fileVersion', 'dllName', 'sha256')) {
         if ([string]$manifest.plugin.$property -cne [string]$plugin.$property) { throw 'The Bridge candidate DLL metadata no longer matches its manifest.' }
     }
     if ([int64]$manifest.plugin.length -ne [int64]$plugin.length -or
@@ -445,9 +505,11 @@ function Test-DysonBridgeCandidateCore {
         [string]$manifestFiles[0].sha256 -ne [string]$plugin.sha256) {
         throw 'The Bridge candidate DLL inventory no longer matches its manifest.'
     }
+    $expectedAssemblyVersion = Get-DysonBridgeAssemblyVersion -Version $plugin.version
     if ($plugin.guid -ne $script:DysonBridgeGuid -or $plugin.name -ne $script:DysonBridgeName -or
         $plugin.assemblyName -ne $script:DysonBridgeAssemblyName -or $plugin.version -ne [string]$manifest.plugin.version -or
-        $plugin.assemblyVersion -ne ($plugin.version + '.0') -or $plugin.fileVersion -ne ($plugin.version + '.0')) {
+        $plugin.informationalVersion -ne $plugin.version -or
+        $plugin.assemblyVersion -ne $expectedAssemblyVersion -or $plugin.fileVersion -ne $expectedAssemblyVersion) {
         throw 'The Bridge candidate DLL identity is unsupported.'
     }
     $actualReferences = @(Get-DysonBridgeReferenceReceipts -DysonServerRoot $DysonServerRoot)
@@ -467,7 +529,8 @@ function Test-DysonBridgeCandidateCore {
     $sources = @($manifest.sources)
     $expectedSourceNames = @(
         'BridgeFileStore.cs', 'BridgeProtocol.cs', 'DysonControlBridge.csproj',
-        'DysonControlBridgePlugin.cs', 'GameSaveAdapter.cs', 'PlayerRosterPublisher.cs',
+        'DysonControlBridgePlugin.cs', 'GameSaveAdapter.cs', 'LoadedSaveEvidencePublisher.cs', 'PlayerRosterPublisher.cs',
+        'SimulationTelemetrySampler.cs',
         'README.md', 'dyson-control-bridge.cfg.example'
     ) | Sort-Object -CaseSensitive
     if ($sources.Count -ne $expectedSourceNames.Count) { throw 'The Bridge source receipt set is incomplete.' }
@@ -518,16 +581,24 @@ function Write-DysonBridgeAtomicText {
     $parent = Assert-DysonBridgePlainDirectory -Path ([System.IO.Path]::GetDirectoryName($Path))
     $target = Get-DysonBridgeFullPath -Path $Path
     if (-not (Test-DysonBridgePathWithin -Candidate $target -Parent $parent)) { throw 'A Bridge write escaped its fixed directory.' }
-    $temporary = Join-Path $parent ('.dyson-bridge-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    # Keep the adjacent staging names shorter than every fixed Bridge metadata
+    # target.  The former GUID-prefixed names added 50 characters and could
+    # cross the WinPS 5.1 path boundary even when the final target was valid.
+    $temporary = Join-Path $parent ([System.IO.Path]::GetRandomFileName())
+    $backup = Join-Path $parent ([System.IO.Path]::GetRandomFileName())
     try {
         [System.IO.File]::WriteAllText($temporary, $Value, [System.Text.UTF8Encoding]::new($false))
         if (Test-Path -LiteralPath $target -PathType Leaf) {
-            [System.IO.File]::Replace($temporary, $target, $null, $true)
+            [System.IO.File]::Replace($temporary, $target, $backup, $true)
+            Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
         }
         elseif (Test-Path -LiteralPath $target) { throw 'A Bridge text publish target is not a regular file.' }
         else { [System.IO.File]::Move($temporary, $target) }
     }
-    finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force } }
+    finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
+    }
 }
 
 function Publish-DysonBridgeFile {
@@ -537,15 +608,20 @@ function Publish-DysonBridgeFile {
     $target = Get-DysonBridgeFullPath -Path $Destination
     if (-not (Test-DysonBridgePathWithin -Candidate $target -Parent $parent)) { throw 'A Bridge publish escaped its fixed directory.' }
     $temporary = Join-Path $parent ('.dyson-bridge-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $backup = Join-Path $parent ('.dyson-bridge-' + [guid]::NewGuid().ToString('N') + '.bak')
     try {
         [System.IO.File]::Copy($sourceItem.FullName, $temporary, $false)
         if (Test-Path -LiteralPath $target -PathType Leaf) {
-            [System.IO.File]::Replace($temporary, $target, $null, $true)
+            [System.IO.File]::Replace($temporary, $target, $backup, $true)
+            Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
         }
         elseif (Test-Path -LiteralPath $target) { throw 'A Bridge publish target is not a regular file.' }
         else { [System.IO.File]::Move($temporary, $target) }
     }
-    finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force } }
+    finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
+    }
 }
 
 function Read-DysonBridgeInstallState {
@@ -555,53 +631,250 @@ function Read-DysonBridgeInstallState {
     catch { throw 'The Bridge installation state is invalid JSON.' }
     Assert-DysonBridgeExactProperties -Value $state -Expected @(
         'protocol', 'schemaVersion', 'guid', 'version', 'dllSha256', 'configSha256',
-        'templateSha256', 'installedAtUtc', 'snapshotId', 'enabledDefault'
+        'templateSha256', 'installedAtUtc', 'snapshotId', 'enabledDefault',
+        'aclContract', 'installerSid', 'controlServiceSid', 'gameServiceSid'
     ) -Name 'Bridge installation state'
-    if ([string]$state.protocol -ne $script:DysonBridgeInstallProtocol -or [int]$state.schemaVersion -ne 1 -or
+    if ([string]$state.protocol -ne $script:DysonBridgeInstallProtocol -or [int]$state.schemaVersion -ne 2 -or
         [string]$state.guid -ne $script:DysonBridgeGuid -or [string]$state.dllSha256 -notmatch '^[0-9a-f]{64}$' -or
         [string]$state.configSha256 -notmatch '^[0-9a-f]{64}$' -or [string]$state.templateSha256 -notmatch '^[0-9a-f]{64}$' -or
-        [string]$state.snapshotId -notmatch '^[0-9]{17}-[0-9a-f]{8}$' -or [bool]$state.enabledDefault -ne $false) {
+        [string]$state.snapshotId -notmatch '^[0-9]{17}-[0-9a-f]{8}$' -or [bool]$state.enabledDefault -ne $false -or
+        [string]$state.aclContract -cne $script:DysonBridgeAclContract) {
         throw 'The Bridge installation state contract is unsupported.'
     }
+    foreach ($sid in @([string]$state.installerSid, [string]$state.controlServiceSid, [string]$state.gameServiceSid)) {
+        [void](Assert-DysonBridgeIdentitySid -Sid $sid -Name 'Bridge installation identity')
+    }
+    Assert-DysonBridgeSeparatedServiceSids -ControlServiceSid ([string]$state.controlServiceSid) `
+        -GameServiceSid ([string]$state.gameServiceSid)
     Assert-DysonBridgeVersion -Version ([string]$state.version)
     return $state
 }
 
-function Protect-DysonBridgeSecretAcl {
-    param([Parameter(Mandatory)][string]$SecretPath, [string[]]$ReaderSids)
-    $item = Assert-DysonBridgePlainFile -Path $SecretPath -MaximumBytes 4096
+function Assert-DysonBridgeIdentitySid {
+    param([Parameter(Mandatory)][string]$Sid, [Parameter(Mandatory)][string]$Name)
+    if ($Sid -cnotmatch '^S-1-(?:[0-9]+-){1,14}[0-9]+$') { throw "$Name SID is invalid." }
+    try { $parsed = [System.Security.Principal.SecurityIdentifier]::new($Sid) }
+    catch { throw "$Name SID is invalid." }
+    if ($parsed.Value -cne $Sid) { throw "$Name SID is not canonical." }
+    return $parsed.Value
+}
+
+function Assert-DysonBridgeSeparatedServiceSids {
+    param(
+        [Parameter(Mandatory)][string]$ControlServiceSid,
+        [Parameter(Mandatory)][string]$GameServiceSid
+    )
+    $control = Assert-DysonBridgeIdentitySid -Sid $ControlServiceSid -Name 'Bridge control service'
+    $game = Assert-DysonBridgeIdentitySid -Sid $GameServiceSid -Name 'Bridge game service'
+    $forbidden = @('S-1-1-0', 'S-1-5-7', 'S-1-5-11', 'S-1-5-18', 'S-1-5-32-544', 'S-1-5-32-545', 'S-1-5-32-546')
+    if ($control -in $forbidden -or $game -in $forbidden -or
+        [string]::Equals($control, $game, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Bridge control and game service SIDs must be distinct non-privileged identities.'
+    }
+}
+
+function Get-DysonBridgeCurrentInstallerSid {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $sids = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    [void]$sids.Add($identity.User.Value)
-    [void]$sids.Add('S-1-5-18')
-    [void]$sids.Add('S-1-5-32-544')
-    foreach ($sid in @($ReaderSids)) {
-        if ([string]$sid -notmatch '^S-1-(?:[0-9]+-){1,14}[0-9]+$') { throw 'A Bridge secret reader SID is invalid.' }
-        [void]$sids.Add([string]$sid)
+    if ($null -eq $identity -or $null -eq $identity.User) { throw 'The Bridge installer identity is unavailable.' }
+    return (Assert-DysonBridgeIdentitySid -Sid $identity.User.Value -Name 'Bridge installer')
+}
+
+function Get-DysonBridgeControlTreePaths {
+    param([Parameter(Mandatory)][string]$ControlRoot)
+    $root = Get-DysonBridgeFullPath -Path $ControlRoot
+    return [ordered]@{
+        root = $root
+        requests = Join-Path $root 'requests'
+        processing = Join-Path $root 'processing'
+        receipts = Join-Path $root 'receipts'
+        processed = Join-Path $root 'processed'
+        rejected = Join-Path $root 'rejected'
     }
-    $acl = New-Object System.Security.AccessControl.FileSecurity
-    $acl.SetOwner($identity.User)
-    $acl.SetAccessRuleProtection($true, $false)
-    foreach ($sidText in $sids) {
-        $sidObject = [System.Security.Principal.SecurityIdentifier]::new($sidText)
-        $rights = if ($sidText -in @($identity.User.Value, 'S-1-5-18', 'S-1-5-32-544')) {
-            [System.Security.AccessControl.FileSystemRights]::FullControl
+}
+
+function Get-DysonBridgeExpectedAclRules {
+    param(
+        [Parameter(Mandatory)][ValidateSet('secret', 'root', 'requests', 'private', 'receipts')][string]$Kind,
+        [Parameter(Mandatory)][string]$InstallerSid,
+        [Parameter(Mandatory)][string]$ControlServiceSid,
+        [Parameter(Mandatory)][string]$GameServiceSid
+    )
+    Assert-DysonBridgeSeparatedServiceSids -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid
+    $installer = Assert-DysonBridgeIdentitySid -Sid $InstallerSid -Name 'Bridge installer'
+    $privileged = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($sid in @($installer, 'S-1-5-18', 'S-1-5-32-544')) { [void]$privileged.Add($sid) }
+    $rules = @()
+    foreach ($sid in $privileged) {
+        $rules += [ordered]@{ sid = $sid; rights = [System.Security.AccessControl.FileSystemRights]::FullControl }
+    }
+    if ($Kind -eq 'secret') {
+        $rules += [ordered]@{ sid = $ControlServiceSid; rights = [System.Security.AccessControl.FileSystemRights]::Read }
+        $rules += [ordered]@{ sid = $GameServiceSid; rights = [System.Security.AccessControl.FileSystemRights]::Read }
+        return @($rules)
+    }
+    $rules += [ordered]@{ sid = $GameServiceSid; rights = [System.Security.AccessControl.FileSystemRights]::Modify }
+    if ($Kind -eq 'requests') {
+        $rules += [ordered]@{ sid = $ControlServiceSid; rights = [System.Security.AccessControl.FileSystemRights]::Modify }
+    }
+    elseif ($Kind -in @('root', 'receipts')) {
+        $rules += [ordered]@{ sid = $ControlServiceSid; rights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute }
+    }
+    return @($rules)
+}
+
+function New-DysonBridgeAclObject {
+    param(
+        [Parameter(Mandatory)][ValidateSet('secret', 'root', 'requests', 'private', 'receipts')][string]$Kind,
+        [Parameter(Mandatory)][string]$InstallerSid,
+        [Parameter(Mandatory)][string]$ControlServiceSid,
+        [Parameter(Mandatory)][string]$GameServiceSid
+    )
+    [void](Assert-DysonBridgeIdentitySid -Sid $InstallerSid -Name 'Bridge installer')
+    $security = if ($Kind -eq 'secret') {
+        [System.Security.AccessControl.FileSecurity]::new()
+    }
+    else { [System.Security.AccessControl.DirectorySecurity]::new() }
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($expected in @(Get-DysonBridgeExpectedAclRules -Kind $Kind -InstallerSid $InstallerSid `
+        -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid)) {
+        $sid = [System.Security.Principal.SecurityIdentifier]::new([string]$expected.sid)
+        $rule = if ($Kind -eq 'secret') {
+            [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, [System.Security.AccessControl.FileSystemRights]$expected.rights,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
         }
-        else { [System.Security.AccessControl.FileSystemRights]::Read }
-        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-            $sidObject, $rights, [System.Security.AccessControl.AccessControlType]::Allow
-        )
-        $acl.AddAccessRule($rule) | Out-Null
-    }
-    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $item.FullName -AclObject $acl -ErrorAction Stop
-    $verified = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
-    if (-not $verified.AreAccessRulesProtected) { throw 'The Bridge secret ACL could not be restricted.' }
-    foreach ($rule in @($verified.Access)) {
-        $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-        if (-not $sids.Contains($sid) -or $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
-            throw 'The Bridge secret ACL could not be verified.'
+        else {
+            [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, [System.Security.AccessControl.FileSystemRights]$expected.rights,
+                [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
         }
+        [void]$security.AddAccessRule($rule)
     }
+    return $security
+}
+
+function Set-DysonBridgeExactAclObject {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Acl,
+        [switch]$Directory
+    )
+    if ($Directory) {
+        [System.IO.DirectoryInfo]::new($Path).SetAccessControl([System.Security.AccessControl.DirectorySecurity]$Acl)
+    }
+    else {
+        [System.IO.FileInfo]::new($Path).SetAccessControl([System.Security.AccessControl.FileSecurity]$Acl)
+    }
+}
+
+function Get-DysonBridgeAccessSddl {
+    param([Parameter(Mandatory)][string]$Path)
+    $sections = [System.Security.AccessControl.AccessControlSections]::Access
+    return (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $Path -ErrorAction Stop).GetSecurityDescriptorSddlForm($sections)
+}
+
+function Restore-DysonBridgeAccessSddl {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Sddl,
+        [switch]$Directory
+    )
+    $sections = [System.Security.AccessControl.AccessControlSections]::Access
+    if ($Directory) {
+        $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+        $acl.SetSecurityDescriptorSddlForm($Sddl, $sections)
+    }
+    else {
+        $acl = [System.Security.AccessControl.FileSecurity]::new()
+        $acl.SetSecurityDescriptorSddlForm($Sddl, $sections)
+    }
+    Set-DysonBridgeExactAclObject -Path $Path -Acl $acl -Directory:$Directory
+}
+
+function Get-DysonBridgeAclRuleKey {
+    param([Parameter(Mandatory)]$Rule)
+    $sid = $Rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    return '{0}|{1}|{2}|{3}|{4}|{5}' -f $sid, [int]$Rule.AccessControlType,
+        [int64]$Rule.FileSystemRights, [int]$Rule.InheritanceFlags, [int]$Rule.PropagationFlags, [bool]$Rule.IsInherited
+}
+
+function Assert-DysonBridgeExactAcl {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('secret', 'root', 'requests', 'private', 'receipts')][string]$Kind,
+        [Parameter(Mandatory)][string]$InstallerSid,
+        [Parameter(Mandatory)][string]$ControlServiceSid,
+        [Parameter(Mandatory)][string]$GameServiceSid
+    )
+    $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if (-not $acl.AreAccessRulesProtected) { throw "The Bridge $Kind ACL is not protected." }
+    $expectedAcl = New-DysonBridgeAclObject -Kind $Kind -InstallerSid $InstallerSid `
+        -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid
+    $expected = @($expectedAcl.Access | ForEach-Object { Get-DysonBridgeAclRuleKey -Rule $_ } | Sort-Object -CaseSensitive)
+    $actual = @($acl.Access | ForEach-Object { Get-DysonBridgeAclRuleKey -Rule $_ } | Sort-Object -CaseSensitive)
+    if ([string]::Join("`n", $actual) -cne [string]::Join("`n", $expected)) {
+        throw "The Bridge $Kind ACL does not match its exact two-identity contract."
+    }
+    return $acl
+}
+
+function Protect-DysonBridgeSecretAcl {
+    param(
+        [Parameter(Mandatory)][string]$SecretPath,
+        [Parameter(Mandatory)][string]$InstallerSid,
+        [Parameter(Mandatory)][string]$ControlServiceSid,
+        [Parameter(Mandatory)][string]$GameServiceSid
+    )
+    $item = Assert-DysonBridgePlainFile -Path $SecretPath -MaximumBytes 4096
+    $acl = New-DysonBridgeAclObject -Kind secret -InstallerSid $InstallerSid `
+        -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid
+    Set-DysonBridgeExactAclObject -Path $item.FullName -Acl $acl
+    [void](Assert-DysonBridgeExactAcl -Path $item.FullName -Kind secret -InstallerSid $InstallerSid `
+        -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid)
+}
+
+function Initialize-DysonBridgeControlTreeAcl {
+    param(
+        [Parameter(Mandatory)][string]$ControlRoot,
+        [Parameter(Mandatory)][string]$InstallerSid,
+        [Parameter(Mandatory)][string]$ControlServiceSid,
+        [Parameter(Mandatory)][string]$GameServiceSid
+    )
+    $paths = Get-DysonBridgeControlTreePaths -ControlRoot $ControlRoot
+    foreach ($entry in @($paths.GetEnumerator())) {
+        [System.IO.Directory]::CreateDirectory([string]$entry.Value) | Out-Null
+        [void](Assert-DysonBridgePlainDirectory -Path ([string]$entry.Value))
+    }
+    $kindByName = @{ root = 'root'; requests = 'requests'; receipts = 'receipts'; processing = 'private'; processed = 'private'; rejected = 'private' }
+    foreach ($name in @('root', 'requests', 'processing', 'receipts', 'processed', 'rejected')) {
+        $acl = New-DysonBridgeAclObject -Kind $kindByName[$name] -InstallerSid $InstallerSid `
+            -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid
+        Set-DysonBridgeExactAclObject -Path ([string]$paths[$name]) -Acl $acl -Directory
+    }
+    [void](Test-DysonBridgeControlTreeAcl -ControlRoot $ControlRoot -InstallerSid $InstallerSid `
+        -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid)
+    return $paths
+}
+
+function Test-DysonBridgeControlTreeAcl {
+    param(
+        [Parameter(Mandatory)][string]$ControlRoot,
+        [Parameter(Mandatory)][string]$InstallerSid,
+        [Parameter(Mandatory)][string]$ControlServiceSid,
+        [Parameter(Mandatory)][string]$GameServiceSid
+    )
+    $paths = Get-DysonBridgeControlTreePaths -ControlRoot $ControlRoot
+    $kindByName = @{ root = 'root'; requests = 'requests'; receipts = 'receipts'; processing = 'private'; processed = 'private'; rejected = 'private' }
+    foreach ($name in @('root', 'requests', 'processing', 'receipts', 'processed', 'rejected')) {
+        [void](Assert-DysonBridgePlainDirectory -Path ([string]$paths[$name]))
+        [void](Assert-DysonBridgeExactAcl -Path ([string]$paths[$name]) -Kind $kindByName[$name] `
+            -InstallerSid $InstallerSid -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid)
+    }
+    return $paths
 }
 
 function Invoke-DysonBridgeProcess {

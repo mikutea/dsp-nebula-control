@@ -1,3 +1,4 @@
 * text=auto eol=lf
 *.ps1 text eol=crlf
 *.png binary
+integrations/nebula-hostname-wss/patches/*.patch whitespace=-blank-at-eol,-blank-at-eof

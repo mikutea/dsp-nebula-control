@@ -18,6 +18,17 @@ afterEach(() => {
 })
 
 describe('save retention workspace', () => {
+  it('keeps the demo honest and does not request a production-only controller', () => {
+    const annotations = vi.spyOn(api, 'backupAnnotations')
+
+    render(<SaveRetentionWorkspace backups={backups()} user={administrator()} demo />)
+
+    expect(screen.getByText('DEMO READ-ONLY')).toBeTruthy()
+    expect(screen.getByText('演示环境未装载持久化保留控制器')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '生成无写入预演' })).toBeNull()
+    expect(annotations).not.toHaveBeenCalled()
+  })
+
   it('requires a server preview and exact local confirmation before retirement', async () => {
     vi.spyOn(api, 'backupAnnotations').mockResolvedValue({ data: [] })
     vi.spyOn(api, 'previewBackupRetention').mockResolvedValue({

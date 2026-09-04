@@ -1,14 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import type { LifecycleScriptRunner, LifecycleScriptName } from './powershell-runner.js'
+import {
+  WindowsLifecycleBrokerClientError,
+  type WindowsLifecycleBrokerClient
+} from './windows-lifecycle-broker.js'
 import {
   WindowsConfigHistoryStopProofAuthorizer,
   WindowsConfigHistoryStopProofError
 } from './windows-config-history-stop-proof.js'
 
 describe('Windows game configuration history stop-proof authorizer', () => {
-  it('issues a high-entropy token after a fixed stopped check and revalidates every restore phase', async () => {
-    const runner = new FixtureRunner()
-    const authorizer = createAuthorizer(runner)
+  it('issues after broker verification and uses a fresh outer request UUID for every proof', async () => {
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient)
     const issue = authorizer.issue
     const validate = authorizer.validate
 
@@ -16,22 +19,43 @@ describe('Windows game configuration history stop-proof authorizer', () => {
     expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/)
     expect(await validate(validationContext(token, 'prepare'))).toBe(true)
     expect(await validate(validationContext(token, 'publish'))).toBe(true)
-    expect(runner.calls).toHaveLength(3)
-    expect(runner.calls).toEqual(runner.calls.map(() => ({
-      scriptName: 'Test-DysonRuntimeState.ps1',
-      scriptArguments: [
-        '-ProjectRoot', projectRoot,
-        '-Expected', 'stopped',
-        '-GamePort', '8469'
-      ],
-      aborted: false
-    })))
+    expect(brokerClient.calls).toHaveLength(3)
+    expect(brokerClient.calls.map(({ expected, aborted }) => ({ expected, aborted }))).toEqual([
+      { expected: 'stopped', aborted: false },
+      { expected: 'stopped', aborted: false },
+      { expected: 'stopped', aborted: false }
+    ])
+    const outerRequestIds = brokerClient.calls.map((call) => call.outerRequestId)
+    expect(outerRequestIds).toEqual(outerRequestIds.map((requestId) =>
+      expect.stringMatching(uuidV4Pattern)
+    ))
+    expect(new Set(outerRequestIds)).toHaveLength(3)
     expect(JSON.stringify(authorizer)).not.toContain(token)
   })
 
+  it('never reuses an issuance proof after broker state changes', async () => {
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient)
+    const token = await authorizer.issue(restoreIssueContext)
+    const issuanceRequestId = brokerClient.calls[0]?.outerRequestId
+
+    brokerClient.result = {
+      ...validStoppedEvidence,
+      matched: false,
+      blockers: ['state_mismatch']
+    }
+    expect(await authorizer.validate(validationContext(token, 'prepare'))).toBe(false)
+    expect(brokerClient.calls).toHaveLength(2)
+    expect(brokerClient.calls[1]?.outerRequestId).not.toBe(issuanceRequestId)
+
+    brokerClient.result = validStoppedEvidence
+    expect(await authorizer.validate(validationContext(token, 'publish'))).toBe(true)
+    expect(new Set(brokerClient.calls.map((call) => call.outerRequestId))).toHaveLength(3)
+  })
+
   it('does not consume a token and binds restore grants to request and snapshot identity', async () => {
-    const runner = new FixtureRunner()
-    const authorizer = createAuthorizer(runner)
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient)
     const token = await authorizer.issue(restoreIssueContext)
 
     expect(await authorizer.validate(validationContext(token, 'prepare'))).toBe(true)
@@ -48,31 +72,51 @@ describe('Windows game configuration history stop-proof authorizer', () => {
     expect(await authorizer.validate({
       ...validationContext('A'.repeat(43), 'publish')
     })).toBe(false)
-    expect(runner.calls).toHaveLength(3)
+    expect(brokerClient.calls).toHaveLength(3)
   })
 
-  it('forwards the host mutation cancellation signal during validation', async () => {
-    const runner = new FixtureRunner()
-    const authorizer = createAuthorizer(runner)
+  it('forwards cancellation to broker verification and rejects an already-cancelled validation', async () => {
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient)
     const token = await authorizer.issue(restoreIssueContext)
     const controller = new AbortController()
 
     expect(await authorizer.validate(
       validationContext(token, 'publish'), controller.signal
     )).toBe(true)
-    expect(runner.signals.at(-1)).toBe(controller.signal)
+    expect(brokerClient.signals.at(-1)).toBe(controller.signal)
 
-    const callCount = runner.calls.length
+    const callCount = brokerClient.calls.length
     controller.abort('fixture-host-lease-lost')
     expect(await authorizer.validate(
       validationContext(token, 'publish'), controller.signal
     )).toBe(false)
-    expect(runner.calls).toHaveLength(callCount)
+    expect(brokerClient.calls).toHaveLength(callCount)
+  })
+
+  it('fails validation closed when cancellation occurs during broker verification', async () => {
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient)
+    const token = await authorizer.issue(restoreIssueContext)
+    const controller = new AbortController()
+    brokerClient.result = ({ signal }: VerifyInput) => {
+      controller.abort('fixture-cancelled-in-flight')
+      expect(signal).toBe(controller.signal)
+      throw new WindowsLifecycleBrokerClientError('WINDOWS_LIFECYCLE_BROKER_FAILED', {
+        brokerErrorCode: 'DYSON_CONTROL_LIFECYCLE_BROKER_CANCELLED'
+      })
+    }
+
+    expect(await authorizer.validate(
+      validationContext(token, 'publish'), controller.signal
+    )).toBe(false)
+    expect(brokerClient.calls).toHaveLength(2)
+    expect(brokerClient.calls[1]?.outerRequestId).not.toBe(brokerClient.calls[0]?.outerRequestId)
   })
 
   it('allows one reconcile grant to revalidate multiple bounded journal contexts', async () => {
-    const runner = new FixtureRunner()
-    const authorizer = createAuthorizer(runner)
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient)
     const token = await authorizer.issue({ operation: 'reconcile' })
 
     expect(await authorizer.validate(validationContext(token, 'reconcile'))).toBe(true)
@@ -82,13 +126,13 @@ describe('Windows game configuration history stop-proof authorizer', () => {
       snapshotId: otherSnapshotId
     })).toBe(true)
     expect(await authorizer.validate(validationContext(token, 'prepare'))).toBe(false)
-    expect(runner.calls).toHaveLength(3)
+    expect(brokerClient.calls).toHaveLength(3)
   })
 
   it('expires tokens at the TTL boundary and frees their bounded capacity', async () => {
-    const runner = new FixtureRunner()
+    const brokerClient = new FixtureLifecycleBrokerClient()
     let now = 10_000
-    const authorizer = createAuthorizer(runner, {
+    const authorizer = createAuthorizer(brokerClient, {
       tokenTtlMs: 1_000,
       maximumTokens: 1,
       now: () => now
@@ -101,24 +145,24 @@ describe('Windows game configuration history stop-proof authorizer', () => {
     expect(await authorizer.validate(validationContext(first, 'publish'))).toBe(false)
     const second = await authorizer.issue(restoreIssueContext)
     expect(second).not.toBe(first)
-    expect(runner.calls).toHaveLength(3)
+    expect(brokerClient.calls).toHaveLength(3)
   })
 
   it('rejects issuance at capacity without evicting a live grant', async () => {
-    const runner = new FixtureRunner()
-    const authorizer = createAuthorizer(runner, { maximumTokens: 1 })
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient, { maximumTokens: 1 })
     const first = await authorizer.issue(restoreIssueContext)
 
     await expect(authorizer.issue({ operation: 'reconcile' })).rejects.toMatchObject({
       code: 'WINDOWS_CONFIG_HISTORY_STOP_PROOF_CAPACITY_EXCEEDED'
     })
     expect(await authorizer.validate(validationContext(first, 'prepare'))).toBe(true)
-    expect(runner.calls).toHaveLength(2)
+    expect(brokerClient.calls).toHaveLength(2)
   })
 
   it('serializes concurrent issuance so capacity can never be exceeded', async () => {
-    const runner = new FixtureRunner()
-    const authorizer = createAuthorizer(runner, { maximumTokens: 1 })
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient, { maximumTokens: 1 })
     const results = await Promise.allSettled([
       authorizer.issue(restoreIssueContext),
       authorizer.issue({ operation: 'reconcile' })
@@ -130,19 +174,36 @@ describe('Windows game configuration history stop-proof authorizer', () => {
       status: 'rejected',
       reason: { code: 'WINDOWS_CONFIG_HISTORY_STOP_PROOF_CAPACITY_EXCEEDED' }
     })
-    expect(runner.calls).toHaveLength(1)
+    expect(brokerClient.calls).toHaveLength(1)
   })
 
   it.each([
-    'not-json',
-    JSON.stringify({ ...validStoppedReceipt, extra: 'unexpected' }),
-    JSON.stringify({ ...validStoppedReceipt, expected: 'running' }),
-    JSON.stringify({ ...validStoppedReceipt, state: 'unmatched' }),
-    JSON.stringify({ ...validStoppedReceipt, processVerified: false }),
-    JSON.stringify({ ...validStoppedReceipt, gamePortListening: true })
-  ])('fails issuance closed for an invalid runtime receipt', async (output) => {
-    const runner = new FixtureRunner(output)
-    const authorizer = createAuthorizer(runner)
+    null,
+    {},
+    { ...validStoppedEvidence, expected: 'running' },
+    { ...validStoppedEvidence, matched: false },
+    { ...validStoppedEvidence, blockers: ['state_mismatch'] },
+    {
+      ...validStoppedEvidence,
+      runtime: { ...validStoppedEvidence.runtime, lifecycleState: 'unknown_unverifiable' }
+    },
+    {
+      ...validStoppedEvidence,
+      runtime: {
+        ...validStoppedEvidence.runtime,
+        process: { ...validStoppedEvidence.runtime.process, status: 'unverifiable' }
+      }
+    },
+    {
+      ...validStoppedEvidence,
+      runtime: {
+        ...validStoppedEvidence.runtime,
+        port: { ...validStoppedEvidence.runtime.port, listenerCount: 1 }
+      }
+    }
+  ])('fails issuance closed for malformed or unmatched broker evidence: %o', async (evidence) => {
+    const brokerClient = new FixtureLifecycleBrokerClient(evidence)
+    const authorizer = createAuthorizer(brokerClient)
 
     await expect(authorizer.issue(restoreIssueContext)).rejects.toEqual(
       expect.objectContaining<Partial<WindowsConfigHistoryStopProofError>>({
@@ -151,13 +212,26 @@ describe('Windows game configuration history stop-proof authorizer', () => {
     )
   })
 
-  it('fails issuance and validation closed on runner errors without reflecting the token', async () => {
-    const runner = new FixtureRunner()
-    const authorizer = createAuthorizer(runner)
+  it('fails issuance and validation closed when the broker blocks the proof', async () => {
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient)
     const token = await authorizer.issue(restoreIssueContext)
-    runner.result = JSON.stringify({ ...validStoppedReceipt, gamePortListening: true })
+    brokerClient.result = new WindowsLifecycleBrokerClientError('WINDOWS_LIFECYCLE_BROKER_BLOCKED', {
+      blockers: ['state_mismatch']
+    })
+
     expect(await authorizer.validate(validationContext(token, 'publish'))).toBe(false)
-    runner.result = new Error(`fictional runner failed token=${token}`)
+    await expect(authorizer.issue({ operation: 'reconcile' })).rejects.toMatchObject({
+      code: 'WINDOWS_CONFIG_HISTORY_STOP_PROOF_RUNTIME_UNAVAILABLE',
+      message: 'WINDOWS_CONFIG_HISTORY_STOP_PROOF_RUNTIME_UNAVAILABLE'
+    })
+  })
+
+  it('fails issuance and validation closed on broker errors without reflecting the token', async () => {
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient)
+    const token = await authorizer.issue(restoreIssueContext)
+    brokerClient.result = new Error(`fictional broker failed token=${token}`)
 
     expect(await authorizer.validate(validationContext(token, 'publish'))).toBe(false)
     await expect(authorizer.issue({ operation: 'reconcile' })).rejects.toMatchObject({
@@ -168,13 +242,13 @@ describe('Windows game configuration history stop-proof authorizer', () => {
       await authorizer.issue({ operation: 'reconcile' })
     } catch (error) {
       expect(String(error)).not.toContain(token)
-      expect(String(error)).not.toContain('fictional runner failed')
+      expect(String(error)).not.toContain('fictional broker failed')
     }
   })
 
-  it('strictly rejects unknown issue and validation context fields before running PowerShell', async () => {
-    const runner = new FixtureRunner()
-    const authorizer = createAuthorizer(runner)
+  it('strictly rejects unknown issue and validation context fields before calling the broker', async () => {
+    const brokerClient = new FixtureLifecycleBrokerClient()
+    const authorizer = createAuthorizer(brokerClient)
     const sensitive = 'C:\\fictional-private\\fake-secret'
 
     for (const field of ['path', 'scriptName', 'command', 'url', 'stopProofToken']) {
@@ -190,32 +264,33 @@ describe('Windows game configuration history stop-proof authorizer', () => {
       ...validationContext('A'.repeat(43), 'prepare'),
       command: sensitive
     } as never)).toBe(false)
-    expect(runner.calls).toHaveLength(0)
+    expect(brokerClient.calls).toHaveLength(0)
   })
 
   it.each([
-    { projectRoot: 'relative-root' },
-    { gamePort: 0 },
+    { brokerClient: null },
+    { brokerClient: { verify: () => Promise.resolve(validStoppedEvidence) } },
     { tokenTtlMs: 999 },
     { tokenTtlMs: 300_001 },
     { maximumTokens: 0 },
     { maximumTokens: 257 },
+    { projectRoot: 'C:\\FictionalDysonProject' },
+    { gamePort: 8469 },
+    { runner: { run: () => Promise.resolve('{}') } },
     { unknown: 'C:\\fictional-private' }
-  ])('rejects invalid or expanded construction options: %o', (override) => {
+  ])('rejects invalid, legacy, or expanded construction options: %o', (override) => {
     expect(() => new WindowsConfigHistoryStopProofAuthorizer({
-      projectRoot,
-      gamePort: 8469,
-      runner: new FixtureRunner(),
+      brokerClient: new FixtureLifecycleBrokerClient(),
       ...override
-    })).toThrow(expect.objectContaining<Partial<WindowsConfigHistoryStopProofError>>({
+    } as never)).toThrow(expect.objectContaining<Partial<WindowsConfigHistoryStopProofError>>({
       code: 'WINDOWS_CONFIG_HISTORY_STOP_PROOF_OPTIONS_INVALID'
     }))
   })
 
   it('fails closed if the injected clock becomes invalid', async () => {
-    const runner = new FixtureRunner()
+    const brokerClient = new FixtureLifecycleBrokerClient()
     let now = 10_000
-    const authorizer = createAuthorizer(runner, { now: () => now })
+    const authorizer = createAuthorizer(brokerClient, { now: () => now })
     const token = await authorizer.issue(restoreIssueContext)
     now = Number.NaN
 
@@ -226,7 +301,7 @@ describe('Windows game configuration history stop-proof authorizer', () => {
   })
 })
 
-const projectRoot = 'C:\\FictionalDysonProject'
+const uuidV4Pattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const requestId = '11111111-1111-4111-8111-111111111111'
 const snapshotId = '22222222-2222-4222-8222-222222222222'
 const otherRequestId = '33333333-3333-4333-8333-333333333333'
@@ -241,13 +316,22 @@ const restoreIssueContext = {
   dryRun: false
 }
 
-const validStoppedReceipt = {
-  protocol: 'DYSON_CONTROL_RUNTIME_V1',
+type VerifyInput = Parameters<WindowsLifecycleBrokerClient['verify']>[0]
+type VerifyEvidence = Awaited<ReturnType<WindowsLifecycleBrokerClient['verify']>>
+
+const validStoppedEvidence = {
   expected: 'stopped',
-  state: 'matched',
-  processVerified: true,
-  gamePortListening: false
-} as const
+  matched: true,
+  blockers: [],
+  runtime: {
+    lifecycleState: 'stopped_verified',
+    session: { status: 'missing', id: null, count: 0 },
+    steam: { status: 'missing', pid: null, sessionId: null },
+    process: { status: 'absent', pid: null, owner: null, sessionId: null },
+    port: { port: 8469, listenerCount: 0 },
+    pidFile: { present: false, valid: false }
+  }
+} satisfies VerifyEvidence
 
 function validationContext(
   token: string,
@@ -257,42 +341,60 @@ function validationContext(
 }
 
 function createAuthorizer(
-  runner: LifecycleScriptRunner,
+  brokerClient: WindowsLifecycleBrokerClient,
   overrides: {
     tokenTtlMs?: number
     maximumTokens?: number
     now?: () => number
   } = {}
 ) {
-  return new WindowsConfigHistoryStopProofAuthorizer({
-    projectRoot,
-    gamePort: 8469,
-    runner,
-    ...overrides
-  })
+  return new WindowsConfigHistoryStopProofAuthorizer({ brokerClient, ...overrides })
 }
 
-class FixtureRunner implements LifecycleScriptRunner {
+type BrokerResult = unknown | Error | ((input: VerifyInput) => unknown | Promise<unknown>)
+
+class FixtureLifecycleBrokerClient implements WindowsLifecycleBrokerClient {
   readonly signals: AbortSignal[] = []
   readonly calls: Array<{
-    scriptName: LifecycleScriptName
-    scriptArguments: string[]
+    expected: 'running' | 'stopped'
+    outerRequestId: string
     aborted: boolean
   }> = []
-  result: string | Error
+  result: BrokerResult
 
-  constructor(result: string | Error = JSON.stringify(validStoppedReceipt)) {
+  constructor(result: BrokerResult = validStoppedEvidence) {
     this.result = result
   }
 
-  async run(
-    scriptName: LifecycleScriptName,
-    scriptArguments: string[],
-    signal: AbortSignal
-  ): Promise<string> {
-    this.signals.push(signal)
-    this.calls.push({ scriptName, scriptArguments: [...scriptArguments], aborted: signal.aborted })
-    if (this.result instanceof Error) throw this.result
-    return this.result
+  preflight(
+    _input: Parameters<WindowsLifecycleBrokerClient['preflight']>[0]
+  ): ReturnType<WindowsLifecycleBrokerClient['preflight']> {
+    throw new Error('unexpected preflight call')
+  }
+
+  dispatch(
+    _input: Parameters<WindowsLifecycleBrokerClient['dispatch']>[0]
+  ): ReturnType<WindowsLifecycleBrokerClient['dispatch']> {
+    throw new Error('unexpected dispatch call')
+  }
+
+  async verify(input: VerifyInput): Promise<VerifyEvidence> {
+    this.signals.push(input.signal)
+    this.calls.push({
+      expected: input.expected,
+      outerRequestId: input.outerRequestId,
+      aborted: input.signal.aborted
+    })
+    const result = typeof this.result === 'function'
+      ? await this.result(input)
+      : this.result
+    if (result instanceof Error) throw result
+    return result as VerifyEvidence
+  }
+
+  status(
+    _input: Parameters<WindowsLifecycleBrokerClient['status']>[0]
+  ): ReturnType<WindowsLifecycleBrokerClient['status']> {
+    throw new Error('unexpected status call')
   }
 }

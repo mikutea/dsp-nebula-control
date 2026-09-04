@@ -8,6 +8,10 @@ export const verifiedNebulaTag = 'v0.9.22' as const
 export const verifiedNebulaRuntimeFileVersion = '0.9.22.2' as const
 export const verifiedNebulaCommit = '3cdf95c594a2f8010b0e87a43be828e6ba2f657f' as const
 export const playerCapabilityVerificationScope = 'source-contract-only-runtime-unverified' as const
+export const playerCapabilityRuntimeVerifiedScope = 'runtime-assembly-identity-verified' as const
+export type PlayerCapabilityVerificationScope =
+  | typeof playerCapabilityVerificationScope
+  | typeof playerCapabilityRuntimeVerifiedScope
 
 export type PlayerCapabilityId =
   | 'observe-roster'
@@ -15,6 +19,8 @@ export type PlayerCapabilityId =
   | 'kick'
   | 'ban'
   | 'whitelist'
+  | 'blacklist'
+  | 'notice'
   | 'permission'
 
 export type PlayerCapabilityAvailability = 'available' | 'unavailable'
@@ -25,6 +31,9 @@ export type PlayerCapabilityReasonCode =
   | 'UPSTREAM_KICK_API_ABSENT'
   | 'UPSTREAM_BAN_API_ABSENT'
   | 'UPSTREAM_WHITELIST_API_ABSENT'
+  | 'UPSTREAM_BLACKLIST_API_ABSENT'
+  | 'UPSTREAM_TARGETED_NOTICE_PRIMITIVES_VERIFIED'
+  | 'NEBULA_NOTICE_RUNTIME_UNVERIFIED'
   | 'UPSTREAM_PERMISSION_API_ABSENT'
 
 export interface PlayerCapability {
@@ -40,10 +49,10 @@ export interface PlayerCapabilitySnapshot {
   verifiedUpstreamTag: typeof verifiedNebulaTag
   verifiedRuntimeFileVersion: typeof verifiedNebulaRuntimeFileVersion
   verifiedUpstreamCommit: typeof verifiedNebulaCommit
-  verificationScope: typeof playerCapabilityVerificationScope
+  verificationScope: PlayerCapabilityVerificationScope
   sessionId: string
   writtenAtUnixMs: number
-  actionsEnabled: false
+  actionsEnabled: boolean
   capabilities: PlayerCapability[]
   hmac: string
 }
@@ -80,12 +89,34 @@ export const verifiedPlayerCapabilities: readonly PlayerCapability[] = Object.fr
     verifiedReasonCode: 'UPSTREAM_WHITELIST_API_ABSENT'
   }),
   Object.freeze({
+    capability: 'blacklist',
+    availability: 'unavailable',
+    mode: 'mutation',
+    verifiedReasonCode: 'UPSTREAM_BLACKLIST_API_ABSENT'
+  }),
+  Object.freeze({
+    capability: 'notice',
+    availability: 'available',
+    mode: 'mutation',
+    verifiedReasonCode: 'UPSTREAM_TARGETED_NOTICE_PRIMITIVES_VERIFIED'
+  }),
+  Object.freeze({
     capability: 'permission',
     availability: 'unavailable',
     mode: 'mutation',
     verifiedReasonCode: 'UPSTREAM_PERMISSION_API_ABSENT'
   })
 ])
+
+export const unverifiedPlayerCapabilities: readonly PlayerCapability[] = Object.freeze(
+  verifiedPlayerCapabilities.map((entry) => Object.freeze(entry.capability === 'notice'
+    ? {
+        ...entry,
+        availability: 'unavailable' as const,
+        verifiedReasonCode: 'NEBULA_NOTICE_RUNTIME_UNVERIFIED' as const
+      }
+    : { ...entry }))
+)
 
 export const playerCapabilityReasonSummaries: Readonly<Record<PlayerCapabilityReasonCode, string>> =
   Object.freeze({
@@ -99,6 +130,12 @@ export const playerCapabilityReasonSummaries: Readonly<Record<PlayerCapabilityRe
       'Nebula v0.9.22 exposes no player-ban operation or persistence contract.',
     UPSTREAM_WHITELIST_API_ABSENT:
       'Nebula v0.9.22 exposes no player-whitelist operation or configuration contract.',
+    UPSTREAM_BLACKLIST_API_ABSENT:
+      'Nebula v0.9.22 exposes no player-blacklist operation or persistence contract.',
+    UPSTREAM_TARGETED_NOTICE_PRIMITIVES_VERIFIED:
+      'Nebula v0.9.22 exposes targeted packet dispatch and a system-message packet; delivery acknowledgement is unavailable.',
+    NEBULA_NOTICE_RUNTIME_UNVERIFIED:
+      'The running Nebula assembly identity has not matched the pinned v0.9.22 artifact; player notice remains disabled.',
     UPSTREAM_PERMISSION_API_ABSENT:
       'Nebula v0.9.22 exposes no per-player permission or role operation.'
   })
@@ -136,13 +173,17 @@ const base64UrlPattern = /^[A-Za-z0-9_-]{2,7000}$/
 type WireFields = Record<(typeof wireKeys)[number], string>
 
 export function buildPlayerCapabilitySnapshot(
-  input: { sessionId: string; writtenAtUnixMs: number },
+  input: { sessionId: string; writtenAtUnixMs: number; runtimeVerified: boolean },
   secret: string
 ): { snapshot: PlayerCapabilitySnapshot; payload: string } {
   const normalizedSecret = validateSecret(secret)
   const sessionId = normalizeSessionId(input.sessionId)
   const writtenAtUnixMs = requireSafePositiveInteger(input.writtenAtUnixMs)
-  const capabilities = cloneVerifiedCapabilities()
+  const runtimeVerified = input.runtimeVerified === true
+  const capabilities = cloneCapabilities(runtimeVerified)
+  const verificationScope = runtimeVerified
+    ? playerCapabilityRuntimeVerifiedScope
+    : playerCapabilityVerificationScope
   const capabilitiesJsonB64 = Buffer.from(canonicalizeCapabilities(capabilities), 'utf8').toString('base64url')
   const fields: WireFields = {
     protocol: playerCapabilityProtocol,
@@ -150,10 +191,10 @@ export function buildPlayerCapabilitySnapshot(
     verifiedUpstreamTag: verifiedNebulaTag,
     verifiedRuntimeFileVersion: verifiedNebulaRuntimeFileVersion,
     verifiedUpstreamCommit: verifiedNebulaCommit,
-    verificationScope: playerCapabilityVerificationScope,
+    verificationScope,
     sessionId,
     writtenAtUnixMs: String(writtenAtUnixMs),
-    actionsEnabled: 'false',
+    actionsEnabled: String(runtimeVerified),
     capabilitiesJsonB64,
     hmac: ''
   }
@@ -165,10 +206,10 @@ export function buildPlayerCapabilitySnapshot(
       verifiedUpstreamTag: verifiedNebulaTag,
       verifiedRuntimeFileVersion: verifiedNebulaRuntimeFileVersion,
       verifiedUpstreamCommit: verifiedNebulaCommit,
-      verificationScope: playerCapabilityVerificationScope,
+      verificationScope,
       sessionId,
       writtenAtUnixMs,
-      actionsEnabled: false,
+      actionsEnabled: runtimeVerified,
       capabilities,
       hmac: fields.hmac
     },
@@ -192,14 +233,20 @@ export function parsePlayerCapabilitySnapshot(payload: string, secret: string): 
     'PLAYER_CAPABILITY_UPSTREAM_INVALID'
   )
   requireLiteral(fields.verifiedUpstreamCommit, verifiedNebulaCommit, 'PLAYER_CAPABILITY_UPSTREAM_INVALID')
-  requireLiteral(
-    fields.verificationScope,
-    playerCapabilityVerificationScope,
-    'PLAYER_CAPABILITY_SCOPE_INVALID'
-  )
+  const actionsEnabled = parseActionsEnabled(fields.actionsEnabled)
+  const verificationScope = actionsEnabled
+    ? requireLiteral(
+        fields.verificationScope,
+        playerCapabilityRuntimeVerifiedScope,
+        'PLAYER_CAPABILITY_SCOPE_INVALID'
+      )
+    : requireLiteral(
+        fields.verificationScope,
+        playerCapabilityVerificationScope,
+        'PLAYER_CAPABILITY_SCOPE_INVALID'
+      )
   const sessionId = normalizeSessionId(fields.sessionId)
   const writtenAtUnixMs = parseSafePositiveInteger(fields.writtenAtUnixMs)
-  requireLiteral(fields.actionsEnabled, 'false', 'PLAYER_CAPABILITY_ACTIONS_INVALID')
   const capabilitiesJsonB64 = requirePattern(
     fields.capabilitiesJsonB64,
     base64UrlPattern,
@@ -221,7 +268,7 @@ export function parsePlayerCapabilitySnapshot(payload: string, secret: string): 
   } catch {
     throw new PlayerCapabilityError('PLAYER_CAPABILITY_LIST_INVALID')
   }
-  const capabilities = validateCapabilityList(decoded)
+  const capabilities = validateCapabilityList(decoded, actionsEnabled)
   if (canonicalizeCapabilities(capabilities) !== capabilitiesJson) {
     throw new PlayerCapabilityError('PLAYER_CAPABILITY_LIST_NONCANONICAL')
   }
@@ -232,10 +279,10 @@ export function parsePlayerCapabilitySnapshot(payload: string, secret: string): 
     verifiedUpstreamTag: verifiedNebulaTag,
     verifiedRuntimeFileVersion: verifiedNebulaRuntimeFileVersion,
     verifiedUpstreamCommit: verifiedNebulaCommit,
-    verificationScope: playerCapabilityVerificationScope,
+    verificationScope,
     sessionId,
     writtenAtUnixMs,
-    actionsEnabled: false,
+    actionsEnabled,
     capabilities,
     hmac
   }
@@ -250,7 +297,7 @@ export function findPlayerCapability(
   return { ...found }
 }
 
-function validateCapabilityList(value: unknown): PlayerCapability[] {
+function validateCapabilityList(value: unknown, runtimeVerified: boolean): PlayerCapability[] {
   if (!Array.isArray(value) || value.length !== verifiedPlayerCapabilities.length) {
     throw new PlayerCapabilityError('PLAYER_CAPABILITY_LIST_INVALID')
   }
@@ -263,7 +310,7 @@ function validateCapabilityList(value: unknown): PlayerCapability[] {
     if (keys.length !== capabilityKeys.length || capabilityKeys.some((key, keyIndex) => keys[keyIndex] !== key)) {
       throw new PlayerCapabilityError('PLAYER_CAPABILITY_LIST_INVALID')
     }
-    const expected = verifiedPlayerCapabilities[index]!
+    const expected = (runtimeVerified ? verifiedPlayerCapabilities : unverifiedPlayerCapabilities)[index]!
     if (record.capability !== expected.capability || record.availability !== expected.availability ||
         record.mode !== expected.mode || record.verifiedReasonCode !== expected.verifiedReasonCode) {
       throw new PlayerCapabilityError('PLAYER_CAPABILITY_DECLARATION_INVALID')
@@ -281,8 +328,9 @@ function canonicalizeCapabilities(capabilities: readonly PlayerCapability[]): st
   })))
 }
 
-function cloneVerifiedCapabilities(): PlayerCapability[] {
-  return verifiedPlayerCapabilities.map((entry) => ({ ...entry }))
+function cloneCapabilities(runtimeVerified: boolean): PlayerCapability[] {
+  return (runtimeVerified ? verifiedPlayerCapabilities : unverifiedPlayerCapabilities)
+    .map((entry) => ({ ...entry }))
 }
 
 function signWireFields(fields: WireFields, secret: string): string {
@@ -360,4 +408,10 @@ function requireLiteral<T extends string>(value: string, literal: T, code: strin
 function requirePattern(value: string, pattern: RegExp, code: string): string {
   if (!pattern.test(value)) throw new PlayerCapabilityError(code)
   return value
+}
+
+function parseActionsEnabled(value: string): boolean {
+  if (value === 'true') return true
+  if (value === 'false') return false
+  throw new PlayerCapabilityError('PLAYER_CAPABILITY_ACTIONS_INVALID')
 }

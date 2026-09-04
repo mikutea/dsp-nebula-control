@@ -57,9 +57,9 @@ export class DemoProvider implements StatusProvider {
         }
       },
       versions: {
-        dsp: '0.10.29.21902',
-        nebula: '0.9.22',
-        bepInEx: '5.4.17',
+        dsp: '0.10.34.28529',
+        nebula: '0.9.22.2',
+        bepInEx: '5.4.17.0',
         compatible: true,
         gameLoaded: true,
         warnings: []
@@ -95,6 +95,7 @@ export class DemoProvider implements StatusProvider {
     await new Promise((resolve) => setTimeout(resolve, 120))
     const needsStartTask = action === 'start' || action === 'restart'
     const needsStopTask = action === 'graceful-stop' || action === 'restart'
+    const needsSteamSession = action === 'start' || action === 'restart'
     const runningEvidence = action !== 'start'
     const checks: LifecycleCheck[] = [
       { id: 'project-root', status: 'pass', message: 'The fictional project root is available.' },
@@ -114,6 +115,9 @@ export class DemoProvider implements StatusProvider {
       { id: 'task-history', status: needsStopTask ? 'warning' : 'not-applicable', message: needsStopTask ? 'The demo keeps history as a visible warning.' : 'Task history is not used by this preview.' },
       { id: 'receipt-channel', status: needsStopTask || action === 'start' ? 'block' : 'not-applicable', message: needsStopTask || action === 'start' ? 'A durable lifecycle receipt is intentionally absent in the demo.' : 'A task receipt is not used by this preview.' },
       { id: 'save-trigger', status: action === 'start' ? 'not-applicable' : 'block', message: action === 'start' ? 'Starting a stopped server does not request an in-game save.' : 'A separately verifiable save acknowledgement is intentionally absent.' },
+      { id: 'interactive-session', status: 'pass', message: 'The fictional game account has one bounded interactive session.' },
+      { id: 'steam-session', status: needsSteamSession ? 'pass' : 'not-applicable', message: needsSteamSession ? 'The fictional Steam process is bound to the game session.' : 'This preview does not require a Steam start session.' },
+      { id: 'lifecycle-broker', status: 'block', message: 'The protected SYSTEM lifecycle broker is intentionally absent in demo mode.' },
       { id: 'execution-lock', status: 'block', message: 'Lifecycle execution is disabled; this endpoint is dry-run only.' }
     ]
     return {
@@ -123,6 +127,7 @@ export class DemoProvider implements StatusProvider {
         ...(action === 'start' ? ['server-already-running' as const, 'game-port-listening' as const] : []),
         ...(needsStopTask || action === 'start' ? ['receipt-channel-missing' as const] : []),
         ...(action === 'start' ? [] : ['save-trigger-unverified' as const]),
+        'lifecycle-broker-unavailable',
         'execution-disabled'
       ],
       rollback: action === 'start'

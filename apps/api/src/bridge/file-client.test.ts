@@ -9,6 +9,8 @@ import {
   BridgeProtocolError,
   buildBridgeHeartbeat,
   buildBridgeReceipt,
+  buildBridgeRuntimeSession,
+  buildBridgeSimulationTelemetry,
   computeBridgeSaveGenerationId,
   parseBridgeRequest
 } from './protocol.js'
@@ -278,6 +280,107 @@ describe('file bridge client', () => {
     await expect(client.probe()).rejects.toMatchObject({ code: 'BRIDGE_HEARTBEAT_STALE' })
   })
 
+  it('accepts fresh actual rates only when heartbeat, session, PID, and process generation all match', async () => {
+    const fixture = await createFixture()
+    const now = 1_788_081_010_000
+    vi.spyOn(Date, 'now').mockReturnValue(now)
+    await writeSimulationEvidence(fixture.controlRoot, {
+      now, sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+      processId: 4242, processStartedAtUnixMs: now - 120_000,
+      bridgeStartedAtUnixMs: now - 60_000, sequence: 7,
+      tickStarted: 1_000, tickFinished: 1_120, upsMilli: 59_875
+    })
+    const client = telemetryClient(fixture)
+
+    await expect(client.readSimulationTelemetry({
+      processId: 4242, processStartedAtUnixMs: now - 120_000
+    })).resolves.toMatchObject({
+      actualUps: 59.875,
+      actualTps: 60,
+      session: { sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff' },
+      telemetry: { sequence: 7, upsSource: 'fpscontroller-stopwatch', tpsSource: 'gamemain-tick-wallclock' }
+    })
+  })
+
+  it('rejects tampered, replayed, stale, and old-session telemetry', async () => {
+    const fixture = await createFixture()
+    const now = 1_788_081_010_000
+    vi.spyOn(Date, 'now').mockReturnValue(now)
+    const evidence = await writeSimulationEvidence(fixture.controlRoot, {
+      now, sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+      processId: 4242, processStartedAtUnixMs: now - 120_000,
+      bridgeStartedAtUnixMs: now - 60_000, sequence: 7,
+      tickStarted: 1_000, tickFinished: 1_120, upsMilli: 59_875
+    })
+    const expectation = { processId: 4242, processStartedAtUnixMs: now - 120_000 }
+
+    await writeFile(path.join(fixture.controlRoot, 'simulation-telemetry'),
+      evidence.telemetryPayload.replace('upsMilli=59875', 'upsMilli=59876'), 'utf8')
+    await expect(telemetryClient(fixture).readSimulationTelemetry(expectation))
+      .rejects.toMatchObject({ code: 'BRIDGE_SIGNATURE_INVALID' })
+
+    await writeFile(path.join(fixture.controlRoot, 'simulation-telemetry'), evidence.telemetryPayload, 'utf8')
+    const replayClient = telemetryClient(fixture)
+    await expect(replayClient.readSimulationTelemetry(expectation)).resolves.toMatchObject({ actualTps: 60 })
+    await expect(replayClient.readSimulationTelemetry(expectation))
+      .rejects.toMatchObject({ code: 'BRIDGE_TELEMETRY_REPLAY' })
+
+    await writeSimulationEvidence(fixture.controlRoot, {
+      now: now - 20_000, heartbeatWrittenAtUnixMs: now,
+      sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+      processId: 4242, processStartedAtUnixMs: now - 120_000,
+      bridgeStartedAtUnixMs: now - 60_000, sequence: 8,
+      tickStarted: 1_120, tickFinished: 1_240, upsMilli: 60_000
+    })
+    await expect(telemetryClient(fixture).readSimulationTelemetry(expectation))
+      .rejects.toMatchObject({ code: 'BRIDGE_TELEMETRY_STALE' })
+
+    const oldTelemetry = (await writeSimulationEvidence(fixture.controlRoot, {
+      now, sessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      processId: 4242, processStartedAtUnixMs: now - 120_000,
+      bridgeStartedAtUnixMs: now - 60_000, sequence: 9,
+      tickStarted: 1_240, tickFinished: 1_360, upsMilli: 60_000
+    })).telemetryPayload
+    await writeSimulationEvidence(fixture.controlRoot, {
+      now, sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+      processId: 4242, processStartedAtUnixMs: now - 120_000,
+      bridgeStartedAtUnixMs: now - 60_000, sequence: 10,
+      tickStarted: 1_360, tickFinished: 1_480, upsMilli: 60_000
+    })
+    await writeFile(path.join(fixture.controlRoot, 'simulation-telemetry'), oldTelemetry, 'utf8')
+    await expect(telemetryClient(fixture).readSimulationTelemetry(expectation))
+      .rejects.toMatchObject({ code: 'BRIDGE_TELEMETRY_IDENTITY_MISMATCH' })
+  })
+
+  it('rejects PID/start mismatches and accepts a fresh process restart only under its new generation', async () => {
+    const fixture = await createFixture()
+    const now = 1_788_081_010_000
+    vi.spyOn(Date, 'now').mockReturnValue(now)
+    await writeSimulationEvidence(fixture.controlRoot, {
+      now, sessionId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+      processId: 4242, processStartedAtUnixMs: now - 120_000,
+      bridgeStartedAtUnixMs: now - 60_000, sequence: 1,
+      tickStarted: 1_000, tickFinished: 1_120, upsMilli: 60_000
+    })
+    const client = telemetryClient(fixture)
+    await expect(client.readSimulationTelemetry({ processId: 4243, processStartedAtUnixMs: now - 120_000 }))
+      .rejects.toMatchObject({ code: 'BRIDGE_RUNTIME_IDENTITY_MISMATCH' })
+    await expect(client.readSimulationTelemetry({ processId: 4242, processStartedAtUnixMs: now - 119_999 }))
+      .rejects.toMatchObject({ code: 'BRIDGE_RUNTIME_IDENTITY_MISMATCH' })
+
+    const restartedAt = now - 10_000
+    await writeSimulationEvidence(fixture.controlRoot, {
+      now, sessionId: 'cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa',
+      processId: 4242, processStartedAtUnixMs: restartedAt,
+      bridgeStartedAtUnixMs: now - 8_000, sequence: 1,
+      tickStarted: 10, tickFinished: 130, upsMilli: 60_000
+    })
+    await expect(client.readSimulationTelemetry({ processId: 4242, processStartedAtUnixMs: now - 120_000 }))
+      .rejects.toMatchObject({ code: 'BRIDGE_RUNTIME_IDENTITY_MISMATCH' })
+    await expect(client.readSimulationTelemetry({ processId: 4242, processStartedAtUnixMs: restartedAt }))
+      .resolves.toMatchObject({ telemetry: { sequence: 1 }, actualTps: 60 })
+  })
+
   it('stops polling a save receipt when its lifecycle phase is aborted', async () => {
     const fixture = await createFixture()
     const client = new FileBridgeClient({
@@ -307,6 +410,67 @@ async function createFixture(): Promise<{ controlRoot: string; secretFile: strin
   const secretFile = path.join(root, 'bridge.secret')
   await writeFile(secretFile, `${secret}\n`, 'utf8')
   return { controlRoot, secretFile }
+}
+
+function telemetryClient(fixture: { controlRoot: string; secretFile: string }): FileBridgeClient {
+  return new FileBridgeClient({
+    controlRoot: fixture.controlRoot,
+    secretFile: fixture.secretFile,
+    timeoutMs: 1_000,
+    heartbeatMaxAgeMs: 10_000,
+    telemetryMaxAgeMs: 10_000
+  })
+}
+
+async function writeSimulationEvidence(controlRoot: string, options: {
+  now: number
+  sessionId: string
+  processId: number
+  processStartedAtUnixMs: number
+  bridgeStartedAtUnixMs: number
+  sequence: number
+  tickStarted: number
+  tickFinished: number
+  upsMilli: number
+  heartbeatWrittenAtUnixMs?: number
+}): Promise<{ sessionPayload: string; telemetryPayload: string }> {
+  const session = buildBridgeRuntimeSession({
+    sessionId: options.sessionId,
+    pluginVersion: '0.1.0',
+    processId: options.processId,
+    processStartedAtUnixMs: options.processStartedAtUnixMs,
+    bridgeStartedAtUnixMs: options.bridgeStartedAtUnixMs,
+    issuedAtUnixMs: options.bridgeStartedAtUnixMs
+  }, secret)
+  const heartbeat = buildBridgeHeartbeat({
+    pluginVersion: '0.1.0',
+    processId: options.processId,
+    startedAtUnixMs: options.bridgeStartedAtUnixMs,
+    writtenAtUnixMs: options.heartbeatWrittenAtUnixMs ?? options.now
+  }, secret)
+  const windowDurationMs = 2_000
+  const tpsMilli = Math.round((options.tickFinished - options.tickStarted) * 1_000_000 / windowDurationMs)
+  const telemetry = buildBridgeSimulationTelemetry({
+    sessionId: options.sessionId,
+    processId: options.processId,
+    processStartedAtUnixMs: options.processStartedAtUnixMs,
+    bridgeStartedAtUnixMs: options.bridgeStartedAtUnixMs,
+    sequence: options.sequence,
+    sampleStartedAtUnixMs: options.now - windowDurationMs,
+    sampleFinishedAtUnixMs: options.now,
+    writtenAtUnixMs: options.now,
+    windowDurationMs,
+    tickStarted: options.tickStarted,
+    tickFinished: options.tickFinished,
+    upsMilli: options.upsMilli,
+    tpsMilli
+  }, secret)
+  await Promise.all([
+    writeFile(path.join(controlRoot, 'heartbeat'), heartbeat.payload, 'utf8'),
+    writeFile(path.join(controlRoot, 'runtime-session'), session.payload, 'utf8'),
+    writeFile(path.join(controlRoot, 'simulation-telemetry'), telemetry.payload, 'utf8')
+  ])
+  return { sessionPayload: session.payload, telemetryPayload: telemetry.payload }
 }
 
 async function waitForRequest(controlRoot: string): Promise<string> {

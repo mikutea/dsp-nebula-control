@@ -4,8 +4,29 @@ import path from 'node:path'
 import test from 'node:test'
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..', '..')
+const ciWorkflowPath = path.join(repositoryRoot, '.github', 'workflows', 'ci.yml')
 const workflowPath = path.join(repositoryRoot, '.github', 'workflows', 'release.yml')
+const ciWorkflow = await readFile(ciWorkflowPath, 'utf8')
 const workflow = await readFile(workflowPath, 'utf8')
+
+test('CI is bounded, read-only, and runs the complete gate on Node 24 and Windows PowerShell 5.1', () => {
+  assert.match(ciWorkflow, /^permissions:\r?\n  contents: read\r?$/m)
+  assert.doesNotMatch(ciWorkflow, /^\s{2}[a-z-]+: write\s*$/m)
+  assert.match(ciWorkflow, /runs-on: windows-latest/)
+  assert.match(ciWorkflow, /timeout-minutes: 90/)
+  assert.ok(ciWorkflow.includes('group: ci-${{ github.workflow }}-${{ github.ref }}'))
+  assert.match(ciWorkflow, /cancel-in-progress: true/)
+  assert.match(ciWorkflow, /actions\/checkout@[0-9a-f]{40} # v5/)
+  assert.match(ciWorkflow, /actions\/setup-node@[0-9a-f]{40} # v6/)
+  assert.match(ciWorkflow, /node-version: 24/)
+  assert.match(ciWorkflow, /powershell\.exe[\s\S]*?\^5\\\.1\\\./)
+  for (const command of [
+    'npm ci',
+    'npm ci --prefix apps/api',
+    'npm ci --prefix apps/web',
+    'npm run check'
+  ]) assert.ok(ciWorkflow.includes(command), `missing CI gate: ${command}`)
+})
 
 test('release workflow is tag-only with a strict in-job canonical gate', () => {
   assert.match(workflow, /^on:\r?\n  push:\r?\n    tags:\r?\n      - 'v\[0-9\]\*\.\[0-9\]\*\.\[0-9\]\*'/m)

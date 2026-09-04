@@ -54,7 +54,10 @@
       "state": "implemented",
       "evidence": [
         { "kind": "contract", "ref": "docs/SECURITY.md" },
-        { "kind": "automated-test", "ref": "apps/api/src/providers/windows.test.ts" }
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows.test.ts" },
+        { "kind": "implementation", "ref": "scripts/public-release/scanner.mjs" },
+        { "kind": "automated-test", "ref": "scripts/public-release/scanner.test.mjs" },
+        { "kind": "automated-test", "ref": "apps/api/src/security/authorization.test.ts" }
       ]
     },
     {
@@ -65,7 +68,9 @@
       "criterion": "Lifecycle actions require a live PID whose executable exactly matches the configured DSP installation and managed PID record.",
       "state": "implemented",
       "evidence": [
-        { "kind": "implementation", "ref": "scripts/windows/Get-DysonLifecyclePreflight.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/lifecycle-broker/DysonLifecycleBroker.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/lifecycle-broker/Invoke-DysonLifecycleBrokerWorker.ps1" },
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-lifecycle-broker.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/providers/windows.test.ts" }
       ]
     },
@@ -74,11 +79,13 @@
       "area": "lifecycle",
       "priority": "P0",
       "title": "Lifecycle preview fails closed",
-      "criterion": "Save, graceful-stop, and restart previews are authenticated, strict, audited, non-mutating, and forced to execution-disabled at the provider boundary.",
+      "criterion": "Save, graceful-stop, restart, and start previews are authenticated, strict, audited, non-mutating, and fail closed unless fresh SYSTEM-broker evidence plus the durable execution lock satisfy the exact action.",
       "state": "implemented",
       "evidence": [
         { "kind": "automated-test", "ref": "apps/api/src/app.test.ts" },
-        { "kind": "automated-test", "ref": "apps/api/src/providers/windows.test.ts" }
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows-lifecycle.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-lifecycle.test.ts" },
+        { "kind": "automated-test", "ref": "apps/web/src/lifecycle-workspace.test.tsx" }
       ]
     },
     {
@@ -91,8 +98,10 @@
       "evidence": [
         { "kind": "implementation", "ref": "apps/api/src/services/lifecycle-service.ts" },
         { "kind": "implementation", "ref": "apps/api/src/storage/database.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/host-mutation/lifecycle-coordinator.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/services/lifecycle-service.test.ts" },
-        { "kind": "api-test", "ref": "apps/api/src/app.test.ts" }
+        { "kind": "api-test", "ref": "apps/api/src/app.test.ts" },
+        { "kind": "host-script-test", "ref": "scripts/windows/SelfTest-DysonHostMutationLease.ps1" }
       ]
     },
     {
@@ -133,9 +142,11 @@
       "evidence": [
         { "kind": "implementation", "ref": "apps/api/src/providers/windows-lifecycle.ts" },
         { "kind": "implementation", "ref": "scripts/windows/Stop-DysonServer.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/Invoke-DysonScheduledTask.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/lifecycle-broker/Submit-DysonLifecycleBrokerRequest.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/lifecycle-broker/Invoke-DysonLifecycleBrokerWorker.ps1" },
         { "kind": "automated-test", "ref": "apps/api/src/services/lifecycle-service.test.ts" },
-        { "kind": "host-script-test", "ref": "apps/api/src/providers/windows-lifecycle-scripts.test.ts" }
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-lifecycle-broker.test.ts" },
+        { "kind": "host-script-test", "ref": "scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1" }
       ]
     },
     {
@@ -149,8 +160,10 @@
         { "kind": "implementation", "ref": "apps/api/src/services/lifecycle-service.ts" },
         { "kind": "implementation", "ref": "apps/api/src/providers/windows-lifecycle.ts" },
         { "kind": "implementation", "ref": "scripts/windows/Start-DysonServer.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/lifecycle-broker/Invoke-DysonLifecycleBrokerWorker.ps1" },
         { "kind": "automated-test", "ref": "apps/api/src/services/lifecycle-service.test.ts" },
-        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-lifecycle.test.ts" }
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-lifecycle.test.ts" },
+        { "kind": "host-script-test", "ref": "scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1" }
       ]
     },
     {
@@ -162,7 +175,9 @@
       "state": "implemented",
       "evidence": [
         { "kind": "implementation", "ref": "apps/api/src/storage/database.ts" },
-        { "kind": "automated-test", "ref": "apps/api/src/services/lifecycle-service.test.ts" }
+        { "kind": "implementation", "ref": "scripts/windows/lifecycle-broker/Invoke-DysonLifecycleBrokerWorker.ps1" },
+        { "kind": "automated-test", "ref": "apps/api/src/services/lifecycle-service.test.ts" },
+        { "kind": "host-script-test", "ref": "scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1" }
       ]
     },
     {
@@ -235,6 +250,9 @@
       "evidence": [
         { "kind": "implementation", "ref": "apps/api/src/saves/transactions.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/saves/transactions.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/saves/transfer.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/saves/transfer.test.ts" },
+        { "kind": "api-test", "ref": "apps/api/src/save-promotion-routes.test.ts" },
         { "kind": "api-test", "ref": "apps/api/src/save-routes.test.ts" },
         { "kind": "implementation", "ref": "apps/web/src/App.tsx" },
         { "kind": "contract", "ref": "docs/SAVES.md" }
@@ -247,7 +265,14 @@
       "title": "Production restore drill",
       "criterion": "A real Dyson backup is restored and loaded successfully in a controlled drill with evidence retained outside the public repository.",
       "state": "not-started",
-      "evidence": []
+      "evidence": [
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.PairedSaveLoad.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/New-DysonQualificationPairedSaveLoadObservationV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Test-DysonQualificationPairedSaveLoadObservationV2.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonQualificationPairedSaveLoadObservationV2.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonQualificationPairedSaveLoadRecordV2.ps1" },
+        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
+      ]
     },
     {
       "id": "UPD-001",
@@ -257,6 +282,8 @@
       "criterion": "Installed versions and compatibility signals are discovered without exposing raw logs or paths.",
       "state": "implemented",
       "evidence": [
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows.ts" },
+        { "kind": "implementation", "ref": "scripts/windows/Get-DysonStatus.ps1" },
         { "kind": "automated-test", "ref": "apps/api/src/providers/windows.test.ts" }
       ]
     },
@@ -274,6 +301,8 @@
         { "kind": "automated-test", "ref": "apps/api/src/update-pipeline/discovery.test.ts" },
         { "kind": "implementation", "ref": "apps/api/src/update-pipeline/bepinex-discovery.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/update-pipeline/bepinex-discovery.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows-runtime-compatibility.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-runtime-compatibility.test.ts" },
         { "kind": "api-test", "ref": "apps/api/src/planning-routes.test.ts" },
         { "kind": "contract", "ref": "docs/UPDATES-CLIENTS.md" }
       ]
@@ -283,7 +312,7 @@
       "area": "updates",
       "priority": "P0",
       "title": "Staged transactional update",
-      "criterion": "Update downloads are verified, staged outside the active tree, protected by a fresh backup, activated atomically, and followed by health checks.",
+      "criterion": "Verified component downloads are staged outside the active tree, protected by a fresh backup, activated atomically, and followed by health checks; the separate DSP path is a default-off official Steam-client handoff that accepts completion only after exact version, compatibility, and current-generation exact-save load proof.",
       "state": "implemented",
       "evidence": [
         { "kind": "implementation", "ref": "apps/api/src/update-pipeline/acquisition.ts" },
@@ -302,18 +331,34 @@
         { "kind": "implementation", "ref": "apps/api/src/update-pipeline/bepinex-layout.ts" },
         { "kind": "implementation", "ref": "apps/api/src/update-pipeline/nebula-layout.ts" },
         { "kind": "implementation", "ref": "apps/api/src/update-pipeline/activation-http.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/update-pipeline/steam-manual-handoff.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/update-pipeline/steam-manual-handoff-http.ts" },
         { "kind": "implementation", "ref": "apps/api/src/providers/windows-update-activation.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/providers/windows-update-activation.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows-update-transaction-provider.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-update-transaction-provider.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows-update-runtime-evidence.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-update-runtime-evidence.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows-runtime-compatibility.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-runtime-compatibility.test.ts" },
+        { "kind": "implementation", "ref": "integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.cs" },
+        { "kind": "cross-runtime-test", "ref": "integrations/dyson-control-bridge/protocol-tests/Program.cs" },
+        { "kind": "automated-test", "ref": "apps/api/src/windows-update-production-assembly.test.ts" },
         { "kind": "implementation", "ref": "apps/api/src/providers/windows-managed-plugin-version.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/providers/windows-managed-plugin-version.test.ts" },
         { "kind": "implementation", "ref": "scripts/windows/Get-DysonManagedPluginVersion.ps1" },
         { "kind": "automated-test", "ref": "apps/api/src/providers/windows-managed-plugin-version-scripts.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/config.ts" },
         { "kind": "implementation", "ref": "apps/api/src/app.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/update-pipeline/activation.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/update-pipeline/activation-live.test.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/update-pipeline/steam-manual-handoff.test.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/update-pipeline/steam-manual-handoff-http.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/update-pipeline/bepinex-layout.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/update-pipeline/nebula-layout.test.ts" },
         { "kind": "api-test", "ref": "apps/api/src/update-activation-routes.test.ts" },
+        { "kind": "api-test", "ref": "apps/api/src/steam-manual-handoff-routes.test.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/config.test.ts" },
         { "kind": "implementation", "ref": "apps/web/src/VersionUpdateWorkspace.tsx" },
         { "kind": "implementation", "ref": "apps/web/src/api.ts" },
         { "kind": "implementation", "ref": "apps/web/src/model.ts" },
@@ -330,15 +375,26 @@
       "area": "updates",
       "priority": "P0",
       "title": "Update rollback and smoke test",
-      "criterion": "A failed update restores binaries, configuration, mod lock, and paired save, then proves the previous version can start and load.",
+      "criterion": "A failed update independently restores and re-reads component bytes, configuration, server mod lock, and paired save, then starts the previous component and proves the exact previous save loaded in the current generation; all five receipt surfaces must verify or recovery remains required.",
       "state": "implemented",
       "evidence": [
         { "kind": "implementation", "ref": "apps/api/src/updates/plan.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/updates/plan.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/update-pipeline/activation-types.ts" },
         { "kind": "implementation", "ref": "apps/api/src/update-pipeline/activation.ts" },
         { "kind": "implementation", "ref": "apps/api/src/update-pipeline/activation-live.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/update-pipeline/activation-http.ts" },
         { "kind": "implementation", "ref": "apps/api/src/providers/windows-update-activation.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/providers/windows-update-activation.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows-update-transaction-provider.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-update-transaction-provider.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows-update-runtime-evidence.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-update-runtime-evidence.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows-runtime-compatibility.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/providers/windows-runtime-compatibility.test.ts" },
+        { "kind": "implementation", "ref": "integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.cs" },
+        { "kind": "cross-runtime-test", "ref": "integrations/dyson-control-bridge/protocol-tests/Program.cs" },
+        { "kind": "automated-test", "ref": "apps/api/src/windows-update-production-assembly.test.ts" },
         { "kind": "implementation", "ref": "apps/api/src/providers/windows-managed-plugin-version.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/providers/windows-managed-plugin-version.test.ts" },
         { "kind": "implementation", "ref": "scripts/windows/Get-DysonManagedPluginVersion.ps1" },
@@ -348,6 +404,7 @@
         { "kind": "automated-test", "ref": "apps/api/src/update-pipeline/activation-live.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/update-pipeline/activation-http.test.ts" },
         { "kind": "api-test", "ref": "apps/api/src/update-activation-routes.test.ts" },
+        { "kind": "implementation", "ref": "apps/web/src/VersionUpdateWorkspace.tsx" },
         { "kind": "automated-test", "ref": "apps/web/src/update-activation-workspace.test.tsx" },
         { "kind": "contract", "ref": "docs/UPDATES-CLIENTS.md" }
       ]
@@ -387,7 +444,13 @@
         { "kind": "automated-test", "ref": "apps/api/src/mods/verified-lock.test.ts" },
         { "kind": "api-test", "ref": "apps/api/src/verified-mod-lock-routes.test.ts" },
         { "kind": "api-test", "ref": "apps/api/src/mod-deployment-routes.test.ts" },
-        { "kind": "automated-test", "ref": "apps/web/src/mod-workspace.test.tsx" }
+        { "kind": "implementation", "ref": "apps/api/src/mods/configuration.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/mods/configuration.test.ts" },
+        { "kind": "api-test", "ref": "apps/api/src/mod-configuration-routes.test.ts" },
+        { "kind": "implementation", "ref": "apps/web/src/App.tsx" },
+        { "kind": "automated-test", "ref": "apps/web/src/mod-workspace.test.tsx" },
+        { "kind": "automated-test", "ref": "apps/web/src/mod-configuration-api.test.ts" },
+        { "kind": "contract", "ref": "docs/CONFIGURATION.md" }
       ]
     },
     {
@@ -417,6 +480,16 @@
         { "kind": "implementation", "ref": "apps/api/src/client-profile/zip.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/client-profile/generator.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/client-profile/zip.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/client-profile/qualification-v2.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/client-profile/qualification-store.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/client-profile/qualified-generator.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/client-profile/issued-profile-store.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows-hostname-wss-qualification.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/client-profile/qualification-v2.test.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/client-profile/qualification-store.test.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/client-profile/qualified-generator.test.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/qualified-client-production-assembly.test.ts" },
+        { "kind": "contract", "ref": "scripts/windows/network/dyson-nebula-hostname-wss-qualification-v1.schema.json" },
         { "kind": "api-test", "ref": "apps/api/src/client-profile-routes.test.ts" },
         { "kind": "automated-test", "ref": "apps/web/src/client-package-workspace.test.tsx" },
         { "kind": "api-test", "ref": "apps/api/src/planning-routes.test.ts" },
@@ -450,12 +523,26 @@
       "criterion": "Whitelist, blacklist, permission, notice, kick, and ban actions exist only where supported and are role-gated, confirmed, and audited.",
       "state": "implemented",
       "evidence": [
+        { "kind": "implementation", "ref": "integrations/dyson-control-bridge/NebulaNoticeRuntimeCompatibility.cs" },
+        { "kind": "implementation", "ref": "integrations/dyson-control-bridge/PlayerNoticeProtocol.cs" },
+        { "kind": "implementation", "ref": "integrations/dyson-control-bridge/PlayerRosterPublisher.cs" },
+        { "kind": "cross-runtime-test", "ref": "integrations/dyson-control-bridge/protocol-tests/Program.cs" },
         { "kind": "implementation", "ref": "apps/api/src/players/capabilities.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/players/capabilities.test.ts" },
         { "kind": "implementation", "ref": "apps/api/src/players/capability-source.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/players/capability-source.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/players/notice.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/players/notice.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/app.ts" },
         { "kind": "api-test", "ref": "apps/api/src/player-routes.test.ts" },
-        { "kind": "automated-test", "ref": "apps/web/src/role-console-player.test.tsx" }
+        { "kind": "implementation", "ref": "apps/web/src/PlayerNoticeWorkspace.tsx" },
+        { "kind": "implementation", "ref": "apps/web/src/player-notice-contract.ts" },
+        { "kind": "implementation", "ref": "apps/web/src/api.ts" },
+        { "kind": "automated-test", "ref": "apps/web/src/player-notice-contract.test.ts" },
+        { "kind": "automated-test", "ref": "apps/web/src/player-notice-api.test.ts" },
+        { "kind": "automated-test", "ref": "apps/web/src/player-notice-workspace.test.tsx" },
+        { "kind": "automated-test", "ref": "apps/web/src/role-console-player.test.tsx" },
+        { "kind": "contract", "ref": "docs/CONSOLE-PLAYERS.md" }
       ]
     },
     {
@@ -539,6 +626,12 @@
         { "kind": "api-test", "ref": "apps/api/src/game-config/history-routes.test.ts" },
         { "kind": "api-test", "ref": "apps/api/src/game-config-history-app-routes.test.ts" },
         { "kind": "api-test", "ref": "apps/api/src/workspace-routes.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/mods/configuration.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/mods/configuration.test.ts" },
+        { "kind": "api-test", "ref": "apps/api/src/mod-configuration-routes.test.ts" },
+        { "kind": "implementation", "ref": "apps/web/src/App.tsx" },
+        { "kind": "automated-test", "ref": "apps/web/src/mod-workspace.test.tsx" },
+        { "kind": "automated-test", "ref": "apps/web/src/mod-configuration-api.test.ts" },
         { "kind": "contract", "ref": "docs/CONFIGURATION.md" }
       ]
     },
@@ -573,6 +666,9 @@
       "criterion": "CPU, processor groups, memory, process, task, storage, port, version, and save health are exposed as bounded validated summaries.",
       "state": "implemented",
       "evidence": [
+        { "kind": "implementation", "ref": "apps/api/src/providers/windows.ts" },
+        { "kind": "implementation", "ref": "scripts/windows/Get-DysonStatus.ps1" },
+        { "kind": "implementation", "ref": "apps/api/src/observability/server-status.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/providers/windows.test.ts" }
       ]
     },
@@ -585,14 +681,28 @@
       "state": "implemented",
       "evidence": [
         { "kind": "implementation", "ref": "scripts/windows/deployment/Install-DysonControlTask.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/lifecycle-broker/Install-DysonLifecycleBrokerTask.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/Install-DysonRuntimeTasks.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/bootstrap/Start-DysonServer.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/bootstrap/Stop-DysonServer.ps1" },
+        { "kind": "implementation", "ref": "apps/api/src/lifecycle/game-runtime-receipts.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/lifecycle/game-runtime-receipts.test.ts" },
+        { "kind": "api-test", "ref": "apps/api/src/game-runtime-receipt-routes.test.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/app.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/security/authorization.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/security/authorization.test.ts" },
         { "kind": "implementation", "ref": "scripts/windows/session/Configure-DysonInteractiveSession.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/session/Disable-DysonInteractiveSession.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/deployment/DysonRebootAcceptance.Common.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/deployment/New-DysonRebootAcceptanceCheckpoint.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/deployment/Test-DysonRebootAcceptanceResume.ps1" },
         { "kind": "self-test", "ref": "scripts/windows/session/SelfTest-DysonInteractiveSession.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/SelfTest-DysonRuntimeTasks.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1" },
         { "kind": "self-test", "ref": "scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/deployment/SelfTest-DysonControlDeploymentStatus.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1" },
         { "kind": "self-test", "ref": "scripts/windows/deployment/SelfTest-DysonRebootAcceptance.ps1" },
         { "kind": "contract", "ref": "docs/WINDOWS-DEPLOYMENT-DRAFT.md" }
       ]
@@ -602,16 +712,27 @@
       "area": "server",
       "priority": "P1",
       "title": "Monitoring, alerting, and capacity history",
-      "criterion": "Health, CPU, memory, disk, network, UPS, save latency, backup latency, failures, and recovery attempts have retained metrics and actionable alerts.",
+      "criterion": "Health, CPU, memory, disk, network, actual simulation UPS/TPS, save latency, backup latency, failures, and recovery attempts have retained metrics and actionable alerts.",
       "state": "implemented",
       "evidence": [
         { "kind": "implementation", "ref": "apps/api/src/observability/snapshot.ts" },
         { "kind": "implementation", "ref": "apps/api/src/observability/history.ts" },
         { "kind": "implementation", "ref": "apps/api/src/observability/persistent-history.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/observability/long-window.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/observability/latency.ts" },
         { "kind": "implementation", "ref": "apps/api/src/observability/alerts.ts" },
         { "kind": "implementation", "ref": "apps/api/src/observability/persistent-alerts.ts" },
         { "kind": "implementation", "ref": "apps/api/src/storage/database.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/observability/windows-bridge.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/app.ts" },
+        { "kind": "implementation", "ref": "integrations/dyson-control-bridge/SimulationTelemetrySampler.cs" },
+        { "kind": "implementation", "ref": "scripts/windows/bridge/DysonBridge.Telemetry.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/bridge/Get-DysonBridgeSimulationTelemetry.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/bridge/SelfTest-DysonBridgeSimulationTelemetry.ps1" },
+        { "kind": "automated-test", "ref": "apps/api/src/observability/windows-bridge.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/observability/persistent-history.test.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/observability/long-window.test.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/observability/latency.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/observability/alerts.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/observability/persistent-alerts.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/storage/database.test.ts" },
@@ -620,6 +741,10 @@
         { "kind": "automated-test", "ref": "apps/web/src/observability-alert-api.test.ts" },
         { "kind": "automated-test", "ref": "apps/web/src/observability-alert-panel.test.tsx" },
         { "kind": "automated-test", "ref": "apps/web/src/observability-workspace.test.tsx" },
+        { "kind": "implementation", "ref": "apps/web/src/api.ts" },
+        { "kind": "implementation", "ref": "apps/web/src/ObservabilityQualificationPanel.tsx" },
+        { "kind": "automated-test", "ref": "apps/web/src/observability-qualification-api.test.ts" },
+        { "kind": "automated-test", "ref": "apps/web/src/observability-qualification-workspace.test.tsx" },
         { "kind": "contract", "ref": "docs/PERFORMANCE.md" }
       ]
     },
@@ -628,12 +753,26 @@
       "area": "server",
       "priority": "P0",
       "title": "Performance and stability qualification",
-      "criterion": "Representative late-game saves pass documented UPS, save-latency, memory, disk, reboot, crash, and extended soak thresholds on the production VM.",
+      "criterion": "Representative late-game saves pass documented actual Bridge UPS/TPS, save-latency, memory, disk, reboot, crash, and extended soak thresholds on the production VM.",
       "state": "implemented",
       "evidence": [
+        { "kind": "implementation", "ref": "integrations/dyson-control-bridge/SimulationTelemetrySampler.cs" },
+        { "kind": "implementation", "ref": "scripts/windows/bridge/DysonBridge.Telemetry.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/bridge/Get-DysonBridgeSimulationTelemetry.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/bridge/SelfTest-DysonBridgeSimulationTelemetry.ps1" },
+        { "kind": "implementation", "ref": "apps/api/src/observability/windows-bridge.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/app.ts" },
         { "kind": "implementation", "ref": "apps/api/src/observability/qualification.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/observability/long-window.ts" },
+        { "kind": "implementation", "ref": "apps/api/src/observability/latency.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/observability/windows-bridge.test.ts" },
         { "kind": "automated-test", "ref": "apps/api/src/observability/qualification.test.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/observability/long-window.test.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/observability/latency.test.ts" },
         { "kind": "api-test", "ref": "apps/api/src/observability/routes.test.ts" },
+        { "kind": "implementation", "ref": "apps/web/src/ObservabilityQualificationPanel.tsx" },
+        { "kind": "automated-test", "ref": "apps/web/src/observability-qualification-api.test.ts" },
+        { "kind": "automated-test", "ref": "apps/web/src/observability-qualification-workspace.test.tsx" },
         { "kind": "contract", "ref": "docs/PERFORMANCE.md" }
       ]
     },
@@ -645,17 +784,30 @@
       "criterion": "A clean supported Windows host can install, upgrade, migrate, roll back, and uninstall without production-specific paths or credentials.",
       "state": "implemented",
       "evidence": [
+        { "kind": "implementation", "ref": "scripts/windows/deployment/DysonDeployment.Common.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/deployment/Install-DysonControl.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/deployment/Invoke-DysonControlDeployment.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/deployment/Uninstall-DysonControl.ps1" },
+        { "kind": "implementation", "ref": "integrations/dyson-control-bridge/DysonControlBridge.csproj" },
+        { "kind": "implementation", "ref": "scripts/windows/bridge/DysonBridge.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/bridge/Build-DysonControlBridgeCandidate.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/bridge/Test-DysonControlBridgeCandidate.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/bridge/SelfTest-DysonControlBridge.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/lifecycle-broker/Install-DysonLifecycleBrokerTask.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/migration/Get-DysonGsManagerMigration.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/migration/New-DysonGsManagerSnapshot.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/migration/Test-DysonGsManagerSnapshot.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/migration/Restore-DysonGsManagerSnapshot.ps1" },
         { "kind": "self-test", "ref": "scripts/windows/migration/SelfTest-DysonGsManagerMigration.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/migration/DysonGsManagerRemoval.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/migration/Remove-DysonGsManagerInstallation.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/migration/Restore-DysonGsManagerRemoval.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/migration/Test-DysonGsManagerRemoval.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/migration/SelfTest-DysonGsManagerRemoval.ps1" },
         { "kind": "self-test", "ref": "scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1" },
         { "kind": "contract", "ref": "docs/WINDOWS-DEPLOYMENT-DRAFT.md" },
-        { "kind": "contract", "ref": "docs/GSM-EVALUATION.md" }
+        { "kind": "contract", "ref": "docs/GSM-EVALUATION.md" },
+        { "kind": "contract", "ref": "docs/MIGRATION-GSMANAGER.md" }
       ]
     },
     {
@@ -673,7 +825,10 @@
         { "kind": "contract", "ref": "docs/PERFORMANCE.md" },
         { "kind": "contract", "ref": "docs/SAVES.md" },
         { "kind": "contract", "ref": "docs/UPDATES-CLIENTS.md" },
-        { "kind": "contract", "ref": "docs/WINDOWS-DEPLOYMENT-DRAFT.md" }
+        { "kind": "contract", "ref": "docs/WINDOWS-DEPLOYMENT-DRAFT.md" },
+        { "kind": "contract", "ref": "docs/MIGRATION-GSMANAGER.md" },
+        { "kind": "contract", "ref": "docs/NETWORK-CONNECTIVITY.md" },
+        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
       ]
     },
     {
@@ -684,9 +839,23 @@
       "criterion": "Source, history, artifacts, screenshots, metadata, and dependency inputs are scanned for secrets and private data; releases are tied to an exact commit and published with hashes.",
       "state": "implemented",
       "evidence": [
+        { "kind": "implementation", "ref": ".github/workflows/ci.yml" },
+        { "kind": "implementation", "ref": ".github/workflows/release.yml" },
+        { "kind": "implementation", "ref": "scripts/windows/release/DysonReleasePackaging.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/release/DysonReleaseArchive.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/release/New-DysonControlReleaseArtifact.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/release/New-DysonControlReleasePackage.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/release/Test-DysonControlReleaseArtifact.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/release/Test-DysonControlReleasePackage.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/release/SelfTest-DysonControlReleaseArtifact.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/release/SelfTest-DysonControlReleasePackage.ps1" },
+        { "kind": "automated-test", "ref": "scripts/windows/release/release-workflow.test.mjs" },
+        { "kind": "contract", "ref": "scripts/public-release/policy.mjs" },
         { "kind": "implementation", "ref": "scripts/public-release/scanner.mjs" },
         { "kind": "implementation", "ref": "scripts/public-release/check.mjs" },
         { "kind": "automated-test", "ref": "scripts/public-release/scanner.test.mjs" },
+        { "kind": "implementation", "ref": "scripts/validate-version-consistency.mjs" },
+        { "kind": "automated-test", "ref": "scripts/validate-version-consistency.test.mjs" },
         { "kind": "contract", "ref": "scripts/public-release/README.md" }
       ]
     },
@@ -697,7 +866,14 @@
       "title": "Side-by-side Dyson deployment",
       "criterion": "A release candidate runs on the Dyson VM against the configured data boundary while GSManager remains recoverable and production responsibilities are unchanged.",
       "state": "not-started",
-      "evidence": []
+      "evidence": [
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.SideBySideV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/New-DysonSideBySideObservationV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Test-DysonSideBySideObservationV2.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonSideBySideObservationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/README.SideBySideV2.md" },
+        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
+      ]
     },
     {
       "id": "PRD-002",
@@ -706,7 +882,16 @@
       "title": "Authenticated TLS management endpoint",
       "criterion": "The production panel is reachable at the approved domain through TLS and authenticated routing while the Node listener remains loopback-only.",
       "state": "not-started",
-      "evidence": []
+      "evidence": [
+        { "kind": "implementation", "ref": "scripts/windows/qualification/PanelObservationV2.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/New-DysonControlPanelObservationV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Test-DysonControlPanelObservationV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.OrchestrationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/dyson-control-panel-observation-v2.schema.json" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonControlPanelObservationV2.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/Invoke-QualificationOrchestrationV2SelfTest.ps1" },
+        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
+      ]
     },
     {
       "id": "PRD-003",
@@ -715,7 +900,23 @@
       "title": "Game DNS and PassWall-bypass path",
       "criterion": "The final game address resolves dynamically, reaches the Nebula game protocol through a supported transport, and is proven not to traverse PassWall.",
       "state": "not-started",
-      "evidence": []
+      "evidence": [
+        { "kind": "implementation", "ref": "scripts/windows/network/DysonNetwork.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/network/Test-DysonNebulaNetwork.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/network/dyson-nebula-network-assessment-v1.schema.json" },
+        { "kind": "self-test", "ref": "scripts/windows/network/SelfTest-DysonNebulaNetwork.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/network/DysonNetworkV2.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/network/Test-DysonNebulaNetworkV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/network/dyson-nebula-network-assessment-v2.schema.json" },
+        { "kind": "self-test", "ref": "scripts/windows/network/SelfTest-DysonNebulaNetworkV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/network/DysonHostnameWssQualification.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/network/Test-DysonHostnameWssQualification.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/network/dyson-nebula-hostname-wss-qualification-v1.schema.json" },
+        { "kind": "self-test", "ref": "scripts/windows/network/SelfTest-DysonHostnameWssQualification.ps1" },
+        { "kind": "contract", "ref": "integrations/nebula-hostname-wss/contract.json" },
+        { "kind": "contract", "ref": "docs/NETWORK-CONNECTIVITY.md" },
+        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
+      ]
     },
     {
       "id": "PRD-004",
@@ -724,7 +925,24 @@
       "title": "External client end-to-end join",
       "criterion": "A real external player resolves the address, authenticates, joins, interacts, triggers a verified save, disconnects, and reconnects successfully.",
       "state": "not-started",
-      "evidence": []
+      "evidence": [
+        { "kind": "implementation", "ref": "scripts/windows/qualification/ExternalJoinObservationV2.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/New-DysonExternalJoinObservationV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Test-DysonExternalJoinObservationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/dyson-external-join-observation-v2.schema.json" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonExternalJoinObservationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/README.ExternalJoinObservationV2.md" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.Protocol.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/network/DysonHostnameWssQualification.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/network/Test-DysonHostnameWssQualification.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/network/dyson-nebula-hostname-wss-qualification-v1.schema.json" },
+        { "kind": "self-test", "ref": "scripts/windows/network/SelfTest-DysonHostnameWssQualification.ps1" },
+        { "kind": "implementation", "ref": "apps/api/src/client-profile/qualification-v2.ts" },
+        { "kind": "automated-test", "ref": "apps/api/src/client-profile/qualification-v2.test.ts" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/Invoke-QualificationSelfTest.ps1" },
+        { "kind": "contract", "ref": "docs/NETWORK-CONNECTIVITY.md" },
+        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
+      ]
     },
     {
       "id": "PRD-005",
@@ -733,7 +951,35 @@
       "title": "Production reboot, fault, and soak evidence",
       "criterion": "Windows reboot recovery, control-plane restart recovery, storage interruption, disk pressure, game crash, update rollback, restore, and sustained-operation drills pass with private evidence.",
       "state": "not-started",
-      "evidence": []
+      "evidence": [
+        { "kind": "implementation", "ref": "scripts/windows/qualification/SoakObservationV2.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/New-DysonSoakObservationV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Test-DysonSoakObservationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/dyson-soak-observation-v2.schema.json" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonSoakObservationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/README.SoakObservationV2.md" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.Plan.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.Executor.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.Shadow.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.ProtocolV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.ExecutorV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.ProductionAdaptersV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.OrchestrationV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Invoke-QualificationOrchestrationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/qualification-plan.v1.json" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/fixtures/adapter-contract.v2.json" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/fixtures/orchestration-adapter-contract.v2.json" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/qualification-production-profile.v2.schema.json" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/qualification-action-request.v2.schema.json" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/qualification-orchestration-request.v2.schema.json" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/qualification-orchestration-profile.v2.schema.json" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/qualification-controlled-evidence.v2.schema.json" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/Invoke-QualificationSelfTest.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/Invoke-QualificationV2SelfTest.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/Invoke-QualificationOrchestrationV2SelfTest.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/README.production-v2.md" },
+        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
+      ]
     },
     {
       "id": "CUT-001",
@@ -742,7 +988,14 @@
       "title": "GSManager and production recovery package",
       "criterion": "GSManager, tasks, configuration, control data, and paired saves have a verified pre-cutover backup and documented restoration procedure.",
       "state": "not-started",
-      "evidence": []
+      "evidence": [
+        { "kind": "implementation", "ref": "scripts/windows/data-recovery/New-DysonDataRootRecoveryBundle.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/data-recovery/Test-DysonDataRootRecoveryBundle.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/data-recovery/Restore-DysonDataRootRecoveryBundle.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/data-recovery/SelfTest-DysonDataRootRecovery.ps1" },
+        { "kind": "contract", "ref": "docs/DATAROOT-RECOVERY.md" },
+        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
+      ]
     },
     {
       "id": "CUT-002",
@@ -751,7 +1004,17 @@
       "title": "Reversible production cutover",
       "criterion": "A declared maintenance window transfers domain and runtime responsibilities to Dyson Control, verifies service, and can revert without save loss.",
       "state": "not-started",
-      "evidence": []
+      "evidence": [
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.ReversibleCutover.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/New-DysonQualificationReversibleCutoverObservationV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Test-DysonQualificationReversibleCutoverObservationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/reversible-cutover-observation.v2.schema.json" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonQualificationReversibleCutoverObservationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/README-ReversibleCutover.md" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.Executor.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/Invoke-QualificationSelfTest.ps1" },
+        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
+      ]
     },
     {
       "id": "CUT-003",
@@ -760,7 +1023,20 @@
       "title": "GSManager removal and post-cutover acceptance",
       "criterion": "GSManager is removed only after observation and rollback drills pass; the final release, deployment baseline, evidence index, limitations, and runbook are delivered.",
       "state": "not-started",
-      "evidence": []
+      "evidence": [
+        { "kind": "implementation", "ref": "scripts/windows/qualification/PostGsManagerRemovalObservationV2.Common.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/New-DysonPostGsManagerRemovalObservationV2.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Test-DysonPostGsManagerRemovalObservationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/dyson-post-gsmanager-removal-observation-v2.schema.json" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonPostGsManagerRemovalObservationV2.ps1" },
+        { "kind": "contract", "ref": "scripts/windows/qualification/README.PostGsManagerRemovalObservationV2.md" },
+        { "kind": "implementation", "ref": "scripts/windows/migration/Remove-DysonGsManagerInstallation.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/migration/Restore-DysonGsManagerRemoval.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/migration/Test-DysonGsManagerRemoval.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/migration/SelfTest-DysonGsManagerRemoval.ps1" },
+        { "kind": "contract", "ref": "docs/MIGRATION-GSMANAGER.md" },
+        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
+      ]
     }
   ]
 }

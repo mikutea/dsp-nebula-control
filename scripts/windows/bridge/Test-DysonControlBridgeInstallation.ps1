@@ -11,7 +11,8 @@ $configRoot = Assert-DysonBridgePlainDirectory -Path (Join-Path $serverRoot 'Bep
 $configPath = Join-Path $configRoot $script:DysonBridgeConfigName
 $statePath = Join-Path $configRoot $script:DysonBridgeStateName
 $secretPath = Join-Path $configRoot $script:DysonBridgeSecretName
-foreach ($fixed in @($pluginPath, $configPath, $statePath, $secretPath)) {
+$controlRoot = Join-Path $serverRoot 'BepInEx\dyson-control-bridge'
+foreach ($fixed in @($pluginPath, $configPath, $statePath, $secretPath, $controlRoot)) {
     [void](Assert-DysonBridgePathComponentsPlain -Path $fixed -Root $serverRoot)
 }
 $state = Read-DysonBridgeInstallState -Path $statePath
@@ -27,19 +28,17 @@ $controlMatches = [regex]::Matches($configText, '(?m)^ControlRoot = (?<value>[^\
 $secretMatches = [regex]::Matches($configText, '(?m)^SecretFile = (?<value>[^\r\n]+)$')
 if ($enabledMatches.Count -ne 1 -or $controlMatches.Count -ne 1 -or $secretMatches.Count -ne 1 -or
     $secretMatches[0].Groups['value'].Value -ne $secretPath -or
-    $controlMatches[0].Groups['value'].Value -ne (Join-Path $serverRoot 'BepInEx\dyson-control-bridge')) {
+    $controlMatches[0].Groups['value'].Value -ne $controlRoot) {
     throw 'The installed Bridge configuration no longer matches its fixed path contract.'
 }
 $secretItem = Assert-DysonBridgePlainFile -Path $secretPath -MaximumBytes 4096
 try { $secretBytes = [Convert]::FromBase64String([System.IO.File]::ReadAllText($secretItem.FullName, [System.Text.Encoding]::UTF8).Trim()) }
 catch { throw 'The installed Bridge secret is invalid.' }
 if ($secretBytes.Length -lt 32) { throw 'The installed Bridge secret is too short.' }
-$acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $secretItem.FullName -ErrorAction Stop
-if (-not $acl.AreAccessRulesProtected) { throw 'The installed Bridge secret ACL is not protected.' }
-foreach ($rule in @($acl.Access)) {
-    $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-    if ($sid -in @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545')) { throw 'The installed Bridge secret ACL grants a broad reader.' }
-}
+[void](Assert-DysonBridgeExactAcl -Path $secretItem.FullName -Kind secret -InstallerSid ([string]$state.installerSid) `
+    -ControlServiceSid ([string]$state.controlServiceSid) -GameServiceSid ([string]$state.gameServiceSid))
+[void](Test-DysonBridgeControlTreeAcl -ControlRoot $controlRoot -InstallerSid ([string]$state.installerSid) `
+    -ControlServiceSid ([string]$state.controlServiceSid) -GameServiceSid ([string]$state.gameServiceSid))
 
 [ordered]@{
     protocol = $script:DysonBridgeInstallProtocol
@@ -52,5 +51,8 @@ foreach ($rule in @($acl.Access)) {
     secretBytesAtLeast32 = $true
     secretDisclosed = $false
     secretAclProtected = $true
+    twoIdentityAclContractVerified = $true
+    controlServiceSid = $state.controlServiceSid
+    gameServiceSid = $state.gameServiceSid
     gameRestarted = $false
 } | ConvertTo-DysonBridgeJsonLine

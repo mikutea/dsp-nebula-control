@@ -2,6 +2,12 @@ import type { ControlDatabase } from '../storage/database.js'
 import { ObservabilityError } from './errors.js'
 import { BoundedObservabilityHistory } from './history.js'
 import { parseServerObservabilitySnapshot } from './snapshot.js'
+import {
+  BoundedObservabilityLongWindow,
+  DEFAULT_OBSERVABILITY_LONG_WINDOW_CAPACITY,
+  type ObservabilityLongWindowReport,
+  type ObservabilityLongWindowSample
+} from './long-window.js'
 import type {
   ObservabilityDownsampleResult,
   ServerObservabilitySnapshot
@@ -15,6 +21,8 @@ export interface ObservabilityHistoryStore {
   latest(): ServerObservabilitySnapshot | null
   list(): ServerObservabilitySnapshot[]
   downsample(maxPoints: number): ObservabilityDownsampleResult
+  readonly longWindowCapacity?: number
+  longWindowReport?(): ObservabilityLongWindowReport
 }
 
 /**
@@ -25,11 +33,17 @@ export interface ObservabilityHistoryStore {
 export class PersistentObservabilityHistory implements ObservabilityHistoryStore {
   readonly #database: ControlDatabase
   readonly #history: BoundedObservabilityHistory
+  readonly #longWindow: BoundedObservabilityLongWindow
   readonly #capacity: number
 
-  constructor(database: ControlDatabase, capacity = 720) {
+  constructor(
+    database: ControlDatabase,
+    capacity = 720,
+    longWindowCapacity = DEFAULT_OBSERVABILITY_LONG_WINDOW_CAPACITY
+  ) {
     this.#database = database
     this.#history = new BoundedObservabilityHistory(capacity)
+    this.#longWindow = new BoundedObservabilityLongWindow(longWindowCapacity)
     this.#capacity = capacity
     for (const payload of database.listObservabilitySamples(capacity)) {
       let parsed: unknown
@@ -42,6 +56,19 @@ export class PersistentObservabilityHistory implements ObservabilityHistoryStore
         this.#history.ingest(parsed)
       } catch (error) {
         throw new ObservabilityError('OBSERVABILITY_PERSISTENCE_INVALID', error)
+      }
+    }
+    for (const payload of database.listObservabilityLongSamples(longWindowCapacity)) {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(payload)
+      } catch (error) {
+        throw new ObservabilityError('OBSERVABILITY_LONG_WINDOW_PERSISTENCE_INVALID', error)
+      }
+      try {
+        this.#longWindow.ingest(parsed)
+      } catch (error) {
+        throw new ObservabilityError('OBSERVABILITY_LONG_WINDOW_PERSISTENCE_INVALID', error)
       }
     }
   }
@@ -58,18 +85,31 @@ export class PersistentObservabilityHistory implements ObservabilityHistoryStore
     return this.#history.droppedSamples
   }
 
+  get longWindowCapacity(): number { return this.#longWindow.capacity }
+  get longWindowSize(): number { return this.#longWindow.size }
+  get longWindowDroppedSamples(): number { return this.#longWindow.droppedSamples }
+
   ingest(input: unknown): ServerObservabilitySnapshot {
     const snapshot = parseServerObservabilitySnapshot(input)
     const latest = this.#history.latest()
     if (latest !== null && Date.parse(snapshot.observedAt) < Date.parse(latest.observedAt)) {
       throw new ObservabilityError('OBSERVABILITY_HISTORY_TIME_REGRESSION')
     }
+    const longSample = this.#longWindow.prepare(snapshot)
     try {
-      this.#database.appendObservabilitySample(snapshot.observedAt, JSON.stringify(snapshot), this.#capacity)
+      this.#database.appendObservabilitySampleWithLongWindow(
+        snapshot.observedAt,
+        JSON.stringify(snapshot),
+        this.#capacity,
+        JSON.stringify(longSample),
+        this.#longWindow.capacity
+      )
     } catch (error) {
       throw new ObservabilityError('OBSERVABILITY_PERSISTENCE_FAILED', error)
     }
-    return this.#history.ingest(snapshot)
+    const stored = this.#history.ingest(snapshot)
+    this.#longWindow.ingest(longSample)
+    return stored
   }
 
   latest(): ServerObservabilitySnapshot | null {
@@ -82,5 +122,13 @@ export class PersistentObservabilityHistory implements ObservabilityHistoryStore
 
   downsample(maxPoints: number): ObservabilityDownsampleResult {
     return this.#history.downsample(maxPoints)
+  }
+
+  listLongWindow(): ObservabilityLongWindowSample[] {
+    return this.#longWindow.list()
+  }
+
+  longWindowReport(): ObservabilityLongWindowReport {
+    return this.#longWindow.report()
   }
 }

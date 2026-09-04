@@ -48,8 +48,59 @@ export interface SaveProtectionPointReceipt {
   requestId: string
   status: 'succeeded'
   backupId: string
+  /** Digest of the canonical paired .dsv/.server protection manifest. */
+  manifestSha256: string
+  /** Opaque digest identity of the protected paired save. */
+  saveIdentity: string
   pairProtected: true
   durable: true
+}
+
+export interface ComponentUpdateRollbackBaselineRequest {
+  requestId: string
+  component: ManagedUpdateComponent
+  targetVersion: string
+  expectedRevision: string
+}
+
+/**
+ * Private durable rollback binding. Values are opaque identities or digests;
+ * no path, command, account material, save name, or configuration content may
+ * cross this adapter boundary.
+ */
+export interface ComponentUpdateRollbackBaseline {
+  configurationSnapshotId: string
+  configurationRevision: string
+  serverModLockSha256: string
+  serverModLockRevision: string
+  previousLoadedSaveIdentity: string
+}
+
+export interface ComponentUpdateRollbackBinding extends ComponentUpdateRollbackBaseline {
+  protectionBackupId: string
+  protectionManifestSha256: string
+  bindingSha256: string
+}
+
+export interface ComponentUpdateRollbackRestoreRequest {
+  requestId: string
+  component: ManagedUpdateComponent
+  binding: ComponentUpdateRollbackBinding
+}
+
+/** Fresh read-back of every non-component rollback surface. */
+export interface ComponentUpdateRollbackReadback {
+  configurationSnapshotId: string
+  configurationRevision: string
+  serverModLockSha256: string
+  serverModLockRevision: string
+  protectionManifestSha256: string
+  loadedSaveIdentity: string
+}
+
+export interface ComponentUpdateRollbackStepReceipt {
+  restored: true
+  rereadVerified: true
 }
 
 export interface FixedUpdateSmokeRequest {
@@ -58,6 +109,8 @@ export interface FixedUpdateSmokeRequest {
   phase: 'candidate' | 'rollback' | 'reconcile-candidate'
   expectedVersion: string | null
   expectedReleaseId: string | null
+  /** Exact opaque save identity captured before publication. */
+  expectedLoadedSaveIdentity: string
 }
 
 export interface FixedUpdateSmokeResult {
@@ -68,6 +121,14 @@ export interface FixedUpdateSmokeResult {
   nebulaLoaded: boolean
   processHealthy: boolean
   portHealthy: boolean
+  /** One opaque identity for the process start generation under test. */
+  startupGenerationId: string | null
+  /** Must equal startupGenerationId and come from the signed Bridge heartbeat. */
+  bridgeHeartbeatGenerationId: string | null
+  /** Must equal startupGenerationId and come from the current-generation load log. */
+  loadedSaveLogGenerationId: string | null
+  /** Exact opaque save identity parsed from that current-generation load log. */
+  loadedSaveIdentity: string | null
 }
 
 export interface ComponentUpdateActivationAdapters {
@@ -79,6 +140,27 @@ export interface ComponentUpdateActivationAdapters {
     request: SaveProtectionPointRequest,
     hostMutation: HostMutationOperationScope
   ): Promise<SaveProtectionPointReceipt>
+  /** Optional at construction so read-only preview remains available; execute fails closed when absent. */
+  captureRollbackBaseline?(
+    request: ComponentUpdateRollbackBaselineRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<ComponentUpdateRollbackBaseline>
+  restoreRollbackConfiguration?(
+    request: ComponentUpdateRollbackRestoreRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<ComponentUpdateRollbackStepReceipt>
+  restoreRollbackServerModLock?(
+    request: ComponentUpdateRollbackRestoreRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<ComponentUpdateRollbackStepReceipt>
+  restoreRollbackPairedSave?(
+    request: ComponentUpdateRollbackRestoreRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<ComponentUpdateRollbackStepReceipt>
+  inspectRollbackReadback?(
+    request: ComponentUpdateRollbackRestoreRequest,
+    hostMutation: HostMutationOperationScope
+  ): Promise<ComponentUpdateRollbackReadback>
   smoke(
     request: FixedUpdateSmokeRequest,
     hostMutation: HostMutationOperationScope
@@ -152,11 +234,14 @@ export interface ComponentUpdateActivationPlan {
     'verify-staged-artifact-and-archive',
     'assemble-immutable-release',
     'prove-process-stopped-and-port-closed',
+    'capture-config-mod-lock-and-loaded-save-baseline',
     'create-paired-save-protection-point',
+    'bind-rollback-context-journal',
     'revalidate-stop-revision-and-compatibility',
     'publish-and-verify-fixed-live-component',
     'run-fixed-health-check',
-    'rollback-and-verify-on-failure',
+    'restore-component-config-mod-lock-and-paired-save-on-failure',
+    'prove-current-generation-exact-save-load',
     'persist-audit-safe-receipt',
     'release-global-update-lock'
   ]
@@ -168,6 +253,16 @@ export interface ComponentUpdateActivationPlan {
 }
 
 export type ComponentUpdateReceiptStatus = 'succeeded' | 'failed' | 'rolled-back' | 'rollback-failed'
+
+export type ComponentUpdateRollbackStepStatus = 'not-required' | 'pending' | 'verified' | 'failed'
+
+export interface ComponentUpdateRollbackSteps {
+  component: ComponentUpdateRollbackStepStatus
+  configuration: ComponentUpdateRollbackStepStatus
+  serverModLock: ComponentUpdateRollbackStepStatus
+  pairedSave: ComponentUpdateRollbackStepStatus
+  previousSaveLoad: ComponentUpdateRollbackStepStatus
+}
 
 /** Audit-safe receipt: no filesystem path, artifact digest, command, URL, or secret. */
 export interface ComponentUpdateActivationReceipt {
@@ -183,6 +278,9 @@ export interface ComponentUpdateActivationReceipt {
   previousRevision: string
   resultingRevision: string
   protectionBackupId: string | null
+  /** Canonical digest over the private journal rollback binding; never a path or secret. */
+  rollbackBindingSha256: string | null
+  rollbackSteps: ComponentUpdateRollbackSteps
   failureCode: string | null
   rollbackVerified: boolean
   recoveryRequired: boolean

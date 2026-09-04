@@ -1,0 +1,73 @@
+{
+  "protocol": "DYSON_QUALIFICATION_ADAPTER_CONTRACT_V1",
+  "schemaVersion": 1,
+  "productionExecutionImplemented": false,
+  "actions": [
+    {
+      "action": "windows-restart",
+      "adapterId": "bounded-windows-restart-v1",
+      "preconditions": ["fresh-protection-point", "maintenance-window", "target-identity"],
+      "timeoutSeconds": 900,
+      "rollback": "resume-checkpoint-and-operator-recovery",
+      "productionAdapterRequired": true
+    },
+    {
+      "action": "control-plane-restart",
+      "adapterId": "bounded-control-plane-restart-v1",
+      "preconditions": ["fresh-protection-point", "maintenance-window", "target-identity"],
+      "timeoutSeconds": 300,
+      "rollback": "restore-previous-control-plane-release",
+      "productionAdapterRequired": true
+    },
+    {
+      "action": "dsp-crash-recovery",
+      "adapterId": "bounded-dsp-crash-recovery-v1",
+      "preconditions": ["fresh-protection-point", "maintenance-window", "target-identity"],
+      "timeoutSeconds": 600,
+      "rollback": "restart-from-protected-paired-save",
+      "productionAdapterRequired": true
+    },
+    {
+      "action": "storage-interruption",
+      "adapterId": "bounded-storage-interruption-v1",
+      "preconditions": ["fresh-protection-point", "maintenance-window", "target-identity"],
+      "timeoutSeconds": 300,
+      "maximumInterruptionSeconds": 300,
+      "rollback": "restore-storage-and-verify-paired-save",
+      "productionAdapterRequired": true
+    },
+    {
+      "action": "disk-pressure",
+      "adapterId": "bounded-disk-pressure-v1",
+      "preconditions": ["fresh-protection-point", "maintenance-window", "target-identity"],
+      "timeoutSeconds": 300,
+      "maximumTargetPercent": 85,
+      "rollback": "remove-bounded-pressure-artifact-and-verify-free-space",
+      "productionAdapterRequired": true
+    },
+    {
+      "action": "update-rollback",
+      "adapterId": "bounded-update-rollback-v1",
+      "preconditions": ["fresh-protection-point", "maintenance-window", "target-identity"],
+      "timeoutSeconds": 900,
+      "rollback": "reactivate-previous-verified-release",
+      "productionAdapterRequired": true
+    },
+    {
+      "action": "gsmanager-switch",
+      "adapterId": "bounded-gsmanager-switch-v1",
+      "preconditions": ["fresh-protection-point", "maintenance-window", "target-identity"],
+      "timeoutSeconds": 900,
+      "rollback": "restore-disabled-recoverable-gsmanager-state",
+      "productionAdapterRequired": true
+    },
+    {
+      "action": "save-restore",
+      "adapterId": "bounded-save-restore-v1",
+      "preconditions": ["fresh-protection-point", "maintenance-window", "target-identity"],
+      "timeoutSeconds": 900,
+      "rollback": "atomic-paired-save-protection-point-restore",
+      "productionAdapterRequired": true
+    }
+  ]
+}

@@ -10,6 +10,7 @@ export {
   parsePlayerCapabilitySnapshot,
   playerCapabilityProtocol,
   playerCapabilityReasonSummaries,
+  playerCapabilityRuntimeVerifiedScope,
   playerCapabilityVerificationScope,
   PlayerCapabilityError,
   verifiedNebulaCommit,
@@ -17,11 +18,13 @@ export {
   verifiedNebulaRuntimeFileVersion,
   verifiedNebulaTag,
   verifiedPlayerCapabilities,
+  unverifiedPlayerCapabilities,
   type PlayerCapability,
   type PlayerCapabilityAvailability,
   type PlayerCapabilityId,
   type PlayerCapabilityMode,
   type PlayerCapabilityReasonCode,
+  type PlayerCapabilityVerificationScope,
   type PlayerCapabilitySnapshot
 } from './capabilities.js'
 export {
@@ -53,3 +56,25 @@ export {
   type PlayerSnapshotEntry,
   type PlayerSnapshotState
 } from './protocol.js'
+export {
+  FilePlayerNoticeClient,
+  PlayerNoticeError,
+  buildPlayerNoticeRequest,
+  parsePlayerNoticeRequest,
+  parsePlayerNoticeReceipt,
+  playerNoticeExecutionRequestSchema,
+  playerNoticePreviewRequestSchema,
+  playerNoticeReceiptProtocol,
+  playerNoticeRequestProtocol,
+  playerNoticeTemplateIds,
+  previewPlayerNotice,
+  publicRosterGeneration,
+  type PlayerNoticeClient,
+  type PlayerNoticeExecutionRequest,
+  type PlayerNoticePlan,
+  type PlayerNoticePreviewRequest,
+  type PlayerNoticeReceipt,
+  type PlayerNoticeReceiptState,
+  type PlayerNoticeTemplateId,
+  type PlayerNoticeWireRequest
+} from './notice.js'

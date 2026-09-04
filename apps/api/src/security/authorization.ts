@@ -7,6 +7,7 @@ export const controlPermissions = [
   'status.read',
   'status.refresh',
   'jobs.read',
+  'jobs.export',
   'observability.read',
   'observability.acknowledge',
   'players.read',
@@ -18,6 +19,7 @@ export const controlPermissions = [
   'saves.backup',
   'saves.restore',
   'saves.transfer',
+  'lifecycle.read',
   'lifecycle.preview',
   'lifecycle.execute',
   'configuration.read',
@@ -28,6 +30,8 @@ export const controlPermissions = [
   'updates.activate',
   'mods.read',
   'mods.mutate',
+  'cutover.read',
+  'cutover.execute',
   'client-profile.generate'
 ] as const
 export type ControlPermission = (typeof controlPermissions)[number]
@@ -45,9 +49,11 @@ const viewerPermissions = [
   'players.read',
   'console.read',
   'saves.read',
+  'lifecycle.read',
   'configuration.read',
   'updates.read',
-  'mods.read'
+  'mods.read',
+  'cutover.read'
 ] as const satisfies readonly ControlPermission[]
 
 const operatorPermissions = [

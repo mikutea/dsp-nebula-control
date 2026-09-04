@@ -3,32 +3,45 @@ import type {
   GameConfigHistoryDiff, GameConfigHistoryRecoveryResult, GameConfigHistoryRestoreReceipt,
   GameConfigHistorySnapshotDetail, GameConfigHistorySnapshotSummary,
   ClientProfileArchiveDownload, GeneratedClientProfile,
-  ConsoleCommandName, ConsoleCommandPreview, JobRecord, LifecycleAction, LifecycleExecutionResult,
+  QualifiedClientArtifactDownload, QualifiedClientArtifactKind,
+  QualifiedClientProfileIssueReference, QualifiedClientProfileIssueRequest,
+  ConsoleCommandName, ConsoleCommandPreview, JobAuditExportDownload, JobAuditExportFormat,
+  JobAuditExportInput, JobAuditExportPreview, JobKind, JobPage, JobPageQuery, JobRecord, JobState,
+  LifecycleAction, LifecycleExecutionResult,
   ArtifactAcquisitionPlan, ArtifactAcquisitionReceipt, BepInExDiscoveryEnvelope,
   ComponentCandidatePreparationExecutionResult, ComponentCandidatePreparationPlan,
   ComponentCandidatePreparationReceipt, LifecyclePreview, NebulaDiscoveryEnvelope,
+  CutoverDesiredAuthority, CutoverErrorCode, CutoverPreviewReceipt, CutoverPreviewRequest,
+  CutoverReceipt, CutoverRecoveryStatus, CutoverRollbackMode,
   SupportedComponentCandidatePreparationComponent,
   ThunderstoreDependencyClosureEnvelope, ThunderstoreDiscoveryEnvelope,
   ThunderstoreModImportPlan, ThunderstoreModImportReceipt, VerifiedModLockReceiptRequest,
   VerifiedModManifestPreview,
-  PlayerCapabilitiesProjection, PlayerRoster, SessionUser,
-  ModDeploymentPreview, ModDeploymentReceipt, ModDeploymentRecoveryDesired,
+  PlayerCapabilitiesProjection, PlayerNoticePlan, PlayerNoticePreviewInput, PlayerNoticeReceipt,
+  PlayerRoster, SessionUser,
+  ModDeploymentPreview, ModDeploymentReceipt, ModDeploymentReceiptHistoryPage, ModDeploymentRecoveryDesired,
   ModDeploymentRecoveryPlan, ModDeploymentRecoveryStatus, ModDeploymentRequest,
-  ModDeploymentStateSummary,
+  ModDeploymentStateSummary, ManagedModConfigurationHistoryPage,
+  ManagedModConfigurationPreview, ManagedModConfigurationReceipt,
+  ManagedModConfigurationRequest, ManagedModConfigurationSchema, ManagedModConfigurationInspection,
   LateGameQualificationReport, ObservabilityDownsampleResult, ObservabilityQualificationEnvelope,
+  ObservabilityLongWindowCheck, ObservabilityLongWindowCheckId, ObservabilityLongWindowReport,
+  OperationLatencySummary, ServerReceiptLatencyReport,
   ObservabilityAlertEnvelope, ObservabilityAlertEpisode,
   QualificationCheck, QualificationCheckId, QualificationStatus, ServerObservabilitySnapshot,
   BackupAnnotation, BackupAnnotationReceipt, BackupRetentionPolicy, BackupRetentionPreview,
   BackupRetirementReceipt, BackupRetirementRestoreReceipt,
   BackupRetentionPurgePreview, BackupRetentionPurgeReceipt,
   SaveJobExecutionResult, SavePairCatalogItem, SavePairExportReceipt, SavePairImportReceipt,
-  SavePairRevision, SavePairTransferDownload, SaveTransactionResult, ServerStatus,
+  SavePairPromotionPlan, SavePairPromotionReceipt, SavePairRevision, SavePairTransferDownload,
+  SaveTransactionResult, ServerStatus,
   StructuredLogFilters, StructuredLogPage, StructuredLogReadRequest,
   UpdateActivationConfirmation, UpdateActivationPlan, UpdateActivationReceipt,
   UpdateActivationRecoveryConfirmation, UpdateActivationRecoveryStatus,
   UpdateActivationRequest, UpdateActivationState, UpdateCleanupPlan,
   UpdateCompatibilityPreparationRequest, UpdateCompatibilityReceipt, UpdateCompatibilityStatus
 } from './model'
+import { jobKinds } from './model'
 import {
   isGameConfigHistorySnapshotId,
   isGameConfigRevision,
@@ -38,10 +51,38 @@ import {
   parseGameConfigHistoryRecoveryResults,
   parseGameConfigHistoryRestoreReceipt
 } from './game-config-history-contract'
+import {
+  normalizeSaveJobExecutionEnvelope,
+  SAVE_JOB_RECONCILE_CONFIRMATION
+} from './save-reconcile-contract'
+import {
+  isPlayerNoticePreviewInput,
+  normalizePlayerNoticeExecutionEnvelope,
+  normalizePlayerNoticePreviewEnvelope,
+  normalizePlayerNoticeReceiptEnvelope
+} from './player-notice-contract'
 
 export class ApiError extends Error {
   constructor(readonly status: number, message: string, readonly code: string | null = null) { super(message) }
 }
+
+export class PlayerNoticeApiError extends ApiError {
+  constructor(
+    status: number,
+    message: string,
+    code: string | null,
+    readonly data: { job: JobRecord; receipt: PlayerNoticeReceipt } | null = null
+  ) {
+    super(status, message, code)
+  }
+}
+
+export const CUTOVER_PREPARE_CONFIRMATION = 'PREPARE_GSMANAGER_TO_DYSON' as const
+export const CUTOVER_ACTIVATE_CONFIRMATION = 'ACTIVATE_GSMANAGER_TO_DYSON' as const
+export const CUTOVER_ROLLBACK_CONFIRMATION = 'ROLLBACK_DYSON_TO_GSMANAGER' as const
+export const CUTOVER_RECOVERY_CONFIRMATION = 'RECOVER_GSMANAGER_CUTOVER' as const
+export const JOB_AUDIT_EXPORT_CONFIRMATION = 'EXPORT_JOB_AUDIT' as const
+export const SAVE_PAIR_PROMOTION_CONFIRMATION = 'PROMOTE_IMPORTED_SAVE_PAIR' as const
 
 export class GameConfigHistoryApiError extends ApiError {
   constructor(
@@ -107,6 +148,42 @@ export const api = {
     method: 'POST', signal, body: JSON.stringify({ confirmation: 'ACKNOWLEDGE_ALERT' })
   }),
   jobs: () => request<{ data: JobRecord[] }>('/api/v1/jobs'),
+  jobPage: (query: JobPageQuery = {}, signal?: AbortSignal) => readJobPage(query, signal),
+  previewJobAuditExport: (input: JobAuditExportInput, signal?: AbortSignal) =>
+    previewJobAuditExport(input, signal),
+  exportJobAudit: (
+    input: JobAuditExportInput,
+    confirmation: typeof JOB_AUDIT_EXPORT_CONFIRMATION,
+    signal?: AbortSignal
+  ) => exportJobAudit(input, confirmation, signal),
+  cutoverStatus: (signal?: AbortSignal) => readCutoverStatus(signal),
+  previewCutover: (input: CutoverPreviewRequest, signal?: AbortSignal) =>
+    runCutoverPreview(input, signal),
+  prepareCutover: (
+    requestId: string,
+    planFingerprint: string,
+    confirmation: typeof CUTOVER_PREPARE_CONFIRMATION,
+    signal?: AbortSignal
+  ) => runCutoverPrepare(requestId, planFingerprint, confirmation, signal),
+  activateCutover: (
+    requestId: string,
+    planFingerprint: string,
+    confirmation: typeof CUTOVER_ACTIVATE_CONFIRMATION,
+    signal?: AbortSignal
+  ) => runCutoverActivate(requestId, planFingerprint, confirmation, signal),
+  rollbackCutover: (
+    requestId: string,
+    mode: CutoverRollbackMode,
+    planFingerprint: string,
+    confirmation: typeof CUTOVER_ROLLBACK_CONFIRMATION,
+    signal?: AbortSignal
+  ) => runCutoverRollback(requestId, mode, planFingerprint, confirmation, signal),
+  recoverCutover: (
+    requestId: string,
+    desired: CutoverDesiredAuthority,
+    confirmation: typeof CUTOVER_RECOVERY_CONFIRMATION,
+    signal?: AbortSignal
+  ) => runCutoverRecovery(requestId, desired, confirmation, signal),
   refresh: () => request<{ data: JobRecord }>('/api/v1/actions/refresh', { method: 'POST' }),
   previewLifecycle: (action: LifecycleAction) => request<{
     data: { job: JobRecord; preview: LifecyclePreview }
@@ -123,6 +200,20 @@ export const api = {
   playerCapabilities: (signal?: AbortSignal) => request<{ data: PlayerCapabilitiesProjection }>(
     '/api/v1/players/capabilities', { signal }
   ),
+  previewPlayerNotice: (input: PlayerNoticePreviewInput, signal?: AbortSignal) =>
+    previewPlayerNotice(input, signal),
+  executePlayerNotice: (
+    input: PlayerNoticePreviewInput & {
+      requestId: string
+      confirmation: 'EXECUTE'
+      expectedTargetJoinedAtUnixMs?: number
+    },
+    signal?: AbortSignal
+  ) => executePlayerNotice(input, signal),
+  playerNoticeReceipt: (
+    input: PlayerNoticePreviewInput & { requestId: string; expectedTargetJoinedAtUnixMs?: number },
+    signal?: AbortSignal
+  ) => readPlayerNoticeReceipt(input, signal),
   discoverNebula: (signal?: AbortSignal) => request<NebulaDiscoveryEnvelope>('/api/v1/updates/discovery/nebula', {
     method: 'POST', signal, body: JSON.stringify({})
   }),
@@ -285,10 +376,66 @@ export const api = {
       }
     })
   }),
+  modDeploymentReceipt: (requestId: string, signal?: AbortSignal) => request<{
+    data: ModDeploymentReceipt
+  }>(`/api/v1/mods/deployment/receipts/${encodeURIComponent(requestId)}`, { signal }),
+  modDeploymentHistory: (
+    input: { cursor?: string | null; pageSize?: number } = {},
+    signal?: AbortSignal
+  ) => {
+    const query = new URLSearchParams()
+    if (input.cursor) query.set('cursor', input.cursor)
+    if (input.pageSize !== undefined) query.set('pageSize', String(input.pageSize))
+    const suffix = query.size > 0 ? `?${query.toString()}` : ''
+    return request<{ data: ModDeploymentReceiptHistoryPage }>(
+      `/api/v1/mods/deployment/history${suffix}`, { signal }
+    )
+  },
+  managedModConfigurationSchemas: (signal?: AbortSignal) => request<{
+    data: ManagedModConfigurationSchema[]
+    meta: { executionEnabled: boolean }
+  }>('/api/v1/mods/configuration/schemas', { signal }),
+  inspectManagedModConfiguration: (input: { schemaId: string; package: { dependencyId: string; version: string }; expectedDeploymentRevision: string }, signal?: AbortSignal) => request<{ data: ManagedModConfigurationInspection }>(
+    '/api/v1/mods/configuration/inspect', { method: 'POST', signal, body: JSON.stringify(input) }),
+  previewManagedModConfiguration: (input: ManagedModConfigurationRequest) => request<{
+    data: ManagedModConfigurationPreview
+    meta: { executionEnabled: boolean }
+  }>('/api/v1/mods/configuration/preview', { method: 'POST', body: JSON.stringify(input) }),
+  executeManagedModConfiguration: (input: ManagedModConfigurationRequest, requestFingerprint: string) => request<{ data: ManagedModConfigurationReceipt }>(
+    '/api/v1/mods/configuration/execute', {
+      method: 'POST', body: JSON.stringify({
+        request: input,
+        confirmation: {
+          action: 'EXECUTE_MOD_CONFIGURATION', requestId: input.requestId, schemaId: input.schemaId,
+          dependencyId: input.package.dependencyId, version: input.package.version,
+          expectedDeploymentRevision: input.expectedDeploymentRevision,
+          expectedConfigurationRevision: input.expectedConfigurationRevision,
+          requestFingerprint,
+          confirmation: 'CONFIGURE_MANAGED_MOD'
+        }
+      })
+    }),
+  managedModConfigurationReceipt: (requestId: string, signal?: AbortSignal) => request<{ data: ManagedModConfigurationReceipt }>(
+    `/api/v1/mods/configuration/receipts/${encodeURIComponent(requestId)}`, { signal }),
+  managedModConfigurationHistory: (input: { cursor?: string | null; pageSize?: number } = {}, signal?: AbortSignal) => {
+    const query = new URLSearchParams()
+    if (input.cursor) query.set('cursor', input.cursor)
+    if (input.pageSize !== undefined) query.set('pageSize', String(input.pageSize))
+    const suffix = query.size ? `?${query.toString()}` : ''
+    return request<{ data: ManagedModConfigurationHistoryPage }>(`/api/v1/mods/configuration/history${suffix}`, { signal })
+  },
   generateClientProfile: (input: unknown) => request<{ data: GeneratedClientProfile }>(
     '/api/v1/client-profile/generate', { method: 'POST', body: JSON.stringify(input) }
   ),
   downloadClientProfileArchive: (input: unknown) => downloadClientProfileArchive(input),
+  issueQualifiedClientProfile: (input: QualifiedClientProfileIssueRequest) => request<{
+    data: QualifiedClientProfileIssueReference
+  }>('/api/v2/client-profile/issue', { method: 'POST', body: JSON.stringify(input) }),
+  downloadQualifiedClientArtifact: (
+    downloadId: string,
+    kind: QualifiedClientArtifactKind,
+    expected: { sha256: string; sizeBytes: number }
+  ) => downloadQualifiedClientArtifact(downloadId, kind, expected),
   saves: (cursor?: string) => request<{ data: CatalogPage<SavePairCatalogItem> }>(
     `/api/v1/saves?pageSize=25${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`
   ),
@@ -365,9 +512,8 @@ export const api = {
   }>('/api/v1/saves/backup/preview', {
     method: 'POST', body: JSON.stringify({ requestId, saveName })
   }),
-  executeSaveBackup: (requestId: string, saveName: string) => request<{
-    data: SaveJobExecutionResult
-  }>('/api/v1/saves/backup/execute', {
+  executeSaveBackup: (requestId: string, saveName: string) => saveJobRequest(
+    '/api/v1/saves/backup/execute', {
     method: 'POST', body: JSON.stringify({ requestId, saveName, confirmation: 'CREATE_BACKUP' })
   }),
   previewSaveRestore: (input: {
@@ -377,14 +523,19 @@ export const api = {
   ),
   executeSaveRestore: (input: {
     requestId: string; backupId: string; expectedRevision: string; protectionRequestId: string
-  }) => request<{ data: SaveJobExecutionResult }>(
+  }) => saveJobRequest(
     '/api/v1/saves/restore/execute', {
       method: 'POST', body: JSON.stringify({ ...input, confirmation: 'RESTORE_SAVE_PAIR' })
     }
   ),
-  saveJob: (jobId: string) => request<{ data: SaveJobExecutionResult }>(
-    `/api/v1/saves/jobs/${encodeURIComponent(jobId)}`
+  saveJob: (jobId: string, signal?: AbortSignal) => saveJobRequest(
+    `/api/v1/saves/jobs/${encodeURIComponent(jobId)}`, { signal, cache: 'no-store' }
   ),
+  reconcileSaveJob: (
+    jobId: string,
+    confirmation: typeof SAVE_JOB_RECONCILE_CONFIRMATION,
+    signal?: AbortSignal
+  ) => reconcileSaveJob(jobId, confirmation, signal),
   prepareSavePairExport: (requestId: string, backupId: string, signal?: AbortSignal) =>
     prepareSavePairExport(requestId, backupId, signal),
   downloadSavePairExport: (
@@ -398,6 +549,14 @@ export const api = {
     sha256: string,
     signal?: AbortSignal
   ) => importSavePairArchive(requestId, payload, sha256, signal),
+  previewSavePairPromotion: (requestId: string, importRequestId: string, signal?: AbortSignal) =>
+    previewSavePairPromotion(requestId, importRequestId, signal),
+  executeSavePairPromotion: (
+    requestId: string,
+    importRequestId: string,
+    confirmation: typeof SAVE_PAIR_PROMOTION_CONFIRMATION,
+    signal?: AbortSignal
+  ) => executeSavePairPromotion(requestId, importRequestId, confirmation, signal),
   configuration: (signal?: AbortSignal) => request<{ data: GameConfigSnapshot }>(
     '/api/v1/configuration', { signal, cache: 'no-store' }
   ),
@@ -446,6 +605,770 @@ export const api = {
   }),
   downloadConsole: (filters: StructuredLogFilters) => downloadConsole(filters)
 }
+
+const jobStateValues = ['queued', 'running', 'succeeded', 'failed'] as const
+const jobKindSet = new Set<string>(jobKinds)
+const jobStateSet = new Set<string>(jobStateValues)
+const jobAuditCursorPattern = /^[A-Za-z0-9_-]{16,512}$/
+const jobAuditErrorCodePattern = /^[A-Z][A-Z0-9_]{0,127}$/
+const jobAuditUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const maximumJobAuditExportBytes = 2 * 1024 * 1024
+
+async function readJobPage(query: JobPageQuery, signal?: AbortSignal): Promise<JobPage> {
+  const normalized = normalizeJobPageQuery(query)
+  const search = new URLSearchParams()
+  if (normalized.pageSize !== undefined) search.set('pageSize', String(normalized.pageSize))
+  if (normalized.cursor !== undefined) search.set('cursor', normalized.cursor)
+  if (normalized.kind !== undefined) search.set('kind', normalized.kind)
+  if (normalized.state !== undefined) search.set('state', normalized.state)
+  const suffix = search.size > 0 ? `?${search.toString()}` : ''
+  const response = await jobAuditFetch(`/api/v1/jobs${suffix}`, { signal, cache: 'no-store' })
+  const body: unknown = await response.json().catch(() => null)
+  if (!response.ok) throw jobAuditHttpError(response.status, body)
+  const page = normalizeJobPage(body)
+  if (page === null) throw jobAuditResponseInvalid()
+  return page
+}
+
+async function previewJobAuditExport(
+  input: JobAuditExportInput,
+  signal?: AbortSignal
+): Promise<{ data: JobAuditExportPreview }> {
+  const normalized = normalizeJobAuditExportInput(input)
+  const response = await jobAuditFetch('/api/v1/jobs/audit/export/preview', {
+    method: 'POST',
+    signal,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(normalized)
+  })
+  const body: unknown = await response.json().catch(() => null)
+  if (!response.ok) throw jobAuditHttpError(response.status, body)
+  if (!hasExactKeys(body, ['data'])) throw jobAuditResponseInvalid()
+  const preview = normalizeJobAuditExportPreview(body.data, normalized)
+  if (preview === null) throw jobAuditResponseInvalid()
+  return { data: preview }
+}
+
+async function exportJobAudit(
+  input: JobAuditExportInput,
+  confirmation: typeof JOB_AUDIT_EXPORT_CONFIRMATION,
+  signal?: AbortSignal
+): Promise<JobAuditExportDownload> {
+  if (confirmation !== JOB_AUDIT_EXPORT_CONFIRMATION) throw jobAuditClientRequestInvalid()
+  const normalized = normalizeJobAuditExportInput(input)
+  const response = await jobAuditFetch('/api/v1/jobs/audit/export', {
+    method: 'POST',
+    signal,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...normalized, confirmation: JOB_AUDIT_EXPORT_CONFIRMATION })
+  })
+  if (!response.ok) {
+    const body: unknown = await response.json().catch(() => null)
+    throw jobAuditHttpError(response.status, body)
+  }
+
+  const expectedFileName = normalized.format === 'json'
+    ? 'dyson-job-audit.json' as const
+    : 'dyson-job-audit.ndjson' as const
+  const expectedContentType = normalized.format === 'json'
+    ? 'application/json; charset=utf-8'
+    : 'application/x-ndjson; charset=utf-8'
+  if (response.headers.get('cache-control') !== 'no-store' ||
+      response.headers.get('x-content-type-options') !== 'nosniff' ||
+      response.headers.get('content-disposition') !== `attachment; filename="${expectedFileName}"` ||
+      response.headers.get('content-type')?.toLowerCase() !== expectedContentType) {
+    throw jobAuditResponseInvalid()
+  }
+
+  const bytes = await response.arrayBuffer()
+  if (bytes.byteLength < 1 || bytes.byteLength > maximumJobAuditExportBytes) {
+    throw jobAuditResponseInvalid()
+  }
+  let text: string
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch {
+    throw jobAuditResponseInvalid()
+  }
+  const artifact = normalizeJobAuditExportArtifact(text, normalized)
+  if (artifact === null) throw jobAuditResponseInvalid()
+  return {
+    blob: new Blob([bytes], { type: expectedContentType }),
+    fileName: expectedFileName,
+    format: normalized.format,
+    byteLength: bytes.byteLength,
+    recordCount: artifact.recordCount,
+    truncated: artifact.truncated,
+    nextCursor: artifact.nextCursor
+  }
+}
+
+async function jobAuditFetch(path: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(path, { credentials: 'same-origin', ...init })
+  } catch (reason) {
+    if (init?.signal?.aborted) throw reason
+    throw new ApiError(
+      0,
+      '无法连接任务审计端点；读取和导出均保持 fail-closed。',
+      'JOB_AUDIT_BROWSER_NETWORK_UNAVAILABLE'
+    )
+  }
+}
+
+function normalizeJobPageQuery(value: JobPageQuery): JobPageQuery {
+  if (!isRecord(value) || Object.keys(value).some((key) =>
+    !['pageSize', 'cursor', 'kind', 'state'].includes(key))) throw jobAuditClientRequestInvalid()
+  const result: JobPageQuery = {}
+  if (value.pageSize !== undefined) {
+    const pageSize = value.pageSize
+    if (typeof pageSize !== 'number' || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 100) {
+      throw jobAuditClientRequestInvalid()
+    }
+    result.pageSize = pageSize
+  }
+  if (value.cursor !== undefined) {
+    if (!isJobAuditCursor(value.cursor)) throw jobAuditClientRequestInvalid()
+    result.cursor = value.cursor
+  }
+  if (value.kind !== undefined) {
+    if (!isJobKind(value.kind)) throw jobAuditClientRequestInvalid()
+    result.kind = value.kind
+  }
+  if (value.state !== undefined) {
+    if (!isJobState(value.state)) throw jobAuditClientRequestInvalid()
+    result.state = value.state
+  }
+  return result
+}
+
+function normalizeJobAuditExportInput(value: JobAuditExportInput): JobAuditExportInput {
+  if (!isRecord(value) || Object.keys(value).some((key) =>
+    !['cursor', 'maximumRecords', 'kind', 'state', 'format'].includes(key)) ||
+      !isJobAuditExportFormat(value.format)) throw jobAuditClientRequestInvalid()
+  const result: JobAuditExportInput = { format: value.format }
+  if (value.cursor !== undefined) {
+    if (!isJobAuditCursor(value.cursor)) throw jobAuditClientRequestInvalid()
+    result.cursor = value.cursor
+  }
+  if (value.maximumRecords !== undefined) {
+    if (!Number.isSafeInteger(value.maximumRecords) ||
+        value.maximumRecords < 1 || value.maximumRecords > 1_000) throw jobAuditClientRequestInvalid()
+    result.maximumRecords = value.maximumRecords
+  }
+  if (value.kind !== undefined) {
+    if (!isJobKind(value.kind)) throw jobAuditClientRequestInvalid()
+    result.kind = value.kind
+  }
+  if (value.state !== undefined) {
+    if (!isJobState(value.state)) throw jobAuditClientRequestInvalid()
+    result.state = value.state
+  }
+  return result
+}
+
+function normalizeJobPage(value: unknown): JobPage | null {
+  if (!hasExactKeys(value, ['data', 'page']) || !Array.isArray(value.data) ||
+      !hasExactKeys(value.page, ['nextCursor']) || !isJobAuditCursorOrNull(value.page.nextCursor)) return null
+  const records = value.data.map(normalizeJobRecord)
+  if (records.some((record) => record === null)) return null
+  return {
+    data: records as JobRecord[],
+    page: { nextCursor: value.page.nextCursor }
+  }
+}
+
+function normalizeJobRecord(value: unknown): JobRecord | null {
+  if (!hasExactKeys(value, [
+    'id', 'kind', 'state', 'actor', 'createdAt', 'startedAt',
+    'finishedAt', 'durationMs', 'summary', 'errorCode'
+  ])) return null
+  if (typeof value.id !== 'string' || !jobAuditUuidPattern.test(value.id) ||
+      !isJobKind(value.kind) || !isJobState(value.state) ||
+      typeof value.actor !== 'string' || value.actor.length < 1 || value.actor.length > 64 ||
+      !/^[A-Za-z][A-Za-z0-9 ._-]*$/.test(value.actor) || !isIsoTimestamp(value.createdAt) ||
+      !isIsoTimestampOrNull(value.startedAt) || !isIsoTimestampOrNull(value.finishedAt) ||
+      !isNullableBoundedSafeInteger(value.durationMs, 0, 31_536_000_000) ||
+      typeof value.summary !== 'string' || value.summary.length < 1 || value.summary.length > 256 ||
+      /[\r\n]/.test(value.summary) || !isJobAuditErrorCodeOrNull(value.errorCode)) return null
+  return {
+    id: value.id,
+    kind: value.kind,
+    state: value.state,
+    actor: value.actor,
+    createdAt: value.createdAt,
+    startedAt: value.startedAt,
+    finishedAt: value.finishedAt,
+    durationMs: value.durationMs as number | null,
+    summary: value.summary,
+    errorCode: value.errorCode
+  }
+}
+
+function normalizeJobAuditExportPreview(
+  value: unknown,
+  input: JobAuditExportInput
+): JobAuditExportPreview | null {
+  if (!hasExactKeys(value, [
+    'mode', 'format', 'recordCount', 'byteLength', 'truncated', 'nextCursor',
+    'filters', 'requiredConfirmation'
+  ]) || value.mode !== 'dry-run' || value.format !== input.format ||
+      !isBoundedSafeInteger(value.recordCount, 0, 1_000) ||
+      !isBoundedSafeInteger(value.byteLength, 1, maximumJobAuditExportBytes) ||
+      typeof value.truncated !== 'boolean' || !isJobAuditCursorOrNull(value.nextCursor) ||
+      value.truncated !== (value.nextCursor !== null) ||
+      value.requiredConfirmation !== JOB_AUDIT_EXPORT_CONFIRMATION ||
+      !hasExactKeys(value.filters, ['kind', 'state']) ||
+      !(value.filters.kind === null || isJobKind(value.filters.kind)) ||
+      !(value.filters.state === null || isJobState(value.filters.state)) ||
+      value.filters.kind !== (input.kind ?? null) || value.filters.state !== (input.state ?? null)) return null
+  return {
+    mode: 'dry-run',
+    format: input.format,
+    recordCount: value.recordCount,
+    byteLength: value.byteLength,
+    truncated: value.truncated,
+    nextCursor: value.nextCursor,
+    filters: { kind: value.filters.kind, state: value.filters.state },
+    requiredConfirmation: JOB_AUDIT_EXPORT_CONFIRMATION
+  }
+}
+
+function normalizeJobAuditExportArtifact(
+  text: string,
+  input: JobAuditExportInput
+): Pick<JobAuditExportDownload, 'recordCount' | 'truncated' | 'nextCursor'> | null {
+  if (!text.endsWith('\n')) return null
+  try {
+    if (input.format === 'json') {
+      return normalizeJobAuditJsonArtifact(JSON.parse(text), input)
+    }
+    const lines = text.slice(0, -1).split('\n')
+    if (lines.length < 1 || lines.some((line) => line.length === 0 || line.includes('\r'))) return null
+    const metadata = JSON.parse(lines[0]!) as unknown
+    if (!hasExactKeys(metadata, [
+      'protocol', 'schemaVersion', 'generatedAt', 'recordCount', 'truncated',
+      'nextCursor', 'filters', 'type'
+    ]) || metadata.type !== 'metadata') return null
+    const jobs = lines.slice(1).map((line) => JSON.parse(line) as unknown)
+    if (jobs.some((entry) => !hasExactKeys(entry, ['type', 'data']) ||
+      entry.type !== 'job' || normalizeJobRecord(entry.data) === null)) return null
+    return normalizeJobAuditArtifactMetadata(metadata, jobs.length, input)
+  } catch {
+    return null
+  }
+}
+
+function normalizeJobAuditJsonArtifact(
+  value: unknown,
+  input: JobAuditExportInput
+): Pick<JobAuditExportDownload, 'recordCount' | 'truncated' | 'nextCursor'> | null {
+  if (!hasExactKeys(value, [
+    'protocol', 'schemaVersion', 'generatedAt', 'recordCount', 'truncated',
+    'nextCursor', 'filters', 'records'
+  ]) || !Array.isArray(value.records) ||
+      value.records.some((record) => normalizeJobRecord(record) === null)) return null
+  return normalizeJobAuditArtifactMetadata(value, value.records.length, input)
+}
+
+function normalizeJobAuditArtifactMetadata(
+  value: Record<string, unknown>,
+  actualRecordCount: number,
+  input: JobAuditExportInput
+): Pick<JobAuditExportDownload, 'recordCount' | 'truncated' | 'nextCursor'> | null {
+  if (value.protocol !== 'DYSON_CONTROL_JOB_AUDIT_EXPORT_V1' || value.schemaVersion !== 1 ||
+      !isIsoTimestamp(value.generatedAt) ||
+      !isBoundedSafeInteger(value.recordCount, 0, input.maximumRecords ?? 1_000) ||
+      value.recordCount !== actualRecordCount || typeof value.truncated !== 'boolean' ||
+      !isJobAuditCursorOrNull(value.nextCursor) || value.truncated !== (value.nextCursor !== null) ||
+      !hasExactKeys(value.filters, ['kind', 'state']) ||
+      value.filters.kind !== (input.kind ?? null) || value.filters.state !== (input.state ?? null)) return null
+  return {
+    recordCount: value.recordCount,
+    truncated: value.truncated,
+    nextCursor: value.nextCursor
+  }
+}
+
+function jobAuditHttpError(status: number, body: unknown): ApiError {
+  const code = safeJobAuditErrorCode(body)
+  const message = status === 400
+    ? '任务筛选、游标或导出参数无效；未执行任何导出。'
+    : status === 401
+      ? '当前会话已失效；任务审计保持只读锁定。'
+      : status === 403
+        ? '当前会话没有任务审计导出权限。'
+        : status === 404
+          ? '任务审计端点尚未配置。'
+          : status === 413
+            ? '审计导出超过固定 2 MiB 上限；请缩小记录数量。'
+            : status === 423
+              ? '任务审计导出门禁当前关闭；读取仍可继续。'
+              : '任务审计服务暂不可用；没有执行下载。'
+  return new ApiError(status, message, code)
+}
+
+function safeJobAuditErrorCode(value: unknown): string | null {
+  if (!isRecord(value) || !isRecord(value.error) ||
+      typeof value.error.code !== 'string' || !jobAuditErrorCodePattern.test(value.error.code)) return null
+  return value.error.code
+}
+
+function jobAuditClientRequestInvalid(): ApiError {
+  return new ApiError(0, '浏览器拒绝了无效的任务审计参数。', 'JOB_AUDIT_BROWSER_REQUEST_INVALID')
+}
+
+function jobAuditResponseInvalid(): ApiError {
+  return new ApiError(502, '任务审计响应未通过完整性校验。', 'JOB_AUDIT_BROWSER_RESPONSE_INVALID')
+}
+
+function isJobKind(value: unknown): value is JobKind {
+  return typeof value === 'string' && jobKindSet.has(value)
+}
+
+function isJobState(value: unknown): value is JobState {
+  return typeof value === 'string' && jobStateSet.has(value)
+}
+
+function isJobAuditExportFormat(value: unknown): value is JobAuditExportFormat {
+  return value === 'json' || value === 'ndjson'
+}
+
+function isJobAuditCursor(value: unknown): value is string {
+  return typeof value === 'string' && jobAuditCursorPattern.test(value)
+}
+
+function isJobAuditCursorOrNull(value: unknown): value is string | null {
+  return value === null || isJobAuditCursor(value)
+}
+
+function isJobAuditErrorCodeOrNull(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && jobAuditErrorCodePattern.test(value))
+}
+
+function isIsoTimestampOrNull(value: unknown): value is string | null {
+  return value === null || isIsoTimestamp(value)
+}
+
+function isNullableBoundedSafeInteger(
+  value: unknown,
+  minimum: number,
+  maximum: number
+): value is number | null {
+  return value === null || isBoundedSafeInteger(value, minimum, maximum)
+}
+
+async function readCutoverStatus(signal?: AbortSignal): Promise<{ data: CutoverRecoveryStatus }> {
+  return cutoverRequest('/api/v1/cutover/status', normalizeCutoverRecoveryStatus, {
+    signal,
+    cache: 'no-store'
+  })
+}
+
+async function runCutoverPreview(
+  input: CutoverPreviewRequest,
+  signal?: AbortSignal
+): Promise<{ data: CutoverPreviewReceipt }> {
+  const request = normalizeCutoverPreviewRequest(input)
+  return cutoverRequest(
+    '/api/v1/cutover/preview',
+    (value) => normalizeCutoverPreviewReceipt(value, request),
+    { method: 'POST', signal, body: JSON.stringify(request) }
+  )
+}
+
+async function runCutoverPrepare(
+  requestId: string,
+  planFingerprint: string,
+  confirmation: typeof CUTOVER_PREPARE_CONFIRMATION,
+  signal?: AbortSignal
+): Promise<{ data: CutoverReceipt }> {
+  if (confirmation !== CUTOVER_PREPARE_CONFIRMATION) throw cutoverClientRequestInvalid()
+  const normalizedRequestId = normalizeCutoverRequestId(requestId)
+  const normalizedPlanFingerprint = normalizeCutoverPlanFingerprint(planFingerprint)
+  return cutoverRequest('/api/v1/cutover/prepare', (value) => normalizeCutoverReceipt(value, {
+    requestId: normalizedRequestId,
+    phase: 'prepared',
+    statuses: ['succeeded']
+  }), {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({
+      requestId: normalizedRequestId,
+      planFingerprint: normalizedPlanFingerprint,
+      confirmation: CUTOVER_PREPARE_CONFIRMATION
+    })
+  })
+}
+
+async function runCutoverActivate(
+  requestId: string,
+  planFingerprint: string,
+  confirmation: typeof CUTOVER_ACTIVATE_CONFIRMATION,
+  signal?: AbortSignal
+): Promise<{ data: CutoverReceipt }> {
+  if (confirmation !== CUTOVER_ACTIVATE_CONFIRMATION) throw cutoverClientRequestInvalid()
+  const normalizedRequestId = normalizeCutoverRequestId(requestId)
+  const normalizedPlanFingerprint = normalizeCutoverPlanFingerprint(planFingerprint)
+  return cutoverRequest('/api/v1/cutover/activate', (value) => normalizeCutoverReceipt(value, {
+    requestId: normalizedRequestId,
+    phase: 'activated',
+    statuses: ['succeeded']
+  }), {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({
+      requestId: normalizedRequestId,
+      planFingerprint: normalizedPlanFingerprint,
+      confirmation: CUTOVER_ACTIVATE_CONFIRMATION
+    })
+  })
+}
+
+async function runCutoverRollback(
+  requestId: string,
+  mode: CutoverRollbackMode,
+  planFingerprint: string,
+  confirmation: typeof CUTOVER_ROLLBACK_CONFIRMATION,
+  signal?: AbortSignal
+): Promise<{ data: CutoverReceipt }> {
+  if (!isCutoverRollbackMode(mode) || confirmation !== CUTOVER_ROLLBACK_CONFIRMATION) {
+    throw cutoverClientRequestInvalid()
+  }
+  const normalizedRequestId = normalizeCutoverRequestId(requestId)
+  const normalizedPlanFingerprint = normalizeCutoverPlanFingerprint(planFingerprint)
+  return cutoverRequest('/api/v1/cutover/rollback', (value) => normalizeCutoverReceipt(value, {
+    requestId: normalizedRequestId,
+    phase: mode === 'immediate-compensation' ? 'rolled-back-immediate' : 'rolled-back-later',
+    statuses: ['rolled-back']
+  }), {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({
+      requestId: normalizedRequestId,
+      mode,
+      planFingerprint: normalizedPlanFingerprint,
+      confirmation: CUTOVER_ROLLBACK_CONFIRMATION
+    })
+  })
+}
+
+async function runCutoverRecovery(
+  requestId: string,
+  desired: CutoverDesiredAuthority,
+  confirmation: typeof CUTOVER_RECOVERY_CONFIRMATION,
+  signal?: AbortSignal
+): Promise<{ data: CutoverReceipt }> {
+  if (!isCutoverDesiredAuthority(desired) || confirmation !== CUTOVER_RECOVERY_CONFIRMATION) {
+    throw cutoverClientRequestInvalid()
+  }
+  const normalizedRequestId = normalizeCutoverRequestId(requestId)
+  return cutoverRequest('/api/v1/cutover/recover', (value) => normalizeCutoverReceipt(value, {
+    requestId: normalizedRequestId,
+    phase: desired === 'candidate' ? 'recovered-candidate' : 'recovered-previous',
+    statuses: desired === 'candidate' ? ['succeeded'] : ['succeeded', 'rolled-back']
+  }), {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({
+      requestId: normalizedRequestId,
+      desired,
+      confirmation: CUTOVER_RECOVERY_CONFIRMATION
+    })
+  })
+}
+
+async function cutoverRequest<T>(
+  path: string,
+  normalize: (value: unknown) => T | null,
+  init?: RequestInit
+): Promise<{ data: T }> {
+  const headers = new Headers(init?.headers)
+  if (init?.body) headers.set('Content-Type', 'application/json')
+  let response: Response
+  try {
+    response = await fetch(path, {
+      credentials: 'same-origin',
+      ...init,
+      headers
+    })
+  } catch (reason) {
+    if (init?.signal?.aborted) throw reason
+    throw new ApiError(0, '无法连接 Cutover 状态端点；所有切换操作保持锁定。', 'CUTOVER_BROWSER_NETWORK_UNAVAILABLE')
+  }
+
+  const body: unknown = await response.json().catch(() => null)
+  if (!response.ok) {
+    const code = safeCutoverFailureCode(body) ?? (
+      response.status === 404 ? 'CUTOVER_HTTP_NOT_CONFIGURED' : 'CUTOVER_HTTP_REQUEST_FAILED'
+    )
+    throw new ApiError(response.status, trustedCutoverErrorMessage(response.status, code), code)
+  }
+  if (!hasExactKeys(body, ['ok', 'data']) || body.ok !== true) throw cutoverResponseInvalid()
+  const data = normalize(body.data)
+  if (data === null) throw cutoverResponseInvalid()
+  return { data }
+}
+
+function normalizeCutoverRequestId(value: string): string {
+  if (typeof value !== 'string' || value !== value.trim() || !uuidPattern.test(value)) {
+    throw cutoverClientRequestInvalid()
+  }
+  return value.toLowerCase()
+}
+
+function normalizeCutoverPlanFingerprint(value: string): string {
+  if (typeof value !== 'string' || value !== value.trim() || !sha256Pattern.test(value)) {
+    throw cutoverClientRequestInvalid()
+  }
+  return value
+}
+
+function normalizeCutoverPreviewRequest(value: CutoverPreviewRequest): CutoverPreviewRequest {
+  if (!isRecord(value) || typeof value.operation !== 'string') throw cutoverClientRequestInvalid()
+  if (value.operation === 'prepare' || value.operation === 'activate') {
+    if (!hasExactKeys(value, ['requestId', 'operation'])) throw cutoverClientRequestInvalid()
+    return { requestId: normalizeCutoverRequestId(value.requestId), operation: value.operation }
+  }
+  if (value.operation === 'rollback' && hasExactKeys(value, ['requestId', 'operation', 'mode']) &&
+      isCutoverRollbackMode(value.mode)) {
+    return {
+      requestId: normalizeCutoverRequestId(value.requestId),
+      operation: 'rollback',
+      mode: value.mode
+    }
+  }
+  throw cutoverClientRequestInvalid()
+}
+
+function normalizeCutoverRecoveryStatus(value: unknown): CutoverRecoveryStatus | null {
+  if (!hasExactKeys(value, [
+    'schemaVersion', 'phase', 'status', 'mutationBlocked', 'recoveryRequired',
+    'requestId', 'allowedDesired', 'summary', 'errorCode'
+  ])) return null
+  const summary = normalizeCutoverSummary(value.summary)
+  const allowedDesired = normalizeCutoverAllowedDesired(value.allowedDesired)
+  if (value.schemaVersion !== 1 || !isCutoverRecoveryPhase(value.phase) ||
+      !isCutoverRecoveryState(value.status) || typeof value.mutationBlocked !== 'boolean' ||
+      typeof value.recoveryRequired !== 'boolean' || summary === null || allowedDesired === null ||
+      !isSafeCutoverErrorCodeOrNull(value.errorCode) || !isLowercaseUuidOrNull(value.requestId)) {
+    return null
+  }
+
+  if (value.phase === 'ready') {
+    if (value.status !== 'ready' || value.mutationBlocked || value.recoveryRequired ||
+        value.requestId !== null || allowedDesired.length !== 0 || value.errorCode !== null) return null
+  } else if (value.phase === 'recovery-required') {
+    if (!value.mutationBlocked || !value.recoveryRequired || value.requestId === null ||
+        !isRecoveryRequiredState(value.status)) return null
+  } else if (value.status !== value.phase || !value.mutationBlocked || value.recoveryRequired ||
+      value.requestId !== null || allowedDesired.length !== 0) {
+    return null
+  }
+
+  return {
+    schemaVersion: 1,
+    phase: value.phase,
+    status: value.status,
+    mutationBlocked: value.mutationBlocked,
+    recoveryRequired: value.recoveryRequired,
+    requestId: value.requestId,
+    allowedDesired,
+    summary,
+    errorCode: value.errorCode
+  }
+}
+
+interface CutoverReceiptExpectation {
+  requestId: string
+  phase: CutoverReceipt['phase']
+  statuses: readonly CutoverReceipt['status'][]
+}
+
+function normalizeCutoverReceipt(
+  value: unknown,
+  expected: CutoverReceiptExpectation
+): CutoverReceipt | null {
+  if (!hasExactKeys(value, [
+    'requestId', 'phase', 'status', 'allowedDesired', 'summary', 'errorCode'
+  ])) return null
+  const summary = normalizeCutoverSummary(value.summary)
+  const allowedDesired = normalizeCutoverAllowedDesired(value.allowedDesired)
+  if (!isLowercaseUuid(value.requestId) || !isCutoverPublicPhase(value.phase) ||
+      !isCutoverPublicStatus(value.status) || summary === null || allowedDesired === null ||
+      !(value.errorCode === null || isCutoverCoreErrorCode(value.errorCode))) return null
+  if (value.requestId !== expected.requestId || value.phase !== expected.phase ||
+      !expected.statuses.includes(value.status) || value.status === 'failed-safe' ||
+      allowedDesired.length !== 0 || value.errorCode !== null) return null
+  return {
+    requestId: value.requestId,
+    phase: value.phase,
+    status: value.status,
+    allowedDesired,
+    summary,
+    errorCode: value.errorCode
+  }
+}
+
+function normalizeCutoverPreviewReceipt(
+  value: unknown,
+  expected: CutoverPreviewRequest
+): CutoverPreviewReceipt | null {
+  if (!hasExactKeys(value, [
+    'format', 'schemaVersion', 'operation', 'requestId', 'rollbackMode',
+    'stateRevision', 'evidenceDigest', 'planFingerprint', 'summary'
+  ])) return null
+  const summary = normalizeCutoverSummary(value.summary)
+  const rollbackMode = expected.operation === 'rollback' ? expected.mode : null
+  if (value.format !== 'dyson-control-cutover-preview' || value.schemaVersion !== 1 ||
+      value.operation !== expected.operation || value.requestId !== expected.requestId ||
+      value.rollbackMode !== rollbackMode || !isLowercaseSha256(value.stateRevision) ||
+      !isLowercaseSha256(value.evidenceDigest) || !isLowercaseSha256(value.planFingerprint) ||
+      summary === null || summary.reused) return null
+  return {
+    format: 'dyson-control-cutover-preview',
+    schemaVersion: 1,
+    operation: expected.operation,
+    requestId: expected.requestId,
+    rollbackMode,
+    stateRevision: value.stateRevision,
+    evidenceDigest: value.evidenceDigest,
+    planFingerprint: value.planFingerprint,
+    summary
+  }
+}
+
+function normalizeCutoverSummary(value: unknown): CutoverReceipt['summary'] | null {
+  const keys = [
+    'candidateDefined', 'candidateDisabled', 'previousAuthorityEnabled',
+    'candidateAuthorityEnabled', 'previousRuntimeHealthy', 'candidateRuntimeHealthy',
+    'processesStopped', 'portClosed', 'uniqueAuthority', 'saveProtected',
+    'baselineRestored', 'currentProgressProtected', 'reused'
+  ] as const
+  if (!hasExactKeys(value, keys) || keys.some((key) => typeof value[key] !== 'boolean')) return null
+  return Object.fromEntries(keys.map((key) => [key, value[key]])) as unknown as CutoverReceipt['summary']
+}
+
+function normalizeCutoverAllowedDesired(value: unknown): CutoverDesiredAuthority[] | null {
+  if (!Array.isArray(value) || value.length > 2 || value.some((item) => !isCutoverDesiredAuthority(item))) {
+    return null
+  }
+  if (new Set(value).size !== value.length) return null
+  return [...value]
+}
+
+function isCutoverDesiredAuthority(value: unknown): value is CutoverDesiredAuthority {
+  return value === 'previous' || value === 'candidate'
+}
+
+function isCutoverRollbackMode(value: unknown): value is CutoverRollbackMode {
+  return value === 'immediate-compensation' || value === 'later-operator-rollback'
+}
+
+function isCutoverPublicPhase(value: unknown): value is CutoverReceipt['phase'] {
+  return value === 'prepared' || value === 'activated' || value === 'rolled-back-immediate' ||
+    value === 'rolled-back-later' || value === 'recovered-candidate' || value === 'recovered-previous'
+}
+
+function isCutoverPublicStatus(value: unknown): value is CutoverReceipt['status'] {
+  return value === 'succeeded' || value === 'rolled-back' || value === 'failed-safe'
+}
+
+function isCutoverRecoveryPhase(value: unknown): value is CutoverRecoveryStatus['phase'] {
+  return value === 'pending' || value === 'reconciling' || value === 'ready' ||
+    value === 'recovery-required' || value === 'unavailable'
+}
+
+function isCutoverRecoveryState(value: unknown): value is CutoverRecoveryStatus['status'] {
+  return value === 'ready' || value === 'interrupted' || value === 'terminal-pending-release' ||
+    value === 'evidence-invalid' || value === 'pending' || value === 'reconciling' || value === 'unavailable'
+}
+
+function isRecoveryRequiredState(value: unknown): boolean {
+  return value === 'interrupted' || value === 'terminal-pending-release' || value === 'evidence-invalid'
+}
+
+function isLowercaseUuid(value: unknown): value is string {
+  return typeof value === 'string' && value === value.toLowerCase() && uuidPattern.test(value)
+}
+
+function isLowercaseUuidOrNull(value: unknown): value is string | null {
+  return value === null || isLowercaseUuid(value)
+}
+
+function isSafeCutoverErrorCodeOrNull(value: unknown): value is string | null {
+  return value === null || isSafeCutoverErrorCode(value)
+}
+
+function safeCutoverFailureCode(value: unknown): string | null {
+  if (!isRecord(value) || !isRecord(value.error) || !isSafeCutoverErrorCode(value.error.code)) return null
+  return value.error.code
+}
+
+function isSafeCutoverErrorCode(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Z][A-Z0-9_]{2,127}$/.test(value)
+}
+
+function isCutoverCoreErrorCode(value: unknown): value is CutoverErrorCode {
+  return typeof value === 'string' && cutoverCoreErrorCodes.has(value as CutoverErrorCode)
+}
+
+function cutoverClientRequestInvalid(): ApiError {
+  return new ApiError(400, 'Cutover 请求必须只包含有效 UUID、固定操作和精确确认。', 'CUTOVER_BROWSER_REQUEST_INVALID')
+}
+
+function cutoverResponseInvalid(): ApiError {
+  return new ApiError(502, 'Cutover 响应未通过严格浏览器合同校验；所有切换操作保持锁定。', 'CUTOVER_BROWSER_RESPONSE_INVALID')
+}
+
+function trustedCutoverErrorMessage(status: number, code: string): string {
+  if (status === 423 && code === 'CUTOVER_HTTP_MUTATION_BUSY') {
+    return '已有 Cutover 事务正在处理；重复提交已被拒绝。'
+  }
+  if (status === 423 && code === 'CUTOVER_HTTP_RECOVERY_MUTATION_DISABLED') {
+    return 'Cutover 恢复门禁默认关闭；当前只允许读取恢复状态。'
+  }
+  if (status === 423) return 'Cutover 普通切换门禁默认关闭；当前只允许读取与预演。'
+  if (status === 404) return 'Cutover 控制链未部署或未启用；所有切换操作保持关闭。'
+  if (status === 403) return '当前认证角色没有 Cutover 执行权限。'
+  if (status === 422) return 'Cutover 请求或精确确认未通过服务端校验。'
+  if (status === 409) return 'Cutover 当前阶段与所选操作不一致；请重新读取持久状态。'
+  if (status === 503) return 'Cutover 安全终态暂不可证明；请读取恢复状态后再处理。'
+  return 'Cutover 请求未完成；所有切换操作保持锁定。'
+}
+
+const cutoverCoreErrorCodes = new Set<CutoverErrorCode>([
+  'CUTOVER_REQUEST_INVALID',
+  'CUTOVER_CONFIRMATION_REQUIRED',
+  'CUTOVER_ROLLBACK_CONFIRMATION_REQUIRED',
+  'CUTOVER_PREVIEW_REQUIRED',
+  'CUTOVER_PREVIEW_CONFLICT',
+  'CUTOVER_IDEMPOTENCY_CONFLICT',
+  'CUTOVER_NOT_PREPARED',
+  'CUTOVER_NOT_CANDIDATE_ACTIVE',
+  'CUTOVER_RECOVERY_REQUIRED',
+  'CUTOVER_RECOVERY_NOT_REQUIRED',
+  'CUTOVER_RECOVERY_TARGET_NOT_ALLOWED',
+  'CUTOVER_RECOVERY_EVIDENCE_INVALID',
+  'CUTOVER_DURABLE_STATE_INVALID',
+  'CUTOVER_DURABLE_STORE_FAILED',
+  'CUTOVER_AUTHORITY_DRIFT',
+  'CUTOVER_RUNTIME_DRIFT',
+  'CUTOVER_PREPARE_INVARIANT_FAILED',
+  'CUTOVER_SAVE_PROTECTION_FAILED',
+  'CUTOVER_SAVE_RESTORE_FAILED',
+  'CUTOVER_STOP_GATE_FAILED',
+  'CUTOVER_HEALTH_GATE_FAILED',
+  'CUTOVER_UNIQUE_AUTHORITY_FAILED',
+  'CUTOVER_ADAPTER_FAILED',
+  'CUTOVER_HOST_LEASE_BUSY',
+  'CUTOVER_HOST_LEASE_DIRTY',
+  'CUTOVER_HOST_LEASE_RECOVERY_REQUIRED',
+  'CUTOVER_HOST_LEASE_RECOVERY_NOT_REQUIRED',
+  'CUTOVER_HOST_LEASE_RECOVERY_MISMATCH',
+  'CUTOVER_HOST_LEASE_LOST',
+  'CUTOVER_HOST_LEASE_UNAVAILABLE'
+])
 
 type GameConfigHistoryParser<T> = (value: unknown) => T | null
 
@@ -732,24 +1655,38 @@ const qualificationCheckIds = [
   'window.samples', 'window.duration',
   'runtime.running-coverage', 'health.critical-ratio',
   'simulation.ups-coverage', 'simulation.ups-floor',
+  'simulation.tps-coverage', 'simulation.tps-floor',
   'host.cpu-coverage', 'host.cpu-p95',
   'host.per-core-coverage', 'host.hottest-core-saturation',
   'process.multicore-coverage', 'process.single-core-bottleneck',
   'host.memory-coverage', 'host.memory-peak',
   'storage.project-coverage', 'storage.project-peak-used', 'storage.project-minimum-free',
-  'storage.save-coverage', 'storage.save-peak-used', 'storage.save-minimum-free'
+  'storage.save-coverage', 'storage.save-peak-used', 'storage.save-minimum-free',
+  'storage.dependency-classification',
+  'storage.project-root-coverage', 'storage.project-root-available',
+  'storage.smb-mapping-coverage', 'storage.smb-mapping-available',
+  'storage.recovery-task-coverage', 'storage.recovery-task-healthy'
 ] as const satisfies readonly QualificationCheckId[]
 
 const qualificationCoverageCheckIds = new Set<QualificationCheckId>([
-  'simulation.ups-coverage', 'host.cpu-coverage', 'host.per-core-coverage',
+  'simulation.ups-coverage', 'simulation.tps-coverage',
+  'host.cpu-coverage', 'host.per-core-coverage',
   'process.multicore-coverage', 'host.memory-coverage',
-  'storage.project-coverage', 'storage.save-coverage'
+  'storage.project-coverage', 'storage.save-coverage',
+  'storage.dependency-classification', 'storage.project-root-coverage',
+  'storage.smb-mapping-coverage', 'storage.recovery-task-coverage'
 ])
 
 const coverageContract: QualificationCheckContract = Object.freeze({
   mode: 'coverage',
   observedKeys: ['value', 'observedSamples', 'totalSamples'],
   required: { minimumRatio: 0.95 }
+})
+
+const exactCoverageContract: QualificationCheckContract = Object.freeze({
+  mode: 'coverage',
+  observedKeys: ['value', 'observedSamples', 'totalSamples'],
+  required: { minimumRatio: 1 }
 })
 
 const qualificationCheckContracts: Record<QualificationCheckId, QualificationCheckContract> = {
@@ -761,6 +1698,11 @@ const qualificationCheckContracts: Record<QualificationCheckId, QualificationChe
   'simulation.ups-floor': {
     mode: 'ratio-minimum', observedKeys: ['value', 'p05', 'median'],
     required: { minimumRatio: 0.95, minimumUps: 55 }
+  },
+  'simulation.tps-coverage': coverageContract,
+  'simulation.tps-floor': {
+    mode: 'ratio-minimum', observedKeys: ['value', 'p05', 'median'],
+    required: { minimumRatio: 0.95, minimumTps: 55 }
   },
   'host.cpu-coverage': coverageContract,
   'host.cpu-p95': { mode: 'maximum', observedKeys: ['value'], required: { maximum: 90 } },
@@ -775,8 +1717,20 @@ const qualificationCheckContracts: Record<QualificationCheckId, QualificationChe
   'storage.project-minimum-free': { mode: 'minimum', observedKeys: ['value'], required: { minimum: 10_737_418_240 } },
   'storage.save-coverage': coverageContract,
   'storage.save-peak-used': { mode: 'maximum', observedKeys: ['value'], required: { maximum: 90 } },
-  'storage.save-minimum-free': { mode: 'minimum', observedKeys: ['value'], required: { minimum: 10_737_418_240 } }
+  'storage.save-minimum-free': { mode: 'minimum', observedKeys: ['value'], required: { minimum: 10_737_418_240 } },
+  'storage.dependency-classification': exactCoverageContract,
+  'storage.project-root-coverage': exactCoverageContract,
+  'storage.project-root-available': { mode: 'ratio-minimum', observedKeys: ['value'], required: { minimumRatio: 1 } },
+  'storage.smb-mapping-coverage': exactCoverageContract,
+  'storage.smb-mapping-available': { mode: 'ratio-minimum', observedKeys: ['value'], required: { minimumRatio: 1 } },
+  'storage.recovery-task-coverage': exactCoverageContract,
+  'storage.recovery-task-healthy': { mode: 'ratio-minimum', observedKeys: ['value'], required: { minimumRatio: 1 } }
 }
+
+const qualificationSmbConditionalCheckIds = new Set<QualificationCheckId>([
+  'storage.smb-mapping-coverage', 'storage.smb-mapping-available',
+  'storage.recovery-task-coverage', 'storage.recovery-task-healthy'
+])
 
 const qualificationRemainingEvidence = [
   'SAVE_LATENCY_DRILL_REQUIRED',
@@ -814,13 +1768,14 @@ function parseQualificationEnvelope(value: unknown): ObservabilityQualificationE
   if (!hasExactKeys(value, ['data', 'meta'])) return null
   const meta = value.meta
   const report = value.data
-  if (!hasExactKeys(meta, ['provider', 'environment', 'capacity'])
+  if (!hasExactKeys(meta, ['provider', 'environment', 'capacity', 'longWindowCapacity'])
       || !['demo', 'windows'].includes(String(meta.provider))
       || !['development', 'test', 'production'].includes(String(meta.environment))
-      || !isBoundedSafeInteger(meta.capacity, 1, 1_000_000)) return null
+      || !isBoundedSafeInteger(meta.capacity, 1, 1_000_000)
+      || !isBoundedSafeInteger(meta.longWindowCapacity, 0, 86_400)) return null
   if (!hasExactKeys(report, [
     'schemaVersion', 'kind', 'profileId', 'result', 'generatedAt', 'from', 'to',
-    'sampleCount', 'spanMs', 'checks', 'remainingEvidence'
+    'sampleCount', 'spanMs', 'checks', 'continuity72h', 'latency', 'remainingEvidence'
   ])) return null
   const remainingEvidence = report.remainingEvidence
   if (report.schemaVersion !== 1 || report.kind !== 'dyson-late-game-qualification-report'
@@ -850,6 +1805,9 @@ function parseQualificationEnvelope(value: unknown): ObservabilityQualificationE
     ? 'insufficient'
     : checks.some((check) => check.status === 'fail') ? 'fail' : 'pass'
   if (report.result !== expectedResult) return null
+  const continuity72h = parseLongWindowReport(report.continuity72h, meta.longWindowCapacity)
+  const latency = parseServerReceiptLatencyReport(report.latency)
+  if (continuity72h === null || latency === null) return null
 
   return {
     data: {
@@ -863,12 +1821,15 @@ function parseQualificationEnvelope(value: unknown): ObservabilityQualificationE
       sampleCount: report.sampleCount,
       spanMs: report.spanMs,
       checks,
+      continuity72h,
+      latency,
       remainingEvidence: [...qualificationRemainingEvidence]
     },
     meta: {
       provider: meta.provider as 'demo' | 'windows',
       environment: meta.environment as 'development' | 'test' | 'production',
-      capacity: meta.capacity
+      capacity: meta.capacity,
+      longWindowCapacity: meta.longWindowCapacity
     }
   }
 }
@@ -881,6 +1842,19 @@ function parseQualificationCheck(
   if (!hasExactKeys(value, ['id', 'status', 'message', 'observed', 'required'])
       || value.id !== expectedId || !isQualificationStatus(value.status)
       || typeof value.message !== 'string' || value.message.length < 1 || value.message.length > 512) return null
+  if (qualificationSmbConditionalCheckIds.has(expectedId)
+      && hasExactKeys(value.observed, ['mode'])
+      && hasExactKeys(value.required, ['storageDependencyKind'])) {
+    if (value.status !== 'pass' || value.observed.mode !== 'not-applicable'
+        || value.required.storageDependencyKind !== 'smb-global-mapping') return null
+    return {
+      id: expectedId,
+      status: 'pass',
+      message: value.message,
+      observed: { mode: 'not-applicable' },
+      required: { storageDependencyKind: 'smb-global-mapping' }
+    }
+  }
   const contract = qualificationCheckContracts[expectedId]
   const requiredKeys = Object.keys(contract.required)
   const observed = value.observed
@@ -918,7 +1892,7 @@ function qualificationObservedDomainValid(
   }
   if (id === 'window.samples') return isBoundedSafeInteger(value, 0, sampleCount) && value === sampleCount
   if (id === 'window.duration') return isBoundedSafeInteger(value, 0, 31_536_000_000)
-  if (id === 'simulation.ups-floor') {
+  if (id === 'simulation.ups-floor' || id === 'simulation.tps-floor') {
     return isNullableBoundedNumber(value, 0, 1)
       && isNullableBoundedNumber(observed.p05, 0, 10_000)
       && isNullableBoundedNumber(observed.median, 0, 10_000)
@@ -926,7 +1900,9 @@ function qualificationObservedDomainValid(
         : observed.p05 !== null && observed.median !== null)
   }
   if (id === 'runtime.running-coverage' || id === 'health.critical-ratio'
-      || id === 'host.hottest-core-saturation' || id === 'process.single-core-bottleneck') {
+      || id === 'host.hottest-core-saturation' || id === 'process.single-core-bottleneck'
+      || id === 'storage.project-root-available' || id === 'storage.smb-mapping-available'
+      || id === 'storage.recovery-task-healthy') {
     return isNullableBoundedNumber(value, 0, 1)
   }
   if (id === 'host.cpu-p95' || id === 'host.memory-peak'
@@ -955,6 +1931,165 @@ function qualificationExpectedStatus(
   if (contract.mode === 'ratio-maximum') return value <= contract.required.maximumRatio! ? 'pass' : 'fail'
   if (contract.mode === 'minimum') return value >= contract.required.minimum! ? 'pass' : 'fail'
   return value <= contract.required.maximum! ? 'pass' : 'fail'
+}
+
+const longWindowCheckIds = [
+  'window.samples', 'window.duration', 'window.maximum-gap',
+  'runtime.source-stable', 'runtime.identity-stable',
+  'runtime.running', 'runtime.game-port-listening',
+  'storage.dependency-kind-stable', 'storage.dependency-classified',
+  'storage.project-root-available', 'storage.smb-mapping-available',
+  'storage.recovery-task-healthy'
+] as const satisfies readonly ObservabilityLongWindowCheckId[]
+
+function parseLongWindowReport(value: unknown, capacity: number): ObservabilityLongWindowReport | null {
+  if (!hasExactKeys(value, [
+    'schemaVersion', 'kind', 'result', 'chainIntegrity', 'sampleCount',
+    'from', 'to', 'spanMs', 'checks'
+  ]) || value.schemaVersion !== 1 || value.kind !== 'dyson-observability-72h-continuity-report'
+      || !isQualificationStatus(value.result)
+      || !['verified', 'unknown'].includes(String(value.chainIntegrity))
+      || !isBoundedSafeInteger(value.sampleCount, 0, capacity)
+      || !isBoundedSafeInteger(value.spanMs, 0, 31_536_000_000)
+      || !Array.isArray(value.checks) || value.checks.length !== longWindowCheckIds.length) return null
+  if (value.sampleCount === 0) {
+    if (value.from !== null || value.to !== null || value.spanMs !== 0 || value.chainIntegrity !== 'unknown') return null
+  } else {
+    if (!isIsoTimestamp(value.from) || !isIsoTimestamp(value.to)
+        || Math.max(0, Date.parse(value.to) - Date.parse(value.from)) !== value.spanMs
+        || value.chainIntegrity !== 'verified') return null
+  }
+  const checks: ObservabilityLongWindowCheck[] = []
+  for (let index = 0; index < longWindowCheckIds.length; index++) {
+    const parsed = parseLongWindowCheck(value.checks[index], longWindowCheckIds[index]!)
+    if (parsed === null) return null
+    checks.push(parsed)
+  }
+  const samplesCheck = checks.find((check) => check.id === 'window.samples')
+  const durationCheck = checks.find((check) => check.id === 'window.duration')
+  if (samplesCheck?.observed.value !== value.sampleCount
+      || durationCheck?.observed.value !== value.spanMs) return null
+  const expected: QualificationStatus = checks.some((check) => check.status === 'insufficient')
+    ? 'insufficient'
+    : checks.some((check) => check.status === 'fail') ? 'fail' : 'pass'
+  if (value.result !== expected) return null
+  return {
+    schemaVersion: 1,
+    kind: 'dyson-observability-72h-continuity-report',
+    result: value.result,
+    chainIntegrity: value.chainIntegrity as 'verified' | 'unknown',
+    sampleCount: value.sampleCount,
+    from: value.from as string | null,
+    to: value.to as string | null,
+    spanMs: value.spanMs,
+    checks
+  }
+}
+
+function parseLongWindowCheck(
+  value: unknown,
+  id: ObservabilityLongWindowCheckId
+): ObservabilityLongWindowCheck | null {
+  if (!hasExactKeys(value, ['id', 'status', 'observed', 'required'])
+      || value.id !== id || !isQualificationStatus(value.status)
+      || !hasExactKeys(value.observed, ['value'])) return null
+  const observed = value.observed.value
+  let required: Record<string, number | boolean>
+  let expected: QualificationStatus
+  if (id === 'window.samples' || id === 'window.duration') {
+    const minimum = id === 'window.samples' ? 17_281 : 259_200_000
+    if (!hasExactKeys(value.required, ['minimum']) || value.required.minimum !== minimum
+        || !isBoundedSafeInteger(observed, 0, Number.MAX_SAFE_INTEGER)) return null
+    required = { minimum }
+    expected = observed >= minimum ? 'pass' : 'insufficient'
+  } else if (id === 'window.maximum-gap') {
+    if (!hasExactKeys(value.required, ['maximum']) || value.required.maximum !== 30_000
+        || !(observed === null || isBoundedSafeInteger(observed, 1, Number.MAX_SAFE_INTEGER))) return null
+    required = { maximum: 30_000 }
+    expected = observed === null ? 'insufficient' : observed <= 30_000 ? 'pass' : 'fail'
+  } else if (id === 'runtime.source-stable' || id === 'runtime.identity-stable'
+      || id === 'storage.dependency-kind-stable') {
+    if (!hasExactKeys(value.required, ['exact']) || value.required.exact !== 1
+        || !isBoundedSafeInteger(observed, 0, Number.MAX_SAFE_INTEGER)) return null
+    required = { exact: 1 }
+    expected = observed === 0 ? 'insufficient' : observed === 1 ? 'pass' : 'fail'
+  } else {
+    if (!hasExactKeys(value.required, ['exact']) || value.required.exact !== true
+        || typeof observed !== 'boolean') return null
+    required = { exact: true }
+    expected = observed ? 'pass' : 'fail'
+  }
+  if (value.status !== expected) return null
+  return { id, status: value.status, observed: { value: observed }, required }
+}
+
+function parseServerReceiptLatencyReport(value: unknown): ServerReceiptLatencyReport | null {
+  if (!hasExactKeys(value, [
+    'schemaVersion', 'kind', 'evidenceStatus', 'generatedAt', 'scannedJobs',
+    'truncated', 'save', 'backup'
+  ]) || value.schemaVersion !== 1 || value.kind !== 'dyson-server-receipt-latency-report'
+      || !['unknown', 'not-qualified'].includes(String(value.evidenceStatus))
+      || !isIsoTimestamp(value.generatedAt) || !isBoundedSafeInteger(value.scannedJobs, 0, 5_000)
+      || typeof value.truncated !== 'boolean'
+      || (value.truncated && value.scannedJobs !== 5_000)) return null
+  const save = parseOperationLatencySummary(value.save, 'save')
+  const backup = parseOperationLatencySummary(value.backup, 'backup')
+  if (save === null || backup === null) return null
+  const expectedStatus = value.truncated || save.totalReceipts + backup.totalReceipts === 0
+    ? 'unknown'
+    : 'not-qualified'
+  if (value.evidenceStatus !== expectedStatus) return null
+  return {
+    schemaVersion: 1,
+    kind: 'dyson-server-receipt-latency-report',
+    evidenceStatus: expectedStatus,
+    generatedAt: value.generatedAt,
+    scannedJobs: value.scannedJobs,
+    truncated: value.truncated,
+    save,
+    backup
+  }
+}
+
+function parseOperationLatencySummary(
+  value: unknown,
+  operation: 'save' | 'backup'
+): OperationLatencySummary | null {
+  if (!hasExactKeys(value, [
+    'operation', 'evidenceStatus', 'totalReceipts', 'successfulReceipts',
+    'failedReceipts', 'incompleteReceipts', 'p50Ms', 'p95Ms', 'maximumMs'
+  ]) || value.operation !== operation
+      || !['unknown', 'not-qualified'].includes(String(value.evidenceStatus))) return null
+  if (!isBoundedSafeInteger(value.totalReceipts, 0, 100_000)
+      || !isBoundedSafeInteger(value.successfulReceipts, 0, 100_000)
+      || !isBoundedSafeInteger(value.failedReceipts, 0, 100_000)
+      || !isBoundedSafeInteger(value.incompleteReceipts, 0, 100_000)) return null
+  const totalReceipts = value.totalReceipts
+  const successfulReceipts = value.successfulReceipts
+  const failedReceipts = value.failedReceipts
+  const incompleteReceipts = value.incompleteReceipts
+  if (totalReceipts !== successfulReceipts + failedReceipts + incompleteReceipts) return null
+  const durations = [value.p50Ms, value.p95Ms, value.maximumMs]
+  if (!durations.every((duration) => duration === null
+      || isBoundedSafeInteger(duration, 0, Number.MAX_SAFE_INTEGER))) return null
+  if (successfulReceipts === 0) {
+    if (durations.some((duration) => duration !== null)) return null
+  } else if (durations.some((duration) => duration === null)
+      || (value.p50Ms as number) > (value.p95Ms as number)
+      || (value.p95Ms as number) > (value.maximumMs as number)) return null
+  const evidenceStatus = totalReceipts === 0 ? 'unknown' : 'not-qualified'
+  if (value.evidenceStatus !== evidenceStatus) return null
+  return {
+    operation,
+    evidenceStatus,
+    totalReceipts,
+    successfulReceipts,
+    failedReceipts,
+    incompleteReceipts,
+    p50Ms: value.p50Ms as number | null,
+    p95Ms: value.p95Ms as number | null,
+    maximumMs: value.maximumMs as number | null
+  }
 }
 
 function hasExactKeys(value: unknown, expected: readonly string[]): value is Record<string, unknown> {
@@ -1328,8 +2463,159 @@ function updateActivationErrorMessage(status: number, code: string | null): stri
   return '组件激活工作流暂不可用；不会尝试绕过门禁。'
 }
 
+async function saveJobRequest(path: string, init?: RequestInit): Promise<{ data: SaveJobExecutionResult }> {
+  const payload = await request<{ data: unknown }>(path, init)
+  const parsed = normalizeSaveJobExecutionEnvelope(payload)
+  if (parsed === null) {
+    throw new ApiError(
+      502,
+      '存档任务响应未通过浏览器合同校验；恢复控制保持锁定。',
+      'SAVE_JOB_BROWSER_RESPONSE_INVALID'
+    )
+  }
+  return parsed
+}
+
+async function previewPlayerNotice(
+  input: PlayerNoticePreviewInput,
+  signal?: AbortSignal
+): Promise<{ data: { job: JobRecord; plan: PlayerNoticePlan } }> {
+  if (!isPlayerNoticePreviewInput(input)) {
+    throw new ApiError(400, '玩家通知浏览器请求未通过固定字段校验。', 'PLAYER_NOTICE_BROWSER_REQUEST_INVALID')
+  }
+  const payload = await request<unknown>('/api/v1/players/notice/preview', {
+    method: 'POST', signal, body: JSON.stringify(input)
+  })
+  const parsed = normalizePlayerNoticePreviewEnvelope(payload, input)
+  if (parsed === null) {
+    throw new ApiError(502, '玩家通知预演响应未通过浏览器合同校验。', 'PLAYER_NOTICE_BROWSER_RESPONSE_INVALID')
+  }
+  return parsed
+}
+
+async function executePlayerNotice(
+  input: PlayerNoticePreviewInput & {
+    requestId: string
+    confirmation: 'EXECUTE'
+    expectedTargetJoinedAtUnixMs?: number
+  },
+  signal?: AbortSignal
+): Promise<{ data: { job: JobRecord; receipt: PlayerNoticeReceipt } }> {
+  if (!isPlayerNoticePreviewInput({
+    rosterGeneration: input.rosterGeneration,
+    rosterSequence: input.rosterSequence,
+    sessionPlayerId: input.sessionPlayerId,
+    templateId: input.templateId
+  }) || !uuidPattern.test(input.requestId) || input.confirmation !== 'EXECUTE') {
+    throw new PlayerNoticeApiError(
+      400, '玩家通知浏览器执行请求无效。', 'PLAYER_NOTICE_BROWSER_REQUEST_INVALID'
+    )
+  }
+
+  if (input.expectedTargetJoinedAtUnixMs !== undefined &&
+      (!Number.isSafeInteger(input.expectedTargetJoinedAtUnixMs) || input.expectedTargetJoinedAtUnixMs <= 0)) {
+    throw new PlayerNoticeApiError(
+      400, '玩家通知目标会话时间无效。', 'PLAYER_NOTICE_BROWSER_REQUEST_INVALID'
+    )
+  }
+  const { expectedTargetJoinedAtUnixMs: _expectedTargetJoinedAtUnixMs, ...wireInput } = input
+  const response = await fetch('/api/v1/players/notice', {
+    credentials: 'same-origin',
+    method: 'POST',
+    signal,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(wireInput)
+  })
+  const payload = await response.json().catch(() => null) as unknown
+  const parsed = normalizePlayerNoticeExecutionEnvelope(payload, input)
+  if (parsed !== null) {
+    if (!response.ok) {
+      throw new PlayerNoticeApiError(
+        response.status,
+        `玩家通知终止：${parsed.data.receipt.state}`,
+        parsed.data.receipt.errorCode,
+        parsed.data
+      )
+    }
+    return parsed
+  }
+  if (!response.ok && isApiErrorEnvelope(payload)) {
+    throw new PlayerNoticeApiError(
+      response.status,
+      payload.error.message ?? `HTTP ${response.status}`,
+      payload.error.code ?? null
+    )
+  }
+  throw new PlayerNoticeApiError(
+    502,
+    '玩家通知执行响应未通过浏览器合同校验；结果保持未知。',
+    'PLAYER_NOTICE_BROWSER_RESPONSE_INVALID'
+  )
+}
+
+async function readPlayerNoticeReceipt(
+  input: PlayerNoticePreviewInput & { requestId: string; expectedTargetJoinedAtUnixMs?: number },
+  signal?: AbortSignal
+): Promise<{ data: { receipt: PlayerNoticeReceipt } }> {
+  if (!isPlayerNoticePreviewInput({
+    rosterGeneration: input.rosterGeneration,
+    rosterSequence: input.rosterSequence,
+    sessionPlayerId: input.sessionPlayerId,
+    templateId: input.templateId
+  }) || !uuidPattern.test(input.requestId) ||
+      (input.expectedTargetJoinedAtUnixMs !== undefined &&
+       (!Number.isSafeInteger(input.expectedTargetJoinedAtUnixMs) || input.expectedTargetJoinedAtUnixMs <= 0))) {
+    throw new ApiError(
+      400,
+      '玩家通知回执查询参数未通过固定字段校验。',
+      'PLAYER_NOTICE_BROWSER_REQUEST_INVALID'
+    )
+  }
+  const payload = await request<unknown>(
+    `/api/v1/players/notice/receipts/${encodeURIComponent(input.requestId.toLowerCase())}`,
+    { signal, cache: 'no-store' }
+  )
+  const parsed = normalizePlayerNoticeReceiptEnvelope(payload, input)
+  if (parsed === null) {
+    throw new ApiError(
+      502,
+      '玩家通知回执未通过浏览器合同校验；请求继续保持锁定。',
+      'PLAYER_NOTICE_BROWSER_RESPONSE_INVALID'
+    )
+  }
+  return parsed
+}
+
+function isApiErrorEnvelope(value: unknown): value is {
+  error: { code?: string; message?: string }
+} {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const error = (value as Record<string, unknown>).error
+  return typeof error === 'object' && error !== null && !Array.isArray(error)
+}
+
+async function reconcileSaveJob(
+  jobId: string,
+  confirmation: typeof SAVE_JOB_RECONCILE_CONFIRMATION,
+  signal?: AbortSignal
+): Promise<{ data: SaveJobExecutionResult }> {
+  if (!uuidPattern.test(jobId) || confirmation !== SAVE_JOB_RECONCILE_CONFIRMATION) {
+    throw new ApiError(
+      400,
+      '存档对账只接受有效作业 UUID 与精确确认词。',
+      'SAVE_JOB_BROWSER_REQUEST_INVALID'
+    )
+  }
+  return saveJobRequest(`/api/v1/saves/jobs/${encodeURIComponent(jobId)}/reconcile`, {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({ confirmation })
+  })
+}
+
 const savePairTransferMediaType = 'application/vnd.dyson-control.save-pair'
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const sha256Pattern = /^[0-9a-f]{64}$/
 const saveTransferBackupIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const saveTransferSha256Pattern = /^[0-9a-f]{64}$/
 
@@ -1421,6 +2707,171 @@ async function importSavePairArchive(
   return { data: parsed.data }
 }
 
+async function previewSavePairPromotion(
+  requestId: string,
+  importRequestId: string,
+  signal?: AbortSignal
+): Promise<{ data: SavePairPromotionPlan }> {
+  const input = normalizeSavePairPromotionRequest(requestId, importRequestId)
+  const data = await savePairPromotionRequest(
+    '/api/v1/saves/transfers/promotions/preview',
+    input,
+    signal
+  )
+  const plan = normalizeSavePairPromotionPlan(data, input)
+  if (plan === null) throw savePairPromotionResponseInvalid()
+  return { data: plan }
+}
+
+async function executeSavePairPromotion(
+  requestId: string,
+  importRequestId: string,
+  confirmation: typeof SAVE_PAIR_PROMOTION_CONFIRMATION,
+  signal?: AbortSignal
+): Promise<{ data: SavePairPromotionReceipt }> {
+  if (confirmation !== SAVE_PAIR_PROMOTION_CONFIRMATION) {
+    throw savePairPromotionClientRequestInvalid()
+  }
+  const input = normalizeSavePairPromotionRequest(requestId, importRequestId)
+  const data = await savePairPromotionRequest(
+    '/api/v1/saves/transfers/promotions/execute',
+    { ...input, confirmation: SAVE_PAIR_PROMOTION_CONFIRMATION },
+    signal
+  )
+  const receipt = normalizeSavePairPromotionReceipt(data, input)
+  if (receipt === null) throw savePairPromotionResponseInvalid()
+  return { data: receipt }
+}
+
+function normalizeSavePairPromotionRequest(
+  requestId: string,
+  importRequestId: string
+): { requestId: string; importRequestId: string } {
+  if (requestId !== requestId.trim() || importRequestId !== importRequestId.trim() ||
+      !uuidPattern.test(requestId) || !uuidPattern.test(importRequestId)) {
+    throw savePairPromotionClientRequestInvalid()
+  }
+  return { requestId: requestId.toLowerCase(), importRequestId: importRequestId.toLowerCase() }
+}
+
+async function savePairPromotionRequest(
+  path: '/api/v1/saves/transfers/promotions/preview' | '/api/v1/saves/transfers/promotions/execute',
+  body: Record<string, string>,
+  signal?: AbortSignal
+): Promise<unknown> {
+  const response = await fetch(path, {
+    method: 'POST',
+    credentials: 'same-origin',
+    signal,
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  })
+  const parsed: unknown = await response.json().catch(() => null)
+  if (!response.ok) throw savePairPromotionHttpError(response.status, parsed)
+  if (!hasExactKeys(parsed, ['data'])) throw savePairPromotionResponseInvalid()
+  return parsed.data
+}
+
+function normalizeSavePairPromotionPlan(
+  value: unknown,
+  expected: { requestId: string; importRequestId: string }
+): SavePairPromotionPlan | null {
+  const keys = [
+    'format', 'schemaVersion', 'mode', 'requestId', 'importRequestId', 'inboxId', 'backupId',
+    'saveName', 'sourceArchiveSha256', 'dsvBytes', 'serverBytes', 'requiredBytes',
+    'availableBytes', 'allowed', 'blockers', 'reused', 'requiredConfirmation', 'effects',
+    'executionEnabled'
+  ] as const
+  if (!hasExactKeys(value, keys) || value.format !== 'dyson-control-save-promotion-plan' ||
+      value.schemaVersion !== 1 || value.mode !== 'dry-run' ||
+      value.requestId !== expected.requestId || value.importRequestId !== expected.importRequestId ||
+      value.inboxId !== `import-${expected.importRequestId}` || value.backupId !== `tx-${expected.requestId}` ||
+      !isSavePromotionName(value.saveName) || !isLowercaseSha256(value.sourceArchiveSha256) ||
+      !isPositiveSafeInteger(value.dsvBytes) || !isPositiveSafeInteger(value.serverBytes) ||
+      !isPositiveSafeInteger(value.requiredBytes) ||
+      !(value.availableBytes === null || isBoundedSafeInteger(value.availableBytes, 0, Number.MAX_SAFE_INTEGER)) ||
+      typeof value.allowed !== 'boolean' || !Array.isArray(value.blockers) || value.blockers.length > 2 ||
+      value.blockers.some((blocker) => blocker !== 'space-insufficient' && blocker !== 'space-unavailable') ||
+      new Set(value.blockers).size !== value.blockers.length || typeof value.reused !== 'boolean' ||
+      value.requiredConfirmation !== SAVE_PAIR_PROMOTION_CONFIRMATION ||
+      typeof value.executionEnabled !== 'boolean' || !hasExactKeys(value.effects, [
+        'quarantinePreserved', 'verifiedBackupCreated', 'liveSaveChanged', 'restoreExecuted'
+      ]) || value.effects.quarantinePreserved !== true || value.effects.liveSaveChanged !== false ||
+      value.effects.restoreExecuted !== false || typeof value.effects.verifiedBackupCreated !== 'boolean' ||
+      value.effects.verifiedBackupCreated !== !value.reused ||
+      value.allowed !== (value.reused || value.blockers.length === 0)) {
+    return null
+  }
+  return value as unknown as SavePairPromotionPlan
+}
+
+function normalizeSavePairPromotionReceipt(
+  value: unknown,
+  expected: { requestId: string; importRequestId: string }
+): SavePairPromotionReceipt | null {
+  const keys = [
+    'format', 'schemaVersion', 'operation', 'requestId', 'importRequestId', 'inboxId', 'backupId',
+    'saveName', 'sourceArchiveSha256', 'manifestSha256', 'dsvBytes', 'serverBytes', 'completedAt',
+    'restoreExecuted', 'reused'
+  ] as const
+  if (!hasExactKeys(value, keys) || value.format !== 'dyson-control-save-promotion-receipt' ||
+      value.schemaVersion !== 1 || value.operation !== 'promote-import' ||
+      value.requestId !== expected.requestId || value.importRequestId !== expected.importRequestId ||
+      value.inboxId !== `import-${expected.importRequestId}` || value.backupId !== `tx-${expected.requestId}` ||
+      !isSavePromotionName(value.saveName) || !isLowercaseSha256(value.sourceArchiveSha256) ||
+      !isLowercaseSha256(value.manifestSha256) || !isPositiveSafeInteger(value.dsvBytes) ||
+      !isPositiveSafeInteger(value.serverBytes) || !isIsoTimestamp(value.completedAt) ||
+      value.restoreExecuted !== false || typeof value.reused !== 'boolean') {
+    return null
+  }
+  return value as unknown as SavePairPromotionReceipt
+}
+
+function isSavePromotionName(value: unknown): value is string {
+  return typeof value === 'string' && value === value.trim() && value.length >= 1 && value.length <= 120 &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+}
+
+function isLowercaseSha256(value: unknown): value is string {
+  return typeof value === 'string' && saveTransferSha256Pattern.test(value) && value === value.toLowerCase()
+}
+
+function savePairPromotionClientRequestInvalid(): ApiError {
+  return new ApiError(
+    400,
+    '存档晋升只接受两个有效 UUID；服务器路径、URL 和命令不会被提交。',
+    'SAVE_PROMOTION_CLIENT_REQUEST_INVALID'
+  )
+}
+
+function savePairPromotionResponseInvalid(): ApiError {
+  return new ApiError(
+    502,
+    '存档晋升响应未通过客户端固定合同校验。',
+    'SAVE_PROMOTION_RESPONSE_INVALID'
+  )
+}
+
+function savePairPromotionHttpError(status: number, body: unknown): ApiError {
+  const code = isRecord(body) && isRecord(body.error) && typeof body.error.code === 'string' &&
+    jobAuditErrorCodePattern.test(body.error.code) ? body.error.code : null
+  return new ApiError(status, savePairPromotionErrorMessage(status, code), code)
+}
+
+function savePairPromotionErrorMessage(status: number, code: string | null): string {
+  if (status === 403) return '当前会话没有将隔离存档晋升为已验证保护点的权限。'
+  if (status === 423 && code === 'SAVE_TRANSFER_DISABLED') {
+    return '存档传输写入门禁仍关闭；预演可读，但晋升执行保持锁定。'
+  }
+  if (status === 423) return '另一项主机变更或恢复门禁正在占用；晋升保持锁定。'
+  if (status === 409) return '隔离存档、目标保护点或 request ID 绑定已变化；请重新生成预演。'
+  if (status === 422) return '隔离存档、manifest、配对文件或 SHA-256 未通过服务端验证。'
+  if (status === 400) return '存档晋升请求未通过固定 UUID 与确认词校验。'
+  if (status === 503) return '存档晋升服务或固定数据根暂不可用；不会尝试绕过门禁。'
+  return '存档晋升请求未完成；不会尝试绕过服务端门禁。'
+}
+
 export async function sha256ArrayBuffer(payload: ArrayBuffer): Promise<string> {
   const subtle = globalThis.crypto?.subtle
   if (!subtle) {
@@ -1507,6 +2958,50 @@ async function downloadClientProfileArchive(input: unknown): Promise<ClientProfi
     throw new ApiError(502, '客户端 ZIP 响应缺少有效的完整性元数据', 'CLIENT_PROFILE_ARCHIVE_RESPONSE_INVALID')
   }
   return { blob, fileName, sha256, sizeBytes }
+}
+
+const qualifiedClientArtifactContract: Record<QualifiedClientArtifactKind, {
+  fileName: string
+  mediaType: 'application/zip' | 'application/json'
+  route: 'archive' | 'client' | 'runtime'
+}> = {
+  profile: { fileName: 'dyson-qualified-client-profile.zip', mediaType: 'application/zip', route: 'archive' },
+  client: { fileName: 'dyson-qualified-nebula-client.zip', mediaType: 'application/zip', route: 'client' },
+  runtime: { fileName: 'qualified-client-runtime.json', mediaType: 'application/json', route: 'runtime' }
+}
+
+async function downloadQualifiedClientArtifact(
+  downloadId: string,
+  kind: QualifiedClientArtifactKind,
+  expected: { sha256: string; sizeBytes: number }
+): Promise<QualifiedClientArtifactDownload> {
+  const contract = qualifiedClientArtifactContract[kind]
+  const response = await fetch(`/api/v2/client-profile/${contract.route}/${encodeURIComponent(downloadId)}`, {
+    method: 'GET', credentials: 'same-origin', cache: 'no-store'
+  })
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { error?: { code?: string; message?: string } } | null
+    throw new ApiError(response.status, body?.error?.message ?? `HTTP ${response.status}`, body?.error?.code ?? null)
+  }
+
+  const sha256 = response.headers.get('X-Dyson-Content-SHA256') ?? ''
+  const expectedSha256 = expected.sha256.startsWith('sha256:') ? expected.sha256.slice(7) : expected.sha256
+  const contentLength = response.headers.get('Content-Length')
+  const disposition = response.headers.get('Content-Disposition') ?? ''
+  const fileName = disposition.match(/filename="([A-Za-z0-9._-]+)"/)?.[1] ?? ''
+  const contentType = response.headers.get('Content-Type')?.split(';', 1)[0]?.toLowerCase() ?? ''
+  const cacheDirectives = (response.headers.get('Cache-Control') ?? '').toLowerCase()
+    .split(',').map((value) => value.trim())
+  const blob = await response.blob()
+  const sizeBytes = contentLength === null ? Number.NaN : Number(contentLength)
+  if (contentType !== contract.mediaType || fileName !== contract.fileName ||
+      !/^[0-9a-f]{64}$/.test(sha256) || sha256 !== expectedSha256 ||
+      !Number.isSafeInteger(sizeBytes) || sizeBytes < 1 || sizeBytes !== blob.size ||
+      sizeBytes !== expected.sizeBytes || !cacheDirectives.includes('no-store') ||
+      response.headers.get('X-Content-Type-Options')?.toLowerCase() !== 'nosniff') {
+    throw new ApiError(502, '资格客户端制品响应未通过签发回执绑定校验', 'QUALIFIED_CLIENT_ARTIFACT_RESPONSE_INVALID')
+  }
+  return { blob, fileName, sha256, sizeBytes, kind }
 }
 
 async function downloadConsole(filters: StructuredLogFilters): Promise<{

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { VersionUpdateWorkspace } from './VersionUpdateWorkspace'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { VersionUpdateWorkspace, steamManualHandoffApi } from './VersionUpdateWorkspace'
 import { api, ApiError } from './api'
 import type {
   ComponentCandidatePreparationReceipt,
@@ -13,6 +13,13 @@ import type {
 const preparedNebulaArtifactId = `prepared-nebula-${'a'.repeat(40)}`
 const preparedNebulaSha256 = 'd'.repeat(64)
 const preparationReceiptId = '33333333-3333-4333-8333-333333333333'
+
+beforeEach(() => {
+  vi.spyOn(steamManualHandoffApi, 'state').mockResolvedValue({ data: steamStateFixture() })
+  vi.spyOn(steamManualHandoffApi, 'receipt').mockRejectedValue(
+    new ApiError(404, 'fixture receipt missing', 'DSP_STEAM_HANDOFF_RECEIPT_NOT_FOUND')
+  )
+})
 
 afterEach(() => {
   cleanup()
@@ -33,7 +40,8 @@ describe('component update activation workspace', () => {
     render(<VersionUpdateWorkspace status={statusFixture()} demo={false} user={administrator()} />)
 
     expect(await screen.findByText('4 个托管组件')).toBeTruthy()
-    expect(screen.getByText('STEAM MANUAL')).toBeTruthy()
+    expect(screen.getAllByText('READY').length).toBeGreaterThan(0)
+    expect(screen.getByText('MANUAL / DURABLE HANDOFF')).toBeTruthy()
     expect(screen.getByText('executeSupported=false')).toBeTruthy()
 
     await loadPreparedNebulaDraft()
@@ -65,6 +73,8 @@ describe('component update activation workspace', () => {
 
     expect(await screen.findByText('已由 receipts/:requestId 重新读取')).toBeTruthy()
     expect(screen.getByText('GATE ACCEPTED')).toBeTruthy()
+    expect(screen.getByText(/ROLLBACK JOURNAL/)).toBeTruthy()
+    expect(screen.getByText(/configuration not-required.*exact previous save load not-required/)).toBeTruthy()
     expect(execute).toHaveBeenCalledWith(submitted, 'ACTIVATE_NEBULA_UPDATE', expect.any(AbortSignal))
     expect(readReceipt).toHaveBeenCalledWith(activationRequest.requestId, expect.any(AbortSignal))
   })
@@ -132,15 +142,15 @@ describe('component update activation workspace', () => {
     expect(execute).not.toHaveBeenCalled()
   })
 
-  it('renders DSP and cleanup as non-activatable surfaces and exposes no host transport inputs', async () => {
+  it('renders DSP as official-client manual handoff, keeps demo mutation-free, and exposes no host transport inputs', async () => {
     const preview = vi.spyOn(api, 'previewUpdateActivation')
     const execute = vi.spyOn(api, 'executeUpdateActivation')
     render(<VersionUpdateWorkspace status={statusFixture()} demo user={administrator()} />)
 
-    expect(await screen.findByText('MANUAL / NON-ACTIVATABLE')).toBeTruthy()
-    expect(screen.getByText(/不提供 DSP artifact、匿名 SteamCMD/)).toBeTruthy()
+    expect(await screen.findByText('MANUAL / DURABLE HANDOFF')).toBeTruthy()
+    expect(screen.getByText(/不会读取或自动化账号、密码、Steam Guard/)).toBeTruthy()
     expect(screen.getByText(/核心没有清理执行合同/)).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /删除|清理执行|激活 DSP/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /删除|清理执行|激活 DSP|启动 Steam/i })).toBeNull()
     expect(screen.queryByRole('textbox', { name: /路径|URL|命令|可执行文件|ZIP/i })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: '使用虚构示例' }))
@@ -152,6 +162,166 @@ describe('component update activation workspace', () => {
     expect((screen.getByRole('button', { name: '演示环境不执行' }) as HTMLButtonElement).disabled).toBe(true)
     expect(preview).not.toHaveBeenCalled()
     expect(execute).not.toHaveBeenCalled()
+  })
+
+  it('contains Steam mount unavailability inside its lane without occupying the shared workflow alert', async () => {
+    mockStateReads()
+    vi.mocked(steamManualHandoffApi.state).mockRejectedValue(
+      new ApiError(404, 'Steam handoff route is not assembled.', 'DSP_STEAM_HANDOFF_NOT_CONFIGURED')
+    )
+
+    render(<VersionUpdateWorkspace status={statusFixture()} demo={false} user={administrator()} />)
+
+    const steamStatus = await screen.findByRole('status', { name: 'Steam 人工交接状态不可用' })
+    expect(steamStatus.textContent).toContain('DSP_STEAM_HANDOFF_NOT_CONFIGURED')
+    expect(screen.getByText('DSP HANDOFF').parentElement?.textContent).toContain('UNAVAILABLE')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('previews the Steam handoff with zero mutation and never submits a wrong begin confirmation', async () => {
+    mockStateReads()
+    const steamPreview = vi.spyOn(steamManualHandoffApi, 'preview').mockImplementation(async (request) => ({
+      data: steamPlanFixture(request)
+    }))
+    const steamBegin = vi.spyOn(steamManualHandoffApi, 'begin')
+    const steamConfirm = vi.spyOn(steamManualHandoffApi, 'confirm')
+    render(<VersionUpdateWorkspace status={statusFixture()} demo={false} user={administrator()} />)
+
+    await screen.findByText('MANUAL / DURABLE HANDOFF')
+    fireEvent.change(screen.getByLabelText('Steam 人工交接目标 DSP 版本'), {
+      target: { value: '0.10.35.29485' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '生成零变更预演' }))
+
+    expect(await screen.findByText('Steam handoff dry-run operations')).toBeTruthy()
+    expect(screen.getByText(/accountAutomation=false/)).toBeTruthy()
+    const request = steamPreview.mock.calls[0]?.[0]
+    expect(request).toMatchObject({
+      requestId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      targetVersion: '0.10.35.29485',
+      expectedRevision: steamStateFixture().revision
+    })
+    expect(JSON.stringify(request)).not.toMatch(/account|password|guard|cookie|path|command|executable/i)
+    expect(steamBegin).not.toHaveBeenCalled()
+    expect(steamConfirm).not.toHaveBeenCalled()
+
+    const beginButton = screen.getByRole('button', { name: '建立持久人工交接' }) as HTMLButtonElement
+    fireEvent.change(screen.getByLabelText('Steam 人工交接开始精确确认'), {
+      target: { value: 'BEGIN_STEAM_UPDATE' }
+    })
+    expect(beginButton.disabled).toBe(true)
+    fireEvent.click(beginButton)
+    expect(steamBegin).not.toHaveBeenCalled()
+  })
+
+  it('persists awaiting state, then confirms exact version and current-generation previous-save load', async () => {
+    mockStateReads()
+    const requestId = '77777777-7777-4777-8777-777777777777'
+    const awaiting = steamReceiptFixture(requestId, 'awaiting-steam-client-update')
+    const succeeded = steamReceiptFixture(requestId, 'succeeded')
+    vi.mocked(steamManualHandoffApi.state).mockReset()
+      .mockResolvedValueOnce({ data: steamStateFixture() })
+      .mockResolvedValueOnce({ data: steamStateFixture({
+        revision: awaiting.resultingRevision, activeRequestId: requestId, current: awaiting
+      }) })
+      .mockResolvedValueOnce({ data: steamStateFixture({
+        revision: succeeded.resultingRevision,
+        lastCompletedTargetVersion: succeeded.targetVersion
+      }) })
+    vi.mocked(steamManualHandoffApi.receipt).mockReset()
+      .mockResolvedValueOnce({ data: awaiting })
+      .mockResolvedValueOnce({ data: succeeded })
+    vi.spyOn(steamManualHandoffApi, 'preview').mockImplementation(async (request) => ({
+      data: steamPlanFixture({ ...request, requestId })
+    }))
+    const begin = vi.spyOn(steamManualHandoffApi, 'begin').mockResolvedValue({ data: awaiting })
+    const confirm = vi.spyOn(steamManualHandoffApi, 'confirm').mockResolvedValue({ data: succeeded })
+
+    render(<VersionUpdateWorkspace status={statusFixture()} demo={false} user={administrator()} />)
+    await screen.findByText('MANUAL / DURABLE HANDOFF')
+    fireEvent.change(screen.getByLabelText('Steam 人工交接目标 DSP 版本'), {
+      target: { value: '0.10.35.29485' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '生成零变更预演' }))
+    await screen.findByText('Steam handoff dry-run operations')
+    fireEvent.change(screen.getByLabelText('Steam 人工交接开始精确确认'), {
+      target: { value: 'BEGIN_STEAM_CLIENT_UPDATE_HANDOFF' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '建立持久人工交接' }))
+
+    expect(await screen.findByText('RECEIPT REREAD VERIFIED')).toBeTruthy()
+    expect(screen.getAllByText('AWAITING STEAM CLIENT').length).toBeGreaterThan(0)
+    expect(begin).toHaveBeenCalledWith(expect.objectContaining({
+      requestId, targetVersion: '0.10.35.29485'
+    }), expect.any(AbortSignal))
+    fireEvent.change(screen.getByLabelText('Steam 客户端更新完成精确确认'), {
+      target: { value: 'CONFIRM_STEAM_CLIENT_UPDATE_COMPLETED' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '确认客户端更新已完成' }))
+
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith(requestId, expect.any(AbortSignal)))
+    expect(await screen.findByText('SUCCEEDED')).toBeTruthy()
+    expect(screen.getAllByText('VERIFIED').length).toBeGreaterThan(0)
+    expect(screen.getByText(/Bridge \+ 日志同启动代际/)).toBeTruthy()
+  })
+
+  it('keeps the durable handoff awaiting when operator confirmation observes the wrong DSP version', async () => {
+    mockStateReads()
+    const requestId = '77777777-7777-4777-8777-777777777777'
+    const awaiting = steamReceiptFixture(requestId, 'awaiting-steam-client-update', {
+      failureCode: 'DSP_STEAM_HANDOFF_VERSION_MISMATCH',
+      steps: {
+        ...steamReceiptFixture(requestId, 'awaiting-steam-client-update').steps,
+        versionResample: 'failed'
+      }
+    })
+    vi.mocked(steamManualHandoffApi.state).mockReset().mockResolvedValue({
+      data: steamStateFixture({ revision: awaiting.resultingRevision, activeRequestId: requestId, current: awaiting })
+    })
+    vi.mocked(steamManualHandoffApi.receipt).mockReset().mockResolvedValue({ data: awaiting })
+    const confirm = vi.spyOn(steamManualHandoffApi, 'confirm').mockRejectedValue(
+      new ApiError(409, '官方 Steam 客户端尚未达到 exact 目标版本；事务仍等待，可完成更新后重试。', 'DSP_STEAM_HANDOFF_VERSION_MISMATCH')
+    )
+
+    render(<VersionUpdateWorkspace status={statusFixture()} demo={false} user={administrator()} />)
+    expect(await screen.findByText('RECEIPT REREAD VERIFIED')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Steam 客户端更新完成精确确认'), {
+      target: { value: 'CONFIRM_STEAM_CLIENT_UPDATE_COMPLETED' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '确认客户端更新已完成' }))
+
+    expect((await screen.findAllByText(/DSP_STEAM_HANDOFF_VERSION_MISMATCH/)).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('AWAITING STEAM CLIENT').length).toBeGreaterThan(0)
+    expect(screen.getByLabelText('Steam 客户端更新完成精确确认')).toBeTruthy()
+    expect(confirm).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders exact-save-load failure as recovery-required and removes completion control', async () => {
+    mockStateReads()
+    const requestId = '77777777-7777-4777-8777-777777777777'
+    const failed = steamReceiptFixture(requestId, 'recovery-required', {
+      recoveryRequired: true,
+      failureCode: 'DSP_STEAM_HANDOFF_EXACT_SAVE_LOAD_UNPROVEN',
+      steps: {
+        ...steamReceiptFixture(requestId, 'recovery-required').steps,
+        exactSaveLoad: 'failed'
+      }
+    })
+    vi.mocked(steamManualHandoffApi.state).mockReset().mockResolvedValue({
+      data: steamStateFixture({
+        revision: failed.resultingRevision, recoveryRequired: true,
+        activeRequestId: requestId, current: failed
+      })
+    })
+    vi.mocked(steamManualHandoffApi.receipt).mockReset().mockResolvedValue({ data: failed })
+    const confirm = vi.spyOn(steamManualHandoffApi, 'confirm')
+
+    render(<VersionUpdateWorkspace status={statusFixture()} demo={false} user={administrator()} />)
+
+    expect((await screen.findAllByText('DSP_STEAM_HANDOFF_EXACT_SAVE_LOAD_UNPROVEN')).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('RECOVERY REQUIRED').length).toBeGreaterThan(0)
+    expect(screen.queryByLabelText('Steam 客户端更新完成精确确认')).toBeNull()
+    expect(confirm).not.toHaveBeenCalled()
   })
 
   it('turns an HTTP 423 into an explicit fail-closed gate without discarding the dry-run plan', async () => {
@@ -263,6 +433,11 @@ describe('component update activation workspace', () => {
       status: 'rolled-back' as const,
       resultingRevision: '1'.repeat(64),
       failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
+      rollbackSteps: {
+        component: 'verified' as const, configuration: 'verified' as const,
+        serverModLock: 'verified' as const, pairedSave: 'verified' as const,
+        previousSaveLoad: 'verified' as const
+      },
       rollbackVerified: true,
       recoveryRequired: false
     }
@@ -317,6 +492,91 @@ function recoveryStatusFixture(
     recoveryRequired: required,
     failureCode: required ? 'UPDATE_RECOVERY_REQUIRED' : null,
     reconciledRequestId: requestId
+  }
+}
+
+type SteamHandoffStateFixture = Awaited<ReturnType<typeof steamManualHandoffApi.state>>['data']
+type SteamHandoffPlanFixture = Awaited<ReturnType<typeof steamManualHandoffApi.preview>>['data']
+type SteamHandoffReceiptFixture = Awaited<ReturnType<typeof steamManualHandoffApi.receipt>>['data']
+
+function steamStateFixture(
+  overrides: Partial<SteamHandoffStateFixture> = {}
+): SteamHandoffStateFixture {
+  return {
+    format: 'dyson-control-steam-manual-handoff-state',
+    schemaVersion: 1,
+    revision: '6'.repeat(64),
+    recoveryRequired: false,
+    activeRequestId: null,
+    lastCompletedTargetVersion: null,
+    current: null,
+    ...overrides
+  }
+}
+
+function steamPlanFixture(request: {
+  requestId: string
+  targetVersion: string
+  expectedRevision: string
+}): SteamHandoffPlanFixture {
+  return {
+    format: 'dyson-control-steam-manual-handoff-plan',
+    schemaVersion: 1,
+    dryRun: true,
+    ...request,
+    timeoutSeconds: 1_800,
+    accountAutomation: false,
+    operations: [
+      'capture-runtime-and-save-baseline',
+      'create-paired-save-protection-point',
+      'request-graceful-stop',
+      'prove-process-stopped-and-port-closed',
+      'await-official-steam-client-update',
+      'require-fixed-operator-confirmation',
+      'resample-exact-dsp-version-and-compatibility',
+      'start-and-prove-current-generation-exact-save-load',
+      'persist-audit-receipt'
+    ]
+  }
+}
+
+function steamReceiptFixture(
+  requestId: string,
+  phase: SteamHandoffReceiptFixture['phase'],
+  overrides: Partial<SteamHandoffReceiptFixture> = {}
+): SteamHandoffReceiptFixture {
+  const succeeded = phase === 'succeeded'
+  const failed = phase === 'recovery-required'
+  return {
+    format: 'dyson-control-steam-manual-handoff-receipt',
+    schemaVersion: 1,
+    requestId,
+    targetVersion: '0.10.35.29485',
+    phase,
+    previousRevision: '6'.repeat(64),
+    resultingRevision: succeeded ? '8'.repeat(64) : '7'.repeat(64),
+    transactionBindingSha256: '9'.repeat(64),
+    protectionBackupId: `save:${requestId}`,
+    protectionManifestSha256: 'a'.repeat(64),
+    previousDspVersion: '0.10.34.28529',
+    compatibilityRevision: 'b'.repeat(64),
+    startedAt: '2026-09-01T10:00:00.000Z',
+    expiresAt: '2026-09-01T10:30:00.000Z',
+    completedAt: succeeded || failed ? '2026-09-01T10:05:00.000Z' : null,
+    failureCode: failed ? 'DSP_STEAM_HANDOFF_RECOVERY_REQUIRED' : null,
+    recoveryRequired: failed,
+    steps: {
+      protectionPoint: 'verified',
+      gracefulStop: 'verified',
+      stoppedProof: 'verified',
+      operatorConfirmation: succeeded ? 'verified' : 'pending',
+      versionResample: succeeded ? 'verified' : 'pending',
+      compatibilityResample: succeeded ? 'verified' : 'pending',
+      exactSaveLoad: succeeded ? 'verified' : 'pending'
+    },
+    auditEvents: ['baseline-captured', 'protection-verified'],
+    reused: false,
+    ...overrides
   }
 }
 
@@ -459,9 +719,11 @@ function planFixture(input: UpdateActivationRequest = requestFixture()): UpdateA
     operations: [
       'acquire-global-update-lock', 'verify-staged-artifact-and-archive',
       'assemble-immutable-release', 'prove-process-stopped-and-port-closed',
-      'create-paired-save-protection-point', 'revalidate-stop-revision-and-compatibility',
-      'atomically-switch-active-manifest', 'run-fixed-health-check',
-      'rollback-and-verify-on-failure', 'persist-audit-safe-receipt',
+      'capture-config-mod-lock-and-loaded-save-baseline', 'create-paired-save-protection-point',
+      'bind-rollback-context-journal', 'revalidate-stop-revision-and-compatibility',
+      'publish-and-verify-fixed-live-component', 'run-fixed-health-check',
+      'restore-component-config-mod-lock-and-paired-save-on-failure',
+      'prove-current-generation-exact-save-load', 'persist-audit-safe-receipt',
       'release-global-update-lock'
     ],
     rollback: { automatic: true, previousReleaseRequired: true, recoveryRequiredIfUnproven: true }
@@ -527,8 +789,14 @@ function receiptFixture(input: UpdateActivationRequest = requestFixture()): Upda
     compatibilityReceiptId: request.compatibilityReceiptId!,
     targetVersion: request.targetVersion, releaseId: `nebula-${'e'.repeat(32)}`,
     status: 'succeeded', previousRevision: request.expectedRevision, resultingRevision: '2'.repeat(64),
-    protectionBackupId: 'fictional-backup-0001', failureCode: null, rollbackVerified: false,
-    recoveryRequired: false, fileCount: 7, expandedBytes: 262_144,
+    protectionBackupId: 'fictional-backup-0001',
+    rollbackBindingSha256: 'f'.repeat(64),
+    rollbackSteps: {
+      component: 'not-required', configuration: 'not-required', serverModLock: 'not-required',
+      pairedSave: 'not-required', previousSaveLoad: 'not-required'
+    },
+    failureCode: null, rollbackVerified: false, recoveryRequired: false,
+    fileCount: 7, expandedBytes: 262_144,
     completedAt: '2026-08-30T12:30:00.000Z', reused: false
   }
 }

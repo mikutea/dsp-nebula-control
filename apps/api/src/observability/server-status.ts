@@ -1,22 +1,35 @@
 import type { ServerStatus } from '../domain.js'
+import { BridgeProtocolError, actualSimulationRates } from '../bridge/protocol.js'
+import type { AcceptedBridgeSimulationTelemetry } from '../bridge/file-client.js'
 import { buildServerObservabilitySnapshot } from './snapshot.js'
 import type { ServerObservabilitySnapshot } from './types.js'
+import type { ObservabilityStorageDependencyKind } from './types.js'
 
 const bytesPerGibibyte = 1_024 ** 3
 
 export interface ServerStatusObservabilityOptions {
   source: string
   gamePort: number
+  /**
+   * Must be supplied by a production caller that knows the configured project
+   * root. Omitting it is deliberately fail-closed when the provider cannot
+   * prove a global mapping.
+   */
+  storageDependencyKind?: Exclude<ObservabilityStorageDependencyKind, 'unknown'>
+  /** undefined preserves the legacy adapter; null means the real bridge source was unavailable. */
+  actualSimulationTelemetry?: AcceptedBridgeSimulationTelemetry | null
 }
 
 /**
  * Maps the already-validated status-provider contract into observability.
- * Actual UPS/TPS remain absent: target UPS is configuration, not telemetry.
+ * Actual UPS/TPS are accepted only as a separately authenticated bridge
+ * reading; target UPS always remains configuration rather than telemetry.
  */
 export function buildObservabilityFromServerStatus(
   status: ServerStatus,
   options: ServerStatusObservabilityOptions
 ): ServerObservabilitySnapshot {
+  const actualSimulation = validateActualSimulationTelemetry(status, options.actualSimulationTelemetry)
   const gameConnection = status.connections.find((connection) => connection.id === 'game-port')
   const listening = gameConnection === undefined
     ? undefined
@@ -32,7 +45,8 @@ export function buildObservabilityFromServerStatus(
     source: options.source,
     runtime: {
       state: status.state,
-      processId: status.runtime.processId
+      processId: status.runtime.processId,
+      startedAt: status.runtime.startedAt
     },
     host: {
       cpu: {
@@ -81,10 +95,49 @@ export function buildObservabilityFromServerStatus(
       gamePort: { port: options.gamePort, listening }
     },
     simulation: {
-      // targetUps is configuration only. Actual UPS and TPS remain unavailable.
+      // targetUps is configuration only; actual values can only arrive through
+      // the separately authenticated, generation-bound bridge reader.
+      ups: actualSimulation?.actualUps ?? (options.actualSimulationTelemetry === null ? null : undefined),
+      tps: actualSimulation?.actualTps ?? (options.actualSimulationTelemetry === null ? null : undefined),
       targetUps: status.runtime.targetUps
+    },
+    automation: {
+      storageDependencyKind: options.storageDependencyKind
+        ?? (status.automation.globalMappingAvailable === null ? 'unknown' : 'smb-global-mapping'),
+      projectRootAvailable: status.automation.projectRootAvailable,
+      globalMappingAvailable: options.storageDependencyKind === 'none'
+        ? undefined
+        : status.automation.globalMappingAvailable,
+      storageTask: options.storageDependencyKind === 'none'
+        ? undefined
+        : {
+            state: status.automation.storageTask.state,
+            lastResult: status.automation.storageTask.lastResult
+          }
     }
   })
+}
+
+function validateActualSimulationTelemetry(
+  status: ServerStatus,
+  telemetry: AcceptedBridgeSimulationTelemetry | null | undefined
+): AcceptedBridgeSimulationTelemetry | null | undefined {
+  if (telemetry === null || telemetry === undefined) return telemetry
+  const expectedProcessStartedAtUnixMs = status.runtime.startedAt === null
+    ? null
+    : Date.parse(status.runtime.startedAt)
+  const rates = actualSimulationRates(telemetry.telemetry)
+  if (status.state !== 'running' || status.runtime.processId === null ||
+      expectedProcessStartedAtUnixMs === null || !Number.isSafeInteger(expectedProcessStartedAtUnixMs) ||
+      telemetry.session.processId !== status.runtime.processId ||
+      telemetry.telemetry.processId !== status.runtime.processId ||
+      telemetry.session.processStartedAtUnixMs !== expectedProcessStartedAtUnixMs ||
+      telemetry.telemetry.processStartedAtUnixMs !== expectedProcessStartedAtUnixMs ||
+      telemetry.session.sessionId !== telemetry.telemetry.sessionId ||
+      telemetry.actualUps !== rates.ups || telemetry.actualTps !== rates.tps) {
+    throw new BridgeProtocolError('BRIDGE_TELEMETRY_STATUS_MISMATCH')
+  }
+  return telemetry
 }
 
 function gibibytesToBytes(value: number | null): number | null {

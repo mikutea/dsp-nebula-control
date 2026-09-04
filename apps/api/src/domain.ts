@@ -18,7 +18,7 @@ export type LifecycleCheckId =
   | 'server-task' | 'server-task-principal' | 'server-task-action'
   | 'stop-task' | 'stop-task-principal' | 'stop-task-action'
   | 'stop-task-result' | 'task-history' | 'receipt-channel' | 'save-trigger'
-  | 'execution-lock'
+  | 'interactive-session' | 'steam-session' | 'lifecycle-broker' | 'execution-lock'
 export type LifecycleBlockerCode =
   | 'project-root-unavailable' | 'managed-executable-unavailable'
   | 'managed-process-unverified' | 'server-already-running' | 'pid-file-unverified'
@@ -30,7 +30,9 @@ export type LifecycleBlockerCode =
   | 'stop-task-missing' | 'stop-task-principal-mismatch' | 'stop-task-not-interactive'
   | 'stop-task-action-unallowlisted' | 'stop-task-last-result-failed'
   | 'receipt-channel-missing' | 'save-trigger-unverified' | 'execution-disabled'
-  | 'execution-lock-busy'
+  | 'interactive-session-missing' | 'interactive-session-ambiguous'
+  | 'steam-session-missing' | 'task-definition-mismatch'
+  | 'runtime-state-mismatch' | 'lifecycle-broker-unavailable' | 'execution-lock-busy'
 
 export interface LifecycleCheck {
   id: LifecycleCheckId
@@ -102,6 +104,17 @@ export interface LifecycleOperationContext {
   action: LifecycleAction
   protectionPointId: string | null
   signal: AbortSignal
+  /**
+   * Present only while the lifecycle transaction owns the process-wide host
+   * mutation lease. Privileged host brokers must borrow this exact lease
+   * instead of acquiring an unrelated nested mutation scope.
+   */
+  hostMutation?: LifecycleHostMutationScope
+}
+
+export interface LifecycleHostMutationScope {
+  assertActive(): void
+  toPowerShellBorrowArguments(): readonly string[]
 }
 
 export interface LifecyclePhaseResult {
@@ -112,6 +125,12 @@ export interface LifecyclePhaseResult {
 
 export interface LifecyclePreviewContext {
   executionLockReady: boolean
+  /** Durable outer request id during execution preflight; absent for public previews. */
+  requestId?: string
+  /** Phase cancellation signal; public previews may omit it. */
+  signal?: AbortSignal
+  /** Only present for the execution preflight while the host lease is held. */
+  hostMutation?: LifecycleHostMutationScope
 }
 
 export interface LifecycleMutationAdapter {
@@ -421,7 +440,8 @@ const lifecycleCheckIdSchema = z.enum([
   'save-pair', 'backup-pair',
   'server-task', 'server-task-principal', 'server-task-action',
   'stop-task', 'stop-task-principal', 'stop-task-action',
-  'stop-task-result', 'task-history', 'receipt-channel', 'save-trigger', 'execution-lock'
+  'stop-task-result', 'task-history', 'receipt-channel', 'save-trigger',
+  'interactive-session', 'steam-session', 'lifecycle-broker', 'execution-lock'
 ])
 const lifecycleBlockerSchema = z.enum([
   'project-root-unavailable', 'managed-executable-unavailable',
@@ -434,7 +454,9 @@ const lifecycleBlockerSchema = z.enum([
   'stop-task-missing', 'stop-task-principal-mismatch', 'stop-task-not-interactive',
   'stop-task-action-unallowlisted', 'stop-task-last-result-failed',
   'receipt-channel-missing', 'save-trigger-unverified', 'execution-disabled',
-  'execution-lock-busy'
+  'interactive-session-missing', 'interactive-session-ambiguous',
+  'steam-session-missing', 'task-definition-mismatch',
+  'runtime-state-mismatch', 'lifecycle-broker-unavailable', 'execution-lock-busy'
 ])
 
 export const lifecyclePreviewSchema: z.ZodType<LifecyclePreview> = z.strictObject({
@@ -464,12 +486,18 @@ export const lifecycleExecutionRequestSchema = z.strictObject({
   confirmation: z.literal('EXECUTE')
 })
 
-export type JobKind =
-  | 'status.refresh'
-  | 'game.start.preview' | 'game.save.preview' | 'game.stop.preview' | 'game.restart.preview'
-  | 'game.start' | 'game.save' | 'game.stop' | 'game.restart'
-  | 'save.backup' | 'save.restore'
-export type JobState = 'queued' | 'running' | 'succeeded' | 'failed'
+export const jobKinds = [
+  'status.refresh',
+  'game.start.preview', 'game.save.preview', 'game.stop.preview', 'game.restart.preview',
+  'game.start', 'game.save', 'game.stop', 'game.restart',
+  'save.backup', 'save.restore',
+  'player.notice.preview', 'player.notice',
+  'audit.export'
+] as const
+export type JobKind = (typeof jobKinds)[number]
+
+export const jobStates = ['queued', 'running', 'succeeded', 'failed'] as const
+export type JobState = (typeof jobStates)[number]
 
 export interface JobRecord {
   id: string
@@ -487,5 +515,5 @@ export interface JobRecord {
 export interface StatusProvider {
   readonly name: 'demo' | 'windows'
   collectStatus(): Promise<ServerStatus>
-  previewLifecycle(action: LifecycleAction): Promise<LifecyclePreview>
+  previewLifecycle(action: LifecycleAction, signal?: AbortSignal): Promise<LifecyclePreview>
 }

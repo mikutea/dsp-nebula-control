@@ -1,5 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
-import path from 'node:path'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type {
   GameConfigHistoryStopProofTokenProvider
@@ -7,7 +6,7 @@ import type {
 import type {
   GameConfigStopProofValidator
 } from '../game-config/history.js'
-import type { LifecycleScriptRunner } from './powershell-runner.js'
+import type { WindowsLifecycleBrokerClient } from './windows-lifecycle-broker.js'
 
 const defaultTokenTtlMs = 120_000
 const maximumTokenTtlMs = 300_000
@@ -36,21 +35,23 @@ const validationContextSchema = z.strictObject({
   snapshotId: z.string().regex(uuidV4Pattern).transform((value) => value.toLowerCase()),
   phase: z.enum(['prepare', 'publish', 'reconcile'])
 })
-const stoppedReceiptSchema = z.strictObject({
-  protocol: z.literal('DYSON_CONTROL_RUNTIME_V1'),
+const stoppedEvidenceSchema = z.object({
   expected: z.literal('stopped'),
-  state: z.literal('matched'),
-  processVerified: z.literal(true),
-  gamePortListening: z.literal(false)
+  matched: z.literal(true),
+  blockers: z.tuple([]),
+  runtime: z.object({
+    lifecycleState: z.literal('stopped_verified'),
+    process: z.object({ status: z.literal('absent') }),
+    port: z.object({ listenerCount: z.literal(0) })
+  })
 })
 const optionsSchema = z.strictObject({
-  projectRoot: z.string().min(1).max(1_024).refine((value) =>
-    path.isAbsolute(value) && !/[\r\n\0]/.test(value)
-  ),
-  gamePort: z.number().int().min(1).max(65_535),
-  runner: z.custom<LifecycleScriptRunner>((value) =>
+  brokerClient: z.custom<WindowsLifecycleBrokerClient>((value) =>
     typeof value === 'object' && value !== null &&
-    typeof (value as { run?: unknown }).run === 'function'
+    typeof (value as { preflight?: unknown }).preflight === 'function' &&
+    typeof (value as { dispatch?: unknown }).dispatch === 'function' &&
+    typeof (value as { verify?: unknown }).verify === 'function' &&
+    typeof (value as { status?: unknown }).status === 'function'
   ),
   tokenTtlMs: z.number().int().min(1_000).max(maximumTokenTtlMs),
   maximumTokens: z.number().int().min(1).max(hardMaximumTokens),
@@ -72,10 +73,7 @@ export class WindowsConfigHistoryStopProofError extends Error {
 }
 
 export interface WindowsConfigHistoryStopProofOptions {
-  /** Trusted, construction-time project root; never sourced from an HTTP request. */
-  projectRoot: string
-  gamePort: number
-  runner: LifecycleScriptRunner
+  brokerClient: WindowsLifecycleBrokerClient
   tokenTtlMs?: number
   maximumTokens?: number
   /** @internal Deterministic monotonic wall clock for unit tests. */
@@ -97,14 +95,12 @@ interface ReconcileGrant {
 type StopProofGrant = RestoreGrant | ReconcileGrant
 
 /**
- * Issues short-lived, process-local capabilities only after a fixed Windows
- * runtime check. Raw tokens are returned to the server-side controller but are
- * never stored; the in-memory registry keeps only SHA-256 token digests.
+ * Issues short-lived, process-local capabilities only after a fixed lifecycle
+ * broker verification. Raw tokens are returned to the server-side controller
+ * but are never stored; the in-memory registry keeps only SHA-256 token digests.
  */
 export class WindowsConfigHistoryStopProofAuthorizer {
-  readonly #projectRoot: string
-  readonly #gamePort: number
-  readonly #runner: LifecycleScriptRunner
+  readonly #brokerClient: WindowsLifecycleBrokerClient
   readonly #tokenTtlMs: number
   readonly #maximumTokens: number
   readonly #now: () => number
@@ -123,9 +119,7 @@ export class WindowsConfigHistoryStopProofAuthorizer {
         'WINDOWS_CONFIG_HISTORY_STOP_PROOF_OPTIONS_INVALID'
       )
     }
-    this.#projectRoot = path.resolve(parsed.data.projectRoot)
-    this.#gamePort = parsed.data.gamePort
-    this.#runner = parsed.data.runner
+    this.#brokerClient = parsed.data.brokerClient
     this.#tokenTtlMs = parsed.data.tokenTtlMs
     this.#maximumTokens = parsed.data.maximumTokens
     this.#now = parsed.data.now
@@ -223,16 +217,14 @@ export class WindowsConfigHistoryStopProofAuthorizer {
 
   async #proveStopped(signal: AbortSignal = new AbortController().signal): Promise<void> {
     try {
-      const output = await this.#runner.run(
-        'Test-DysonRuntimeState.ps1',
-        [
-          '-ProjectRoot', this.#projectRoot,
-          '-Expected', 'stopped',
-          '-GamePort', String(this.#gamePort)
-        ],
+      if (signal.aborted) throw new Error('stop-proof-cancelled')
+      const evidence = await this.#brokerClient.verify({
+        expected: 'stopped',
+        outerRequestId: randomUUID(),
         signal
-      )
-      stoppedReceiptSchema.parse(JSON.parse(output) as unknown)
+      })
+      stoppedEvidenceSchema.parse(evidence)
+      if (signal.aborted) throw new Error('stop-proof-cancelled')
     } catch {
       throw new WindowsConfigHistoryStopProofError(
         'WINDOWS_CONFIG_HISTORY_STOP_PROOF_RUNTIME_UNAVAILABLE'

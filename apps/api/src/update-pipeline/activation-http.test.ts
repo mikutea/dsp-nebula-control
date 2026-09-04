@@ -283,6 +283,10 @@ describe('component update activation HTTP contract', () => {
       resultingRevision: receiptFixture.previousRevision,
       failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
       rollbackVerified: true,
+      rollbackSteps: {
+        component: 'verified', configuration: 'verified', serverModLock: 'verified',
+        pairedSave: 'verified', previousSaveLoad: 'verified'
+      } as const,
       recoveryRequired: false
     }
     const getState = vi.fn()
@@ -370,6 +374,10 @@ describe('component update activation HTTP contract', () => {
       resultingRevision: receiptFixture.previousRevision,
       failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
       rollbackVerified: true,
+      rollbackSteps: {
+        component: 'verified', configuration: 'verified', serverModLock: 'verified',
+        pairedSave: 'verified', previousSaveLoad: 'verified'
+      } as const,
       recoveryRequired: false
     }
     const service = createService({
@@ -610,7 +618,7 @@ describe('component update activation HTTP contract', () => {
   })
 
   it('returns only stable codes and never reflects filesystem, input, or adapter errors', async () => {
-    const sensitive = 'C:\\Users\\Administrator\\Steam token=top-secret'
+    const sensitive = 'C:\\Users\\example\\Steam token=top-secret'
     const cases: Array<{ error: Error; expectedCode: string }> = [
       {
         error: new ComponentUpdateActivationError('UPDATE_ROOT_UNAVAILABLE', { cause: new Error(sensitive) }),
@@ -636,7 +644,7 @@ describe('component update activation HTTP contract', () => {
         body: { ok: false, error: { code: testCase.expectedCode } }
       })
       const serialized = JSON.stringify(result)
-      expect(serialized).not.toContain('Administrator')
+      expect(serialized).not.toContain('example')
       expect(serialized).not.toContain('top-secret')
       expect(serialized).not.toContain('UNTRUSTED_DYNAMIC_CODE')
     }
@@ -766,11 +774,14 @@ const planFixture: ComponentUpdateActivationPlan = {
     'verify-staged-artifact-and-archive',
     'assemble-immutable-release',
     'prove-process-stopped-and-port-closed',
+    'capture-config-mod-lock-and-loaded-save-baseline',
     'create-paired-save-protection-point',
+    'bind-rollback-context-journal',
     'revalidate-stop-revision-and-compatibility',
     'publish-and-verify-fixed-live-component',
     'run-fixed-health-check',
-    'rollback-and-verify-on-failure',
+    'restore-component-config-mod-lock-and-paired-save-on-failure',
+    'prove-current-generation-exact-save-load',
     'persist-audit-safe-receipt',
     'release-global-update-lock'
   ],
@@ -790,6 +801,11 @@ const receiptFixture: ComponentUpdateActivationReceipt = {
   previousRevision: '0'.repeat(64),
   resultingRevision: '1'.repeat(64),
   protectionBackupId: 'backup-0001',
+  rollbackBindingSha256: '2'.repeat(64),
+  rollbackSteps: {
+    component: 'not-required', configuration: 'not-required', serverModLock: 'not-required',
+    pairedSave: 'not-required', previousSaveLoad: 'not-required'
+  },
   failureCode: null,
   rollbackVerified: false,
   recoveryRequired: false,

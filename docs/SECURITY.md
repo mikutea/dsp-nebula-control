@@ -26,6 +26,11 @@
   Component activation accepts opaque IDs, digests, versions and compatibility
   evidence only; its independent runtime adapter remains fail-closed until a
   deployment explicitly configures it.
+- Cutover status has its own read permission. Every GSManager authority
+  mutation requires the Administrator-only `cutover.execute` permission, a
+  separate default-off ordinary or recovery gate, an exact confirmation, one
+  global host lease, and a durable child transaction; task names, scripts,
+  paths, XML and lease tokens never come from the browser.
 - Steam credentials are outside Dyson Control. The product must never ask for,
   persist, or echo a Steam password or guard code.
 
@@ -43,9 +48,9 @@ list by the authenticated session endpoint:
 
 | Role | Intended boundary |
 | --- | --- |
-| Viewer | Read status, jobs, telemetry, player presence, redacted console, saves, configuration, update and mod inventory. |
-| Operator | Viewer access plus refresh, durable-alert acknowledgement, log export, fixed lifecycle/console commands, backup, configuration preview, offline staging and client-profile generation. |
-| Administrator | All declared permissions, including restore, configuration apply, component activation, mod mutation and any future verified player mutation. |
+| Viewer | Read status, jobs, telemetry, player presence, redacted console, saves, configuration, update/mod inventory and bounded cutover status. |
+| Operator | Viewer access plus refresh, durable-alert acknowledgement, log export, fixed lifecycle/console commands, backup, configuration preview, offline staging and client-profile generation. Cutover execution remains denied. |
+| Administrator | All declared permissions, including restore, configuration apply, component activation, mod mutation, cutover execution and any future verified player mutation. |
 
 An omitted optional Viewer or Operator password hash disables that login role.
 Authentication never upgrades a role, and every route names one permission in
@@ -67,7 +72,7 @@ The project does not expose:
 - arbitrary console text, command-line arguments, paths, URLs or executables.
 
 The presence of a route does not imply that its mutation is enabled. Save,
-configuration, mod and component-update routes each retain independent safety
+configuration, mod, component-update and cutover routes each retain independent safety
 gates. Console execution is limited to four typed lifecycle commands. Player
 moderation is not synthesized: the published capability proof currently marks
 unsupported Nebula actions unavailable, and no corresponding mutation route is

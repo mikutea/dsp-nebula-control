@@ -363,7 +363,9 @@ function snapshot(index: number, options: SnapshotOptions = {}) {
     schemaVersion: 1,
     observedAt: observedAt(index),
     source: options.source ?? 'fixture.alerts',
-    runtime: { state: 'running', processId: 4242 },
+    runtime: {
+      state: 'running', processId: 4242, startedAt: '2026-08-30T11:00:00.000Z'
+    },
     host: {
       cpu: {
         logicalProcessorCount: 2,
@@ -397,7 +399,8 @@ function snapshot(index: number, options: SnapshotOptions = {}) {
       threadCount: 200
     },
     network: { gamePort: { port: 8469, listening: true } },
-    simulation: { ups, tps: ups, targetUps: 60 }
+    simulation: { ups, tps: ups, targetUps: 60 },
+    automation: { storageDependencyKind: 'none', projectRootAvailable: true }
   })
 }
 

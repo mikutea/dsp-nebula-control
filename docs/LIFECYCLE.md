@@ -7,8 +7,12 @@ runtime adapter is still **execution-disabled**, so a normal checkout can be
 exercised and audited without changing a process, scheduled task, save, backup,
 or configuration. Target-host mutation exists only when the Windows provider
 is selected and `DYSON_LIFECYCLE_ENABLED=true` is supplied together with the
-absolute bridge-control and secret-file paths. Omitting any of those conditions
-fails closed during configuration or preflight.
+absolute bridge-control, secret-file, stable runtime-bootstrap, protected
+lifecycle-broker profile, and exact interactive service-account bindings. The
+API remains a nonprivileged service. It can submit only four fixed capabilities
+to a protected SYSTEM broker, and that broker can trigger only the two pinned
+interactive game tasks. Omitting or drifting any boundary fails closed during
+configuration, startup validation, or preflight.
 
 ## API contract
 
@@ -16,6 +20,7 @@ Authenticated operators can submit exactly one of these actions to the
 lifecycle APIs:
 
 - `save`
+- `start`
 - `graceful-stop`
 - `restart`
 
@@ -43,9 +48,11 @@ With the default disabled adapter, every preview has these invariant fields:
 - `rollback` describes the required recovery strategy without mutating data.
 
 When the opt-in Windows adapter is configured, preview is still read-only. It
-can report `allowed=true` and `executionEnabled=true` only when the fixed host
-collector has no blockers, a fresh signed game-bridge heartbeat is valid, a
-verified rollback baseline exists, and the global execution lock is available.
+can report `allowed=true` and `executionEnabled=true` only when the fixed SYSTEM
+broker validates the task definitions and authoritative runtime/session state,
+the fixed host collector has no remaining data blockers, a fresh signed
+game-bridge heartbeat is valid when required, a verified rollback baseline
+exists, and the global execution lock is available.
 The browser then requires a separate explicit confirmation before submitting an
 execution request.
 
@@ -84,6 +91,81 @@ the explicit `interrupted` state. Any open phase receives a
 automatically. The operator must inspect the recovery-required flag before a
 new transaction.
 
+## Autonomous start and crash recovery
+
+The installed game task runs the stable bootstrap wrapper in the dedicated
+interactive Steam session. It has one exact `AtLogOn` trigger with a bounded
+delay, `IgnoreNew` duplicate suppression, no execution-time limit, and a pinned
+three-attempt/one-minute Task Scheduler restart policy. `StartWhenAvailable`
+is required. The protected broker hashes this complete descriptor—including
+the restart settings—so removing or weakening crash recovery makes lifecycle
+status unverifiable and blocks dispatch. The stop task has no trigger and no
+restart policy, preventing an intentional graceful stop from starting the game
+again.
+
+The wrapper remains attached to the managed DSP process. A zero process exit is
+clean only when the controlled stable `Stop-DysonServer.ps1` path has published
+and completed a matching `DYSON_CONTROL_GAME_EXPECTED_EXIT_V1` intent. The stop
+wrapper first creates the `requested` record bound to the exact lifecycle
+binding ID, immutable version, project-root SHA-256, and data-root identity. It
+then invokes that binding's pinned release stop script. Only after the pinned
+stop succeeds does it transition the same record to `completed`. Repeating the
+same bound request is idempotent; a different or partially matching record is a
+conflict.
+
+The `requested` to `completed` transition uses canonical JSON, verified ACL
+intent, a same-directory pending file, atomic replacement, and fixed recovery
+and rollback-discard artifacts. Startup reconciles only the byte-, ACL-, and
+binding-exact crash states defined by that protocol. An unknown, redirected,
+malformed, multiple, or cross-binding expected-exit artifact fails closed and
+is preserved for investigation. A new start also reconciles any prior durable
+game binding through its pinned old-release stop script before resolving the
+current active release.
+
+ACL equivalence is evaluated from the owner SID, primary-group SID, protected
+DACL state, and the binary DACL ACE sequence. Windows may normalize only the
+`SE_DACL_AUTO_INHERITED` bookkeeping flag during an atomic replacement; that
+metadata-only normalization is accepted when all effective and inheritable
+permissions remain byte-equivalent. Any owner, group, protection, ACE, or
+permission drift still fails closed.
+
+After the managed process returns zero, the attached start wrapper consumes
+exactly one matching `completed` intent before returning zero. A missing intent,
+a still-`requested` intent, or any field/ACL/recovery mismatch is classified as
+`BOOTSTRAP_UNEXPECTED_CLEAN_EXIT`; the wrapper records an abnormal failure when
+possible and returns one so Task Scheduler can perform the bounded retry. A
+non-zero managed-process exit likewise returns one. Before returning, the
+wrapper atomically writes an append-only
+`DYSON_CONTROL_GAME_RUNTIME_RECEIPT_V1` record beneath the selected private data
+root. Each record is keyed by a new canonical attempt ID and binds the immutable
+release version, lifecycle binding ID, project-root identity hash, data-root
+identity hash, publication timestamp, terminal outcome, restart expectation,
+and receipt SHA-256. It never contains a host path, log text, command line,
+player data, or secret.
+
+If a receipt for an already validated intentional clean stop cannot be
+persisted, the wrapper reports `receiptPersisted=false` but still returns zero:
+an evidence-storage failure after consuming the completed intent must not turn
+that stop into an automatic game restart. Conversely, an abnormal exit still
+returns non-zero even when its receipt cannot be written, preserving the
+bounded recovery attempt while status and acceptance continue to treat the
+missing receipt as unverified evidence.
+
+During manual recovery, keep both game tasks and the managed process quiesced
+and preserve the binding plus the canonical, pending, recovery, and
+rollback-discard expected-exit files. Do not delete, rename, or edit one to make
+startup pass. Resume only through the fixed bootstrap recovery path with the
+same exact binding and request; if the state cannot be reconciled unambiguously,
+leave it fail closed and retain the private artifacts for review.
+
+This repository proof covers real child-process non-zero and unexpected-zero
+exits, the crash-safe expected-exit matrix, and the next wrapper invocation in
+the Windows PowerShell 5.1 shadow fixture. Production acceptance still requires
+an approved DSP process interruption on the target Windows host,
+observation of the Task Scheduler retry, a new durable crash receipt, verified
+port/process recovery, and a successful client rejoin. A descriptor or unit
+test is not production recovery evidence.
+
 ## Evidence checks
 
 | Check ID | Evidence collected |
@@ -96,11 +178,14 @@ new transaction.
 | `server-task` | The fixed start task exists when restart needs it. |
 | `stop-task` | The fixed graceful-stop task exists when stop is needed. |
 | `stop-task-principal` | The stop task is interactive and matches the game process owner. |
-| `stop-task-action` | The stop adapter is inside the configured script allowlist. |
+| `stop-task-action` | The task invokes the exact stable bootstrap wrapper and fixed project root. |
 | `stop-task-result` | The previous stop task returned zero. This is supporting evidence only. |
 | `task-history` | Task Scheduler operational history is available; absence is a warning. |
 | `receipt-channel` | The stop adapter declares the versioned durable receipt protocol. |
 | `save-trigger` | A separate, verifiable save acknowledgement exists. |
+| `interactive-session` | Exactly one interactive session is bound to the configured game account. |
+| `steam-session` | Steam is verified in the same interactive session when start is required. |
+| `lifecycle-broker` | The protected profile, dependencies, task definitions, and durable broker channel validate. |
 | `execution-lock` | The global lifecycle execution gate is available; an active transaction blocks a new preview. |
 
 Check status is one of `pass`, `warning`, `block`, or `not-applicable`. The UI
@@ -119,6 +204,10 @@ Blockers are stable machine-readable reasons. They currently include:
   `stop-task-action-unallowlisted`, `stop-task-last-result-failed`;
 - proof of completion: `receipt-channel-missing`,
   `save-trigger-unverified`;
+- broker/session authority: `interactive-session-missing`,
+  `interactive-session-ambiguous`, `steam-session-missing`,
+  `task-definition-mismatch`, `runtime-state-mismatch`,
+  `lifecycle-broker-unavailable`;
 - execution gate: `execution-disabled`, `execution-lock-busy`.
 
 No UI state, process presence, task state, or previous zero exit code can remove
@@ -138,11 +227,145 @@ The backup verifier requires schema version 1, one `.dsv`, one matching
 `.server`, exact byte lengths, and matching SHA-256 hashes. Missing, malformed,
 or tampered manifests fail closed.
 
-The repository also contains a standalone paired-save backup/restore
-transaction core and a retention dry-run planner. They are not yet exposed as
-authenticated mutation routes or coordinated with this lifecycle service, so
-they do not enable restore in the browser or production. See
-[SAVES.md](SAVES.md) for that implementation boundary.
+The repository also contains authenticated paired-save backup, retention,
+transfer, quarantine-promotion, restore-preview, and restore execution routes.
+They share the global host-mutation coordinator and preserve `.dsv` plus
+`.server` as one unit, but production mutation remains fail-closed until the
+Windows provider and execution gates are explicitly enabled. See
+[SAVES.md](SAVES.md) for the exact confirmation, protection, and recovery
+contracts.
+
+## Windows broker deployment and removal
+
+The public release does not bundle Node. Windows deployment requires an
+independently provisioned Node.js 24-or-newer runtime under a dedicated
+`-RuntimeRoot`, outside both `InstallRoot` and `DataRoot`, plus the exact
+`-NodeExecutable` below it and independently authenticated
+`-ExpectedNodeSha256`. A game panel's or game manager's embedded runtime is not
+a deployment prerequisite and must not be reused implicitly. The runtime root,
+path chain, file type, SHA-256, owner, and protected DACL are checked before
+installation, task registration, every launch, status/readiness observation,
+reboot checkpoint/resume, and uninstall. Runtime evidence is bound into those
+receipts and task arguments, not exported to the API as an unknown `DYSON_*`
+configuration key.
+The top-level installer also requires `-ExpectedArtifactPayloadSha256` copied
+from independently authenticated release provenance. Trusted deployment code
+recomputes and binds the source manifest/inventory to that digest and never
+executes a verifier or common script from the selected source directory,
+including during `-WhatIf`.
+
+Lifecycle-broker installation is opt-in through the top-level
+`Install-DysonControl.ps1` entry point. The exact lifecycle parameters are:
+
+- `-InstallLifecycleBrokerTask`;
+- `-ProjectRoot`, `-RuntimeBootstrapRoot`, `-ServiceUser`, `-GamePort`, and
+  `-DispatchReadyTimeout` (5 through 60 seconds);
+- `-ConfigurationSource`, `-RegisterStartupTask`, `-StartAfterInstall`, and a
+  loopback `-ReadinessUri`;
+- `-UpgradeLifecycleBrokerExisting` only for an existing broker that must move
+  to a different immutable release.
+
+`RuntimeBootstrapRoot` must equal `<InstallRoot>\bootstrap`. The configuration
+source must explicitly set `DYSON_PROVIDER=windows`,
+`DYSON_LIFECYCLE_ENABLED=true`, and bind `DYSON_PROJECT_ROOT`,
+`DYSON_DATA_DIR`, `DYSON_LIFECYCLE_BROKER_PROFILE_FILE`,
+`DYSON_RUNTIME_BOOTSTRAP_ROOT`, `DYSON_RUNTIME_SERVICE_USER`,
+`DYSON_GAME_PORT`, `DYSON_SERVER_TASK`, and `DYSON_STOP_TASK` to the same values
+used by the installer. `DYSON_DATA_DIR` is exactly `<DataRoot>\data`; the profile
+is exactly `<DataRoot>\data\lifecycle-broker\broker-profile.json`; and the two
+task variables must name the fixed runtime task pair.
+
+For a fictional custom deployment, those roots may be
+`C:\GameServer\Example\DysonControl`,
+`C:\GameServer\Example\DysonControlData`, and
+`C:\GameServer\Example\DSP`, with
+`C:\GameServer\Example\DysonControlRuntime` as the separately installed runtime
+root. `Install-DysonNodeRuntime.ps1` can publish an independently authenticated
+ZIP through same-volume stage/rename and rollback; control-plane uninstall
+preserves that runtime by default. No real host path, account, endpoint, port,
+task export, or secret belongs in this repository.
+
+The protected lifecycle profile pins the active release's `scripts\windows`
+directory and its exact `lifecycle-broker` child, project/data/bootstrap roots,
+service user, game port, fixed server/stop tasks, and dependency hashes. Its
+worker task is fixed to SYSTEM with `ServiceAccount` logon, highest run level,
+no trigger, `IgnoreNew`, a five-minute execution limit, and one profile-bound
+PowerShell action. The profile file/ACL and task/task DACL are part of the
+installation preimage and rollback contract.
+
+Cutover installation is rejected unless `-InstallCutoverBrokerTask` is combined
+with `-InstallLifecycleBrokerTask` in the same call. Its exact additional inputs
+are `-CutoverProjectRoot`, `-CutoverAuthorityProfileFile`,
+`-CutoverAuthorityInventoryRevision`, `-CutoverRuntimeTaskTransactionRoot`,
+`-CutoverServiceUser`, `-CutoverGamePort`, and
+`-CutoverRuntimeBootstrapRoot`; a cross-release change also needs
+`-UpgradeCutoverBrokerExisting`. Project, bootstrap, service-user, and game-port
+values must equal the lifecycle values. The environment must enable
+`DYSON_CUTOVER_ENABLED=true` and `DYSON_CUTOVER_RECOVERY_ENABLED=true` and bind
+the same authority profile, transaction root, account, and port.
+
+`-WhatIf` validates these complete bindings and reports the requested install,
+upgrade, or reuse modes without running Node, registering tasks, publishing
+profiles, starting the control task, or polling readiness. A real operation has
+this strict order:
+
+```text
+release + bootstrap + configuration + control task
+  -> lifecycle broker
+  -> cutover broker (when requested)
+  -> control-task start + exact-version readiness
+```
+
+The final readiness check requires `lifecycleBroker`; a cutover transaction also
+requires `cutoverRecovery`. Same-release lifecycle reuse returns `reused`, proves
+the preimage stayed exact, and is never compensated. A cross-release lifecycle
+change must have `-UpgradeLifecycleBrokerExisting` or the transaction fails
+closed.
+
+If anything after a first lifecycle installation fails, the deployment invokes
+that active candidate release's lifecycle installer with
+`-CompensateFirstInstall`. It removes only the new fixed profile and worker task
+and preserves durable requests and receipts. If a cross-release upgrade later
+fails, the deployment first removes the replacement control task and restores
+the old active release, bootstrap, configuration, and data ACL. Only then does it
+invoke the **old release's** lifecycle installer with `-UpgradeExisting`, restore
+the old profile bytes/profile ACL and task XML/enabled state/task DACL, and prove
+the old preimage exact. Deferred cutover restoration follows lifecycle; the old
+control task is restored last.
+
+Normal control-plane uninstall captures the lifecycle profile hash and calls the
+active release installer with `-RemoveCurrent -ExpectedProfileHash <sha256>`.
+`ExpectedProfileHash` is mandatory for that mode, forbidden outside it, and
+`RemoveCurrent` is mutually exclusive with `UpgradeExisting` and
+`CompensateFirstInstall`. Before mutation, removal requires the same-release
+profile, pinned dependencies, fixed runtime-task pair, profile ACL, worker task
+and task DACL, closed request/receipt pairs, an empty intent directory, and no
+orphaned or unknown broker state. It removes only the fixed profile and worker
+task and returns a bounded
+`DYSON_CONTROL_LIFECYCLE_BROKER_REMOVAL_RECEIPT_V1`. Requests, receipts, empty
+intent storage, audits, recovery sentinels, and other DataRoot evidence remain.
+`-RemoveData` is rejected while retained lifecycle/cutover/authority evidence
+exists.
+
+Control-plane uninstall validates both broker preimages before any mutation. It
+then stops and removes the control task first to quiesce the request entry point,
+removes the dependent cutover broker with `RemoveCurrent`, removes lifecycle with
+`-RemoveCurrent -ExpectedProfileHash`, and only then moves the release or performs
+explicitly approved data removal. Quiescing the request entry point is not a
+reversal of broker dependency order: cutover is still removed before lifecycle;
+the early control-task step only prevents new work from arriving during teardown.
+If any later step fails, rollback restores release and active-pointer state first,
+then lifecycle, then cutover, and restores the exact prior control task last.
+
+`Test-DysonControlDeployment.ps1` performs the read-only static lifecycle check:
+an enabled broker must be bound to the active release, environment, dependencies,
+runtime tasks, worker task, and clean channel; a disabled configuration must have
+no residual broker state. With `-ReadinessUri`, status additionally requires
+`lifecycleBroker` and `cutoverRecovery`. Reboot checkpoint creation and resume
+are stricter: they require static lifecycle state `ready` and both deep readiness
+checks before accepting either side of the reboot. The repository-only gates are
+`npm run lifecycle:broker-selftest`, `npm run deployment:status-selftest`, and
+`npm run deployment:reboot-selftest`; none is evidence of a real host change.
 
 ## Signed save bridge candidate
 
@@ -161,31 +384,49 @@ tests, strict field ordering, bounded files, request expiry, cooldown,
 interrupted-request reconciliation, and a signed two-second plugin heartbeat.
 
 The Windows lifecycle adapter now has fixed implementations for protection
-point creation, bridge save, scheduled stop/start dispatch, and independent
-runtime verification. Its paired-save protection script copies into a private
+point creation and bridge save. Scheduled stop/start dispatch and independent
+runtime verification are performed only through the fixed SYSTEM lifecycle
+broker; the API no longer invokes the task dispatcher or privileged runtime
+probe directly. Broker requests, intents, and receipts are durable,
+fingerprint-bound, bounded, and idempotent. Its paired-save protection script copies into a private
 same-volume staging directory, compares source fingerprints before and after
 the copy, verifies destination hashes, writes a schema-v1 manifest, and only
 then publishes the directory atomically. The same request ID re-verifies and
 reuses the original protection point; a modified copy fails validation.
+`New-DysonSaveProtectionPoint.ps1` is itself a `SupportsShouldProcess` entry
+point. `-WhatIf` validates the source pair and any existing final or stale
+staging identity without creating the backup root, deleting stale staging,
+moving a directory, or writing a file. It emits exactly one redacted,
+timestamp-free `DYSON_CONTROL_PROTECTION_V1` preview receipt with
+`dryRun=true` and `mutationPerformed=false`. The lifecycle provider accepts
+only the distinct successful execution receipt (`dryRun=false`, a verified
+manifest, and mutation semantics consistent with `reused`). The unattended
+provider reaches that entry point only after the authenticated lifecycle
+preview and durable host-mutation lock have passed; an interactive operator can
+still request the common `-Confirm` prompt explicitly.
 
 This is implementation evidence, not production verification. The execution
-HTTP route now feeds the durable coordinator, but its repository-default
-adapter is non-mutating, provider capability remains false, and the bridge is
-not installed or enabled by repository defaults. The current Windows preflight
-continues to report `save-trigger-unverified` until a signed bridge heartbeat
-and controlled integration save have been verified on the target host.
+HTTP route feeds the durable coordinator, and the Windows mutation adapter is
+constructed only when the lifecycle gate, protected broker profile, fixed
+service account, runtime bootstrap, and host bindings all validate. Repository
+defaults still use the non-mutating demo provider, and the Bridge is neither
+installed nor enabled by default. A Windows save/stop/restart preflight reports
+`save-trigger-unverified` until a current signed Bridge heartbeat is verified;
+start additionally requires one bound interactive game session and Steam in
+that same session.
 
 ## Requirements before production cutover
 
 The repository implementation is not, by itself, production verification.
 Before enabling target-host lifecycle mutation, the release manifest still
-requires all of the following on the Dyson VM:
+requires all of the following on the target Windows host:
 
 1. install the version-pinned API, web bundle, bridge plugin, and fixed Windows
    scripts through the reviewed deployment package;
 2. create the interactive start and graceful-stop scheduled tasks for the same
-   Windows account that owns the Steam/DSP process, then verify their principal,
-   action, history, and durable receipts;
+   Windows account that owns the Steam/DSP process, install the protected SYSTEM
+   lifecycle broker, then verify task definitions, DACLs, hashes, principal,
+   action, session binding, and durable receipts;
 3. verify a fresh signed heartbeat and a controlled save acknowledgement against
    a disposable paired save before any live save is used;
 4. exercise save, graceful stop, restart, failed-start rollback, timeout,

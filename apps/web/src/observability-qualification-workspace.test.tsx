@@ -23,11 +23,20 @@ describe('observability qualification panel', () => {
     expect(screen.getByText('361 / 360')).toBeTruthy()
     expect(screen.getByText('6 小时 0 分 / 6 小时')).toBeTruthy()
     expect(screen.getByText('实测 UPS 资格')).toBeTruthy()
+    expect(screen.getByText('实测 TPS 资格')).toBeTruthy()
+    expect(screen.getByText('TPS ≥55 合规率')).toBeTruthy()
+    expect(screen.getByText(/P05 57\.9 TPS/)).toBeTruthy()
     expect(screen.getByText('主机 CPU 与最热核心')).toBeTruthy()
     expect(screen.getByText('DSP 多核与单核瓶颈')).toBeTruthy()
     expect(screen.getByText('主机内存压力')).toBeTruthy()
     expect(screen.getByText('项目卷容量')).toBeTruthy()
     expect(screen.getByText('存档卷容量')).toBeTruthy()
+    expect(screen.getByText('72H CONTINUITY & TRUSTED LATENCY')).toBeTruthy()
+    expect(screen.getByText('17,281 / 17,281')).toBeTruthy()
+    expect(screen.getByText('VERIFIED')).toBeTruthy()
+    expect(screen.getByText(/P50 4\.0 s · P95 8\.0 s · MAX 8\.0 s/)).toBeTruthy()
+    expect(screen.getByText(/成功 4 · 失败 1 · 未完成 0 · NOT QUALIFIED/)).toBeTruthy()
+    expect(screen.getByText('项目根与 SMB 自动恢复')).toBeTruthy()
     expect(screen.getByText('24.00 GiB')).toBeTruthy()
     expect(screen.getByText('42.00 GiB')).toBeTruthy()
     expect(screen.getByText('SAVE_LATENCY_DRILL_REQUIRED')).toBeTruthy()
@@ -76,5 +85,50 @@ describe('observability qualification panel', () => {
     expect(screen.getByText('CRASH_RECOVERY_DRILL_REQUIRED')).toBeTruthy()
     expect(screen.getByText('EXTERNAL_JOIN_SOAK_REQUIRED')).toBeTruthy()
     expect(screen.queryByText('通过')).toBeNull()
+  })
+
+  it('shows unknown latency instead of manufacturing zero when no trusted receipt exists', () => {
+    const fixture = qualificationEnvelopeFixture()
+    for (const summary of [fixture.data.latency.save, fixture.data.latency.backup]) {
+      summary.evidenceStatus = 'unknown'
+      summary.totalReceipts = 0
+      summary.successfulReceipts = 0
+      summary.failedReceipts = 0
+      summary.incompleteReceipts = 0
+      summary.p50Ms = null
+      summary.p95Ms = null
+      summary.maximumMs = null
+    }
+    fixture.data.latency.evidenceStatus = 'unknown'
+    fixture.data.latency.scannedJobs = 0
+    render(<ObservabilityQualificationPanel
+      report={fixture.data}
+      meta={fixture.meta}
+      stale={false}
+      error=""
+      busy={false}
+    />)
+
+    expect(screen.getAllByText('UNKNOWN · NOT QUALIFIED')).toHaveLength(2)
+    expect(screen.getAllByText('没有可信服务端回执；不会显示 0 ms')).toHaveLength(2)
+    expect(screen.queryByText(/P50 0/)).toBeNull()
+  })
+
+  it('surfaces a bounded latency scan and does not present partial percentiles', () => {
+    const fixture = qualificationEnvelopeFixture()
+    fixture.data.latency.evidenceStatus = 'unknown'
+    fixture.data.latency.scannedJobs = 5_000
+    fixture.data.latency.truncated = true
+    render(<ObservabilityQualificationPanel
+      report={fixture.data}
+      meta={fixture.meta}
+      stale={false}
+      error=""
+      busy={false}
+    />)
+
+    expect(screen.getAllByText('TRUNCATED · NOT QUALIFIED')).toHaveLength(2)
+    expect(screen.getAllByText(/仅扫描最新 5,000 个任务/)).toHaveLength(2)
+    expect(screen.queryByText(/P50 4\.0 s/)).toBeNull()
   })
 })

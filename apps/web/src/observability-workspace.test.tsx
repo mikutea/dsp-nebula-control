@@ -150,6 +150,7 @@ function snapshotFixture(): ServerObservabilitySnapshot {
     runtime: {
       state: 'running',
       processId: { status: 'available', value: 4242 },
+      startedAt: { status: 'available', value: '2026-08-30T11:00:00.000Z' },
       gamePort: {
         port: { status: 'available', value: 8469 },
         listening: { status: 'available', value: true }

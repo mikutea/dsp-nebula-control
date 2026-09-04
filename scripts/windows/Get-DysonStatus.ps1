@@ -131,8 +131,12 @@ function Get-HostCpuTelemetry {
         }
 
         $parsedCores = @($parsedCores | Sort-Object group, processor)
-        $expectedCount = if ($null -ne $ExpectedLogicalProcessors -and $ExpectedLogicalProcessors.Value -gt 0) {
-            $ExpectedLogicalProcessors.Value
+        # PowerShell boxes a non-null Nullable[int] argument as System.Int32, so
+        # `.Value` resolves to $null. Read the boxed value directly or a
+        # processor-group-limited sample (for example 64 of 128 processors)
+        # can be mistaken for a complete set.
+        $expectedCount = if ($null -ne $ExpectedLogicalProcessors -and [int]$ExpectedLogicalProcessors -gt 0) {
+            [int]$ExpectedLogicalProcessors
         } else {
             $parsedCores.Count
         }
@@ -163,6 +167,44 @@ function Get-HostCpuTelemetry {
     }
 }
 
+function Get-NativeVolumeCapacity {
+    param([Parameter(Mandatory)][string]$PathRoot)
+
+    if ($null -eq ('DysonStatusVolumeNativeMethodsV1' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class DysonStatusVolumeNativeMethodsV1
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetDiskFreeSpaceEx(
+        string directoryName,
+        out ulong freeBytesAvailable,
+        out ulong totalNumberOfBytes,
+        out ulong totalNumberOfFreeBytes);
+}
+'@ -Language CSharp -ErrorAction Stop
+    }
+
+    [uint64]$freeBytesAvailable = 0
+    [uint64]$totalNumberOfBytes = 0
+    [uint64]$totalNumberOfFreeBytes = 0
+    if (-not [DysonStatusVolumeNativeMethodsV1]::GetDiskFreeSpaceEx(
+        $PathRoot,
+        [ref]$freeBytesAvailable,
+        [ref]$totalNumberOfBytes,
+        [ref]$totalNumberOfFreeBytes
+    )) {
+        throw 'Native volume capacity is unavailable.'
+    }
+    return [pscustomobject][ordered]@{
+        totalBytes = $totalNumberOfBytes
+        availableBytes = $freeBytesAvailable
+    }
+}
+
 function Get-VolumeTelemetry {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -175,13 +217,23 @@ function Get-VolumeTelemetry {
         $availableBytes = $null
         $driveId = $pathRoot.TrimEnd([char]'\')
         if ($driveId -match '^[A-Za-z]:$') {
-            $escapedDriveId = $driveId.Replace("'", "''")
-            $logicalDisk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID = '$escapedDriveId'" -ErrorAction Stop |
-                Select-Object -First 1
-            if ($logicalDisk -and $null -ne $logicalDisk.Size -and $null -ne $logicalDisk.FreeSpace) {
-                $totalBytes = [long]$logicalDisk.Size
-                $availableBytes = [long]$logicalDisk.FreeSpace
+            try {
+                $escapedDriveId = $driveId.Replace("'", "''")
+                $logicalDisk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID = '$escapedDriveId'" -ErrorAction Stop |
+                    Select-Object -First 1
+                if ($logicalDisk -and $null -ne $logicalDisk.Size -and $null -ne $logicalDisk.FreeSpace) {
+                    $totalBytes = [long]$logicalDisk.Size
+                    $availableBytes = [long]$logicalDisk.FreeSpace
+                }
             }
+            catch {
+                # A mapped drive can be usable even when CIM cannot enumerate it.
+            }
+        }
+        if ($null -eq $totalBytes -or $null -eq $availableBytes) {
+            $nativeCapacity = Get-NativeVolumeCapacity -PathRoot $pathRoot
+            $totalBytes = [uint64]$nativeCapacity.totalBytes
+            $availableBytes = [uint64]$nativeCapacity.availableBytes
         }
         if ($null -eq $totalBytes -or $null -eq $availableBytes) {
             $driveInfo = [System.IO.DriveInfo]::new($pathRoot)

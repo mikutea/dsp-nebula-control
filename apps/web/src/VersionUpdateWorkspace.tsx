@@ -5,6 +5,7 @@ import {
 } from 'lucide-react'
 import { api, ApiError } from './api'
 import { relativeTime } from './format'
+import { NebulaPluginTransactionWorkspace } from './NebulaPluginTransactionWorkspace'
 import { createUiRequestId } from './request-id'
 import type {
   ArtifactAcquisitionCandidate, ArtifactAcquisitionDiscoveryMeta, ArtifactAcquisitionPlan,
@@ -13,7 +14,7 @@ import type {
   ComponentCandidatePreparationReceipt, ComponentDiscoveryRelease,
   ManagedUpdateComponent, ServerStatus, SessionUser,
   SupportedComponentCandidatePreparationComponent,
-  UpdateActivationConfirmation, UpdateActivationOperation, UpdateActivationPlan,
+  UpdateActivationConfirmation, UpdateActivationPlan,
   UpdateActivationReceipt, UpdateActivationRecoveryStatus, UpdateActivationRequest, UpdateActivationState,
   UpdateCleanupPlan, UpdateCompatibilityPreparationRequest, UpdateCompatibilityReceipt,
   UpdateCompatibilityStatus
@@ -21,14 +22,86 @@ import type {
 
 interface ActivationDraft {
   requestId: string
-  component: ManagedUpdateComponent
+  component: SupportedComponentCandidatePreparationComponent
   artifactId: string
   sha256: string
   targetVersion: string
   expectedRevision: string
 }
 
+type SteamManualHandoffPhase =
+  | 'preparing' | 'awaiting-steam-client-update' | 'validating-client-update'
+  | 'starting-and-verifying' | 'succeeded' | 'recovery-required'
+
+interface SteamManualHandoffRequest {
+  requestId: string
+  targetVersion: string
+  expectedRevision: string
+}
+
+interface SteamManualHandoffPlan extends SteamManualHandoffRequest {
+  format: 'dyson-control-steam-manual-handoff-plan'
+  schemaVersion: 1
+  dryRun: true
+  timeoutSeconds: number
+  accountAutomation: false
+  operations: readonly string[]
+}
+
+interface SteamManualHandoffReceipt {
+  format: 'dyson-control-steam-manual-handoff-receipt'
+  schemaVersion: 1
+  requestId: string
+  targetVersion: string
+  phase: SteamManualHandoffPhase
+  previousRevision: string
+  resultingRevision: string
+  transactionBindingSha256: string | null
+  protectionBackupId: string | null
+  protectionManifestSha256: string | null
+  previousDspVersion: string | null
+  compatibilityRevision: string | null
+  startedAt: string
+  expiresAt: string
+  completedAt: string | null
+  failureCode: string | null
+  recoveryRequired: boolean
+  steps: {
+    protectionPoint: 'pending' | 'verified' | 'failed'
+    gracefulStop: 'pending' | 'verified' | 'failed'
+    stoppedProof: 'pending' | 'verified' | 'failed'
+    operatorConfirmation: 'pending' | 'verified'
+    versionResample: 'pending' | 'verified' | 'failed'
+    compatibilityResample: 'pending' | 'verified' | 'failed'
+    exactSaveLoad: 'pending' | 'verified' | 'failed'
+  }
+  auditEvents: string[]
+  reused: boolean
+}
+
+interface SteamManualHandoffState {
+  format: 'dyson-control-steam-manual-handoff-state'
+  schemaVersion: 1
+  revision: string
+  recoveryRequired: boolean
+  activeRequestId: string | null
+  lastCompletedTargetVersion: string | null
+  current: SteamManualHandoffReceipt | null
+}
+
+interface ComponentRollbackReceiptProjection {
+  rollbackBindingSha256: string | null
+  rollbackSteps: {
+    component: 'not-required' | 'pending' | 'verified' | 'failed'
+    configuration: 'not-required' | 'pending' | 'verified' | 'failed'
+    serverModLock: 'not-required' | 'pending' | 'verified' | 'failed'
+    pairedSave: 'not-required' | 'pending' | 'verified' | 'failed'
+    previousSaveLoad: 'not-required' | 'pending' | 'verified' | 'failed'
+  }
+}
+
 type ExecutionGateSignal = 'server-enforced' | 'accepted' | 'fail-closed'
+type SteamHandoffBusy = 'preview' | 'begin' | 'confirm' | null
 
 type CompatibilityReceiptStateCode =
   | 'ready' | 'status-unavailable' | 'policy-unavailable' | 'receipt-missing'
@@ -43,22 +116,23 @@ interface CompatibilityReceiptState {
 }
 
 const managedComponents: Array<{
-  component: ManagedUpdateComponent
+  component: SupportedComponentCandidatePreparationComponent
   label: string
   source: string
   description: string
 }> = [
   { component: 'nebula', label: 'Nebula', source: 'github:NebulaModTeam/nebula', description: '多人运行时' },
-  { component: 'bepinex', label: 'BepInEx', source: 'github:BepInEx/BepInEx', description: '模组加载框架' },
-  { component: 'bridge', label: 'Bridge', source: 'thunderstore:DysonControl/Bridge', description: '固定桥接插件' },
-  { component: 'control', label: 'Control', source: 'thunderstore:DysonControl/Control', description: '固定控制插件' }
+  { component: 'bepinex', label: 'BepInEx', source: 'github:BepInEx/BepInEx', description: '模组加载框架' }
 ]
 
-const componentConfirmations: Record<ManagedUpdateComponent, UpdateActivationConfirmation> = {
+const unavailableManagedComponents = [
+  { component: 'bridge', label: 'Bridge', description: '固定桥接插件' },
+  { component: 'control', label: 'Control', description: '固定控制插件' }
+] as const
+
+const componentConfirmations: Record<SupportedComponentCandidatePreparationComponent, UpdateActivationConfirmation> = {
   nebula: 'ACTIVATE_NEBULA_UPDATE',
-  bepinex: 'ACTIVATE_BEPINEX_UPDATE',
-  bridge: 'ACTIVATE_BRIDGE_UPDATE',
-  control: 'ACTIVATE_CONTROL_UPDATE'
+  bepinex: 'ACTIVATE_BEPINEX_UPDATE'
 }
 
 const versionPattern = /^(?:v)?\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
@@ -69,6 +143,48 @@ const acquisitionConfirmation = 'ACQUIRE_UPDATE_ARTIFACT'
 const preparationConfirmation = 'PREPARE_COMPONENT_CANDIDATE'
 const compatibilityConfirmation = 'PREPARE_COMPATIBILITY_EVIDENCE'
 const recoveryConfirmation = 'RECOVER_COMPONENT_UPDATE' as const
+const steamHandoffBeginConfirmation = 'BEGIN_STEAM_CLIENT_UPDATE_HANDOFF' as const
+const steamHandoffCompleteConfirmation = 'CONFIRM_STEAM_CLIENT_UPDATE_COMPLETED' as const
+const steamHandoffOperations = [
+  'capture-runtime-and-save-baseline',
+  'create-paired-save-protection-point',
+  'request-graceful-stop',
+  'prove-process-stopped-and-port-closed',
+  'await-official-steam-client-update',
+  'require-fixed-operator-confirmation',
+  'resample-exact-dsp-version-and-compatibility',
+  'start-and-prove-current-generation-exact-save-load',
+  'persist-audit-receipt'
+] as const
+
+export const steamManualHandoffApi = {
+  state: (signal?: AbortSignal) => steamHandoffRequest(
+    '/api/v1/updates/steam-handoff/state', parseSteamHandoffState, { signal }
+  ),
+  preview: (request: SteamManualHandoffRequest, signal?: AbortSignal) => steamHandoffRequest(
+    '/api/v1/updates/steam-handoff/preview', parseSteamHandoffPlan,
+    { method: 'POST', signal, body: JSON.stringify(request) }
+  ),
+  begin: (request: SteamManualHandoffRequest, signal?: AbortSignal) => steamHandoffRequest(
+    '/api/v1/updates/steam-handoff/begin', parseSteamHandoffReceipt,
+    {
+      method: 'POST', signal,
+      body: JSON.stringify({ ...request, confirmation: steamHandoffBeginConfirmation })
+    }
+  ),
+  confirm: (requestId: string, signal?: AbortSignal) => steamHandoffRequest(
+    '/api/v1/updates/steam-handoff/confirm', parseSteamHandoffReceipt,
+    {
+      method: 'POST', signal,
+      body: JSON.stringify({ requestId, confirmation: steamHandoffCompleteConfirmation })
+    }
+  ),
+  receipt: (requestId: string, signal?: AbortSignal) => steamHandoffRequest(
+    `/api/v1/updates/steam-handoff/receipts/${encodeURIComponent(requestId)}`,
+    parseSteamHandoffReceipt,
+    { signal }
+  )
+}
 
 export function VersionUpdateWorkspace({ status, demo, user }: {
   status: ServerStatus
@@ -130,6 +246,17 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
   const [readingReceipt, setReadingReceipt] = useState(false)
   const [loadError, setLoadError] = useState('')
   const [workflowError, setWorkflowError] = useState('')
+  const [steamState, setSteamState] = useState<SteamManualHandoffState | null>(null)
+  const [steamTargetVersion, setSteamTargetVersion] = useState('')
+  const [steamRequestId, setSteamRequestId] = useState(() => createUiRequestId())
+  const [steamPlan, setSteamPlan] = useState<SteamManualHandoffPlan | null>(null)
+  const [steamReceipt, setSteamReceipt] = useState<SteamManualHandoffReceipt | null>(null)
+  const [steamReceiptVerified, setSteamReceiptVerified] = useState(false)
+  const [steamBeginConfirmationInput, setSteamBeginConfirmationInput] = useState('')
+  const [steamCompleteConfirmationInput, setSteamCompleteConfirmationInput] = useState('')
+  const [steamBusy, setSteamBusy] = useState<SteamHandoffBusy>(null)
+  const [steamLoadError, setSteamLoadError] = useState('')
+  const [steamError, setSteamError] = useState('')
   const operationSequence = useRef(0)
   const acquisitionSequence = useRef(0)
   const preparationSequence = useRef(0)
@@ -138,6 +265,8 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
   const preparationAbort = useRef<AbortController | null>(null)
   const compatibilityAbort = useRef<AbortController | null>(null)
   const operationAbort = useRef<AbortController | null>(null)
+  const steamSequence = useRef(0)
+  const steamAbort = useRef<AbortController | null>(null)
 
   const canActivate = user.permissions.includes('updates.activate')
   const canReadUpdates = user.permissions.includes('updates.read')
@@ -158,23 +287,28 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
       setRecoveryStatus(fictionalActivationRecoveryStatus)
       setCleanupPlan(fictionalCleanupPlan)
       setCompatibilityStatus(fictionalCompatibilityStatus)
+      setSteamState(fictionalSteamHandoffState)
+      setSteamTargetVersion((current) => current || '0.10.35.29485')
       setDraft((current) => current.expectedRevision
         ? current
         : { ...current, expectedRevision: fictionalActivationState.revision })
       setGateSignal('fail-closed')
       setLoadError('')
+      setSteamLoadError('')
       if (showLoading) setLoading(false)
       return
     }
 
-    const [stateResult, recoveryResult, cleanupResult, compatibilityResult] = await Promise.allSettled([
+    const [stateResult, recoveryResult, cleanupResult, compatibilityResult, steamResult] = await Promise.allSettled([
       api.updateActivationState(signal),
       api.updateActivationRecoveryStatus(signal),
       api.updateActivationCleanupPreview(signal),
-      api.updateCompatibilityStatus(signal)
+      api.updateCompatibilityStatus(signal),
+      steamManualHandoffApi.state(signal)
     ])
     if (signal?.aborted) return
     const errors: string[] = []
+    const steamErrors: string[] = []
     if (stateResult.status === 'fulfilled') {
       setActivationState(stateResult.value.data)
       setDraft((current) => current.expectedRevision
@@ -208,7 +342,32 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
       setCompatibilityReceiptVerified(false)
       errors.push(formatCompatibilityError(compatibilityResult.reason, '可信兼容性状态暂不可用；激活保持锁定。'))
     }
+    if (steamResult.status === 'fulfilled') {
+      const nextSteam = steamResult.value.data
+      setSteamState(nextSteam)
+      setSteamReceipt(nextSteam.current)
+      setSteamReceiptVerified(false)
+      setSteamRequestId((current) => nextSteam.activeRequestId ?? current)
+      if (nextSteam.current !== null) {
+        try {
+          const persisted = await steamManualHandoffApi.receipt(nextSteam.current.requestId, signal)
+          if (signal?.aborted) return
+          if (!sameSteamHandoffReceipt(nextSteam.current, persisted.data)) {
+            throw new ApiError(502, 'Steam 交接状态与持久回执不一致。', 'DSP_STEAM_HANDOFF_BROWSER_READBACK_INVALID')
+          }
+          setSteamReceipt(persisted.data)
+          setSteamReceiptVerified(true)
+        } catch (reason) {
+          steamErrors.push(formatSteamHandoffError(reason, 'Steam 交接持久回执暂不可重读；完成确认保持锁定。'))
+        }
+      }
+    } else {
+      setSteamState(null)
+      setSteamReceiptVerified(false)
+      steamErrors.push(formatSteamHandoffError(steamResult.reason, 'Steam 人工交接状态暂不可用；停服与启动操作保持锁定。'))
+    }
     setLoadError(errors.join(' '))
+    setSteamLoadError(steamErrors.join(' '))
     if (showLoading) setLoading(false)
   }, [demo])
 
@@ -221,10 +380,12 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
       preparationAbort.current?.abort()
       compatibilityAbort.current?.abort()
       operationAbort.current?.abort()
+      steamAbort.current?.abort()
       operationSequence.current += 1
       acquisitionSequence.current += 1
       preparationSequence.current += 1
       compatibilitySequence.current += 1
+      steamSequence.current += 1
     }
   }, [load])
 
@@ -268,7 +429,7 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
     setPreparationGateClosed(false)
   }
 
-  function selectComponent(component: ManagedUpdateComponent): void {
+  function selectComponent(component: SupportedComponentCandidatePreparationComponent): void {
     if (component === draft.component) return
     resetPreparation()
     resetTransaction({
@@ -888,8 +1049,136 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
     }
   }
 
+  async function previewSteamHandoff(): Promise<void> {
+    const request: SteamManualHandoffRequest = {
+      requestId: steamRequestId.trim().toLowerCase(),
+      targetVersion: steamTargetVersion.trim(),
+      expectedRevision: steamState?.revision ?? ''
+    }
+    if (validateSteamHandoffDraft(request, steamState) !== null || !canReadUpdates) return
+    const controller = replaceAbortController(steamAbort)
+    const sequence = ++steamSequence.current
+    setSteamBusy('preview')
+    setSteamError('')
+    setSteamReceiptVerified(false)
+    try {
+      const result = demo
+        ? { data: fictionalSteamHandoffPlan(request) }
+        : await steamManualHandoffApi.preview(request, controller.signal)
+      if (sequence !== steamSequence.current || controller.signal.aborted) return
+      setSteamPlan(result.data)
+      setSteamBeginConfirmationInput('')
+    } catch (reason) {
+      if (sequence === steamSequence.current && !controller.signal.aborted) {
+        setSteamError(formatSteamHandoffError(reason, 'Steam 人工交接预演被拒绝；服务器没有发生变更。'))
+      }
+    } finally {
+      if (sequence === steamSequence.current) setSteamBusy(null)
+    }
+  }
+
+  async function beginSteamHandoff(): Promise<void> {
+    if (steamPlan === null || !canActivate || demo || steamState === null ||
+        steamState.recoveryRequired || steamState.activeRequestId !== null ||
+        steamBeginConfirmationInput !== steamHandoffBeginConfirmation) return
+    const request: SteamManualHandoffRequest = {
+      requestId: steamPlan.requestId,
+      targetVersion: steamPlan.targetVersion,
+      expectedRevision: steamPlan.expectedRevision
+    }
+    const controller = replaceAbortController(steamAbort)
+    const sequence = ++steamSequence.current
+    setSteamBusy('begin')
+    setSteamError('')
+    setSteamReceiptVerified(false)
+    try {
+      const accepted = await steamManualHandoffApi.begin(request, controller.signal)
+      if (sequence !== steamSequence.current || controller.signal.aborted) return
+      if (accepted.data.phase !== 'awaiting-steam-client-update' || accepted.data.recoveryRequired) {
+        throw new ApiError(502, 'Steam 交接响应未证明已进入人工客户端等待阶段。', 'DSP_STEAM_HANDOFF_BROWSER_RESPONSE_INVALID')
+      }
+      const [stateResult, receiptResult] = await Promise.all([
+        steamManualHandoffApi.state(controller.signal),
+        steamManualHandoffApi.receipt(request.requestId, controller.signal)
+      ])
+      if (sequence !== steamSequence.current || controller.signal.aborted) return
+      if (!steamHandoffReadbackMatches(
+        accepted.data, receiptResult.data, stateResult.data, 'awaiting-steam-client-update'
+      )) {
+        throw new ApiError(502, 'Steam 交接持久回读不一致。', 'DSP_STEAM_HANDOFF_BROWSER_READBACK_INVALID')
+      }
+      setSteamState(stateResult.data)
+      setSteamReceipt(receiptResult.data)
+      setSteamReceiptVerified(true)
+      setSteamBeginConfirmationInput('')
+    } catch (reason) {
+      if (sequence === steamSequence.current && !controller.signal.aborted) {
+        setSteamError(formatSteamHandoffError(
+          reason,
+          'Steam 人工交接没有得到可验证等待回执；请重新读取状态，勿假定服务器已安全停服。'
+        ))
+      }
+    } finally {
+      if (sequence === steamSequence.current) setSteamBusy(null)
+    }
+  }
+
+  async function confirmSteamHandoff(): Promise<void> {
+    const current = steamState?.current
+    if (!canActivate || demo || !steamReceiptVerified || current?.phase !== 'awaiting-steam-client-update' ||
+        current.recoveryRequired || steamCompleteConfirmationInput !== steamHandoffCompleteConfirmation) return
+    const controller = replaceAbortController(steamAbort)
+    const sequence = ++steamSequence.current
+    setSteamBusy('confirm')
+    setSteamError('')
+    setSteamReceiptVerified(false)
+    try {
+      const accepted = await steamManualHandoffApi.confirm(current.requestId, controller.signal)
+      if (sequence !== steamSequence.current || controller.signal.aborted) return
+      if (accepted.data.phase !== 'succeeded' || accepted.data.recoveryRequired) {
+        throw new ApiError(502, 'Steam 交接响应未证明 exact save 已加载。', 'DSP_STEAM_HANDOFF_BROWSER_RESPONSE_INVALID')
+      }
+      const [stateResult, receiptResult] = await Promise.all([
+        steamManualHandoffApi.state(controller.signal),
+        steamManualHandoffApi.receipt(current.requestId, controller.signal)
+      ])
+      if (sequence !== steamSequence.current || controller.signal.aborted) return
+      if (!steamHandoffReadbackMatches(accepted.data, receiptResult.data, stateResult.data, 'succeeded')) {
+        throw new ApiError(502, 'Steam 完成交接的持久回读不一致。', 'DSP_STEAM_HANDOFF_BROWSER_READBACK_INVALID')
+      }
+      setSteamState(stateResult.data)
+      setSteamReceipt(receiptResult.data)
+      setSteamReceiptVerified(true)
+      setSteamPlan(null)
+      setSteamCompleteConfirmationInput('')
+      setSteamRequestId(createUiRequestId())
+    } catch (reason) {
+      if (sequence === steamSequence.current && !controller.signal.aborted) {
+        setSteamError(formatSteamHandoffError(
+          reason,
+          '客户端更新确认未通过 exact version、兼容性或旧存档加载证明；事务保持等待或进入明确恢复状态。'
+        ))
+        try {
+          const [stateResult, receiptResult] = await Promise.all([
+            steamManualHandoffApi.state(controller.signal),
+            steamManualHandoffApi.receipt(current.requestId, controller.signal)
+          ])
+          if (sequence === steamSequence.current && !controller.signal.aborted) {
+            setSteamState(stateResult.data)
+            setSteamReceipt(receiptResult.data)
+            setSteamReceiptVerified(true)
+          }
+        } catch {
+          // The primary bounded error remains visible; no stale readback is trusted.
+        }
+      }
+    } finally {
+      if (sequence === steamSequence.current) setSteamBusy(null)
+    }
+  }
+
   if (loading) {
-    return <div className="loading-state compact"><span className="spinner" />正在并行读取活动 revision、可信兼容性状态与只读清理预演…</div>
+    return <div className="loading-state compact"><span className="spinner" />正在并行读取活动 revision、Steam 交接、可信兼容性状态与只读清理预演…</div>
   }
 
   const gateLabel = gateSignal === 'accepted' ? 'GATE ACCEPTED'
@@ -913,6 +1202,7 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
     preparationReceipt,
     preparationReceiptVerified
   )
+  const rollbackProjection = componentRollbackReceiptProjection(receipt)
 
   return <div className="version-workspace update-activation-workspace">
     <div className="workspace-toolbar update-toolbar"><div><strong>确定性组件更新事务</strong><span>官方发现 · 持久获取 · 严格准备 · revision CAS · smoke · rollback</span></div><div><button type="button" onClick={() => void load()}><RefreshCw size={15} />刷新事务状态</button><button type="button" onClick={() => void discover('nebula')} disabled={discovering || !canReadUpdates}><CloudDownload className={discovering && discoveryComponent === 'nebula' ? 'spin' : ''} size={15} />{discovering && discoveryComponent === 'nebula' ? 'Nebula 发现中…' : '发现 Nebula'}</button><button type="button" onClick={() => void discover('bepinex')} disabled={discovering || !canReadUpdates}><CloudDownload className={discovering && discoveryComponent === 'bepinex' ? 'spin' : ''} size={15} />{discovering && discoveryComponent === 'bepinex' ? 'BepInEx 发现中…' : '发现 BepInEx'}</button></div></div>
@@ -924,13 +1214,14 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
     {compatibilityError && <div className="update-workflow-error compatibility-error" role="alert"><TriangleAlert size={16} /><span>{compatibilityError}</span></div>}
     {acquisitionError && <div className="update-workflow-error acquisition-error" role="alert"><TriangleAlert size={16} /><span>{acquisitionError}</span></div>}
     {preparationError && <div className="update-workflow-error acquisition-error" role="alert"><TriangleAlert size={16} /><span>{preparationError}</span></div>}
+    {steamError && <div className="update-workflow-error" role="alert"><TriangleAlert size={16} /><span>{steamError}</span></div>}
 
     <section className="update-state-deck">
       <div><span>ACTIVE REVISION</span><strong>{activationState ? shortHash(activationState.revision, 16) : 'UNAVAILABLE'}</strong><small>{activationState ? `${activationState.components.length} 个托管组件` : '事务未配置或状态不可读'}</small></div>
       <div><span>RECOVERY FLAG</span><strong className={activationState?.recoveryRequired || recoveryStatus?.recoveryRequired ? 'danger' : 'green'}>{activationState ? activationState.recoveryRequired || recoveryStatus?.recoveryRequired ? 'REQUIRED' : 'CLEAR' : 'UNKNOWN'}</strong><small>{activationState?.recoveryRequired || recoveryStatus?.recoveryRequired ? '必须先执行精确 broker-bound 恢复' : '没有活动恢复标志'}</small></div>
       <div><span>HISTORY</span><strong>{activationState?.historyEntries ?? '—'}</strong><small>有界审计安全回执</small></div>
       <div className={gateSignal === 'fail-closed' ? 'gate-closed' : gateSignal === 'accepted' ? 'gate-open' : ''}><span>EXECUTION GATE</span><strong>{gateLabel}</strong><small>{gateDetail}</small></div>
-      <div><span>DSP CHANNEL</span><strong className="amber">STEAM MANUAL</strong><small>不可通过组件激活事务更新</small></div>
+      <div><span>DSP HANDOFF</span><strong className={steamState?.recoveryRequired ? 'danger' : steamState?.current?.phase === 'awaiting-steam-client-update' ? 'amber' : 'green'}>{steamState?.recoveryRequired ? 'RECOVERY' : steamState?.current?.phase === 'awaiting-steam-client-update' ? 'AWAITING CLIENT' : steamState ? 'READY' : 'UNAVAILABLE'}</strong><small>官方 Steam 客户端人工更新；控制面只协调保护、停服与证明</small></div>
     </section>
 
     {(activationState?.recoveryRequired || recoveryStatus?.phase === 'recovery-required') && <section className="update-execution-confirm update-recovery-confirm">
@@ -949,9 +1240,81 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
 
     <section className="dsp-manual-channel">
       <span className="dsp-channel-mark"><CloudDownload size={22} /></span>
-      <div><strong>Dyson Sphere Program · {status.versions.dsp ?? '版本待采集'}</strong><small>游戏本体必须由已登录的 Steam 客户端人工更新。UI 不提供 DSP artifact、匿名 SteamCMD 或“激活”按钮。</small></div>
-      <b>MANUAL / NON-ACTIVATABLE</b>
+      <div><strong>Dyson Sphere Program · {status.versions.dsp ?? '版本待采集'}</strong><small>游戏本体仍必须由已登录的官方 Steam 客户端人工更新。控制面不会读取或自动化账号、密码、Steam Guard、cookie、客户端路径或命令。</small></div>
+      <b>MANUAL / DURABLE HANDOFF</b>
     </section>
+
+    <section className="update-compatibility-panel">
+      <header><div><CloudDownload size={17} /><span><strong>DSP 官方 Steam 客户端人工交接</strong><small>保护点 + 优雅停服 → 人工客户端更新 → exact version/compatibility → exact previous save 当前代际证明</small></span></div><b>{steamState?.current ? steamHandoffPhaseLabel(steamState.current.phase) : steamState ? 'READY' : 'FAIL-CLOSED'}</b></header>
+      {steamLoadError && <div className="update-workflow-error" role="status" aria-label="Steam 人工交接状态不可用"><TriangleAlert size={16} /><span>{steamLoadError}</span></div>}
+      <div className="update-compatibility-grid">
+        <div><span>CURRENT DSP</span><strong>{status.versions.dsp ?? 'UNAVAILABLE'}</strong><small>只读运行时采集，不作为更新完成证明</small></div>
+        <div><span>HANDOFF REVISION</span><strong>{steamState ? shortHash(steamState.revision, 18) : 'UNAVAILABLE'}</strong><small>begin 使用 expectedRevision CAS</small></div>
+        <div><span>ACTIVE REQUEST</span><strong>{steamState?.activeRequestId ? shortHash(steamState.activeRequestId, 18) : 'NONE'}</strong><small>{steamReceiptVerified ? '持久 receipt 已按 UUID 重读' : steamState?.activeRequestId ? '回执未重读；确认保持锁定' : '没有等待中的停服交接'}</small></div>
+        <div><span>RECOVERY</span><strong className={steamState?.recoveryRequired ? 'danger' : 'green'}>{steamState?.recoveryRequired ? 'REQUIRED' : steamState ? 'CLEAR' : 'UNKNOWN'}</strong><small>{steamState?.current?.failureCode ?? '失败不会写入伪造完成状态'}</small></div>
+      </div>
+      <div className="compatibility-control-deck">
+        <div className={`compatibility-state-callout tone-${steamState?.recoveryRequired || steamState === null ? 'red' : steamState.current ? 'amber' : 'green'}`}><ShieldCheck size={17} /><span><strong>{steamState?.recoveryRequired ? '恢复状态锁定' : steamState?.current ? '已进入人工 Steam 客户端阶段' : steamState ? '可生成零变更预演' : '状态不可用'}</strong><small>{steamState?.recoveryRequired ? '不要启动新交接；按持久失败回执执行受控恢复。' : steamState?.current ? '仅在官方客户端明确完成后输入固定确认；错误版本可重试。' : '预演不会创建保护点、停服、启动或接触 Steam 账号。'}</small></span></div>
+        <label><span>TARGET DSP VERSION</span><input aria-label="Steam 人工交接目标 DSP 版本" value={steamTargetVersion}
+          disabled={steamBusy !== null || steamState?.activeRequestId !== null}
+          onChange={(event) => {
+            setSteamTargetVersion(event.target.value)
+            setSteamPlan(null)
+            setSteamBeginConfirmationInput('')
+          }} placeholder="0.10.35.29485" autoComplete="off" spellCheck={false} /></label>
+        <button type="button" onClick={() => void previewSteamHandoff()}
+          disabled={steamBusy !== null || !canReadUpdates || validateSteamHandoffDraft({
+            requestId: steamRequestId.trim().toLowerCase(), targetVersion: steamTargetVersion.trim(),
+            expectedRevision: steamState?.revision ?? ''
+          }, steamState) !== null}><PackageCheck className={steamBusy === 'preview' ? 'spin' : ''} size={14} />{steamBusy === 'preview' ? '预演中…' : '生成零变更预演'}</button>
+        <label><span>REQUEST ID</span><input aria-label="Steam 人工交接 request ID" value={steamRequestId} readOnly /></label>
+        <button type="button" onClick={() => {
+          setSteamRequestId(createUiRequestId())
+          setSteamPlan(null)
+          setSteamReceipt(null)
+          setSteamReceiptVerified(false)
+          setSteamError('')
+        }} disabled={steamBusy !== null || steamState?.activeRequestId !== null}><RefreshCw size={14} />新建 request</button>
+      </div>
+    </section>
+
+    {steamPlan && <>
+      <section className="update-operation-plan">
+        <header><div><History size={16} /><strong>Steam handoff dry-run operations</strong></div><span>{steamPlan.operations.length} 步 · accountAutomation=false · 零变更</span></header>
+        <div>{steamPlan.operations.map((operation, index) => <div key={`${operation}-${index}`}><b>{String(index + 1).padStart(2, '0')}</b><span><strong>{steamHandoffOperationLabel(operation)}</strong><code>{operation}</code></span></div>)}</div>
+      </section>
+      <section className="update-execution-confirm">
+        <div><TriangleAlert size={22} /><span><strong>先保护并优雅停服，再交给官方 Steam 客户端</strong><small>输入 <code>{steamHandoffBeginConfirmation}</code>。服务端会持久化 baseline、配对存档保护点、停止态证明和超时；不会启动或操纵 Steam 客户端。</small></span></div>
+        <input aria-label="Steam 人工交接开始精确确认" value={steamBeginConfirmationInput}
+          disabled={!canActivate || demo || steamBusy !== null || steamState?.activeRequestId !== null || steamState?.recoveryRequired}
+          onChange={(event) => setSteamBeginConfirmationInput(event.target.value)}
+          placeholder={steamHandoffBeginConfirmation} autoComplete="off" />
+        <button type="button" className="confirm-execute" onClick={() => void beginSteamHandoff()}
+          disabled={!canActivate || demo || steamBusy !== null || steamState?.activeRequestId !== null || steamState?.recoveryRequired || steamBeginConfirmationInput !== steamHandoffBeginConfirmation}>
+          {steamBusy === 'begin' ? '保护与停服证明中…' : !canActivate ? '需要 Administrator' : demo ? '演示环境不停服' : '建立持久人工交接'}</button>
+      </section>
+    </>}
+
+    {steamState?.current?.phase === 'awaiting-steam-client-update' && <section className="update-execution-confirm update-recovery-confirm">
+      <div><CloudDownload size={22} /><span><strong>等待操作员使用官方 Steam 客户端完成更新</strong><small>交接 request <code>{steamState.current.requestId}</code> 已证明进程停止且端口关闭。完成客户端操作后输入 <code>{steamHandoffCompleteConfirmation}</code>；服务端会重新采集 exact DSP version 与兼容性，再启动并要求 Bridge heartbeat 与加载日志在同一启动代际证明 exact previous save。</small></span></div>
+      <input aria-label="Steam 客户端更新完成精确确认" value={steamCompleteConfirmationInput}
+        disabled={!canActivate || demo || steamBusy !== null || !steamReceiptVerified}
+        onChange={(event) => setSteamCompleteConfirmationInput(event.target.value)}
+        placeholder={steamHandoffCompleteConfirmation} autoComplete="off" />
+      <button type="button" className="confirm-execute" onClick={() => void confirmSteamHandoff()}
+        disabled={!canActivate || demo || steamBusy !== null || !steamReceiptVerified || steamCompleteConfirmationInput !== steamHandoffCompleteConfirmation}>
+        {steamBusy === 'confirm' ? '重采、启动与 exact save 证明中…' : !steamReceiptVerified ? '先重读持久回执' : '确认客户端更新已完成'}</button>
+    </section>}
+
+    {steamReceipt && <section className="update-receipt-panel">
+      <header><div><ShieldCheck size={16} /><strong>Steam handoff 持久回执</strong></div><span>{steamReceiptVerified ? 'RECEIPT REREAD VERIFIED' : 'STATE PROJECTION ONLY'}</span></header>
+      <div className="update-receipt-grid">
+        <div><span>PHASE</span><strong>{steamHandoffPhaseLabel(steamReceipt.phase)}</strong><small>{steamReceipt.reused ? '幂等重放' : '首次响应'}</small></div>
+        <div><span>PROTECTION</span><strong>{steamReceipt.steps.protectionPoint.toUpperCase()}</strong><small>{steamReceipt.protectionBackupId ? shortHash(steamReceipt.protectionBackupId, 22) : '未创建'}</small></div>
+        <div><span>EXACT SAVE LOAD</span><strong>{steamReceipt.steps.exactSaveLoad.toUpperCase()}</strong><small>Bridge + 日志同启动代际</small></div>
+        <div><span>BINDING</span><strong>{steamReceipt.transactionBindingSha256 ? shortHash(steamReceipt.transactionBindingSha256, 18) : 'UNAVAILABLE'}</strong><small>{steamReceipt.failureCode ?? '没有失败码'}</small></div>
+      </div>
+    </section>}
 
     <div className="update-activation-grid">
       <section className="update-component-panel">
@@ -961,6 +1324,11 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
           return <button type="button" key={item.component} className={draft.component === item.component ? 'active' : ''} onClick={() => selectComponent(item.component)}>
             <span className={active ? 'online' : 'empty'}>{active ? 'ON' : '—'}</span><div><strong>{item.label}</strong><small>{item.description}</small><code>{item.source}</code></div><b>{active?.version ?? '未记录'}</b>
           </button>
+        })}{unavailableManagedComponents.map((item) => {
+          const active = activationState?.components.find((entry) => entry.component === item.component)
+          return <div className="active-component-unavailable" key={item.component} aria-label={`${item.label} 自更新不可用`}>
+            <span className={active ? 'online' : 'empty'}>{active ? 'ON' : '—'}</span><div><strong>{item.label}</strong><small>{item.description}</small><code>自更新 provider 未装配 · READ ONLY</code></div><b>{active?.version ?? '未记录'}</b>
+          </div>
         })}</div>
       </section>
 
@@ -975,6 +1343,8 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
         <footer><ShieldCheck size={14} />请求只能由重新读取并严格核验的 prepared receipt 生成；raw acquisition receipt 永远不会直接解锁激活。</footer>
       </section>
     </div>
+
+    <NebulaPluginTransactionWorkspace demo={demo} user={user} />
 
     <section className={`update-compatibility-panel state-${currentCompatibilityState.code}`}>
       <header><div><PackageCheck size={17} /><span><strong>服务端可信兼容性回执</strong><small>策略与运行时 inventory 只由服务端读取；浏览器无法提交替代矩阵。</small></span></div><b>{currentCompatibilityState.label}</b></header>
@@ -1019,8 +1389,8 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
       <section className="update-safety-semantics">
         <div><span className="semantic-icon"><ShieldCheck size={17} /></span><strong>存档保护点</strong><small>发布前创建 `.dsv + .server` 成对、持久保护；不是单文件复制。</small></div>
         <div><span className="semantic-icon"><LockKeyhole size={17} /></span><strong>停止态证明</strong><small>在保护与发布阶段分别证明 DSP 进程停止且游戏端口关闭。</small></div>
-        <div><span className="semantic-icon"><ScanSearch size={17} /></span><strong>固定 Smoke</strong><small>发布后验证版本、BepInEx、Nebula、进程与端口；浏览器不能传命令。</small></div>
-        <div><span className="semantic-icon"><Undo2 size={17} /></span><strong>自动回滚</strong><small>{plan.rollback.previousReleaseRequired ? '失败时切回上一不可变 release 并再次 smoke。' : '首次激活没有上一 release；无法证明安全时设置 recoveryRequired。'}</small></div>
+        <div><span className="semantic-icon"><ScanSearch size={17} /></span><strong>当前代际 exact save 证明</strong><small>版本/进程/端口只是前置条件；Bridge heartbeat 与加载日志必须在同一启动代际证明目标存档身份。</small></div>
+        <div><span className="semantic-icon"><Undo2 size={17} /></span><strong>事务化回滚</strong><small>{plan.rollback.previousReleaseRequired ? '失败时逐项恢复组件、配置 revision、server mod-lock、配对存档，并证明 exact previous save。' : '首次激活没有上一 release；任何恢复能力或重读证明缺失都会 fail closed 到 recoveryRequired。'}</small></div>
       </section>
 
       <section className="update-execution-confirm">
@@ -1035,6 +1405,7 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
       <header><div>{receipt?.status === 'succeeded' ? <Check size={17} /> : <History size={17} />}<strong>事务回执</strong></div><span>{receiptVerified ? '已由 receipts/:requestId 重新读取' : '尚无已核对的持久回执'}</span></header>
       {receipt ? <div className="update-receipt-body"><div><span>STATUS</span><strong>{receipt.status}</strong><small>{receipt.failureCode ?? '没有失败代码'}</small></div><div><span>RESULT REVISION</span><code>{shortHash(receipt.resultingRevision, 18)}</code><small>{receipt.reused ? '幂等复用既有回执' : '首次事务回执'}</small></div><div><span>PROTECTION</span><strong>{receipt.protectionBackupId ?? '未创建'}</strong><small>{receipt.rollbackVerified ? '回滚已验证' : receipt.recoveryRequired ? '需要人工恢复' : '未触发回滚'}</small></div><div><span>COMPLETED</span><strong>{relativeTime(receipt.completedAt)}</strong><small>{receipt.fileCount} 文件 · {formatBytes(receipt.expandedBytes)}</small></div></div>
         : <div className="update-receipt-empty"><History size={23} /><span><strong>历史计数 {activationState?.historyEntries ?? '—'}</strong><small>状态 API 只返回有界计数；具体回执必须使用当前 request ID 精确读取，不枚举主机文件。</small></span></div>}
+      {rollbackProjection && <div className="acquisition-operation-strip"><ShieldCheck size={15} /><span><strong>ROLLBACK JOURNAL {rollbackProjection.rollbackBindingSha256 ? shortHash(rollbackProjection.rollbackBindingSha256, 18) : 'UNBOUND'}</strong><small>component {rollbackProjection.rollbackSteps.component} · configuration {rollbackProjection.rollbackSteps.configuration} · server mod-lock {rollbackProjection.rollbackSteps.serverModLock} · paired save {rollbackProjection.rollbackSteps.pairedSave} · exact previous save load {rollbackProjection.rollbackSteps.previousSaveLoad}</small></span></div>}
       {(preparedRequest || receipt) && !demo && <footer><code>{receipt?.requestId ?? preparedRequest?.requestId}</code><button type="button" onClick={() => void readPersistedReceipt()} disabled={readingReceipt}><RefreshCw className={readingReceipt ? 'spin' : ''} size={13} />{readingReceipt ? '读取中…' : '核对持久回执'}</button></footer>}
     </section>
 
@@ -1173,6 +1544,252 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
       </footer>
     </section>
   </div>
+}
+
+async function steamHandoffRequest<T>(
+  path: string,
+  parser: (value: unknown) => T | null,
+  init: RequestInit = {}
+): Promise<{ data: T }> {
+  const headers = new Headers(init.headers)
+  if (init.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+  let response: Response
+  try {
+    response = await fetch(path, { credentials: 'same-origin', ...init, headers })
+  } catch (error) {
+    if (init.signal?.aborted === true) throw error
+    throw new ApiError(503, 'Steam 人工交接接口暂不可用；所有停服与启动操作保持锁定。', 'DSP_STEAM_HANDOFF_BROWSER_UNAVAILABLE')
+  }
+  const value = await response.json().catch(() => null) as unknown
+  if (!response.ok) {
+    const code = safeSteamHandoffErrorCode(value)
+    throw new ApiError(response.status, steamHandoffErrorMessage(response.status, code), code)
+  }
+  if (!hasExactObjectKeys(value, ['ok', 'data']) || value.ok !== true) {
+    throw new ApiError(502, 'Steam 人工交接响应 envelope 无效；所有操作保持锁定。', 'DSP_STEAM_HANDOFF_BROWSER_RESPONSE_INVALID')
+  }
+  const data = parser(value.data)
+  if (data === null) {
+    throw new ApiError(502, 'Steam 人工交接响应未通过严格浏览器合同校验。', 'DSP_STEAM_HANDOFF_BROWSER_RESPONSE_INVALID')
+  }
+  return { data }
+}
+
+function parseSteamHandoffPlan(value: unknown): SteamManualHandoffPlan | null {
+  if (!hasExactObjectKeys(value, [
+    'format', 'schemaVersion', 'dryRun', 'requestId', 'targetVersion', 'expectedRevision',
+    'timeoutSeconds', 'accountAutomation', 'operations'
+  ]) || value.format !== 'dyson-control-steam-manual-handoff-plan' || value.schemaVersion !== 1 ||
+      value.dryRun !== true || value.accountAutomation !== false ||
+      !validSteamHandoffRequestFields(value) || !Number.isSafeInteger(value.timeoutSeconds) ||
+      (value.timeoutSeconds as number) < 1 || !Array.isArray(value.operations) ||
+      value.operations.length !== steamHandoffOperations.length ||
+      value.operations.some((operation, index) => operation !== steamHandoffOperations[index])) return null
+  return value as unknown as SteamManualHandoffPlan
+}
+
+function parseSteamHandoffReceipt(value: unknown): SteamManualHandoffReceipt | null {
+  if (!hasExactObjectKeys(value, [
+    'format', 'schemaVersion', 'requestId', 'targetVersion', 'phase', 'previousRevision',
+    'resultingRevision', 'transactionBindingSha256', 'protectionBackupId',
+    'protectionManifestSha256', 'previousDspVersion', 'compatibilityRevision', 'startedAt',
+    'expiresAt', 'completedAt', 'failureCode', 'recoveryRequired', 'steps', 'auditEvents', 'reused'
+  ]) || value.format !== 'dyson-control-steam-manual-handoff-receipt' || value.schemaVersion !== 1 ||
+      typeof value.requestId !== 'string' || value.requestId !== value.requestId.toLowerCase() ||
+      !uuidPattern.test(value.requestId) || typeof value.targetVersion !== 'string' ||
+      !versionPattern.test(value.targetVersion) || !isSteamHandoffPhase(value.phase) ||
+      typeof value.previousRevision !== 'string' || !sha256Pattern.test(value.previousRevision) ||
+      typeof value.resultingRevision !== 'string' || !sha256Pattern.test(value.resultingRevision) ||
+      !nullableSha256(value.transactionBindingSha256) || !nullableBoundedString(value.protectionBackupId) ||
+      !nullableSha256(value.protectionManifestSha256) || !nullableVersion(value.previousDspVersion) ||
+      !nullableSha256(value.compatibilityRevision) || !validIsoTimestamp(value.startedAt) ||
+      !validIsoTimestamp(value.expiresAt) || !nullableIsoTimestamp(value.completedAt) ||
+      !nullableSteamFailureCode(value.failureCode) || typeof value.recoveryRequired !== 'boolean' ||
+      !validSteamHandoffSteps(value.steps) || !Array.isArray(value.auditEvents) ||
+      value.auditEvents.length > 32 || value.auditEvents.some((event) => typeof event !== 'string' || event.length > 96) ||
+      typeof value.reused !== 'boolean') return null
+  if ((value.phase === 'succeeded' && (value.recoveryRequired || value.failureCode !== null || value.completedAt === null)) ||
+      (value.phase === 'recovery-required' && (!value.recoveryRequired || value.failureCode === null))) return null
+  return value as unknown as SteamManualHandoffReceipt
+}
+
+function parseSteamHandoffState(value: unknown): SteamManualHandoffState | null {
+  if (!hasExactObjectKeys(value, [
+    'format', 'schemaVersion', 'revision', 'recoveryRequired', 'activeRequestId',
+    'lastCompletedTargetVersion', 'current'
+  ]) || value.format !== 'dyson-control-steam-manual-handoff-state' || value.schemaVersion !== 1 ||
+      typeof value.revision !== 'string' || !sha256Pattern.test(value.revision) ||
+      typeof value.recoveryRequired !== 'boolean' || !nullableUuid(value.activeRequestId) ||
+      !nullableVersion(value.lastCompletedTargetVersion)) return null
+  const current = value.current === null ? null : parseSteamHandoffReceipt(value.current)
+  if (value.current !== null && current === null) return null
+  if ((value.activeRequestId === null) !== (current === null) ||
+      (current !== null && current.requestId !== value.activeRequestId) ||
+      (value.recoveryRequired && current?.phase !== 'recovery-required')) return null
+  return { ...(value as unknown as Omit<SteamManualHandoffState, 'current'>), current }
+}
+
+function validSteamHandoffRequestFields(value: Record<string, unknown>): boolean {
+  return typeof value.requestId === 'string' && value.requestId === value.requestId.toLowerCase() &&
+    uuidPattern.test(value.requestId) && typeof value.targetVersion === 'string' &&
+    versionPattern.test(value.targetVersion) && typeof value.expectedRevision === 'string' &&
+    sha256Pattern.test(value.expectedRevision)
+}
+
+function validSteamHandoffSteps(value: unknown): boolean {
+  if (!hasExactObjectKeys(value, [
+    'protectionPoint', 'gracefulStop', 'stoppedProof', 'operatorConfirmation',
+    'versionResample', 'compatibilityResample', 'exactSaveLoad'
+  ])) return false
+  const triState = new Set(['pending', 'verified', 'failed'])
+  return triState.has(String(value.protectionPoint)) && triState.has(String(value.gracefulStop)) &&
+    triState.has(String(value.stoppedProof)) &&
+    (value.operatorConfirmation === 'pending' || value.operatorConfirmation === 'verified') &&
+    triState.has(String(value.versionResample)) && triState.has(String(value.compatibilityResample)) &&
+    triState.has(String(value.exactSaveLoad))
+}
+
+function validateSteamHandoffDraft(
+  request: SteamManualHandoffRequest,
+  state: SteamManualHandoffState | null
+): string | null {
+  if (state === null) return 'Steam 人工交接状态不可用。'
+  if (state.recoveryRequired) return 'Steam 人工交接需要恢复。'
+  if (state.activeRequestId !== null) return '已有 Steam 人工交接等待完成。'
+  if (!uuidPattern.test(request.requestId) || request.requestId !== request.requestId.toLowerCase()) return 'request ID 无效。'
+  if (!versionPattern.test(request.targetVersion)) return '目标 DSP 版本无效。'
+  if (!sha256Pattern.test(request.expectedRevision) || request.expectedRevision !== state.revision) return '交接 revision 已过期。'
+  return null
+}
+
+function steamHandoffReadbackMatches(
+  accepted: SteamManualHandoffReceipt,
+  persisted: SteamManualHandoffReceipt,
+  state: SteamManualHandoffState,
+  expectedPhase: 'awaiting-steam-client-update' | 'succeeded'
+): boolean {
+  if (!sameSteamHandoffReceipt(accepted, persisted) || persisted.phase !== expectedPhase ||
+      state.recoveryRequired || persisted.recoveryRequired) return false
+  if (expectedPhase === 'awaiting-steam-client-update') {
+    return state.activeRequestId === persisted.requestId && state.current !== null &&
+      sameSteamHandoffReceipt(state.current, persisted)
+  }
+  return state.activeRequestId === null && state.current === null &&
+    state.lastCompletedTargetVersion === persisted.targetVersion &&
+    state.revision === persisted.resultingRevision
+}
+
+function sameSteamHandoffReceipt(
+  left: SteamManualHandoffReceipt,
+  right: SteamManualHandoffReceipt
+): boolean {
+  return left.requestId === right.requestId && left.targetVersion === right.targetVersion &&
+    left.phase === right.phase && left.previousRevision === right.previousRevision &&
+    left.resultingRevision === right.resultingRevision &&
+    left.transactionBindingSha256 === right.transactionBindingSha256 &&
+    left.protectionManifestSha256 === right.protectionManifestSha256 &&
+    left.failureCode === right.failureCode && left.recoveryRequired === right.recoveryRequired &&
+    JSON.stringify(left.steps) === JSON.stringify(right.steps)
+}
+
+function fictionalSteamHandoffPlan(request: SteamManualHandoffRequest): SteamManualHandoffPlan {
+  return {
+    format: 'dyson-control-steam-manual-handoff-plan', schemaVersion: 1, dryRun: true,
+    ...request, timeoutSeconds: 1_800, accountAutomation: false,
+    operations: [...steamHandoffOperations]
+  }
+}
+
+function steamHandoffOperationLabel(operation: string): string {
+  return ({
+    'capture-runtime-and-save-baseline': '采集运行时、兼容性与旧存档身份基线',
+    'create-paired-save-protection-point': '创建配对存档保护点并绑定 manifest',
+    'request-graceful-stop': '请求优雅停服',
+    'prove-process-stopped-and-port-closed': '证明进程停止且端口关闭',
+    'await-official-steam-client-update': '等待官方 Steam 客户端人工更新',
+    'require-fixed-operator-confirmation': '要求操作员固定确认',
+    'resample-exact-dsp-version-and-compatibility': '重采 exact DSP 版本与兼容性',
+    'start-and-prove-current-generation-exact-save-load': '启动并证明当前代际 exact previous save',
+    'persist-audit-receipt': '持久化审计回执'
+  } as Record<string, string>)[operation] ?? operation
+}
+
+function steamHandoffPhaseLabel(phase: SteamManualHandoffPhase): string {
+  return ({
+    preparing: 'PREPARING',
+    'awaiting-steam-client-update': 'AWAITING STEAM CLIENT',
+    'validating-client-update': 'VALIDATING CLIENT UPDATE',
+    'starting-and-verifying': 'STARTING + VERIFYING',
+    succeeded: 'SUCCEEDED',
+    'recovery-required': 'RECOVERY REQUIRED'
+  } satisfies Record<SteamManualHandoffPhase, string>)[phase]
+}
+
+function isSteamHandoffPhase(value: unknown): value is SteamManualHandoffPhase {
+  return value === 'preparing' || value === 'awaiting-steam-client-update' ||
+    value === 'validating-client-update' || value === 'starting-and-verifying' ||
+    value === 'succeeded' || value === 'recovery-required'
+}
+
+function nullableSha256(value: unknown): boolean {
+  return value === null || (typeof value === 'string' && sha256Pattern.test(value))
+}
+
+function nullableUuid(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && value === value.toLowerCase() && uuidPattern.test(value))
+}
+
+function nullableVersion(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && versionPattern.test(value))
+}
+
+function nullableBoundedString(value: unknown): boolean {
+  return value === null || (typeof value === 'string' && value.length >= 1 && value.length <= 128)
+}
+
+function validIsoTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 40 && Number.isFinite(Date.parse(value))
+}
+
+function nullableIsoTimestamp(value: unknown): boolean {
+  return value === null || validIsoTimestamp(value)
+}
+
+function nullableSteamFailureCode(value: unknown): boolean {
+  return value === null || (typeof value === 'string' && /^DSP_STEAM_HANDOFF_[A-Z0-9_]{1,72}$/.test(value))
+}
+
+function safeSteamHandoffErrorCode(value: unknown): string | null {
+  if (!hasExactObjectKeys(value, ['ok', 'error']) || value.ok !== false ||
+      !hasExactObjectKeys(value.error, ['code']) || typeof value.error.code !== 'string' ||
+      !/^(?:DSP_STEAM_HANDOFF|WINDOWS_STEAM_HANDOFF)_[A-Z0-9_]{1,96}$/.test(value.error.code)) return null
+  return value.error.code
+}
+
+function steamHandoffErrorMessage(status: number, code: string | null): string {
+  if (code === 'DSP_STEAM_HANDOFF_VERSION_MISMATCH') return '官方 Steam 客户端尚未达到 exact 目标版本；事务仍等待，可完成更新后重试。'
+  if (code === 'DSP_STEAM_HANDOFF_COMPATIBILITY_CONFLICT') return '更新后运行时与可信兼容性证据不匹配；事务仍等待。'
+  if (code?.includes('EXACT_SAVE_LOAD_UNPROVEN')) return '启动后的 Bridge heartbeat/加载日志未在当前代际证明 exact previous save；需要恢复。'
+  if (status === 423) return 'Steam 人工交接 mutation gate 默认关闭；当前只允许读取与预演。'
+  if (status === 409) return 'Steam 人工交接阶段、revision 或固定确认不一致；请重新读取持久状态。'
+  if (status === 503) return 'Steam 人工交接安全状态暂不可证明；所有新操作保持锁定。'
+  if (status === 404) return 'Steam 人工交接回执不存在或服务尚未接线。'
+  return 'Steam 人工交接请求未完成。'
+}
+
+function formatSteamHandoffError(reason: unknown, fallback: string): string {
+  if (!(reason instanceof ApiError)) return fallback
+  return `${reason.message}${reason.code ? ` · ${reason.code}` : ''}`
+}
+
+const fictionalSteamHandoffState: SteamManualHandoffState = {
+  format: 'dyson-control-steam-manual-handoff-state',
+  schemaVersion: 1,
+  revision: '9'.repeat(64),
+  recoveryRequired: false,
+  activeRequestId: null,
+  lastCompletedTargetVersion: null,
+  current: null
 }
 
 function normalizeComponentDiscoveryPage(
@@ -1681,7 +2298,7 @@ function isAcquisitionRegistrationStatus(
   )
 }
 
-function emptyDraft(component: ManagedUpdateComponent): ActivationDraft {
+function emptyDraft(component: SupportedComponentCandidatePreparationComponent): ActivationDraft {
   return {
     requestId: createUiRequestId(),
     component,
@@ -1838,21 +2455,46 @@ function componentLabel(component: ManagedUpdateComponent): string {
   return managedComponents.find((entry) => entry.component === component)?.label ?? component
 }
 
-function operationLabel(operation: UpdateActivationOperation): string {
+function operationLabel(operation: string): string {
   return ({
     'acquire-global-update-lock': '获取全局更新锁',
     'verify-staged-artifact-and-archive': '核验固定暂存资源与压缩包',
     'assemble-immutable-release': '组装不可变 release',
     'prove-process-stopped-and-port-closed': '证明进程停止且端口关闭',
+    'capture-config-mod-lock-and-loaded-save-baseline': '采集配置、模组锁与旧存档身份基线',
     'create-paired-save-protection-point': '创建成对存档保护点',
+    'bind-rollback-context-journal': '绑定 rollback transaction journal',
     'revalidate-stop-revision-and-compatibility': '重新核验停止态、revision 与兼容性',
-    'atomically-switch-active-manifest': '原子切换活动清单',
+    'atomically-switch-active-manifest': '原子切换活动清单（旧预演合同）',
     'publish-and-verify-fixed-live-component': '发布并核验固定 live component',
     'run-fixed-health-check': '运行固定 smoke 健康检查',
-    'rollback-and-verify-on-failure': '失败时回滚并重新核验',
+    'restore-component-config-mod-lock-and-paired-save-on-failure': '失败时逐项恢复组件、配置、模组锁与配对存档',
+    'rollback-and-verify-on-failure': '失败时回滚并重新核验（旧预演合同）',
+    'prove-current-generation-exact-save-load': '证明 Bridge 与日志在当前启动代际加载 exact previous save',
     'persist-audit-safe-receipt': '持久化审计安全回执',
     'release-global-update-lock': '释放全局更新锁'
-  } satisfies Record<UpdateActivationOperation, string>)[operation]
+  } as Record<string, string>)[operation] ?? operation
+}
+
+function componentRollbackReceiptProjection(
+  receipt: UpdateActivationReceipt | null
+): ComponentRollbackReceiptProjection | null {
+  if (receipt === null || !hasOnlyObjectKeys(receipt, [
+    'format', 'schemaVersion', 'requestId', 'component', 'artifactId', 'compatibilityReceiptId',
+    'targetVersion', 'releaseId', 'status', 'previousRevision', 'resultingRevision',
+    'protectionBackupId', 'rollbackBindingSha256', 'rollbackSteps', 'failureCode',
+    'rollbackVerified', 'recoveryRequired', 'fileCount', 'expandedBytes', 'completedAt', 'reused'
+  ], [])) return null
+  const value = receipt as unknown as Record<string, unknown>
+  if (!nullableSha256(value.rollbackBindingSha256) || !hasExactObjectKeys(value.rollbackSteps, [
+    'component', 'configuration', 'serverModLock', 'pairedSave', 'previousSaveLoad'
+  ])) return null
+  const statuses = new Set(['not-required', 'pending', 'verified', 'failed'])
+  if (Object.values(value.rollbackSteps).some((status) => !statuses.has(String(status)))) return null
+  return {
+    rollbackBindingSha256: value.rollbackBindingSha256 as string | null,
+    rollbackSteps: value.rollbackSteps as unknown as ComponentRollbackReceiptProjection['rollbackSteps']
+  }
 }
 
 function formatActivationError(reason: unknown, fallback: string): string {
@@ -1925,11 +2567,14 @@ function fictionalPlan(
       'verify-staged-artifact-and-archive',
       'assemble-immutable-release',
       'prove-process-stopped-and-port-closed',
+      'capture-config-mod-lock-and-loaded-save-baseline',
       'create-paired-save-protection-point',
+      'bind-rollback-context-journal',
       'revalidate-stop-revision-and-compatibility',
-      'atomically-switch-active-manifest',
+      'publish-and-verify-fixed-live-component',
       'run-fixed-health-check',
-      'rollback-and-verify-on-failure',
+      'restore-component-config-mod-lock-and-paired-save-on-failure',
+      'prove-current-generation-exact-save-load',
       'persist-audit-safe-receipt',
       'release-global-update-lock'
     ],
@@ -1953,10 +2598,7 @@ const fictionalCompatibilityStatus: UpdateCompatibilityStatus = {
     dsp: '0.10.32.25700',
     nebula: '0.9.22.2',
     bepInEx: '5.4.23',
-    plugins: [
-      { sourceId: 'thunderstore:DysonControl/Bridge', version: '1.2.0' },
-      { sourceId: 'thunderstore:DysonControl/Control', version: '1.2.0' }
-    ]
+    plugins: []
   }
 }
 

@@ -49,6 +49,10 @@ import {
   type ComponentUpdateActivationReceipt,
   type ComponentUpdateCleanupCandidate,
   type ComponentUpdateCleanupPlan,
+  type ComponentUpdateRollbackBaseline,
+  type ComponentUpdateRollbackBinding,
+  type ComponentUpdateRollbackReadback,
+  type ComponentUpdateRollbackSteps,
   type ComponentUpdateStateSummary,
   type FixedUpdateSmokeRequest,
   type FixedUpdateSmokeResult,
@@ -121,6 +125,7 @@ interface StoredTransaction {
   releaseId: string
   previousRevision: string
   protectionBackupId: string
+  rollback: ComponentUpdateRollbackBinding | null
   fileCount: number
   expandedBytes: number
   activatedAt: string
@@ -203,6 +208,16 @@ const storedTransactionSchema: z.ZodType<StoredTransaction> = z.strictObject({
   releaseId: releaseIdSchema,
   previousRevision: revisionSchema,
   protectionBackupId: backupIdSchema,
+  rollback: z.strictObject({
+    configurationSnapshotId: backupIdSchema,
+    configurationRevision: revisionSchema,
+    serverModLockSha256: sha256Schema,
+    serverModLockRevision: revisionSchema,
+    previousLoadedSaveIdentity: sha256Schema,
+    protectionBackupId: backupIdSchema,
+    protectionManifestSha256: sha256Schema,
+    bindingSha256: sha256Schema
+  }).nullable().default(null),
   fileCount: z.number().int().min(1).max(512),
   expandedBytes: z.number().int().min(0).max(2 * 1_024 * 1_024 * 1_024),
   activatedAt: isoDateSchema
@@ -261,6 +276,20 @@ const receiptSchema: z.ZodType<ComponentUpdateActivationReceipt> = z.strictObjec
   previousRevision: revisionSchema,
   resultingRevision: revisionSchema,
   protectionBackupId: backupIdSchema.nullable(),
+  rollbackBindingSha256: sha256Schema.nullable().default(null),
+  rollbackSteps: z.strictObject({
+    component: z.enum(['not-required', 'pending', 'verified', 'failed']),
+    configuration: z.enum(['not-required', 'pending', 'verified', 'failed']),
+    serverModLock: z.enum(['not-required', 'pending', 'verified', 'failed']),
+    pairedSave: z.enum(['not-required', 'pending', 'verified', 'failed']),
+    previousSaveLoad: z.enum(['not-required', 'pending', 'verified', 'failed'])
+  }).default({
+    component: 'not-required',
+    configuration: 'not-required',
+    serverModLock: 'not-required',
+    pairedSave: 'not-required',
+    previousSaveLoad: 'not-required'
+  }),
   failureCode: z.string().min(1).max(96).regex(/^[A-Z][A-Z0-9_]*$/).nullable(),
   rollbackVerified: z.boolean(),
   recoveryRequired: z.boolean(),
@@ -292,6 +321,8 @@ const saveProtectionReceiptSchema: z.ZodType<SaveProtectionPointReceipt> = z.str
   requestId: requestIdSchema,
   status: z.literal('succeeded'),
   backupId: backupIdSchema,
+  manifestSha256: sha256Schema,
+  saveIdentity: sha256Schema,
   pairProtected: z.literal(true),
   durable: z.literal(true)
 })
@@ -303,7 +334,33 @@ const smokeResultSchema: z.ZodType<FixedUpdateSmokeResult> = z.strictObject({
   bepInExLoaded: z.boolean(),
   nebulaLoaded: z.boolean(),
   processHealthy: z.boolean(),
-  portHealthy: z.boolean()
+  portHealthy: z.boolean(),
+  startupGenerationId: sha256Schema.nullable(),
+  bridgeHeartbeatGenerationId: sha256Schema.nullable(),
+  loadedSaveLogGenerationId: sha256Schema.nullable(),
+  loadedSaveIdentity: sha256Schema.nullable()
+})
+
+const rollbackBaselineSchema: z.ZodType<ComponentUpdateRollbackBaseline> = z.strictObject({
+  configurationSnapshotId: backupIdSchema,
+  configurationRevision: revisionSchema,
+  serverModLockSha256: sha256Schema,
+  serverModLockRevision: revisionSchema,
+  previousLoadedSaveIdentity: sha256Schema
+})
+
+const rollbackReadbackSchema: z.ZodType<ComponentUpdateRollbackReadback> = z.strictObject({
+  configurationSnapshotId: backupIdSchema,
+  configurationRevision: revisionSchema,
+  serverModLockSha256: sha256Schema,
+  serverModLockRevision: revisionSchema,
+  protectionManifestSha256: sha256Schema,
+  loadedSaveIdentity: sha256Schema
+})
+
+const rollbackStepReceiptSchema = z.strictObject({
+  restored: z.literal(true),
+  rereadVerified: z.literal(true)
 })
 
 const activationLockSchema = z.strictObject({
@@ -343,6 +400,11 @@ export class ComponentUpdateActivationService {
   readonly #now: () => Date
   readonly #verifyStoppedState: ComponentUpdateActivationOptions['verifyStoppedState']
   readonly #createSaveProtectionPoint: ComponentUpdateActivationOptions['createSaveProtectionPoint']
+  readonly #captureRollbackBaseline: NonNullable<ComponentUpdateActivationOptions['captureRollbackBaseline']> | null
+  readonly #restoreRollbackConfiguration: NonNullable<ComponentUpdateActivationOptions['restoreRollbackConfiguration']> | null
+  readonly #restoreRollbackServerModLock: NonNullable<ComponentUpdateActivationOptions['restoreRollbackServerModLock']> | null
+  readonly #restoreRollbackPairedSave: NonNullable<ComponentUpdateActivationOptions['restoreRollbackPairedSave']> | null
+  readonly #inspectRollbackReadback: NonNullable<ComponentUpdateActivationOptions['inspectRollbackReadback']> | null
   readonly #smoke: ComponentUpdateActivationOptions['smoke']
   readonly #compatibilityVerifier: ComponentUpdateActivationOptions['compatibilityVerifier']
   readonly #hostMutationCoordinator: HostMutationOperationCoordinator | null
@@ -379,6 +441,11 @@ export class ComponentUpdateActivationService {
     this.#now = options.now ?? (() => new Date())
     this.#verifyStoppedState = options.verifyStoppedState
     this.#createSaveProtectionPoint = options.createSaveProtectionPoint
+    this.#captureRollbackBaseline = options.captureRollbackBaseline ?? null
+    this.#restoreRollbackConfiguration = options.restoreRollbackConfiguration ?? null
+    this.#restoreRollbackServerModLock = options.restoreRollbackServerModLock ?? null
+    this.#restoreRollbackPairedSave = options.restoreRollbackPairedSave ?? null
+    this.#inspectRollbackReadback = options.inspectRollbackReadback ?? null
     this.#smoke = options.smoke
     if (typeof options.compatibilityVerifier?.assertCurrent !== 'function') {
       throw new ComponentUpdateActivationError('UPDATE_COMPATIBILITY_VERIFIER_INVALID')
@@ -440,6 +507,7 @@ export class ComponentUpdateActivationService {
             let fileCount = 0
             let expandedBytes = 0
             let protectionBackupId: string | null = null
+            let rollbackBinding: ComponentUpdateRollbackBinding | null = null
             let journalPersisted = false
             try {
               if (state.recoveryRequired) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_REQUIRED')
@@ -463,8 +531,14 @@ export class ComponentUpdateActivationService {
                 { requestId: request.requestId, component: request.component, phase: 'before-protection' },
                 context
               )
+              const rollbackBaseline = await this.#captureRollbackBaselineChecked(request, context)
               const protection = await this.#createProtection(request, context)
               protectionBackupId = protection.backupId
+              rollbackBinding = createRollbackBinding(rollbackBaseline, protection)
+              if (protection.saveIdentity !== rollbackBinding.previousLoadedSaveIdentity) {
+                throw new ComponentUpdateActivationError('UPDATE_SAVE_PROTECTION_IDENTITY_MISMATCH')
+              }
+              await this.#assertRollbackReadback(rollbackBinding, request, context)
 
               state = await this.#loadState(true)
               if (state.recoveryRequired) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_REQUIRED')
@@ -495,6 +569,7 @@ export class ComponentUpdateActivationService {
                 releaseId,
                 previousRevision: state.revision,
                 protectionBackupId: protection.backupId,
+                rollback: rollbackBinding,
                 fileCount,
                 expandedBytes,
                 activatedAt
@@ -531,6 +606,7 @@ export class ComponentUpdateActivationService {
                 previousRevision: state.revision,
                 resultingRevision: current.revision,
                 protectionBackupId,
+                rollbackBindingSha256: rollbackBinding?.bindingSha256 ?? null,
                 failureCode: normalized.code,
                 rollbackVerified: false,
                 recoveryRequired: current.recoveryRequired,
@@ -705,9 +781,15 @@ export class ComponentUpdateActivationService {
         component: transaction.component,
         phase,
         expectedVersion: transaction.targetVersion,
-        expectedReleaseId: transaction.releaseId
+        expectedReleaseId: transaction.releaseId,
+        expectedLoadedSaveIdentity: requireRollbackBinding(transaction).previousLoadedSaveIdentity
       }, context)
-      healthy = smokeIsHealthy(result, transaction.component, transaction.targetVersion)
+      healthy = smokeIsHealthy(
+        result,
+        transaction.component,
+        transaction.targetVersion,
+        requireRollbackBinding(transaction).previousLoadedSaveIdentity
+      )
       if (!healthy) candidateFailure = 'UPDATE_SMOKE_UNHEALTHY'
     } catch (error) {
       if (error instanceof HostMutationLeaseError) throw error
@@ -730,6 +812,7 @@ export class ComponentUpdateActivationService {
         previousRevision: previousState.revision,
         resultingRevision: candidateState.revision,
         protectionBackupId: transaction.protectionBackupId,
+        rollbackBindingSha256: requireRollbackBinding(transaction).bindingSha256,
         failureCode: null,
         rollbackVerified: false,
         recoveryRequired: false,
@@ -764,6 +847,8 @@ export class ComponentUpdateActivationService {
         previousRevision: previousState.revision,
         resultingRevision: recoveryState.revision,
         protectionBackupId: transaction.protectionBackupId,
+        rollbackBindingSha256: transaction.rollback?.bindingSha256 ?? null,
+        rollbackSteps: rollbackStepsForFailure('UPDATE_ROLLBACK_STOP_UNPROVEN'),
         failureCode: 'UPDATE_ROLLBACK_STOP_UNPROVEN',
         rollbackVerified: false,
         recoveryRequired: true,
@@ -783,6 +868,7 @@ export class ComponentUpdateActivationService {
         context.scope
       )
       context.scope.assertActive()
+      await this.#restoreRollbackEnvironment(transaction, context)
       await this.#writeActiveState(previousState, context)
     } catch (error) {
       if (error instanceof HostMutationLeaseError) throw error
@@ -796,7 +882,9 @@ export class ComponentUpdateActivationService {
         previousRevision: previousState.revision,
         resultingRevision: recoveryState.revision,
         protectionBackupId: transaction.protectionBackupId,
-        failureCode: normalized.code.startsWith('UPDATE_LIVE_')
+        rollbackBindingSha256: transaction.rollback?.bindingSha256 ?? null,
+        rollbackSteps: rollbackStepsForFailure(normalized.code),
+        failureCode: normalized.code.startsWith('UPDATE_LIVE_') || normalized.code.startsWith('UPDATE_ROLLBACK_')
           ? normalized.code
           : 'UPDATE_ROLLBACK_SWITCH_FAILED',
         rollbackVerified: false,
@@ -817,9 +905,15 @@ export class ComponentUpdateActivationService {
         component: transaction.component,
         phase: 'rollback',
         expectedVersion: previousComponent?.version ?? null,
-        expectedReleaseId: previousComponent?.releaseId ?? null
+        expectedReleaseId: previousComponent?.releaseId ?? null,
+        expectedLoadedSaveIdentity: requireRollbackBinding(transaction).previousLoadedSaveIdentity
       }, context)
-      rollbackVerified = smokeIsHealthy(rollback, transaction.component, previousComponent?.version ?? null)
+      rollbackVerified = smokeIsHealthy(
+        rollback,
+        transaction.component,
+        previousComponent?.version ?? null,
+        requireRollbackBinding(transaction).previousLoadedSaveIdentity
+      )
     } catch (error) {
       if (error instanceof HostMutationLeaseError) throw error
       rollbackVerified = false
@@ -832,6 +926,8 @@ export class ComponentUpdateActivationService {
         previousRevision: previousState.revision,
         resultingRevision: previousState.revision,
         protectionBackupId: transaction.protectionBackupId,
+        rollbackBindingSha256: requireRollbackBinding(transaction).bindingSha256,
+        rollbackSteps: verifiedRollbackSteps(),
         failureCode: candidateFailure,
         rollbackVerified: true,
         recoveryRequired: false,
@@ -853,6 +949,11 @@ export class ComponentUpdateActivationService {
       previousRevision: previousState.revision,
       resultingRevision: recoveryState.revision,
       protectionBackupId: transaction.protectionBackupId,
+      rollbackBindingSha256: transaction.rollback?.bindingSha256 ?? null,
+      rollbackSteps: {
+        component: 'verified', configuration: 'verified', serverModLock: 'verified',
+        pairedSave: 'verified', previousSaveLoad: 'failed'
+      },
       failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
       rollbackVerified: false,
       recoveryRequired: true,
@@ -893,6 +994,14 @@ export class ComponentUpdateActivationService {
     if (previousState.revision !== journal.transaction.previousRevision) {
       throw new ComponentUpdateActivationError('UPDATE_RECONCILIATION_UNCERTAIN')
     }
+    if (journal.transaction.rollback === null) {
+      return await this.#recordLiveReconciliationFailure(
+        journal.transaction,
+        state,
+        new ComponentUpdateActivationError('UPDATE_ROLLBACK_CONTEXT_MISSING'),
+        context
+      )
+    }
     if (state.lastTransaction?.requestId === journal.transaction.requestId &&
         state.lastTransaction.requestFingerprint === journal.transaction.requestFingerprint) {
       const active = state.components.find((component) => component.component === journal.transaction.component)
@@ -924,6 +1033,12 @@ export class ComponentUpdateActivationService {
         return await this.#recordLiveReconciliationFailure(journal.transaction, state, error, context)
       }
       if (liveResult === 'previous') {
+        try {
+          await this.#restoreRollbackEnvironment(journal.transaction, context)
+        } catch (error) {
+          if (error instanceof HostMutationLeaseError) throw error
+          return await this.#recordLiveReconciliationFailure(journal.transaction, state, error, context)
+        }
         await this.#writeActiveState(previousState, context)
         return await this.#finishInterruptedPrevious(journal.transaction, previousState, context)
       }
@@ -951,6 +1066,7 @@ export class ComponentUpdateActivationService {
           context.scope
         )
         context.scope.assertActive()
+        await this.#restoreRollbackEnvironment(journal.transaction, context)
       } catch (error) {
         if (error instanceof HostMutationLeaseError) throw error
         return await this.#recordLiveReconciliationFailure(journal.transaction, previousState, error, context)
@@ -973,9 +1089,15 @@ export class ComponentUpdateActivationService {
         component: transaction.component,
         phase: 'rollback',
         expectedVersion: previousComponent?.version ?? null,
-        expectedReleaseId: previousComponent?.releaseId ?? null
+        expectedReleaseId: previousComponent?.releaseId ?? null,
+        expectedLoadedSaveIdentity: requireRollbackBinding(transaction).previousLoadedSaveIdentity
       }, context)
-      rollbackVerified = smokeIsHealthy(smoke, transaction.component, previousComponent?.version ?? null)
+      rollbackVerified = smokeIsHealthy(
+        smoke,
+        transaction.component,
+        previousComponent?.version ?? null,
+        requireRollbackBinding(transaction).previousLoadedSaveIdentity
+      )
     } catch (error) {
       if (error instanceof HostMutationLeaseError) throw error
       rollbackVerified = false
@@ -1203,6 +1325,145 @@ export class ComponentUpdateActivationService {
     // write window. Later precondition failures are ordinary safe rejections.
     context.resolvePossibleWrite()
     return receipt
+  }
+
+  async #captureRollbackBaselineChecked(
+    request: NormalizedActivationRequest,
+    context: ActivationHostMutationContext
+  ): Promise<ComponentUpdateRollbackBaseline> {
+    if (this.#captureRollbackBaseline === null || this.#restoreRollbackConfiguration === null ||
+        this.#restoreRollbackServerModLock === null || this.#restoreRollbackPairedSave === null ||
+        this.#inspectRollbackReadback === null) {
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CAPABILITY_UNAVAILABLE')
+    }
+    try {
+      context.scope.assertActive()
+      context.markPossibleWrite()
+      const baseline = rollbackBaselineSchema.parse(await this.#captureRollbackBaseline({
+        requestId: request.requestId,
+        component: request.component,
+        targetVersion: request.targetVersion,
+        expectedRevision: request.expectedRevision
+      }, context.scope))
+      context.scope.assertActive()
+      context.resolvePossibleWrite()
+      return baseline
+    } catch (error) {
+      context.scope.assertActive()
+      if (error instanceof HostMutationLeaseError) throw error
+      if (error instanceof ComponentUpdateActivationError) throw error
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_BASELINE_FAILED', { cause: error })
+    }
+  }
+
+  async #assertRollbackReadback(
+    binding: ComponentUpdateRollbackBinding,
+    request: Pick<NormalizedActivationRequest, 'requestId' | 'component'>,
+    context: ActivationHostMutationContext
+  ): Promise<ComponentUpdateRollbackReadback> {
+    if (this.#inspectRollbackReadback === null) {
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CAPABILITY_UNAVAILABLE')
+    }
+    let readback: ComponentUpdateRollbackReadback
+    try {
+      context.scope.assertActive()
+      readback = rollbackReadbackSchema.parse(await this.#inspectRollbackReadback({
+        requestId: request.requestId,
+        component: request.component,
+        binding
+      }, context.scope))
+      context.scope.assertActive()
+    } catch (error) {
+      context.scope.assertActive()
+      if (error instanceof HostMutationLeaseError) throw error
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_READBACK_FAILED', { cause: error })
+    }
+    if (!rollbackReadbackMatches(binding, readback)) {
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_READBACK_MISMATCH')
+    }
+    return readback
+  }
+
+  async #restoreRollbackEnvironment(
+    transaction: StoredTransaction,
+    context: ActivationHostMutationContext
+  ): Promise<void> {
+    const binding = requireRollbackBinding(transaction)
+    const request = {
+      requestId: transaction.requestId,
+      component: transaction.component,
+      binding
+    }
+    if (this.#restoreRollbackConfiguration === null || this.#restoreRollbackServerModLock === null ||
+        this.#restoreRollbackPairedSave === null || this.#inspectRollbackReadback === null) {
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CAPABILITY_UNAVAILABLE')
+    }
+    await this.#runRollbackRestoreStep(
+      'UPDATE_ROLLBACK_CONFIGURATION_FAILED',
+      () => this.#restoreRollbackConfiguration!(request, context.scope),
+      context
+    )
+    let readback = await this.#readRollbackReadback(request, context)
+    if (readback.configurationSnapshotId !== binding.configurationSnapshotId ||
+        readback.configurationRevision !== binding.configurationRevision) {
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CONFIGURATION_MISMATCH')
+    }
+    await this.#runRollbackRestoreStep(
+      'UPDATE_ROLLBACK_MOD_LOCK_FAILED',
+      () => this.#restoreRollbackServerModLock!(request, context.scope),
+      context
+    )
+    readback = await this.#readRollbackReadback(request, context)
+    if (readback.configurationSnapshotId !== binding.configurationSnapshotId ||
+        readback.configurationRevision !== binding.configurationRevision ||
+        readback.serverModLockSha256 !== binding.serverModLockSha256 ||
+        readback.serverModLockRevision !== binding.serverModLockRevision) {
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_MOD_LOCK_MISMATCH')
+    }
+    await this.#runRollbackRestoreStep(
+      'UPDATE_ROLLBACK_PAIRED_SAVE_FAILED',
+      () => this.#restoreRollbackPairedSave!(request, context.scope),
+      context
+    )
+    readback = await this.#readRollbackReadback(request, context)
+    if (!rollbackReadbackMatches(binding, readback)) {
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_PAIRED_SAVE_MISMATCH')
+    }
+  }
+
+  async #runRollbackRestoreStep(
+    failureCode: string,
+    operation: () => Promise<unknown>,
+    context: ActivationHostMutationContext
+  ): Promise<void> {
+    try {
+      context.scope.assertActive()
+      context.markPossibleWrite()
+      rollbackStepReceiptSchema.parse(await operation())
+      context.scope.assertActive()
+    } catch (error) {
+      context.scope.assertActive()
+      if (error instanceof HostMutationLeaseError) throw error
+      throw new ComponentUpdateActivationError(failureCode, { cause: error })
+    }
+  }
+
+  async #readRollbackReadback(
+    request: Parameters<NonNullable<ComponentUpdateActivationOptions['inspectRollbackReadback']>>[0],
+    context: ActivationHostMutationContext
+  ): Promise<ComponentUpdateRollbackReadback> {
+    try {
+      context.scope.assertActive()
+      const readback = rollbackReadbackSchema.parse(
+        await this.#inspectRollbackReadback!(request, context.scope)
+      )
+      context.scope.assertActive()
+      return readback
+    } catch (error) {
+      context.scope.assertActive()
+      if (error instanceof HostMutationLeaseError) throw error
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_READBACK_FAILED', { cause: error })
+    }
   }
 
   async #smokeChecked(
@@ -1605,11 +1866,12 @@ export class ComponentUpdateActivationService {
       const active = state.components.find((component) => component.component === receipt.component)
       if (active?.releaseId !== receipt.releaseId || active.artifactId !== receipt.artifactId ||
           active.version !== receipt.targetVersion || receipt.failureCode !== null ||
-          receipt.rollbackVerified) {
+          receipt.rollbackVerified || receipt.rollbackBindingSha256 === null) {
         throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
       }
     } else if (state.revision !== receipt.previousRevision || !receipt.rollbackVerified ||
-        receipt.failureCode === null) {
+        receipt.failureCode === null || receipt.rollbackBindingSha256 === null ||
+        !rollbackStepsAreVerified(receipt.rollbackSteps)) {
       throw new ComponentUpdateActivationError('UPDATE_RECOVERY_TERMINAL_UNPROVEN')
     }
     context.scope.assertActive()
@@ -2242,11 +2504,14 @@ function createActivationPlan(
       'verify-staged-artifact-and-archive',
       'assemble-immutable-release',
       'prove-process-stopped-and-port-closed',
+      'capture-config-mod-lock-and-loaded-save-baseline',
       'create-paired-save-protection-point',
+      'bind-rollback-context-journal',
       'revalidate-stop-revision-and-compatibility',
       'publish-and-verify-fixed-live-component',
       'run-fixed-health-check',
-      'rollback-and-verify-on-failure',
+      'restore-component-config-mod-lock-and-paired-save-on-failure',
+      'prove-current-generation-exact-save-load',
       'persist-audit-safe-receipt',
       'release-global-update-lock'
     ],
@@ -2374,6 +2639,7 @@ function assertReceiptBoundToTransaction(
     [receipt.releaseId, transaction.releaseId],
     [receipt.previousRevision, transaction.previousRevision],
     [receipt.protectionBackupId, transaction.protectionBackupId],
+    [receipt.rollbackBindingSha256, transaction.rollback?.bindingSha256 ?? null],
     [receipt.fileCount, transaction.fileCount],
     [receipt.expandedBytes, transaction.expandedBytes]
   ] as const
@@ -2385,11 +2651,13 @@ function assertReceiptBoundToTransaction(
 function isCoherentTerminalReceipt(receipt: ComponentUpdateActivationReceipt): boolean {
   if (receipt.recoveryRequired) return false
   if (receipt.status === 'succeeded') {
-    return receipt.failureCode === null && !receipt.rollbackVerified
+    return receipt.failureCode === null && !receipt.rollbackVerified &&
+      receipt.rollbackBindingSha256 !== null
   }
   if (receipt.status === 'rolled-back') {
     return receipt.failureCode !== null && receipt.rollbackVerified &&
-      receipt.resultingRevision === receipt.previousRevision
+      receipt.resultingRevision === receipt.previousRevision &&
+      receipt.rollbackBindingSha256 !== null && rollbackStepsAreVerified(receipt.rollbackSteps)
   }
   return receipt.status === 'failed' && receipt.failureCode !== null && !receipt.rollbackVerified
 }
@@ -2404,14 +2672,17 @@ function isValidRecoveryReceiptTransition(
   }
   const immutableKeys = [
     'requestId', 'component', 'artifactId', 'compatibilityReceiptId', 'targetVersion',
-    'releaseId', 'previousRevision', 'protectionBackupId', 'fileCount', 'expandedBytes'
+    'releaseId', 'previousRevision', 'protectionBackupId', 'rollbackBindingSha256',
+    'fileCount', 'expandedBytes'
   ] as const
   if (immutableKeys.some((key) => original.receipt[key] !== recovered.receipt[key])) return false
   if (recovered.receipt.status === 'succeeded') {
-    return recovered.receipt.failureCode === null && !recovered.receipt.rollbackVerified
+    return recovered.receipt.failureCode === null && !recovered.receipt.rollbackVerified &&
+      recovered.receipt.rollbackBindingSha256 !== null
   }
   return recovered.receipt.status === 'rolled-back' && recovered.receipt.failureCode !== null &&
     recovered.receipt.rollbackVerified &&
+    rollbackStepsAreVerified(recovered.receipt.rollbackSteps) &&
     recovered.receipt.resultingRevision === recovered.receipt.previousRevision
 }
 
@@ -2437,6 +2708,94 @@ function requestFingerprint(request: NormalizedActivationRequest): string {
   return createHash('sha256').update(canonicalJson(request)).digest('hex')
 }
 
+function createRollbackBinding(
+  baseline: ComponentUpdateRollbackBaseline,
+  protection: SaveProtectionPointReceipt
+): ComponentUpdateRollbackBinding {
+  const value = {
+    ...rollbackBaselineSchema.parse(baseline),
+    protectionBackupId: protection.backupId,
+    protectionManifestSha256: protection.manifestSha256
+  }
+  return {
+    ...value,
+    bindingSha256: createHash('sha256').update(canonicalJson(value)).digest('hex')
+  }
+}
+
+function requireRollbackBinding(transaction: StoredTransaction): ComponentUpdateRollbackBinding {
+  if (transaction.rollback === null) {
+    throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CONTEXT_MISSING')
+  }
+  const { bindingSha256, ...value } = transaction.rollback
+  if (createHash('sha256').update(canonicalJson(value)).digest('hex') !== bindingSha256 ||
+      transaction.protectionBackupId !== transaction.rollback.protectionBackupId) {
+    throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CONTEXT_INVALID')
+  }
+  return transaction.rollback
+}
+
+function rollbackReadbackMatches(
+  binding: ComponentUpdateRollbackBinding,
+  readback: ComponentUpdateRollbackReadback
+): boolean {
+  return readback.configurationSnapshotId === binding.configurationSnapshotId &&
+    readback.configurationRevision === binding.configurationRevision &&
+    readback.serverModLockSha256 === binding.serverModLockSha256 &&
+    readback.serverModLockRevision === binding.serverModLockRevision &&
+    readback.protectionManifestSha256 === binding.protectionManifestSha256 &&
+    readback.loadedSaveIdentity === binding.previousLoadedSaveIdentity
+}
+
+function notRequiredRollbackSteps(): ComponentUpdateRollbackSteps {
+  return {
+    component: 'not-required', configuration: 'not-required', serverModLock: 'not-required',
+    pairedSave: 'not-required', previousSaveLoad: 'not-required'
+  }
+}
+
+function verifiedRollbackSteps(): ComponentUpdateRollbackSteps {
+  return {
+    component: 'verified', configuration: 'verified', serverModLock: 'verified',
+    pairedSave: 'verified', previousSaveLoad: 'verified'
+  }
+}
+
+function rollbackStepsAreVerified(steps: ComponentUpdateRollbackSteps): boolean {
+  return Object.values(steps).every((status) => status === 'verified')
+}
+
+function rollbackStepsForFailure(code: string): ComponentUpdateRollbackSteps {
+  if (code === 'UPDATE_ROLLBACK_SMOKE_FAILED' || code === 'UPDATE_RECONCILIATION_UNCERTAIN') {
+    return {
+      component: 'verified', configuration: 'verified', serverModLock: 'verified',
+      pairedSave: 'verified', previousSaveLoad: 'failed'
+    }
+  }
+  if (code.includes('PAIRED_SAVE')) {
+    return {
+      component: 'verified', configuration: 'verified', serverModLock: 'verified',
+      pairedSave: 'failed', previousSaveLoad: 'pending'
+    }
+  }
+  if (code.includes('MOD_LOCK')) {
+    return {
+      component: 'verified', configuration: 'verified', serverModLock: 'failed',
+      pairedSave: 'pending', previousSaveLoad: 'pending'
+    }
+  }
+  if (code.includes('CONFIGURATION')) {
+    return {
+      component: 'verified', configuration: 'failed', serverModLock: 'pending',
+      pairedSave: 'pending', previousSaveLoad: 'pending'
+    }
+  }
+  return {
+    component: code.startsWith('UPDATE_LIVE_') ? 'failed' : 'pending',
+    configuration: 'pending', serverModLock: 'pending', pairedSave: 'pending', previousSaveLoad: 'pending'
+  }
+}
+
 function createReceipt(input: {
   request: Pick<NormalizedActivationRequest, 'requestId' | 'component' | 'artifactId' | 'targetVersion' | 'compatibilityReceiptId'>
   releaseId: string
@@ -2444,6 +2803,8 @@ function createReceipt(input: {
   previousRevision: string
   resultingRevision: string
   protectionBackupId: string | null
+  rollbackBindingSha256?: string | null
+  rollbackSteps?: ComponentUpdateRollbackSteps
   failureCode: string | null
   rollbackVerified: boolean
   recoveryRequired: boolean
@@ -2464,6 +2825,8 @@ function createReceipt(input: {
     previousRevision: input.previousRevision,
     resultingRevision: input.resultingRevision,
     protectionBackupId: input.protectionBackupId,
+    rollbackBindingSha256: input.rollbackBindingSha256 ?? null,
+    rollbackSteps: input.rollbackSteps ?? notRequiredRollbackSteps(),
     failureCode: input.failureCode,
     rollbackVerified: input.rollbackVerified,
     recoveryRequired: input.recoveryRequired,
@@ -2490,6 +2853,10 @@ function journalToReceipt(
     previousRevision: transaction.previousRevision,
     resultingRevision: resultingState.revision,
     protectionBackupId: transaction.protectionBackupId,
+    rollbackBindingSha256: transaction.rollback?.bindingSha256 ?? null,
+    rollbackSteps: rollbackVerified
+      ? verifiedRollbackSteps()
+      : rollbackStepsForFailure(failureCode),
     failureCode,
     rollbackVerified,
     recoveryRequired,
@@ -2534,12 +2901,21 @@ function handleExistingReceipt(envelope: StoredReceiptEnvelope, fingerprint: str
   return reused
 }
 
-function smokeIsHealthy(result: FixedUpdateSmokeResult, component: ManagedUpdateComponent, expectedVersion: string | null): boolean {
+function smokeIsHealthy(
+  result: FixedUpdateSmokeResult,
+  component: ManagedUpdateComponent,
+  expectedVersion: string | null,
+  expectedLoadedSaveIdentity: string
+): boolean {
   const observedNormalized = result.observedVersion === null
     ? null
     : normalizeManagedVersion(result.observedVersion, component)
   return result.component === component && result.versionMatches && observedNormalized === expectedVersion &&
-    result.bepInExLoaded && result.nebulaLoaded && result.processHealthy && result.portHealthy
+    result.bepInExLoaded && result.nebulaLoaded && result.processHealthy && result.portHealthy &&
+    result.startupGenerationId !== null &&
+    result.bridgeHeartbeatGenerationId === result.startupGenerationId &&
+    result.loadedSaveLogGenerationId === result.startupGenerationId &&
+    result.loadedSaveIdentity === expectedLoadedSaveIdentity
 }
 
 function normalizeManagedVersion(value: unknown, component: ManagedUpdateComponent): string {

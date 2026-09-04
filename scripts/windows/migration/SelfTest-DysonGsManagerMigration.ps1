@@ -20,6 +20,21 @@ $protectionRequestId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
 $protectionPointId = 'save:' + $protectionRequestId
 $sensitiveMarker = 'FICTIONAL-SENSITIVE-GSM-TOKEN-DO-NOT-PRINT'
 $junctions = New-Object 'System.Collections.Generic.List[string]'
+$previousMigrationSelfTest = [string]$env:DYSON_GSMANAGER_MIGRATION_SELFTEST
+$previousMigrationShadowRoot = [string]$env:DYSON_GSMANAGER_MIGRATION_SHADOW_ROOT
+[System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $testRoot $script:DysonGsShadowSentinel), 'fixture', [System.Text.UTF8Encoding]::new($false))
+$env:DYSON_GSMANAGER_MIGRATION_SELFTEST = '1'
+$env:DYSON_GSMANAGER_MIGRATION_SHADOW_ROOT = $testRoot
+$global:DysonGsMigrationShadowSecurity = @{}
+$global:DysonGsMigrationShadowSecurityWriteCount = 0
+$global:DysonGsMigrationShadowSecurityDefaultCount = 0
+$global:DysonGsMigrationShadowTaskSecurityWriteCount = 0
+$global:DysonGsMigrationNativeSecurityCallCount = 0
+$script:FixtureTaskSddl = ConvertTo-DysonGsCanonicalSecurityDescriptorSddl `
+    'O:SYG:BAD:P(A;;0x1f01ff;;;SY)(A;;GR;;;BU)'
+$script:DriftTaskSddl = ConvertTo-DysonGsCanonicalSecurityDescriptorSddl `
+    'O:SYG:BAD:AI(A;;0x1f01ff;;;SY)(A;;GX;;;BU)'
 
 function Assert-MigrationSelfTest {
     param([bool]$Condition, [string]$Message)
@@ -71,7 +86,8 @@ function New-MigrationTaskFixture {
         [string]$Path = '\',
         [string]$Xml = '<Task><Description>fictional safe task</Description></Task>',
         [bool]$Enabled = $true,
-        [string]$State = 'Ready'
+        [string]$State = 'Ready',
+        [string]$SecurityDescriptorSddl = $script:FixtureTaskSddl
     )
     return [pscustomobject][ordered]@{
         TaskName = $Name
@@ -79,6 +95,7 @@ function New-MigrationTaskFixture {
         State = $State
         Settings = [pscustomobject][ordered]@{ Enabled = $Enabled }
         Xml = $Xml
+        SecurityDescriptorSddl = ConvertTo-DysonGsCanonicalSecurityDescriptorSddl $SecurityDescriptorSddl
     }
 }
 
@@ -186,10 +203,32 @@ try {
     Write-FixtureText -Path (Join-Path $gsManagerRoot 'config\settings.json') `
         -Value ('{"endpoint":"https://example.com","token":"' + $sensitiveMarker + '"}')
     Write-FixtureText -Path (Join-Path $gsManagerRoot 'bin\gsmanager-helper.exe') -Value 'fictional GSManager helper'
+    [System.IO.Directory]::CreateDirectory((Join-Path $gsManagerRoot 'empty-explicit-directory')) | Out-Null
+    $fixtureRootSddl = ConvertTo-DysonGsCanonicalSecurityDescriptorSddl `
+        'O:SYG:BAD:P(A;OICI;FA;;;SY)(A;OICI;GRGX;;;BU)'
+    $fixtureConfigSddl = ConvertTo-DysonGsCanonicalSecurityDescriptorSddl `
+        'O:SYG:BAD:AI(A;OICI;FA;;;SY)(A;OICIID;GR;;;BU)'
+    $fixtureFileSddl = ConvertTo-DysonGsCanonicalSecurityDescriptorSddl `
+        'O:SYG:BAD:P(A;;FA;;;SY)(A;;GR;;;BU)'
+    $fixtureEmptyDirectorySddl = ConvertTo-DysonGsCanonicalSecurityDescriptorSddl `
+        'O:SYG:BAD:P(A;OICI;FA;;;SY)(A;OICI;GX;;;BU)'
+    Set-DysonGsFileSystemSecurityDescriptor -Path $gsManagerRoot -SecurityDescriptorSddl $fixtureRootSddl
+    Set-DysonGsFileSystemSecurityDescriptor -Path (Join-Path $gsManagerRoot 'config') `
+        -SecurityDescriptorSddl $fixtureConfigSddl
+    Set-DysonGsFileSystemSecurityDescriptor -Path (Join-Path $gsManagerRoot 'config\settings.json') `
+        -SecurityDescriptorSddl $fixtureFileSddl
+    Set-DysonGsFileSystemSecurityDescriptor -Path (Join-Path $gsManagerRoot 'empty-explicit-directory') `
+        -SecurityDescriptorSddl $fixtureEmptyDirectorySddl
 
     $protectionRoot = Join-Path $projectRoot ('backups\saves\tx-' + $protectionRequestId)
     [System.IO.Directory]::CreateDirectory($protectionRoot) | Out-Null
     $saveName = 'fictional-paired-save'
+    $saveDsvPath = Join-Path $protectionRoot ($saveName + '.dsv')
+    $saveServerPath = Join-Path $protectionRoot ($saveName + '.server')
+    # Equal byte lengths ensure the swap rejection proves name-to-digest binding,
+    # rather than succeeding only because the length check happened to differ.
+    Write-FixtureText -Path $saveDsvPath -Value 'paired-dsv-fixture!'
+    Write-FixtureText -Path $saveServerPath -Value 'paired-srv-fixture!'
     $protectionManifest = [ordered]@{
         protocol = 'DYSON_CONTROL_PROTECTION_V1'
         schemaVersion = 1
@@ -197,16 +236,79 @@ try {
         createdAt = '2026-01-01T00:00:00.0000000Z'
         saveName = $saveName
         files = @(
-            [ordered]@{ name = $saveName + '.dsv'; bytes = 17; sha256 = ('1' * 64) },
-            [ordered]@{ name = $saveName + '.server'; bytes = 19; sha256 = ('2' * 64) }
+            [ordered]@{ name = $saveName + '.dsv'; bytes = (Get-Item -LiteralPath $saveDsvPath).Length; sha256 = Get-DysonGsSha256 -Path $saveDsvPath },
+            [ordered]@{ name = $saveName + '.server'; bytes = (Get-Item -LiteralPath $saveServerPath).Length; sha256 = Get-DysonGsSha256 -Path $saveServerPath }
         )
     }
     Write-DysonGsUtf8Json -Path (Join-Path $protectionRoot 'manifest.json') -Value $protectionManifest
-    Write-FixtureText -Path (Join-Path $protectionRoot ($saveName + '.dsv')) -Value 'paired-dsv-untouched'
-    Write-FixtureText -Path (Join-Path $protectionRoot ($saveName + '.server')) -Value 'paired-server-untouched'
     $script:ProtectionDigest = Get-DysonGsSha256 -Path (Join-Path $protectionRoot 'manifest.json')
-    $saveDsvBefore = Get-DysonGsSha256 -Path (Join-Path $protectionRoot ($saveName + '.dsv'))
-    $saveServerBefore = Get-DysonGsSha256 -Path (Join-Path $protectionRoot ($saveName + '.server'))
+    $saveDsvBefore = Get-DysonGsSha256 -Path $saveDsvPath
+    $saveServerBefore = Get-DysonGsSha256 -Path $saveServerPath
+    $saveDsvBytes = [System.IO.File]::ReadAllBytes($saveDsvPath)
+    $saveServerBytes = [System.IO.File]::ReadAllBytes($saveServerPath)
+    $manifestBytes = [System.IO.File]::ReadAllBytes((Join-Path $protectionRoot 'manifest.json'))
+
+    $protectionFailure = $null
+    [System.IO.File]::AppendAllText($saveDsvPath, 'tampered', [System.Text.UTF8Encoding]::new($false))
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$protectionFailure) -Command {
+        Test-DysonGsProtectionPointBinding -ProjectRoot $projectRoot -ProtectionPointId $protectionPointId `
+            -ManifestSha256 $script:ProtectionDigest
+    }) -Message 'paired-save content tampering was accepted'
+    [System.IO.File]::WriteAllBytes($saveDsvPath, $saveDsvBytes)
+
+    $missingHold = Join-Path $testRoot 'missing-paired-save.dsv'
+    [System.IO.File]::Move($saveDsvPath, $missingHold)
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$protectionFailure) -Command {
+        Test-DysonGsProtectionPointBinding -ProjectRoot $projectRoot -ProtectionPointId $protectionPointId `
+            -ManifestSha256 $script:ProtectionDigest
+    }) -Message 'a missing paired-save file was accepted'
+    [System.IO.File]::Move($missingHold, $saveDsvPath)
+
+    [System.IO.File]::WriteAllBytes($saveDsvPath, $saveServerBytes)
+    [System.IO.File]::WriteAllBytes($saveServerPath, $saveDsvBytes)
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$protectionFailure) -Command {
+        Test-DysonGsProtectionPointBinding -ProjectRoot $projectRoot -ProtectionPointId $protectionPointId `
+            -ManifestSha256 $script:ProtectionDigest
+    }) -Message 'swapped paired-save payloads were accepted'
+    [System.IO.File]::WriteAllBytes($saveDsvPath, $saveDsvBytes)
+    [System.IO.File]::WriteAllBytes($saveServerPath, $saveServerBytes)
+
+    $extraProtectionPath = Join-Path $protectionRoot 'unexpected.txt'
+    Write-FixtureText -Path $extraProtectionPath -Value 'unexpected protection fixture'
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$protectionFailure) -Command {
+        Test-DysonGsProtectionPointBinding -ProjectRoot $projectRoot -ProtectionPointId $protectionPointId `
+            -ManifestSha256 $script:ProtectionDigest
+    }) -Message 'an extra paired-save protection entry was accepted'
+    Remove-Item -LiteralPath $extraProtectionPath -Force
+
+    $badProtectionManifest = Read-DysonGsJsonBounded -Path (Join-Path $protectionRoot 'manifest.json')
+    $badProtectionManifest.saveName = 'different-save-name'
+    Write-DysonGsUtf8Json -Path (Join-Path $protectionRoot 'manifest.json') -Value $badProtectionManifest
+    $badProtectionDigest = Get-DysonGsSha256 -Path (Join-Path $protectionRoot 'manifest.json')
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$protectionFailure) -Command {
+        Test-DysonGsProtectionPointBinding -ProjectRoot $projectRoot -ProtectionPointId $protectionPointId `
+            -ManifestSha256 $badProtectionDigest
+    }) -Message 'a protection manifest with a different save-name binding was accepted'
+    [System.IO.File]::WriteAllBytes((Join-Path $protectionRoot 'manifest.json'), $manifestBytes)
+
+    $redirectTarget = Join-Path $testRoot 'redirected-paired-save-target'
+    [System.IO.Directory]::CreateDirectory($redirectTarget) | Out-Null
+    [System.IO.File]::Move($saveDsvPath, $missingHold)
+    New-Item -ItemType Junction -Path $saveDsvPath -Target $redirectTarget -ErrorAction Stop | Out-Null
+    $junctions.Add($saveDsvPath)
+    Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$protectionFailure) -Command {
+        Test-DysonGsProtectionPointBinding -ProjectRoot $projectRoot -ProtectionPointId $protectionPointId `
+            -ManifestSha256 $script:ProtectionDigest
+    }) -Message 'a redirected paired-save protection file was accepted'
+    [System.IO.Directory]::Delete($saveDsvPath, $false)
+    [void]$junctions.Remove($saveDsvPath)
+    [System.IO.File]::Move($missingHold, $saveDsvPath)
+
+    $verifiedProtection = Test-DysonGsProtectionPointBinding -ProjectRoot $projectRoot `
+        -ProtectionPointId $protectionPointId -ManifestSha256 $script:ProtectionDigest
+    Assert-MigrationSelfTest -Condition ($verifiedProtection.fileCount -eq 2 -and
+        [int64]$verifiedProtection.totalBytes -eq ([int64]$saveDsvBytes.Length + [int64]$saveServerBytes.Length)) `
+        -Message 'a byte-exact paired-save protection point did not verify'
 
     $inspectRaw = & $inspectScript -ProjectRoot $projectRoot -GsManagerRoot $gsManagerRoot -TaskName $taskName
     $inspect = Convert-LastMigrationJson -Output $inspectRaw
@@ -383,6 +485,16 @@ try {
     Assert-MigrationSelfTest -Condition ([bool]$noOpResult.taskNoOp -and -not [bool]$noOpResult.taskChanged -and
         $global:DysonGsMigrationSelfTestRegisterCount -eq $registerBeforeNoOp) `
         -Message 'an already exact scheduled task was registered again instead of remaining a true no-op'
+    $global:DysonGsMigrationSelfTestTasks[0].SecurityDescriptorSddl = $script:DriftTaskSddl
+    $registerBeforeSecurityOnly = $global:DysonGsMigrationSelfTestRegisterCount
+    $securityWritesBeforeSecurityOnly = $global:DysonGsMigrationShadowTaskSecurityWriteCount
+    $securityOnlyResult = Set-DysonGsTaskCapture -Capture $noOpCapture -TaskName $taskName
+    $securityOnlyActual = Get-DysonGsTaskCapture -TaskName $taskName -IncludeXml
+    Assert-MigrationSelfTest -Condition ([bool]$securityOnlyResult.taskChanged -and
+        $global:DysonGsMigrationSelfTestRegisterCount -eq $registerBeforeSecurityOnly -and
+        $global:DysonGsMigrationShadowTaskSecurityWriteCount -eq ($securityWritesBeforeSecurityOnly + 1) -and
+        (Test-DysonGsTaskDefinitionsEqual -Left $noOpCapture -Right $securityOnlyActual)) `
+        -Message 'task DACL-only drift was not restored without re-registering the task'
 
     $partialXml = '<Task><Description>fictional partial task replacement</Description></Task>'
     $partialCapture = [pscustomobject][ordered]@{
@@ -393,6 +505,8 @@ try {
         state = 'Disabled'
         xmlSha256 = Get-DysonGsTextSha256 -Value $partialXml
         xml = $partialXml
+        securityDescriptorSddl = $script:FixtureTaskSddl
+        securityDescriptorSha256 = Get-DysonGsTextSha256 -Value $script:FixtureTaskSddl
     }
     $registerBeforePartial = $global:DysonGsMigrationSelfTestRegisterCount
     $global:DysonGsMigrationSelfTestFailNextDisable = $true
@@ -418,6 +532,8 @@ try {
         state = 'Ready'
         xmlSha256 = Get-DysonGsTextSha256 -Value $unexpectedRunXml
         xml = $unexpectedRunXml
+        securityDescriptorSddl = $script:FixtureTaskSddl
+        securityDescriptorSha256 = Get-DysonGsTextSha256 -Value $script:FixtureTaskSddl
     }
     $stopBeforeUnexpectedRun = $global:DysonGsMigrationSelfTestStopCount
     $global:DysonGsMigrationSelfTestRunAfterRegister = $true
@@ -433,7 +549,9 @@ try {
         -not (Test-DysonGsTaskIsRunning -Capture $afterUnexpectedRun)) `
         -Message 'an unexpectedly running registered task was not stopped and compensated'
     Reset-MigrationTaskFixture
-
+    $snapshotTaskXml = '<Task><Description>fictional captured task with custom DACL</Description></Task>'
+    $global:DysonGsMigrationSelfTestTasks.Add((New-MigrationTaskFixture -Xml $snapshotTaskXml -Enabled $false `
+        -State 'Disabled' -SecurityDescriptorSddl $script:FixtureTaskSddl))
     $restoreSnapshot = New-FixtureSnapshot
     $verifiedPublicRaw = & $verifyScript -DataRoot $dataRoot -SnapshotId $restoreSnapshot.snapshotId `
         -ExpectedSnapshotManifestSha256 $restoreSnapshot.snapshotManifestSha256
@@ -447,7 +565,7 @@ try {
         -Message 'sensitive content, a path, or a command leaked into migration JSON'
 
     $originalHold = Join-Path $projectRoot 'tools\GSManager-original-fixture'
-    [System.IO.Directory]::Move($gsManagerRoot, $originalHold)
+    Move-DysonGsDirectory -Source $gsManagerRoot -Destination $originalHold
     [System.IO.Directory]::CreateDirectory($gsManagerRoot) | Out-Null
     $restorePreviewRaw = & $restoreScript -ProjectRoot $projectRoot -GsManagerRoot $gsManagerRoot -DataRoot $dataRoot `
         -SnapshotId $restoreSnapshot.snapshotId -ExpectedSnapshotManifestSha256 $restoreSnapshot.snapshotManifestSha256 `
@@ -463,35 +581,61 @@ try {
         -SnapshotId $restoreSnapshot.snapshotId) -ExpectedSnapshotId $restoreSnapshot.snapshotId `
         -ExpectedManifestSha256 $restoreSnapshot.snapshotManifestSha256
     $currentTaskXml = '<Task><Description>' + $sensitiveMarker + '</Description></Task>'
-    $currentTaskCapture = [pscustomobject][ordered]@{
-        taskName = $taskName
-        taskPath = '\'
-        present = $true
-        enabled = $true
-        state = 'Ready'
-        xmlSha256 = Get-DysonGsTextSha256 -Value $currentTaskXml
-        xml = $currentTaskXml
-    }
+    $global:DysonGsMigrationSelfTestTasks[0].Xml = $currentTaskXml
+    $global:DysonGsMigrationSelfTestTasks[0].Settings.Enabled = $true
+    $global:DysonGsMigrationSelfTestTasks[0].State = 'Ready'
+    $global:DysonGsMigrationSelfTestTasks[0].SecurityDescriptorSddl = $script:DriftTaskSddl
+    $currentTaskCapture = Get-DysonGsTaskCapture -TaskName $taskName -IncludeXml
     $script:TaskApplyEvents = New-Object 'System.Collections.Generic.List[string]'
     $taskApply = {
         param($capture, $selectedTaskName)
         $captureStatus = if ([bool]$capture.present) { 'present' } else { 'absent' }
         $script:TaskApplyEvents.Add($captureStatus)
+        Set-DysonGsTaskCapture -Capture $capture -TaskName $selectedTaskName | Out-Null
     }
     $coreResult = Invoke-DysonGsRestoreCore -Layout $layout -SnapshotVerification $snapshotVerification -DataRoot $dataRoot `
         -Disposition 'empty' -CurrentTaskCapture $currentTaskCapture -TaskApply $taskApply
     Assert-MigrationSelfTest -Condition ([bool]$coreResult.rootChanged -and $script:TaskApplyEvents.Count -eq 1 -and
-        $script:TaskApplyEvents[0] -eq 'absent') -Message 'the restore core did not apply the exact captured task state'
+        $script:TaskApplyEvents[0] -eq 'present') -Message 'the restore core did not apply the exact captured task state'
     $restoredInventory = Get-DysonGsTreeInventory -Root $gsManagerRoot -RejectSaveFiles
     $expectedUnprefixed = @($snapshotVerification.gsManagerInventory.entries | ForEach-Object {
         [pscustomobject][ordered]@{ path = ([string]$_.path).Substring('gsmanager/'.Length); length = [int64]$_.length; sha256 = [string]$_.sha256 }
     })
     Assert-MigrationSelfTest -Condition (Test-DysonGsEntryListsEqual -Left $expectedUnprefixed -Right $restoredInventory.entries) `
         -Message 'the GSManager root did not restore byte-for-byte'
+    $restoredSecurity = Get-DysonGsFileSystemSecurityInventory -Root $gsManagerRoot
+    $restoredTask = Get-DysonGsTaskCapture -TaskName $taskName -IncludeXml
+    Assert-MigrationSelfTest -Condition (
+        (Test-DysonGsFileSystemSecurityInventoriesEqual `
+            -Left $snapshotVerification.gsManagerSecurityInventory -Right $restoredSecurity) -and
+        (Test-DysonGsTaskDefinitionsEqual -Left $snapshotVerification.taskCapture -Right $restoredTask) -and
+        (Test-Path -LiteralPath (Join-Path $gsManagerRoot 'empty-explicit-directory') -PathType Container)
+    ) -Message 'filesystem SDDL, empty-directory metadata, or task DACL was not restored exactly'
     $guardRoot = Join-Path (Join-Path $dataRoot $script:DysonGsGuardRelativeRoot) $coreResult.guardId
     $guardVerified = Test-DysonGsGuardCore -GuardRoot $guardRoot -GuardId $coreResult.guardId -Limits $snapshotVerification.manifest.limits
     Assert-MigrationSelfTest -Condition ([bool]$guardVerified.manifest.root.existed -and [bool]$guardVerified.taskCapture.present) `
         -Message 'the private restore guard did not capture root and task state'
+
+    $bytesBeforeSecurityDriftRestore = Get-DysonGsTreeInventory -Root $gsManagerRoot -RejectSaveFiles
+    Set-DysonGsFileSystemSecurityDescriptor -Path (Join-Path $gsManagerRoot 'config') `
+        -SecurityDescriptorSddl $fixtureEmptyDirectorySddl
+    $global:DysonGsMigrationSelfTestTasks[0].SecurityDescriptorSddl = $script:DriftTaskSddl
+    $securityDriftDisposition = Get-DysonGsRestoreDisposition -Layout $layout -SnapshotVerification $snapshotVerification
+    $securityDriftTask = Get-DysonGsTaskCapture -TaskName $taskName -IncludeXml
+    $registerBeforeMetadataRestore = $global:DysonGsMigrationSelfTestRegisterCount
+    $metadataRestore = Invoke-DysonGsRestoreCore -Layout $layout -SnapshotVerification $snapshotVerification `
+        -DataRoot $dataRoot -Disposition $securityDriftDisposition -CurrentTaskCapture $securityDriftTask
+    $bytesAfterSecurityDriftRestore = Get-DysonGsTreeInventory -Root $gsManagerRoot -RejectSaveFiles
+    $securityAfterDriftRestore = Get-DysonGsFileSystemSecurityInventory -Root $gsManagerRoot
+    $taskAfterDriftRestore = Get-DysonGsTaskCapture -TaskName $taskName -IncludeXml
+    Assert-MigrationSelfTest -Condition (
+        $securityDriftDisposition -ceq 'security-drift' -and [bool]$metadataRestore.rootChanged -and
+        (Test-DysonGsEntryListsEqual -Left $bytesBeforeSecurityDriftRestore.entries -Right $bytesAfterSecurityDriftRestore.entries) -and
+        (Test-DysonGsFileSystemSecurityInventoriesEqual `
+            -Left $snapshotVerification.gsManagerSecurityInventory -Right $securityAfterDriftRestore) -and
+        (Test-DysonGsTaskDefinitionsEqual -Left $snapshotVerification.taskCapture -Right $taskAfterDriftRestore) -and
+        $global:DysonGsMigrationSelfTestRegisterCount -eq $registerBeforeMetadataRestore
+    ) -Message 'metadata-only drift was not restored and verified without changing bytes or re-registering the task'
 
     Write-FixtureText -Path (Join-Path $gsManagerRoot 'conflict.txt') -Value 'different target'
     $conflictLayout = Resolve-DysonGsLayout -ProjectRoot $projectRoot -GsManagerRoot $gsManagerRoot -DataRoot $dataRoot
@@ -502,19 +646,21 @@ try {
     Remove-Item -LiteralPath (Join-Path $gsManagerRoot 'conflict.txt') -Force
 
     $successfulRestoreHold = Join-Path $projectRoot 'tools\GSManager-restored-fixture'
-    [System.IO.Directory]::Move($gsManagerRoot, $successfulRestoreHold)
+    Move-DysonGsDirectory -Source $gsManagerRoot -Destination $successfulRestoreHold
     [System.IO.Directory]::CreateDirectory($gsManagerRoot) | Out-Null
     $failureLayout = Resolve-DysonGsLayout -ProjectRoot $projectRoot -GsManagerRoot $gsManagerRoot -DataRoot $dataRoot
+    $failureCurrentTask = Get-DysonGsTaskCapture -TaskName $taskName -IncludeXml
     $script:TaskApplyCount = 0
     $failingTaskApply = {
         param($capture, $selectedTaskName)
         $script:TaskApplyCount++
+        Set-DysonGsTaskCapture -Capture $capture -TaskName $selectedTaskName | Out-Null
         if ($script:TaskApplyCount -eq 1) { throw ('fixture task failure ' + $sensitiveMarker) }
     }
     $compensationFailure = $null
     Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$compensationFailure) -Command {
         Invoke-DysonGsRestoreCore -Layout $failureLayout -SnapshotVerification $snapshotVerification -DataRoot $dataRoot `
-            -Disposition 'empty' -CurrentTaskCapture $currentTaskCapture -TaskApply $failingTaskApply
+            -Disposition 'empty' -CurrentTaskCapture $failureCurrentTask -TaskApply $failingTaskApply
     }) -Message 'the injected task restore failure unexpectedly succeeded'
     Assert-MigrationSelfTest -Condition ($compensationFailure -eq 'GSManager restore failed and was compensated from its restore guard.' -and
         $script:TaskApplyCount -eq 2 -and (Test-Path -LiteralPath $gsManagerRoot -PathType Container) -and
@@ -529,6 +675,8 @@ try {
         -Message 'the migration workflow deleted or changed GSM, game, or paired-save fixtures'
     $partialDirectories = @(Get-ChildItem -LiteralPath $dataRoot -Directory -Recurse -Force -ErrorAction Stop | Where-Object { $_.Name.StartsWith('.partial-') })
     Assert-MigrationSelfTest -Condition ($partialDirectories.Count -eq 0) -Message 'a failed operation left a partial snapshot or guard'
+    Assert-MigrationSelfTest -Condition ($global:DysonGsMigrationNativeSecurityCallCount -eq 0) `
+        -Message 'the Shadow metadata fixture invoked a native ACL or Task Scheduler security API'
 
     [ordered]@{
         protocol = 'DYSON_GSMANAGER_MIGRATION_SELFTEST_V1'
@@ -536,6 +684,8 @@ try {
         inspectAndWhatIfNonMutating = $true
         snapshotAtomicAndPrivate = $true
         pairedSaveProtectionBound = $true
+        pairedSaveProtectionPayloadVerified = $true
+        pairedSaveProtectionTamperMissingSwapExtraAndRedirectRejected = $true
         pairedSaveFilesNeverSnapshotted = $true
         strictSchemaAndFullRehash = $true
         tamperExtraAndReparseRejected = $true
@@ -546,9 +696,14 @@ try {
         crossPathTaskAmbiguityRejected = $true
         unsupportedTaskXmlRejected = $true
         exactTaskNoOp = $true
+        taskDaclOnlyRestoreAvoidedRegistration = $true
         partialTaskApplicationCompensated = $true
         unexpectedRunningTaskStopped = $true
         restoreGuardVerified = $true
+        filesystemSddlAndTaskDaclSnapshotRestored = $true
+        nonDefaultInheritanceExplicitAceAndEmptyDirectoryPreserved = $true
+        metadataOnlyDriftRestoredWithoutByteChange = $true
+        shadowSecurityNativeApiCalls = 0
         restoreConflictRejected = $true
         restoreFailureCompensated = $true
         gsmGameAndSavesPreserved = $true
@@ -565,7 +720,12 @@ finally {
         'DysonGsMigrationSelfTestStopCount',
         'DysonGsMigrationSelfTestFailNextEnable',
         'DysonGsMigrationSelfTestFailNextDisable',
-        'DysonGsMigrationSelfTestRunAfterRegister'
+        'DysonGsMigrationSelfTestRunAfterRegister',
+        'DysonGsMigrationShadowSecurity',
+        'DysonGsMigrationShadowSecurityWriteCount',
+        'DysonGsMigrationShadowSecurityDefaultCount',
+        'DysonGsMigrationShadowTaskSecurityWriteCount',
+        'DysonGsMigrationNativeSecurityCallCount'
     )) {
         Remove-Variable -Name $fixtureVariable -Scope Global -ErrorAction SilentlyContinue
     }
@@ -579,6 +739,8 @@ finally {
     }
     $testFull = [System.IO.Path]::GetFullPath($testRoot).TrimEnd('\', '/')
     $expectedPrefix = $temporaryBase + [System.IO.Path]::DirectorySeparatorChar + 'dyson-gsm-migration-selftest-'
+    $env:DYSON_GSMANAGER_MIGRATION_SELFTEST = if ([string]::IsNullOrEmpty($previousMigrationSelfTest)) { $null } else { $previousMigrationSelfTest }
+    $env:DYSON_GSMANAGER_MIGRATION_SHADOW_ROOT = if ([string]::IsNullOrEmpty($previousMigrationShadowRoot)) { $null } else { $previousMigrationShadowRoot }
     if ($testFull.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $testFull)) {
         Remove-Item -LiteralPath $testFull -Recurse -Force
     }

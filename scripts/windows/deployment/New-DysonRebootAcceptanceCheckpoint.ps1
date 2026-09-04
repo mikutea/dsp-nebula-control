@@ -2,6 +2,9 @@
 param(
     [string]$InstallRoot = (Join-Path $env:ProgramFiles 'DysonControl'),
     [string]$DataRoot = (Join-Path $env:ProgramData 'DysonControl'),
+    [Parameter(Mandatory)][string]$RuntimeRoot,
+    [Parameter(Mandatory)][string]$NodeExecutable,
+    [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedNodeSha256,
     [Parameter(Mandatory)][uri]$ReadinessUri,
     [ValidatePattern('^[\p{L}\p{N}_. -]{1,128}$')][string]$TaskName = 'Dyson-Control-Plane',
     [ValidateRange(1, 65535)][int]$GamePort = 8469,
@@ -19,7 +22,8 @@ if ($commonItem.PSIsContainer -or
 . $commonItem.FullName
 
 $context = New-DysonNativeRebootAcceptanceContext -InstallRoot $InstallRoot `
-    -DataRoot $DataRoot -ReadinessUri $ReadinessUri
+    -DataRoot $DataRoot -RuntimeRoot $RuntimeRoot -NodeExecutable $NodeExecutable `
+    -ExpectedNodeSha256 $ExpectedNodeSha256 -ReadinessUri $ReadinessUri
 $apply = $PSCmdlet.ShouldProcess(
     'the ACL-restricted Dyson Control reboot-acceptance checkpoint store',
     'capture a bounded healthy pre-reboot checkpoint without restarting or rebooting the host'

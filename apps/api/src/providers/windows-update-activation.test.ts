@@ -14,12 +14,18 @@ import type { HostMutationOperationScope } from '../host-mutation/operation-coor
 import {
   WindowsUpdateActivationAdapterError,
   WindowsUpdateActivationAdapters,
+  deriveWindowsSteamHandoffLifecycleRequestId,
   deriveWindowsUpdateSmokeRequestId,
-  type FixedComponentVersionProbeRequest
+  type FixedComponentVersionProbeRequest,
+  type WindowsSteamManualHandoffTransactionProvider,
+  type WindowsUpdateActivationTransactionProvider
 } from './windows-update-activation.js'
 
 const requestId = '11111111-1111-4111-8111-111111111111'
 const revision = 'a'.repeat(64)
+const saveIdentity = 'c'.repeat(64)
+const protectionManifestSha256 = 'd'.repeat(64)
+const startupGenerationId = 'e'.repeat(64)
 const hostMutationScope: HostMutationOperationScope = {
   signal: new AbortController().signal,
   assertActive: () => undefined,
@@ -45,6 +51,8 @@ describe('Windows component update activation adapters', () => {
       requestId,
       status: 'succeeded',
       backupId: `save:${requestId}`,
+      manifestSha256: protectionManifestSha256,
+      saveIdentity,
       pairProtected: true,
       durable: true
     })
@@ -106,7 +114,11 @@ describe('Windows component update activation adapters', () => {
       bepInExLoaded: true,
       nebulaLoaded: true,
       processHealthy: true,
-      portHealthy: true
+      portHealthy: true,
+      startupGenerationId,
+      bridgeHeartbeatGenerationId: startupGenerationId,
+      loadedSaveLogGenerationId: startupGenerationId,
+      loadedSaveIdentity: saveIdentity
     })
     expect(fixture.events).toEqual(['start', 'verify-running', 'status', 'stop', 'verify-stopped'])
     expect(fixture.lifecycle.contexts.map((entry) => entry.context.requestId)).toEqual([
@@ -152,7 +164,23 @@ describe('Windows component update activation adapters', () => {
     expect(Object.isFrozen(fixture.probeCalls[0]!)).toBe(true)
   })
 
-  it('returns bounded unhealthy evidence while still stopping after a status mismatch', async () => {
+  it('requires the exact RC release and never treats its numeric file version as equivalent', async () => {
+    const exactRelease = createFixture({ probedVersion: '0.1.0-rc.1' })
+    await expect(exactRelease.adapter.smoke(
+      smokeRequest('bridge', 'candidate', '0.1.0-rc.1'), hostMutationScope
+    )).resolves.toMatchObject({
+      component: 'bridge', observedVersion: '0.1.0-rc.1', versionMatches: true
+    })
+
+    const numericFileVersion = createFixture({ probedVersion: '0.1.0.0' })
+    await expect(numericFileVersion.adapter.smoke(
+      smokeRequest('bridge', 'candidate', '0.1.0-rc.1'), hostMutationScope
+    )).resolves.toMatchObject({
+      component: 'bridge', observedVersion: '0.1.0.0', versionMatches: false
+    })
+  })
+
+  it('fails closed when current-generation load evidence cannot bind to runtime status and still stops', async () => {
     const status = healthyStatus()
     status.state = 'unknown'
     status.runtime.processId = null
@@ -164,13 +192,7 @@ describe('Windows component update activation adapters', () => {
 
     await expect(fixture.adapter.smoke(
       smokeRequest('nebula', 'candidate', '0.9.22'), hostMutationScope
-    )).resolves.toMatchObject({
-      versionMatches: true,
-      bepInExLoaded: false,
-      nebulaLoaded: false,
-      processHealthy: false,
-      portHealthy: false
-    })
+    )).rejects.toMatchObject({ code: 'WINDOWS_UPDATE_SMOKE_LOAD_EVIDENCE_FAILED' })
     expect(fixture.events.slice(-2)).toEqual(['stop', 'verify-stopped'])
   })
 
@@ -256,6 +278,89 @@ describe('Windows component update activation adapters', () => {
       componentVersionProbe: async () => null
     })).toThrowError(expect.objectContaining({ code: 'WINDOWS_UPDATE_STATUS_PROVIDER_INVALID' }))
   })
+
+  it('maps the fixed Windows protection/stop boundary for the official Steam-client handoff', async () => {
+    const fixture = createFixture()
+    const targetVersion = '0.10.33.26727'
+
+    await expect(fixture.adapter.captureBaseline({
+      requestId, targetVersion, expectedRevision: revision
+    }, hostMutationScope)).resolves.toEqual({
+      dspVersion: targetVersion,
+      compatibilityRevision: '7'.repeat(64),
+      compatible: true,
+      loadedSaveIdentity: saveIdentity
+    })
+    await expect(fixture.adapter.createProtectionPoint({
+      requestId, targetVersion
+    }, hostMutationScope)).resolves.toEqual({
+      requestId,
+      backupId: `save:${requestId}`,
+      manifestSha256: protectionManifestSha256,
+      saveIdentity,
+      pairProtected: true,
+      durable: true
+    })
+    await expect(fixture.adapter.requestGracefulStop({ requestId }, hostMutationScope))
+      .resolves.toEqual({ dispatched: true })
+    await expect(fixture.adapter.verifyStopped({ requestId }, hostMutationScope))
+      .resolves.toEqual({ processStopped: true, portClosed: true })
+    const lifecycleId = deriveWindowsSteamHandoffLifecycleRequestId(requestId, 'prepare')
+    expect(fixture.lifecycle.contexts.slice(-3).map((entry) => entry.context.requestId))
+      .toEqual([lifecycleId, lifecycleId, lifecycleId])
+  })
+
+  it('resamples and starts only from fixed evidence, proving exact save plus one bridge/log generation', async () => {
+    const fixture = createFixture()
+    const targetVersion = '0.10.33.26727'
+
+    await expect(fixture.adapter.resampleUpdatedRuntime({ requestId, targetVersion }, hostMutationScope))
+      .resolves.toEqual({
+        dspVersion: targetVersion,
+        compatibilityRevision: '8'.repeat(64),
+        compatible: true
+      })
+    await expect(fixture.adapter.startAndVerifyExactSave({
+      requestId, targetVersion, expectedLoadedSaveIdentity: saveIdentity
+    }, hostMutationScope)).resolves.toEqual({
+      dspVersion: targetVersion,
+      compatibilityRevision: '8'.repeat(64),
+      compatible: true,
+      startupGenerationId,
+      bridgeHeartbeatGenerationId: startupGenerationId,
+      loadedSaveLogGenerationId: startupGenerationId,
+      loadedSaveIdentity: saveIdentity
+    })
+    expect(fixture.events).toEqual(['start', 'verify-running', 'status'])
+    expect(fixture.events).not.toContain('stop')
+  })
+
+  it('compensates and fails closed when health exists but current-generation exact-save proof is wrong', async () => {
+    const fixture = createFixture({ steamBridgeGeneration: 'f'.repeat(64) })
+    const targetVersion = '0.10.33.26727'
+
+    await expect(fixture.adapter.startAndVerifyExactSave({
+      requestId, targetVersion, expectedLoadedSaveIdentity: saveIdentity
+    }, hostMutationScope)).rejects.toMatchObject({
+      code: 'WINDOWS_STEAM_HANDOFF_EXACT_SAVE_LOAD_UNPROVEN'
+    })
+    expect(fixture.events).toEqual([
+      'start', 'verify-running', 'status', 'stop', 'verify-stopped'
+    ])
+  })
+
+  it('fails closed before Windows lifecycle mutation when the fixed Steam evidence provider is absent', async () => {
+    const events: string[] = []
+    const adapter = new WindowsUpdateActivationAdapters({
+      lifecycleAdapter: new FakeLifecycleAdapter(events),
+      statusProvider: new FakeStatusProvider(events, healthyStatus()),
+      componentVersionProbe: async () => null
+    })
+    await expect(adapter.captureBaseline({
+      requestId, targetVersion: '0.10.33.26727', expectedRevision: revision
+    }, hostMutationScope)).rejects.toMatchObject({ code: 'WINDOWS_STEAM_HANDOFF_CAPABILITY_UNAVAILABLE' })
+    expect(events).toEqual([])
+  })
 })
 
 interface FixtureOptions {
@@ -263,6 +368,9 @@ interface FixtureOptions {
   statusFailure?: boolean
   probedVersion?: string | null
   probeFailure?: boolean
+  steamBridgeGeneration?: string
+  steamLogGeneration?: string
+  steamLoadedSaveIdentity?: string
 }
 
 function createFixture(options: FixtureOptions = {}) {
@@ -279,7 +387,8 @@ function createFixture(options: FixtureOptions = {}) {
       probeCalls.push(request)
       if (options.probeFailure === true) throw new Error('fixture probe failure')
       return options.probedVersion ?? '0.2.0'
-    }
+    },
+    transactionProvider: fakeTransactionProvider(options.status ?? healthyStatus(), options)
   })
   return { adapter, lifecycle, statusProvider, events, probeCalls }
 }
@@ -294,7 +403,66 @@ function smokeRequest(
     component,
     phase,
     expectedVersion,
-    expectedReleaseId: expectedVersion === null ? null : `${component}-${'b'.repeat(32)}`
+    expectedReleaseId: expectedVersion === null ? null : `${component}-${'b'.repeat(32)}`,
+    expectedLoadedSaveIdentity: saveIdentity
+  }
+}
+
+function fakeTransactionProvider(
+  status: ServerStatus,
+  options: FixtureOptions = {}
+): WindowsUpdateActivationTransactionProvider & WindowsSteamManualHandoffTransactionProvider {
+  const readback = {
+    configurationSnapshotId: 'config-snapshot-fixture',
+    configurationRevision: '1'.repeat(64),
+    serverModLockSha256: '2'.repeat(64),
+    serverModLockRevision: '3'.repeat(64),
+    protectionManifestSha256,
+    loadedSaveIdentity: saveIdentity
+  }
+  return {
+    captureRollbackBaseline: async () => ({
+      configurationSnapshotId: readback.configurationSnapshotId,
+      configurationRevision: readback.configurationRevision,
+      serverModLockSha256: readback.serverModLockSha256,
+      serverModLockRevision: readback.serverModLockRevision,
+      previousLoadedSaveIdentity: saveIdentity
+    }),
+    inspectProtectionPoint: async () => ({ manifestSha256: protectionManifestSha256, saveIdentity }),
+    restoreConfiguration: async () => ({ restored: true, rereadVerified: true }),
+    restoreServerModLock: async () => ({ restored: true, rereadVerified: true }),
+    restorePairedSave: async () => ({ restored: true, rereadVerified: true }),
+    inspectRollbackReadback: async () => readback,
+    probeRuntimeLoadEvidence: async () => ({
+      processId: status.runtime.processId,
+      startedAt: status.runtime.startedAt,
+      startupGenerationId,
+      bridgeHeartbeatGenerationId: startupGenerationId,
+      loadedSaveLogGenerationId: startupGenerationId,
+      loadedSaveIdentity: saveIdentity
+    }),
+    captureSteamManualBaseline: async () => ({
+      dspVersion: status.versions.dsp,
+      compatibilityRevision: '7'.repeat(64),
+      compatible: true,
+      loadedSaveIdentity: saveIdentity
+    }),
+    resampleSteamManualRuntime: async () => ({
+      dspVersion: status.versions.dsp,
+      compatibilityRevision: '8'.repeat(64),
+      compatible: true
+    }),
+    probeSteamManualLoadEvidence: async () => ({
+      processId: status.runtime.processId,
+      startedAt: status.runtime.startedAt,
+      dspVersion: status.versions.dsp,
+      compatibilityRevision: '8'.repeat(64),
+      compatible: true,
+      startupGenerationId,
+      bridgeHeartbeatGenerationId: options.steamBridgeGeneration ?? startupGenerationId,
+      loadedSaveLogGenerationId: options.steamLogGeneration ?? startupGenerationId,
+      loadedSaveIdentity: options.steamLoadedSaveIdentity ?? saveIdentity
+    })
   }
 }
 

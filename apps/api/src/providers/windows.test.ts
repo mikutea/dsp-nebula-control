@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createHash } from 'node:crypto'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { serverStatusSchema } from '../domain.js'
 import { DemoProvider } from './demo.js'
-import { WindowsProvider } from './windows.js'
+import { applyBrokerStatus, WindowsProvider } from './windows.js'
+import type { WindowsLifecycleBrokerClient } from './windows-lifecycle-broker.js'
 
 const temporaryRoots: string[] = []
 
@@ -44,9 +45,48 @@ describe('Windows status provider', () => {
     })
   })
 
+  it('does not mix fixed broker task state with legacy collector task telemetry', async () => {
+    const collected = await new DemoProvider().collectStatus()
+    collected.automation.serverTask = {
+      state: 'running', lastResult: 267_009, lastRunAt: '2026-08-31T01:02:03.000Z'
+    }
+    collected.automation.stopTask = {
+      state: 'ready', lastResult: 1, lastRunAt: '2026-08-31T02:03:04.000Z'
+    }
+    const storageTask = structuredClone(collected.automation.storageTask)
+    const evidence = await new FixtureLifecycleBrokerClient().status()
+
+    const status = applyBrokerStatus(collected, evidence)
+
+    expect(status.automation).toEqual({
+      ...collected.automation,
+      serverTask: { state: 'ready', lastResult: null, lastRunAt: null },
+      stopTask: { state: 'disabled', lastResult: null, lastRunAt: null },
+      storageTask
+    })
+    expect(Object.keys(status.automation.serverTask).sort()).toEqual(['lastResult', 'lastRunAt', 'state'])
+    expect(Object.keys(status.automation.stopTask).sort()).toEqual(['lastResult', 'lastRunAt', 'state'])
+  })
+
+  it('does not spawn the legacy preflight collector for an already-aborted preview', async () => {
+    const repositoryRoot = path.resolve(import.meta.dirname, '..', '..', '..', '..')
+    const provider = new WindowsProvider({
+      projectRoot: path.join(tmpdir(), 'fictional-dyson-preview'),
+      scriptRoot: path.join(repositoryRoot, 'scripts', 'windows'),
+      runtimeBootstrapRoot: path.join(repositoryRoot, 'scripts', 'windows', 'bootstrap'),
+      timeoutMs: 30_000,
+      gamePort: 8469
+    })
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(provider.previewLifecycle('start', controller.signal)).rejects.toThrow('STATUS_COLLECTOR_ABORTED')
+  })
+
   it('parses a fictional read-only installation without returning host paths', async () => {
-    const projectRoot = await mkdtemp(path.join(tmpdir(), 'dyson-control-fixture-'))
-    temporaryRoots.push(projectRoot)
+    const fixtureRoot = await mkdtemp(path.join(tmpdir(), 'dyson-control-fixture-'))
+    temporaryRoots.push(fixtureRoot)
+    const projectRoot = await realpath(fixtureRoot)
 
     const logRoot = path.join(projectRoot, 'server', 'BepInEx')
     const saveRoot = path.join(projectRoot, 'userdata', 'Save')
@@ -82,11 +122,16 @@ describe('Windows status provider', () => {
     ])
 
     const repositoryRoot = path.resolve(import.meta.dirname, '..', '..', '..', '..')
+    const broker = new FixtureLifecycleBrokerClient()
     const provider = new WindowsProvider({
       projectRoot,
       scriptRoot: path.join(repositoryRoot, 'scripts', 'windows'),
+      runtimeBootstrapRoot: path.join(repositoryRoot, 'scripts', 'windows', 'bootstrap'),
       timeoutMs: 30_000,
-      gamePort: 65432
+      gamePort: 65432,
+      serverTaskName: 'Dyson-Fixture-Missing-Server-Task',
+      stopTaskName: 'Dyson-Fixture-Missing-Stop-Task',
+      lifecycleBrokerClient: broker
     })
     const status = await provider.collectStatus()
 
@@ -133,7 +178,13 @@ describe('Windows status provider', () => {
     }
     expect(status.capabilities).toEqual({ refresh: true, start: false, save: false, gracefulStop: false, restart: false })
     expect(status.connections.find((connection) => connection.id === 'game-port')).toMatchObject({
-      label: 'Game port 65432'
+      label: 'Game port 65432',
+      status: 'warning',
+      detail: '固定 SYSTEM 生命周期代理确认游戏服务已停止'
+    })
+    expect(status.automation).toMatchObject({
+      serverTask: { state: 'ready', lastResult: null, lastRunAt: null },
+      stopTask: { state: 'disabled', lastResult: null, lastRunAt: null }
     })
     const serializedStatus = JSON.stringify(status)
     expect(serializedStatus).not.toContain(projectRoot)
@@ -171,8 +222,57 @@ describe('Windows status provider', () => {
     const tamperedPreview = await provider.previewLifecycle('restart')
     expect(tamperedPreview.checks.find((check) => check.id === 'backup-pair')?.status).toBe('block')
     expect(tamperedPreview.blockers).toContain('backup-pair-unverified')
+
+    broker.unavailable = true
+    const failClosedStatus = await provider.collectStatus()
+    expect(failClosedStatus).toMatchObject({
+      state: 'unknown',
+      runtime: { processId: null },
+      automation: {
+        serverTask: { state: 'unknown', lastResult: null, lastRunAt: null },
+        stopTask: { state: 'unknown', lastResult: null, lastRunAt: null }
+      }
+    })
+    expect(failClosedStatus.connections.find((connection) => connection.id === 'game-port'))
+      .toMatchObject({ status: 'unknown' })
   }, 45_000)
 })
+
+class FixtureLifecycleBrokerClient implements WindowsLifecycleBrokerClient {
+  unavailable = false
+
+  preflight(): ReturnType<WindowsLifecycleBrokerClient['preflight']> {
+    return Promise.reject(new Error('not used by status fixture'))
+  }
+
+  dispatch(): ReturnType<WindowsLifecycleBrokerClient['dispatch']> {
+    return Promise.reject(new Error('not used by status fixture'))
+  }
+
+  verify(): ReturnType<WindowsLifecycleBrokerClient['verify']> {
+    return Promise.reject(new Error('not used by status fixture'))
+  }
+
+  async status() {
+    if (this.unavailable) throw new Error('fixture lifecycle broker unavailable')
+    return {
+      lifecycleState: 'stopped_verified' as const,
+      task: {
+        valid: true,
+        server: { name: 'Dyson-Nebula-Server' as const, path: '\\' as const, state: 'Ready' },
+        stop: { name: 'Dyson-Nebula-Stop' as const, path: '\\' as const, state: 'Disabled' }
+      },
+      runtime: {
+        lifecycleState: 'stopped_verified' as const,
+        session: { status: 'verified' as const, id: 3, count: 1 },
+        steam: { status: 'verified' as const, pid: 300, sessionId: 3 },
+        process: { status: 'absent' as const, pid: null, owner: null, sessionId: null },
+        port: { port: 65432, listenerCount: 0 },
+        pidFile: { present: false, valid: false }
+      }
+    }
+  }
+}
 
 function mutate<T>(input: T, change: (value: T) => void): T {
   const value = structuredClone(input)

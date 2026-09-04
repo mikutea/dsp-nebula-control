@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [System.Management.Automation.PSCredential]$Credential
+    [System.Management.Automation.PSCredential]$Credential,
+    [Parameter(Mandatory)]
+    [string]$RuntimeBootstrapRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +17,6 @@ if ($commonItem.PSIsContainer -or
 . $commonItem.FullName
 
 Assert-DysonSessionAdministrator
-$context = New-DysonNativeSessionContext
+$context = New-DysonNativeSessionContext -RuntimeBootstrapRoot $RuntimeBootstrapRoot
 $result = Get-DysonInteractiveSessionConfiguration -Context $context -Credential $Credential
 $result | ConvertTo-Json -Depth 7 -Compress

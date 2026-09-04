@@ -20,6 +20,10 @@ Assert-DysonGsLimits -MaximumFiles $MaximumFiles -MaximumTotalBytes $MaximumTota
 $layout = Resolve-DysonGsLayout -ProjectRoot $ProjectRoot -GsManagerRoot $GsManagerRoot -DataRoot $DataRoot -DataRootMayBeMissing
 $sourceBefore = Get-DysonGsTreeInventory -Root $layout.gsManagerRoot -MaximumFiles $MaximumFiles `
     -MaximumTotalBytes $MaximumTotalBytes -MaximumSingleFileBytes $MaximumSingleFileBytes -RejectSaveFiles
+$securityMaximumEntries = [Math]::Min(100001, [Math]::Max(1, ($MaximumFiles * 2) + 1))
+$sourceSecurityBefore = Get-DysonGsFileSystemSecurityInventory -Root $layout.gsManagerRoot `
+    -MaximumEntries $securityMaximumEntries
+Assert-DysonGsSecurityInventoryMatchesByteInventory -SecurityInventory $sourceSecurityBefore -ByteInventory $sourceBefore
 $protection = Test-DysonGsProtectionPointBinding -ProjectRoot $layout.projectRoot `
     -ProtectionPointId $PairedSaveProtectionPointId -ManifestSha256 $PairedSaveProtectionManifestSha256
 $task = Get-DysonGsTaskCapture -TaskName $TaskName -IncludeXml
@@ -53,10 +57,16 @@ $published = $false
 try {
     [void](New-DysonGsPlainDirectory -Path $stage -Private)
     [void](New-DysonGsPlainDirectory -Path (Join-Path $stage 'gsmanager'))
-    Copy-DysonGsInventory -SourceRoot $layout.gsManagerRoot -DestinationRoot (Join-Path $stage 'gsmanager') -Inventory $sourceBefore
+    Copy-DysonGsInventory -SourceRoot $layout.gsManagerRoot -DestinationRoot (Join-Path $stage 'gsmanager') `
+        -Inventory $sourceBefore -SecurityInventory $sourceSecurityBefore
+    Write-DysonGsFileSystemSecurityInventory -Path (Join-Path $stage 'filesystem-security.json') `
+        -Inventory $sourceSecurityBefore
     $sourceAfter = Get-DysonGsTreeInventory -Root $layout.gsManagerRoot -MaximumFiles $MaximumFiles `
         -MaximumTotalBytes $MaximumTotalBytes -MaximumSingleFileBytes $MaximumSingleFileBytes -RejectSaveFiles
-    if (-not (Test-DysonGsEntryListsEqual -Left $sourceBefore.entries -Right $sourceAfter.entries)) {
+    $sourceSecurityAfter = Get-DysonGsFileSystemSecurityInventory -Root $layout.gsManagerRoot `
+        -MaximumEntries $securityMaximumEntries
+    if (-not (Test-DysonGsEntryListsEqual -Left $sourceBefore.entries -Right $sourceAfter.entries) -or
+        -not (Test-DysonGsFileSystemSecurityInventoriesEqual -Left $sourceSecurityBefore -Right $sourceSecurityAfter)) {
         throw 'The GSManager source tree changed while it was being snapshotted.'
     }
     $taskAfter = Get-DysonGsTaskCapture -TaskName $TaskName -IncludeXml
@@ -84,13 +94,21 @@ try {
         taskName = $TaskName
         pairedSaveProtection = [ordered]@{ id = $protection.protectionPointId; manifestSha256 = $protection.manifestSha256 }
         limits = [ordered]@{ maximumFiles = $MaximumFiles; maximumTotalBytes = $MaximumTotalBytes; maximumSingleFileBytes = $MaximumSingleFileBytes }
-        gsManager = [ordered]@{ fileCount = $copied.fileCount; totalBytes = $copied.totalBytes; treeSha256 = $copied.treeSha256 }
+        gsManager = [ordered]@{
+            fileCount = $copied.fileCount
+            totalBytes = $copied.totalBytes
+            treeSha256 = $copied.treeSha256
+            securityEntryCount = $sourceSecurityBefore.entryCount
+            directoryCount = $sourceSecurityBefore.directoryCount
+            securityInventorySha256 = $sourceSecurityBefore.inventorySha256
+        }
         task = [ordered]@{
             taskPath = [string]$task.taskPath
             present = [bool]$task.present
             enabled = [bool]$task.enabled
             state = [string]$task.state
             xmlSha256 = if ([bool]$task.present) { [string]$task.xmlSha256 } else { $null }
+            securityDescriptorSha256 = if ([bool]$task.present) { [string]$task.securityDescriptorSha256 } else { $null }
         }
         payloadSha256 = $payload.treeSha256
         fileCount = $payload.fileCount
@@ -100,7 +118,7 @@ try {
     Write-DysonGsUtf8Json -Path (Join-Path $stage 'manifest.json') -Value $manifest
     $stageManifestSha256 = Get-DysonGsSha256 -Path (Join-Path $stage 'manifest.json')
     [void](Test-DysonGsSnapshotCore -SnapshotRoot $stage -ExpectedSnapshotId $snapshotId -ExpectedManifestSha256 $stageManifestSha256)
-    [System.IO.Directory]::Move($stage, $final)
+    Move-DysonGsDirectory -Source $stage -Destination $final
     $published = $true
     $verified = Test-DysonGsSnapshotCore -SnapshotRoot $final -ExpectedSnapshotId $snapshotId -ExpectedManifestSha256 $stageManifestSha256
     [ordered]@{

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dyson-control:schema:qualification-orchestration-request:v2",
+  "title": "Dyson qualification orchestration request v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "schemaVersion", "requestId", "approvalId", "runId", "profileId", "profileSha256", "action", "actionTargetId", "mode", "executionScope", "targetIdentity", "subjectCommit", "runtimePayloadSha256", "issuedAtUtc", "deadlineAtUtc", "evidenceRelativePath", "evidenceFileSha256", "predecessorReceiptSha256", "confirmationPhrase", "previewSha256"],
+  "properties": {
+    "protocol": { "const": "DYSON_QUALIFICATION_ORCHESTRATION_REQUEST_V2" },
+    "schemaVersion": { "const": 2 },
+    "requestId": { "$ref": "#/$defs/uuid" },
+    "approvalId": { "$ref": "#/$defs/uuid" },
+    "runId": { "$ref": "#/$defs/uuid" },
+    "profileId": { "$ref": "#/$defs/uuid" },
+    "profileSha256": { "$ref": "#/$defs/digest" },
+    "action": { "enum": ["paired-save-restore", "windows-reboot-recovery", "update-rollback", "side-by-side-deployment", "gsmanager-recoverable-switch", "gsmanager-removal", "six-hour-soak", "seventy-two-hour-soak", "authenticated-panel", "game-protocol-path", "external-client-e2e"] },
+    "actionTargetId": { "$ref": "#/$defs/identifier" },
+    "mode": { "enum": ["preview", "consume"] },
+    "executionScope": { "enum": ["production", "fixture"] },
+    "targetIdentity": { "$ref": "#/$defs/digest" },
+    "subjectCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "runtimePayloadSha256": { "$ref": "#/$defs/digest" },
+    "issuedAtUtc": { "$ref": "#/$defs/utc" },
+    "deadlineAtUtc": { "$ref": "#/$defs/utc" },
+    "evidenceRelativePath": { "$ref": "#/$defs/relativePath" },
+    "evidenceFileSha256": { "$ref": "#/$defs/digest" },
+    "predecessorReceiptSha256": { "$ref": "#/$defs/digest" },
+    "confirmationPhrase": { "type": "string", "maxLength": 512 },
+    "previewSha256": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "identifier": { "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[a-z0-9](?:[a-z0-9._-]{6,126}[a-z0-9])$" },
+    "relativePath": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)[^\\u0000-\\u001f]+$" }
+  }
+}

@@ -8,15 +8,33 @@ $ErrorActionPreference = 'Stop'
 $temporaryBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $testRoot = Join-Path $temporaryBase ('dyson-control-bridge-selftest-' + [guid]::NewGuid().ToString('N'))
 $serverRoot = Join-Path $testRoot 'fictional-dsp-server'
+$snapshotIdBoundary = ('0' * 17) + '-' + ('a' * 8)
+$legacyAtomicNameBoundary = '.dyson-bridge-' + ('a' * 32) + '.tmp'
+$legacyAtomicSuffixBoundary = Join-Path `
+    (Join-Path 'BepInEx\config\dyson-control-bridge-snapshots' $snapshotIdBoundary) `
+    $legacyAtomicNameBoundary
+$boundaryServerRootLength = 260 - 1 - $legacyAtomicSuffixBoundary.Length
+if ($serverRoot.Length -lt $boundaryServerRootLength) {
+    $serverRoot += 'x' * ($boundaryServerRootLength - $serverRoot.Length)
+}
 $sourceRoot = Join-Path $testRoot 'public-source'
 $sourceTampered = Join-Path $testRoot 'public-source-tampered'
+$sourcePluginTampered = Join-Path $testRoot 'public-source-plugin-tampered'
+$sourceMissing = Join-Path $testRoot 'public-source-missing'
+$sourceExtra = Join-Path $testRoot 'public-source-extra'
 $sourceTargetInjected = Join-Path $testRoot 'public-source-target-injected'
 $candidateRoot = Join-Path $testRoot 'private-candidate'
 $candidateExtra = Join-Path $testRoot 'private-candidate-extra'
 $candidateTampered = Join-Path $testRoot 'private-candidate-tampered'
+$candidateManifestVersionTampered = Join-Path $testRoot 'private-candidate-manifest-version-tampered'
 $candidateRedirect = Join-Path $testRoot 'private-candidate-redirect'
+$candidateProductVersionMismatch = Join-Path $testRoot 'private-candidate-product-version-mismatch'
+$builtCandidateRoot = Join-Path $testRoot 'build path with spaces\private-candidate-built'
+$fakeDotnetRoot = Join-Path $testRoot 'controlled-dotnet'
 $redirectTarget = Join-Path $testRoot 'redirect-target'
 $redirectCreated = $false
+$controlServiceSid = 'S-1-5-19'
+$gameServiceSid = 'S-1-5-21-42424242-42424242-42424242-1001'
 
 function Assert-BridgeSelfTest {
     param([bool]$Condition, [string]$Message)
@@ -59,6 +77,16 @@ function Set-Acl {
 }
 
 try {
+    $telemetrySelfTest = Get-LastBridgeJson -Output (& (Join-Path $PSScriptRoot 'SelfTest-DysonBridgeSimulationTelemetry.ps1'))
+    Assert-BridgeSelfTest -Condition ($telemetrySelfTest.state -eq 'passed' -and
+        [bool]$telemetrySelfTest.crossRuntimeVectors -and [bool]$telemetrySelfTest.productionWrapper -and
+        [bool]$telemetrySelfTest.actualUpsAndTps -and
+        [bool]$telemetrySelfTest.tamperRejected -and [bool]$telemetrySelfTest.replayRejected -and
+        [bool]$telemetrySelfTest.staleRejected -and [bool]$telemetrySelfTest.sessionMismatchRejected -and
+        [bool]$telemetrySelfTest.pidMismatchRejected -and [bool]$telemetrySelfTest.restartGenerationBound -and
+        [int]$telemetrySelfTest.shadowCommandsInvoked -eq 0) `
+        -Message 'the signed simulation telemetry protocol self-test did not pass'
+
     [System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
     [System.IO.Directory]::CreateDirectory((Join-Path $serverRoot 'BepInEx\core')) | Out-Null
     [System.IO.Directory]::CreateDirectory((Join-Path $serverRoot 'BepInEx\config')) | Out-Null
@@ -119,10 +147,38 @@ public static class BridgeProcessFixture {
             -TimeoutMilliseconds 2000 -MaximumOutputCharacters 1024
     } -Message 'a nonzero controlled build process was accepted'
 
+    foreach ($versionCase in @(
+        [ordered]@{ version = '1.2.3'; pluginVersion = '1.2.3'; assemblyVersion = '1.2.3.0' },
+        [ordered]@{ version = '1.2.3-rc.0'; pluginVersion = '1.2.3'; assemblyVersion = '1.2.3.0' },
+        [ordered]@{ version = '40.20.30-rc.12'; pluginVersion = '40.20.30'; assemblyVersion = '40.20.30.0' },
+        [ordered]@{ version = '65534.65534.65534'; pluginVersion = '65534.65534.65534'; assemblyVersion = '65534.65534.65534.0' },
+        [ordered]@{ version = '65534.0.1-rc.999999'; pluginVersion = '65534.0.1'; assemblyVersion = '65534.0.1.0' }
+    )) {
+        Assert-DysonBridgeVersion -Version ([string]$versionCase.version)
+        Assert-BridgeSelfTest `
+            -Condition ((Get-DysonBridgeBepInExVersion -Version ([string]$versionCase.version)) -ceq
+                [string]$versionCase.pluginVersion) `
+            -Message "the Bridge release-to-BepInEx mapping rejected $($versionCase.version)"
+        Assert-BridgeSelfTest `
+            -Condition ((Get-DysonBridgeAssemblyVersion -Version ([string]$versionCase.version)) -ceq
+                [string]$versionCase.assemblyVersion) `
+            -Message "the Bridge version-to-assembly mapping rejected $($versionCase.version)"
+    }
+    foreach ($invalidVersion in @(
+        '01.2.3', '1.02.3', '1.2.03', '1.2', '1.2.3.4',
+        '1.2.3-alpha.1', '1.2.3+build.1', '1.2.3-rc.01', '1.2.3-RC.1',
+        '65535.0.0', '1.65535.0', '1.2.65535', '1.2.3-rc.1000000'
+    )) {
+        Assert-BridgeRejected -Action {
+            Get-DysonBridgeAssemblyVersion -Version $invalidVersion
+        } -Message "a non-canonical Bridge version was accepted: $invalidVersion"
+    }
+
     $publicSource = Join-Path $PSScriptRoot '..\..\..\integrations\dyson-control-bridge'
     foreach ($name in @(
         'BridgeFileStore.cs', 'BridgeProtocol.cs', 'DysonControlBridgePlugin.cs',
-        'GameSaveAdapter.cs', 'PlayerRosterPublisher.cs', 'DysonControlBridge.csproj',
+        'GameSaveAdapter.cs', 'LoadedSaveEvidencePublisher.cs', 'PlayerRosterPublisher.cs',
+        'SimulationTelemetrySampler.cs', 'DysonControlBridge.csproj',
         'dyson-control-bridge.cfg.example', 'README.md'
     )) {
         $target = Join-Path $sourceRoot $name
@@ -130,15 +186,43 @@ public static class BridgeProcessFixture {
         [System.IO.File]::Copy((Join-Path $publicSource $name), $target, $false)
     }
     $sourceContract = Get-DysonBridgeSourceContract -SourceRoot $sourceRoot
-    Assert-BridgeSelfTest -Condition ($sourceContract.version -eq '0.1.0') -Message 'the public source contract was not accepted'
+    $sourceVersion = [string]$sourceContract.version
+    $sourcePluginVersion = [string]$sourceContract.pluginVersion
+    $sourceAssemblyVersion = Get-DysonBridgeAssemblyVersion -Version $sourceVersion
+    Assert-BridgeSelfTest -Condition ($sourceVersion -cmatch '^\d+\.\d+\.\d+(?:-rc\.\d+)?$' -and
+        $sourcePluginVersion -ceq (Get-DysonBridgeBepInExVersion -Version $sourceVersion)) `
+        -Message 'the public source contract was not accepted'
+    Copy-BridgeTree -Source $sourceRoot -Destination $sourceMissing
+    [System.IO.File]::Delete((Join-Path $sourceMissing 'LoadedSaveEvidencePublisher.cs'))
+    Assert-BridgeRejected -Action { Get-DysonBridgeSourceContract -SourceRoot $sourceMissing } `
+        -Message 'a real artifact layout missing LoadedSaveEvidencePublisher.cs was accepted'
+    Copy-BridgeTree -Source $sourceRoot -Destination $sourceExtra
+    [System.IO.File]::WriteAllText(
+        (Join-Path $sourceExtra 'UnexpectedBridgeSource.cs'),
+        'namespace DysonControl.Bridge { internal sealed class UnexpectedBridgeSource {} }',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    Assert-BridgeRejected -Action { Get-DysonBridgeSourceContract -SourceRoot $sourceExtra } `
+        -Message 'a real artifact layout with an unexpected source file was accepted'
     Copy-BridgeTree -Source $sourceRoot -Destination $sourceTampered
     $tamperedPluginSource = Join-Path $sourceTampered 'DysonControlBridgePlugin.cs'
+    $mismatchedSourceVersion = if ($sourceVersion -ceq '9.9.9') { '9.9.8' } else { '9.9.9' }
     $tamperedPluginText = [System.IO.File]::ReadAllText($tamperedPluginSource, [System.Text.Encoding]::UTF8).Replace(
-        'public const string PluginVersion = "0.1.0";',
-        'public const string PluginVersion = "0.1.1";'
+        "public const string ReleaseVersion = `"$sourceVersion`";",
+        "public const string ReleaseVersion = `"$mismatchedSourceVersion`";"
     )
     [System.IO.File]::WriteAllText($tamperedPluginSource, $tamperedPluginText, [System.Text.UTF8Encoding]::new($false))
     Assert-BridgeRejected -Action { Get-DysonBridgeSourceContract -SourceRoot $sourceTampered } `
+        -Message 'a source package with mismatched ReleaseVersion was accepted'
+    Copy-BridgeTree -Source $sourceRoot -Destination $sourcePluginTampered
+    $tamperedPluginSource = Join-Path $sourcePluginTampered 'DysonControlBridgePlugin.cs'
+    $mismatchedPluginVersion = if ($sourcePluginVersion -ceq '9.9.9') { '9.9.8' } else { '9.9.9' }
+    $tamperedPluginText = [System.IO.File]::ReadAllText($tamperedPluginSource, [System.Text.Encoding]::UTF8).Replace(
+        "public const string PluginVersion = `"$sourcePluginVersion`";",
+        "public const string PluginVersion = `"$mismatchedPluginVersion`";"
+    )
+    [System.IO.File]::WriteAllText($tamperedPluginSource, $tamperedPluginText, [System.Text.UTF8Encoding]::new($false))
+    Assert-BridgeRejected -Action { Get-DysonBridgeSourceContract -SourceRoot $sourcePluginTampered } `
         -Message 'a source package with mismatched PluginVersion was accepted'
     Copy-BridgeTree -Source $sourceRoot -Destination $sourceTargetInjected
     $injectedProjectPath = Join-Path $sourceTargetInjected 'DysonControlBridge.csproj'
@@ -151,24 +235,51 @@ public static class BridgeProcessFixture {
         -Message 'a source project with an executable MSBuild target was accepted'
 
     [System.IO.Directory]::CreateDirectory($candidateRoot) | Out-Null
-    $pluginSource = @'
+    $pluginSource = @"
 using System.Reflection;
-[assembly: AssemblyVersion("0.1.0.0")]
-[assembly: AssemblyFileVersion("0.1.0.0")]
+[assembly: AssemblyVersion("$sourceAssemblyVersion")]
+[assembly: AssemblyFileVersion("$sourceAssemblyVersion")]
+[assembly: AssemblyInformationalVersion("$sourceVersion")]
 namespace DysonControl.Bridge {
     public sealed class DysonControlBridgePlugin {
         public const string PluginGuid = "io.github.mikutea.dyson-control-bridge";
         public const string PluginName = "Dyson Control Bridge";
-        public const string PluginVersion = "0.1.0";
+        public const string PluginVersion = "$sourcePluginVersion";
+        public const string ReleaseVersion = "$sourceVersion";
     }
 }
-'@
+"@
     Add-Type -TypeDefinition $pluginSource -Language CSharp -OutputAssembly (Join-Path $candidateRoot $script:DysonBridgeDllName) -OutputType Library
     $references = @(Get-DysonBridgeReferenceReceipts -DysonServerRoot $serverRoot)
     $plugin = Get-DysonBridgeAssemblyMetadata -AssemblyPath (Join-Path $candidateRoot $script:DysonBridgeDllName) -DysonServerRoot $serverRoot
     [void](Write-DysonBridgeCandidateManifest -CandidateRoot $candidateRoot -Plugin $plugin -References $references -Sources $sourceContract.files)
-    $verified = Test-DysonBridgeCandidateCore -CandidateRoot $candidateRoot -DysonServerRoot $serverRoot -ExpectedVersion '0.1.0'
+    $verified = Test-DysonBridgeCandidateCore -CandidateRoot $candidateRoot -DysonServerRoot $serverRoot `
+        -ExpectedVersion $sourceVersion
     Assert-BridgeSelfTest -Condition ([bool]$verified.ready -and $verified.guid -eq $script:DysonBridgeGuid) -Message 'the controlled private candidate was not verified'
+
+    [System.IO.Directory]::CreateDirectory($candidateProductVersionMismatch) | Out-Null
+    $mismatchedProductVersion = if ($sourceVersion -cne $sourcePluginVersion) { $sourcePluginVersion } else { '9.9.9' }
+    $mismatchedProductSource = @"
+using System.Reflection;
+[assembly: AssemblyVersion("$sourceAssemblyVersion")]
+[assembly: AssemblyFileVersion("$sourceAssemblyVersion")]
+[assembly: AssemblyInformationalVersion("$mismatchedProductVersion")]
+namespace DysonControl.Bridge {
+    public sealed class DysonControlBridgePlugin {
+        public const string PluginGuid = "io.github.mikutea.dyson-control-bridge";
+        public const string PluginName = "Dyson Control Bridge";
+        public const string PluginVersion = "$sourcePluginVersion";
+        public const string ReleaseVersion = "$sourceVersion";
+    }
+}
+"@
+    Add-Type -TypeDefinition $mismatchedProductSource -Language CSharp `
+        -OutputAssembly (Join-Path $candidateProductVersionMismatch $script:DysonBridgeDllName) -OutputType Library
+    Assert-BridgeRejected -Action {
+        Get-DysonBridgeAssemblyMetadata `
+            -AssemblyPath (Join-Path $candidateProductVersionMismatch $script:DysonBridgeDllName) `
+            -DysonServerRoot $serverRoot
+    } -Message 'a candidate whose ProductVersion did not exactly match ReleaseVersion was accepted'
 
     $referenceToTamper = Join-Path $serverRoot 'BepInEx\core\BepInEx.dll'
     $referenceBackup = Join-Path $testRoot 'BepInEx.reference.backup.dll'
@@ -188,6 +299,46 @@ namespace DysonControl.Bridge {
     Assert-BridgeRejected -Action { Test-DysonBridgeCandidateCore -CandidateRoot $candidateTampered -DysonServerRoot $serverRoot } `
         -Message 'a tampered private candidate DLL was accepted'
 
+    Copy-BridgeTree -Source $candidateRoot -Destination $candidateManifestVersionTampered
+    $tamperedManifestPath = Join-Path $candidateManifestVersionTampered $script:DysonBridgeManifestName
+    $tamperedManifest = [System.IO.File]::ReadAllText($tamperedManifestPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    $tamperedManifest.plugin.informationalVersion = $mismatchedProductVersion
+    [System.IO.File]::WriteAllText(
+        $tamperedManifestPath,
+        ($tamperedManifest | ConvertTo-Json -Depth 12 -Compress),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    Assert-BridgeRejected -Action {
+        Test-DysonBridgeCandidateCore -CandidateRoot $candidateManifestVersionTampered -DysonServerRoot $serverRoot
+    } -Message 'a candidate manifest with a changed informational release version was accepted'
+
+    $buildScript = Join-Path $PSScriptRoot 'Build-DysonControlBridgeCandidate.ps1'
+    $netstandardReference = Join-Path $serverRoot 'DSPGAME_Data\Managed\netstandard.dll'
+    $netstandardBackup = Join-Path $testRoot 'netstandard.reference.backup.dll'
+    $missingNetstandardOutput = Join-Path $testRoot 'missing-netstandard-build-must-not-exist'
+    [System.IO.File]::Move($netstandardReference, $netstandardBackup)
+    try {
+        Assert-BridgeRejected -Action {
+            Get-DysonBridgeReferenceReceipts -DysonServerRoot $serverRoot
+        } -Message 'reference receipts were issued without the fixed netstandard.dll dependency'
+        Assert-BridgeRejected -Action {
+            & $buildScript -SourcePath $sourceRoot -DysonServerRoot $serverRoot `
+                -OutputPath $missingNetstandardOutput -ExpectedVersion $sourceVersion -WhatIf 6>$null
+        } -Message 'the target builder accepted a server root missing the fixed netstandard.dll dependency'
+        Assert-BridgeSelfTest -Condition (-not (Test-Path -LiteralPath $missingNetstandardOutput)) `
+            -Message 'the rejected missing-netstandard target build published output'
+    }
+    finally {
+        [System.IO.File]::Move($netstandardBackup, $netstandardReference)
+    }
+    $restoredReferenceReceipts = @(Get-DysonBridgeReferenceReceipts -DysonServerRoot $serverRoot)
+    Assert-BridgeSelfTest -Condition (
+        $restoredReferenceReceipts.Count -eq @(Get-DysonBridgeReferenceSpecifications).Count -and
+        @($restoredReferenceReceipts | Where-Object {
+            $_.name -ceq 'netstandard.dll' -and $_.relativePath -ceq 'DSPGAME_Data/Managed/netstandard.dll'
+        }).Count -eq 1
+    ) -Message 'restoring the fixed netstandard.dll dependency did not restore reference receipt validation'
+
     [System.IO.Directory]::CreateDirectory($redirectTarget) | Out-Null
     [void](New-Item -ItemType Junction -Path $candidateRedirect -Target $redirectTarget -ErrorAction Stop)
     $redirectCreated = $true
@@ -196,12 +347,149 @@ namespace DysonControl.Bridge {
     Remove-Item -LiteralPath $candidateRedirect -Force
     $redirectCreated = $false
 
-    $buildScript = Join-Path $PSScriptRoot 'Build-DysonControlBridgeCandidate.ps1'
     $buildPreviewPath = Join-Path $testRoot 'build-preview-must-not-exist'
     $buildPreview = Get-LastBridgeJson -Output (& $buildScript -SourcePath $sourceRoot -DysonServerRoot $serverRoot `
-        -OutputPath $buildPreviewPath -ExpectedVersion '0.1.0' -WhatIf 6>$null)
+        -OutputPath $buildPreviewPath -ExpectedVersion $sourceVersion -WhatIf 6>$null)
     Assert-BridgeSelfTest -Condition ($buildPreview.state -eq 'preview' -and -not (Test-Path -LiteralPath $buildPreviewPath)) `
         -Message 'the private builder WhatIf changed the filesystem'
+
+    $realDotnetCommand = Get-Command 'dotnet.exe' -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $realDotnetPath = (Assert-DysonBridgePlainFile -Path $realDotnetCommand.Source -MaximumBytes 512MB).FullName
+    $dotnetVersionResult = Invoke-DysonBridgeProcess -Executable $realDotnetPath -Arguments '--version' `
+        -WorkingDirectory $sourceRoot -TimeoutMilliseconds 30000 -MaximumOutputCharacters 4096
+    $dotnetMajorText = ([string]$dotnetVersionResult.stdout).Trim().Split('.')[0]
+    if ($dotnetMajorText -notmatch '^[0-9]{1,2}$' -or [int]$dotnetMajorText -lt 8) {
+        throw 'The controlled real dotnet build requires SDK major version 8 or newer.'
+    }
+    $realBuildRoot = Join-Path $testRoot 'real dotnet path with spaces'
+    $realProjectRoot = Join-Path $realBuildRoot 'project source'
+    [System.IO.Directory]::CreateDirectory($realProjectRoot) | Out-Null
+    $realProjectPath = Join-Path $realProjectRoot 'ProcessStartInfoVersionFixture.csproj'
+    $realProjectSource = @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net$dotnetMajorText.0</TargetFramework>
+    <AssemblyName>ProcessStartInfoVersionFixture</AssemblyName>
+    <Version>$sourceVersion</Version>
+    <AssemblyVersion>$sourceAssemblyVersion</AssemblyVersion>
+    <FileVersion>$sourceAssemblyVersion</FileVersion>
+    <InformationalVersion>$sourceVersion</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+</Project>
+"@
+    [System.IO.File]::WriteAllText($realProjectPath, $realProjectSource, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText(
+        (Join-Path $realProjectRoot 'VersionFixture.cs'),
+        'public sealed class VersionFixture { }',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $realObjRoot = [System.IO.Path]::GetFullPath((Join-Path $realBuildRoot 'obj output')).TrimEnd('\', '/') + '/'
+    $realBinRoot = [System.IO.Path]::GetFullPath((Join-Path $realBuildRoot 'bin output')).TrimEnd('\', '/') + '/'
+    $realPackagesRoot = [System.IO.Path]::GetFullPath((Join-Path $realBuildRoot 'packages cache')).TrimEnd('\', '/') + '/'
+    $realCliHome = Join-Path $realBuildRoot 'dotnet cli home'
+    foreach ($directory in @($realObjRoot, $realBinRoot, $realPackagesRoot, $realCliHome)) {
+        [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    }
+    $realBuildArguments = @(
+        'build', ('"{0}"' -f $realProjectPath), '--configuration', 'Release', '--nologo', '--verbosity', 'quiet',
+        '--disable-build-servers', ('--property:BaseIntermediateOutputPath="{0}"' -f $realObjRoot),
+        ('--property:MSBuildProjectExtensionsPath="{0}"' -f $realObjRoot),
+        ('--property:OutputPath="{0}"' -f $realBinRoot),
+        ('--property:RestorePackagesPath="{0}"' -f $realPackagesRoot),
+        '--property:RestoreIgnoreFailedSources=true', '--property:ImportDirectoryBuildProps=false',
+        '--property:ImportDirectoryBuildTargets=false', '--property:UseSharedCompilation=false',
+        '--property:ContinuousIntegrationBuild=true', '--property:Deterministic=true',
+        '--property:IncludeSourceRevisionInInformationalVersion=false'
+    ) -join ' '
+    [void](Invoke-DysonBridgeProcess -Executable $realDotnetPath -Arguments $realBuildArguments `
+        -WorkingDirectory $realProjectRoot -TimeoutMilliseconds 120000 -MaximumOutputCharacters 262144 `
+        -Environment @{
+            DOTNET_CLI_HOME = $realCliHome
+            DOTNET_NOLOGO = '1'
+            DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
+            DOTNET_CLI_TELEMETRY_OPTOUT = '1'
+        })
+    $realBuiltDlls = @(Assert-DysonBridgeTreePlain -Root $realBinRoot | Where-Object {
+        $_.Name -ceq 'ProcessStartInfoVersionFixture.dll'
+    })
+    Assert-BridgeSelfTest -Condition ($realBuiltDlls.Count -eq 1) `
+        -Message 'the real dotnet ProcessStartInfo fixture did not produce exactly one DLL'
+    $realBuiltAssemblyName = [System.Reflection.AssemblyName]::GetAssemblyName($realBuiltDlls[0].FullName)
+    $realBuiltVersionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($realBuiltDlls[0].FullName)
+    Assert-BridgeSelfTest -Condition (
+        [string]$realBuiltAssemblyName.Version -ceq $sourceAssemblyVersion -and
+        [string]$realBuiltVersionInfo.FileVersion -ceq $sourceAssemblyVersion -and
+        [string]$realBuiltVersionInfo.ProductVersion -ceq $sourceVersion
+    ) -Message 'the real dotnet build did not preserve the numeric and full RC version layers'
+
+    [System.IO.Directory]::CreateDirectory($fakeDotnetRoot) | Out-Null
+    $fakeDotnetPath = Join-Path $fakeDotnetRoot 'dotnet.exe'
+    $fakeDotnetFixturePath = Join-Path $fakeDotnetRoot 'DysonControlBridge.fixture.dll'
+    [System.IO.File]::Copy((Join-Path $candidateRoot $script:DysonBridgeDllName), $fakeDotnetFixturePath, $false)
+    $fakeDotnetSource = @'
+using System;
+using System.IO;
+
+public static class ControlledDotnetFixture
+{
+    private static string ReadDirectory(string[] arguments, string name)
+    {
+        var prefix = "--property:" + name + "=";
+        string value = null;
+        foreach (var argument in arguments)
+        {
+            if (!argument.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            if (value != null) throw new InvalidOperationException("duplicate build directory");
+            value = argument.Substring(prefix.Length);
+        }
+        if (value == null || value.IndexOf('"') >= 0)
+            throw new InvalidOperationException("missing or incorrectly tokenized build directory");
+        if (!Path.IsPathRooted(value) ||
+            !value.EndsWith(Path.AltDirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("build directory is not normalized with a safe trailing separator");
+        }
+        return value;
+    }
+
+    public static int Main(string[] arguments)
+    {
+        try
+        {
+            ReadDirectory(arguments, "BaseIntermediateOutputPath");
+            ReadDirectory(arguments, "MSBuildProjectExtensionsPath");
+            var output = ReadDirectory(arguments, "OutputPath");
+            ReadDirectory(arguments, "RestorePackagesPath");
+            if (Array.FindAll(arguments, value =>
+                    value == "--property:IncludeSourceRevisionInInformationalVersion=false").Length != 1)
+                throw new InvalidOperationException("informational version stability was not pinned");
+            Directory.CreateDirectory(output);
+            File.Copy(
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "DysonControlBridge.fixture.dll"),
+                Path.Combine(output, "DysonControlBridge.dll"),
+                false
+            );
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(exception.GetType().Name);
+            return 19;
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $fakeDotnetSource -Language CSharp -OutputAssembly $fakeDotnetPath -OutputType ConsoleApplication
+    $builtCandidate = Get-LastBridgeJson -Output (& $buildScript -SourcePath $sourceRoot -DysonServerRoot $serverRoot `
+        -OutputPath $builtCandidateRoot -DotnetExecutable $fakeDotnetPath -ExpectedVersion $sourceVersion `
+        -BuildTimeoutSeconds 30 -Confirm:$false)
+    $builtCandidateVerification = Test-DysonBridgeCandidateCore -CandidateRoot $builtCandidateRoot `
+        -DysonServerRoot $serverRoot -ExpectedVersion $sourceVersion
+    Assert-BridgeSelfTest -Condition ($builtCandidate.state -eq 'created' -and
+        $builtCandidate.version -ceq $sourceVersion -and [bool]$builtCandidateVerification.ready -and
+        $builtCandidateVerification.version -ceq $sourceVersion) `
+        -Message 'the controlled non-WhatIf builder fixture did not produce a verified RC candidate'
 
     $installScript = Join-Path $PSScriptRoot 'Install-DysonControlBridge.ps1'
     $testScript = Join-Path $PSScriptRoot 'Test-DysonControlBridgeInstallation.ps1'
@@ -209,32 +497,67 @@ namespace DysonControl.Bridge {
     $pluginPath = Join-Path $serverRoot ('BepInEx\plugins\dyson-control-bridge\' + $script:DysonBridgeDllName)
     $configPath = Join-Path $serverRoot ('BepInEx\config\' + $script:DysonBridgeConfigName)
     $secretPath = Join-Path $serverRoot ('BepInEx\config\' + $script:DysonBridgeSecretName)
-    $installPreview = Get-LastBridgeJson -Output (& $installScript -CandidatePath $candidateRoot -DysonServerRoot $serverRoot -WhatIf 6>$null)
+    $installPreview = Get-LastBridgeJson -Output (& $installScript -CandidatePath $candidateRoot -DysonServerRoot $serverRoot `
+        -ControlServiceSid $controlServiceSid -GameServiceSid $gameServiceSid -WhatIf 6>$null)
     Assert-BridgeSelfTest -Condition ($installPreview.state -eq 'preview' -and -not (Test-Path -LiteralPath $pluginPath) -and
         -not (Test-Path -LiteralPath $configPath) -and -not (Test-Path -LiteralPath $secretPath)) `
         -Message 'Bridge install WhatIf changed the game tree'
 
-    $installed = Get-LastBridgeJson -Output (& $installScript -CandidatePath $candidateRoot -DysonServerRoot $serverRoot -Confirm:$false)
+    $installed = Get-LastBridgeJson -Output (& $installScript -CandidatePath $candidateRoot -DysonServerRoot $serverRoot `
+        -ControlServiceSid $controlServiceSid -GameServiceSid $gameServiceSid -Confirm:$false)
     Assert-BridgeSelfTest -Condition ($installed.state -eq 'installed' -and $installed.enabled -eq $false -and
         $installed.secretDisclosed -eq $false -and $installed.gameRestarted -eq $false) -Message 'Bridge installation did not complete fail-closed'
     $installation = Get-LastBridgeJson -Output (& $testScript -DysonServerRoot $serverRoot)
     Assert-BridgeSelfTest -Condition ([bool]$installation.ready -and $installation.enabled -eq $false -and
-        [bool]$installation.secretBytesAtLeast32 -and [bool]$installation.secretAclProtected) `
+        [bool]$installation.secretBytesAtLeast32 -and [bool]$installation.secretAclProtected -and
+        [bool]$installation.twoIdentityAclContractVerified -and $installation.controlServiceSid -eq $controlServiceSid -and
+        $installation.gameServiceSid -eq $gameServiceSid) `
         -Message 'the installed Bridge did not verify'
     Assert-BridgeSelfTest -Condition ($global:DysonBridgeSelfTestAclShadowCalls -eq 0) `
         -Message 'a Bridge ACL operation resolved through an untrusted command shadow'
 
     $beforeRollbackDll = Get-DysonBridgeSha256 -Path $pluginPath
     $beforeRollbackConfig = Get-DysonBridgeSha256 -Path $configPath
+    $controlRoot = Join-Path $serverRoot 'BepInEx\dyson-control-bridge'
+    $controlPaths = Get-DysonBridgeControlTreePaths -ControlRoot $controlRoot
+    $beforeRollbackAcls = @{}
+    foreach ($entry in @($controlPaths.GetEnumerator())) {
+        $beforeRollbackAcls[[string]$entry.Key] = Get-DysonBridgeAccessSddl -Path ([string]$entry.Value)
+    }
+    $beforeRollbackSecretAcl = Get-DysonBridgeAccessSddl -Path $secretPath
     $env:DYSON_BRIDGE_ALLOW_SELFTEST_FAILURE = 'true'
     try {
         Assert-BridgeRejected -Action {
-            & $installScript -CandidatePath $candidateRoot -DysonServerRoot $serverRoot -SelfTestFailureAfterPluginPublish -Confirm:$false
+            & $installScript -CandidatePath $candidateRoot -DysonServerRoot $serverRoot `
+                -ControlServiceSid $controlServiceSid -GameServiceSid $gameServiceSid `
+                -SelfTestFailureAfterPluginPublish -Confirm:$false
         } -Message 'the isolated install failure hook did not fail'
     }
     finally { Remove-Item Env:DYSON_BRIDGE_ALLOW_SELFTEST_FAILURE -ErrorAction SilentlyContinue }
     Assert-BridgeSelfTest -Condition ((Get-DysonBridgeSha256 -Path $pluginPath) -eq $beforeRollbackDll -and
         (Get-DysonBridgeSha256 -Path $configPath) -eq $beforeRollbackConfig) -Message 'a failed Bridge install did not restore the prior DLL/config'
+    Assert-BridgeSelfTest -Condition ((Get-DysonBridgeAccessSddl -Path $secretPath) -eq $beforeRollbackSecretAcl) `
+        -Message 'a failed Bridge install did not restore the prior secret ACL'
+    foreach ($entry in @($controlPaths.GetEnumerator())) {
+        Assert-BridgeSelfTest -Condition ((Get-DysonBridgeAccessSddl -Path ([string]$entry.Value)) -eq $beforeRollbackAcls[[string]$entry.Key]) `
+            -Message "a failed Bridge install did not restore the prior $($entry.Key) ACL"
+    }
+
+    $requestsAcl = New-DysonBridgeAclObject -Kind requests -InstallerSid (Get-DysonBridgeCurrentInstallerSid) `
+        -ControlServiceSid $controlServiceSid -GameServiceSid $gameServiceSid
+    $requestsAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        [System.Security.Principal.SecurityIdentifier]::new($controlServiceSid),
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )) | Out-Null
+    Set-DysonBridgeExactAclObject -Path ([string]$controlPaths.requests) -Acl $requestsAcl -Directory
+    Assert-BridgeRejected -Action { & $testScript -DysonServerRoot $serverRoot } `
+        -Message 'a Bridge request directory granting control-service FullControl was accepted'
+    [void](Initialize-DysonBridgeControlTreeAcl -ControlRoot $controlRoot `
+        -InstallerSid (Get-DysonBridgeCurrentInstallerSid) -ControlServiceSid $controlServiceSid -GameServiceSid $gameServiceSid)
+    [void](& $testScript -DysonServerRoot $serverRoot)
 
     $uninstallPreview = Get-LastBridgeJson -Output (& $uninstallScript -DysonServerRoot $serverRoot -WhatIf 6>$null)
     Assert-BridgeSelfTest -Condition ($uninstallPreview.state -eq 'uninstall-preview' -and
@@ -243,6 +566,21 @@ namespace DysonControl.Bridge {
     Assert-BridgeSelfTest -Condition ($uninstalled.state -eq 'uninstalled-recoverable' -and
         -not (Test-Path -LiteralPath $pluginPath) -and -not (Test-Path -LiteralPath $configPath) -and
         (Test-Path -LiteralPath $secretPath)) -Message 'recoverable Bridge uninstall did not preserve its boundary'
+    $uninstallSnapshotRoot = Join-Path `
+        (Join-Path $serverRoot 'BepInEx\config\dyson-control-bridge-snapshots') `
+        ([string]$uninstalled.snapshotId)
+    $uninstallManifestPath = Join-Path $uninstallSnapshotRoot 'uninstall-manifest.json'
+    $legacyAtomicBoundaryPath = Join-Path $uninstallSnapshotRoot $legacyAtomicNameBoundary
+    $atomicResidue = @(Get-ChildItem -LiteralPath $uninstallSnapshotRoot -Force | Where-Object {
+        $_.Name -match '^(?:\.dyson-bridge-[0-9a-f]{32}\.(?:tmp|bak)|[a-z0-9]{8}\.[a-z0-9]{3})$' -and
+        $_.Name -ne 'uninstall-manifest.json'
+    })
+    Assert-BridgeSelfTest -Condition (
+        $legacyAtomicBoundaryPath.Length -ge 260 -and
+        $uninstallManifestPath.Length -lt $legacyAtomicBoundaryPath.Length -and
+        (Test-Path -LiteralPath $uninstallManifestPath -PathType Leaf) -and
+        $atomicResidue.Count -eq 0
+    ) -Message 'the recoverable uninstall did not cover the long-path atomic manifest boundary without residue'
     $restored = Get-LastBridgeJson -Output (& $uninstallScript -DysonServerRoot $serverRoot `
         -RestoreSnapshotId ([string]$uninstalled.snapshotId) -Confirm:$false)
     $restoredVerification = Get-LastBridgeJson -Output (& $testScript -DysonServerRoot $serverRoot)
@@ -263,17 +601,33 @@ namespace DysonControl.Bridge {
         protocol = 'DYSON_CONTROL_BRIDGE_DELIVERY_SELFTEST_V1'
         state = 'passed'
         publicSourceContractValidated = $true
+        realArtifactSourceLayoutValidated = $true
+        missingAndUnexpectedSourceLayoutRejected = $true
+        stableAndPrereleaseVersionsValidated = $true
+        prereleaseBepInExVersionCoreMappingValidated = $true
+        prereleaseAssemblyVersionCoreMappingValidated = $true
+        informationalProductVersionBoundToReleaseVersion = $true
+        productVersionMismatchRejected = $true
         sourceVersionAndExecutableTargetTamperRejected = $true
         buildBoundaryPreviewValidated = $true
+        nonWhatIfBuildDirectoryArgumentsValidated = $true
+        realDotnetProcessStartInfoBuildWithSpacesValidated = $true
+        sourceRevisionSuffixDisabledDuringBuild = $true
         controlledBuildProcessTimeoutAndOutputBounded = $true
         fullBuildRequiresLawfulLocalAssemblies = $true
+        missingFixedNetstandardDependencyRejected = $true
+        restoredFixedNetstandardDependencyValidated = $true
         candidateMetadataAndReferencesValidated = $true
+        candidateInformationalVersionTamperRejected = $true
         changedAndRedirectedReferencesRejected = $true
         candidateTamperExtraAndReparseRejected = $true
+        signedSimulationTelemetryValidated = $true
         installWhatIfWasNonMutating = $true
         installDefaultedDisabled = $true
         platformSecurityModuleBound = $true
         secretWasRandomProtectedAndUndisclosed = $true
+        exactTwoIdentityAclContractValidated = $true
+        controlServiceFullControlDriftRejected = $true
         failedInstallRolledBack = $true
         uninstallWasRecoverable = $true
         saveGameNebulaAndGsmWereUntouched = $true
@@ -292,6 +646,13 @@ finally {
     $testFull = [System.IO.Path]::GetFullPath($testRoot).TrimEnd('\', '/')
     $expectedPrefix = $temporaryBase + [System.IO.Path]::DirectorySeparatorChar + 'dyson-control-bridge-selftest-'
     if ($testFull.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $testFull)) {
-        Remove-Item -LiteralPath $testFull -Recurse -Force
+        $separator = [string][System.IO.Path]::DirectorySeparatorChar
+        $doubleSeparator = $separator + $separator
+        $extendedPrefix = $doubleSeparator + '?' + $separator
+        $extendedTestFull = if ($testFull.StartsWith($doubleSeparator, [System.StringComparison]::Ordinal)) {
+            $extendedPrefix + 'UNC' + $separator + $testFull.Substring(2)
+        }
+        else { $extendedPrefix + $testFull }
+        [System.IO.Directory]::Delete($extendedTestFull, $true)
     }
 }

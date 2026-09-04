@@ -1,7 +1,9 @@
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory)]
-    [System.Management.Automation.PSCredential]$Credential
+    [System.Management.Automation.PSCredential]$Credential,
+    [Parameter(Mandatory)]
+    [string]$RuntimeBootstrapRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,7 +17,7 @@ if ($commonItem.PSIsContainer -or
 . $commonItem.FullName
 
 Assert-DysonSessionAdministrator
-$context = New-DysonNativeSessionContext
+$context = New-DysonNativeSessionContext -RuntimeBootstrapRoot $RuntimeBootstrapRoot
 $apply = $PSCmdlet.ShouldProcess(
     'Windows Winlogon LSA private data and fixed non-secret automatic-logon flags',
     'Configure the dedicated Dyson interactive session with a rollback backup'

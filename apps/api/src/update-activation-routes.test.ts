@@ -166,6 +166,14 @@ describe('component update activation routes', () => {
       previousRevision: revision,
       resultingRevision: revision,
       protectionBackupId: 'fictional-backup-0001',
+      rollbackBindingSha256: 'b'.repeat(64),
+      rollbackSteps: {
+        component: 'verified' as const,
+        configuration: 'verified' as const,
+        serverModLock: 'verified' as const,
+        pairedSave: 'verified' as const,
+        previousSaveLoad: 'failed' as const
+      },
       failureCode: 'UPDATE_ROLLBACK_SMOKE_FAILED',
       rollbackVerified: false,
       recoveryRequired: true,
@@ -177,6 +185,13 @@ describe('component update activation routes', () => {
     const terminal = {
       ...interrupted,
       status: 'rolled-back' as const,
+      rollbackSteps: {
+        component: 'verified' as const,
+        configuration: 'verified' as const,
+        serverModLock: 'verified' as const,
+        pairedSave: 'verified' as const,
+        previousSaveLoad: 'verified' as const
+      },
       rollbackVerified: true,
       recoveryRequired: false,
       completedAt: '2026-08-30T12:31:00.000Z'
