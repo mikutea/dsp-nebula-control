@@ -197,6 +197,7 @@ function New-TestEnvironmentText {
         ('DYSON_DEPLOYMENT_VERSION=' + [string]$Bindings['DYSON_DEPLOYMENT_VERSION']),
         'DYSON_PROVIDER=windows',
         'DYSON_PORT=13010',
+        'DYSON_PLAYER_NOTICE_MUTATIONS_ENABLED=false',
         'DYSON_ADMIN_PASSWORD_HASH=scrypt$16384$8$1$fictional$fixture',
         ('DYSON_SESSION_SECRET=' + $script:SecretSentinel)
     )) + "`n"
@@ -473,6 +474,9 @@ try {
         -ExpectedLauncherBindings $parserBindings
     Assert-SelfTest ($parsed.length -eq $validBytes.Length) 'VALID_UTF8'
     Assert-SelfTest ($parsed.privateValues['DYSON_SESSION_SECRET'] -ceq $script:SecretSentinel) 'VALUE_EXACT'
+    Assert-SelfTest (
+        [string]$parsed.privateValues['DYSON_PLAYER_NOTICE_MUTATIONS_ENABLED'] -ceq 'false'
+    ) 'PLAYER_NOTICE_MUTATIONS_EXPLICITLY_DISABLED'
     Assert-SelfTest (-not (($parsed | Select-Object -Property * -ExcludeProperty privateBytes, privateValues |
         ConvertTo-Json -Depth 4 -Compress).Contains($script:SecretSentinel))) 'PUBLIC_EVIDENCE_REDACTED'
 

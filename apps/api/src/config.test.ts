@@ -65,6 +65,16 @@ describe('production configuration', () => {
     expect(loadConfig({ NODE_ENV: 'test' }).bridgePluginVersion).toBe('0.1.0-rc.1')
   })
 
+  it('keeps player notices disabled and validates the closed mutation gate', () => {
+    expect(loadConfig({ NODE_ENV: 'test' }).playerNoticeMutationsEnabled).toBe(false)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PLAYER_NOTICE_MUTATIONS_ENABLED: 'true'
+    })).toThrow(/requires the Windows provider/)
+    expect(() => loadConfig({
+      NODE_ENV: 'test', DYSON_PLAYER_NOTICE_MUTATIONS_ENABLED: 'enabled'
+    })).toThrow()
+  })
+
   it('keeps the console disabled without its independent signed-cursor secret', () => {
     expect(loadConfig({ NODE_ENV: 'test' }).consoleCursorSecret).toBeNull()
     expect(() => loadConfig({
