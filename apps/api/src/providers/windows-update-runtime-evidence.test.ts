@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -35,14 +35,14 @@ const crossRuntimePayload =
   'observationGeneration=3\n' +
   'observedAtUnixMs=1788081004000\n' +
   'writtenAtUnixMs=1788081004000\n' +
-  'saveNameB64=X2xhc3RleGl0Xw\n' +
+  'saveName=_lastexit_\n' +
   'dsvBytes=5242880\n' +
   'dsvWriteTimeUtcTicks=638817408010000001\n' +
   'dsvSha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' +
   'serverBytes=22016\n' +
   'serverWriteTimeUtcTicks=638817408010000777\n' +
   'serverSha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' +
-  'hmac=b091d7fb4a122872daec763da2f697af21db08280048c085b3d52ff53dfd4c39\n'
+  'hmac=39f7848082f8f134e09073effdffc5affafae1361764141dfe8ad9cc8fe16a72\n'
 
 const temporaryRoots: string[] = []
 
@@ -51,16 +51,34 @@ afterEach(async () => {
 })
 
 describe('WindowsUpdateRuntimeEvidenceReader', () => {
-  it('shares the exact loaded-save HMAC vector with the C# Bridge', () => {
+  it('shares the exact loaded-save HMAC vector with the C# Bridge', async () => {
+    // Read the producer's public vector directly: a second handwritten fixture
+    // previously drifted to a different field and signing input under the same V1.
+    const producerTests = await readFile(path.resolve(import.meta.dirname,
+      '..', '..', '..', '..', 'integrations', 'dyson-control-bridge', 'protocol-tests', 'Program.cs'), 'utf8')
+    const declaration = producerTests.match(/private const string LoadedSaveEvidencePayload\s*=([\s\S]*?);/)
+    expect(declaration).not.toBeNull()
+    const producerPayload = [...declaration![1]!.matchAll(/"(?:[^"\\]|\\.)*"/g)]
+      .map(([literal]) => JSON.parse(literal) as string).join('')
+    expect(producerPayload).toBe(crossRuntimePayload)
     const built = buildWindowsUpdateRuntimeEvidence(evidenceInput(), secret)
-    expect(built.payload).toBe(crossRuntimePayload)
-    expect(parseWindowsUpdateRuntimeEvidence(crossRuntimePayload, secret)).toMatchObject({
+    expect(built.payload).toBe(producerPayload)
+    expect(parseWindowsUpdateRuntimeEvidence(producerPayload, secret)).toMatchObject({
       sessionId,
       processId,
       saveName: '_lastexit_',
       dsvWriteTimeUtcTicks: 638_817_408_010_000_001n,
       serverWriteTimeUtcTicks: 638_817_408_010_000_777n
     })
+  })
+
+  it('rejects the divergent base64 save-name wire format rather than accepting two V1 formats', () => {
+    const divergentPayload = crossRuntimePayload
+      .replace('saveName=_lastexit_', 'saveNameB64=X2xhc3RleGl0Xw')
+      .replace('39f7848082f8f134e09073effdffc5affafae1361764141dfe8ad9cc8fe16a72',
+        'b091d7fb4a122872daec763da2f697af21db08280048c085b3d52ff53dfd4c39')
+    expect(() => parseWindowsUpdateRuntimeEvidence(divergentPayload, secret))
+      .toThrow('WINDOWS_UPDATE_EVIDENCE_PAYLOAD_INVALID')
   })
 
   it('accepts an old durable load observation only when the current signed session and heartbeat match', async () => {

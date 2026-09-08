@@ -2441,7 +2441,7 @@ function Read-DysonDeploymentStatusEnvironmentFile {
 }
 
 function Assert-DysonLifecycleBrokerStaticNoPendingWork {
-    param([Parameter(Mandatory)]$Storage)
+    param([Parameter(Mandatory)]$Storage, [switch]$AllowPendingStatusRequests)
 
     if (@(Get-ChildItem -LiteralPath $Storage.intents -Force -ErrorAction Stop).Count -ne 0) {
         throw 'The lifecycle broker has an unfinished intent.'
@@ -2454,8 +2454,7 @@ function Assert-DysonLifecycleBrokerStaticNoPendingWork {
         $id = ConvertTo-DysonLifecycleBrokerGuid ([string]$file.BaseName) `
             'DYSON_CONTROL_LIFECYCLE_BROKER_RECOVERY_REQUIRED'
         $paths = Get-DysonLifecycleBrokerRecordPaths -Storage $Storage -BrokerRequestId $id
-        if (-not (Test-DysonLifecycleBrokerSamePath ([string]$file.FullName) ([string]$paths.request)) -or
-            -not (Test-Path -LiteralPath $paths.receipt -PathType Leaf)) {
+        if (-not (Test-DysonLifecycleBrokerSamePath ([string]$file.FullName) ([string]$paths.request))) {
             throw 'The lifecycle broker has an unfinished request.'
         }
         $request = ConvertTo-DysonLifecycleBrokerValidatedRequest (
@@ -2463,6 +2462,16 @@ function Assert-DysonLifecycleBrokerStaticNoPendingWork {
                 -MaximumBytes $script:DysonLifecycleBrokerMaximumRequestBytes `
                 -InvalidCode 'DYSON_CONTROL_LIFECYCLE_BROKER_REQUEST_INVALID'
         )
+        if (-not (Test-Path -LiteralPath $paths.receipt -PathType Leaf)) {
+            # Only the identity preflight before panel quiescence may observe
+            # a validated, read-only status request awaiting its receipt.
+            if ($AllowPendingStatusRequests -and $request.capability -ceq 'LifecycleStatus' -and
+                $request.brokerRequestId -ceq $id) {
+                $requestIds[$id] = $true
+                continue
+            }
+            throw 'The lifecycle broker has an unfinished request.'
+        }
         $receipt = ConvertTo-DysonLifecycleBrokerValidatedReceipt (
             Read-DysonLifecycleBrokerJson -Path $paths.receipt `
                 -MaximumBytes $script:DysonLifecycleBrokerMaximumReceiptBytes `
@@ -2637,7 +2646,10 @@ function Get-DysonLifecycleBrokerStaticStatus {
         throw 'The lifecycle broker profile is not bound to the active release and production environment.'
     }
     Assert-DysonLifecycleBrokerDependencies -Profile $profile
-    [void](Assert-DysonLifecycleBrokerTaskPair -Profile $profile)
+    # Deployment readiness validates the installed broker while cutover still
+    # owns activation of a prepared, disabled game-task pair. Worker dispatch
+    # retains the default active-task requirement.
+    [void](Assert-DysonLifecycleBrokerTaskPair -Profile $profile -AllowPreparedDisabled)
     Assert-DysonLifecycleBrokerStaticWorkerTask -Task $tasks[0] -Profile $profile -ProfileFile $expectedProfileFile
     return [pscustomobject][ordered]@{
         ready = $true
@@ -2671,10 +2683,20 @@ function Test-DysonLoopbackReadiness {
         $ReadinessUri.Host -notin @('127.0.0.1', 'localhost', '::1')) {
         throw 'ReadinessUri must be a loopback HTTP /readyz endpoint.'
     }
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $readinessTimer = [System.Diagnostics.Stopwatch]::StartNew()
     do {
+        $remainingSeconds = $TimeoutSeconds - $readinessTimer.Elapsed.TotalSeconds
+        if ($remainingSeconds -le 0) { break }
+        # /readyz includes real broker round trips. Give each HTTP request the
+        # remaining overall budget, capped at 30 seconds, rather than resetting
+        # a two-second timeout that can never admit a healthy slow response.
+        # Invoke-WebRequest only accepts whole seconds; a late response is
+        # independently rejected below even if cancellation rounds upward.
+        $requestTimeoutSeconds = [int][Math]::Min(30, [Math]::Ceiling($remainingSeconds))
         try {
-            $response = Invoke-WebRequest -Uri $ReadinessUri.AbsoluteUri -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri $ReadinessUri.AbsoluteUri -UseBasicParsing `
+                -TimeoutSec $requestTimeoutSeconds -ErrorAction Stop
+            if ($readinessTimer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { break }
             if ([int]$response.StatusCode -ge 200 -and [int]$response.StatusCode -lt 300) {
                 $readinessBody = ConvertFrom-Json -InputObject ([string]$response.Content) -ErrorAction Stop
                 $reportedHeaderVersion = [string]$response.Headers['X-Dyson-Control-Release']
@@ -2707,8 +2729,12 @@ function Test-DysonLoopbackReadiness {
             }
         }
         catch { }
-        if ((Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
-    } while ((Get-Date) -lt $deadline)
+        $remainingMilliseconds = [int][Math]::Floor(
+            ($TimeoutSeconds * 1000) - $readinessTimer.Elapsed.TotalMilliseconds)
+        if ($remainingMilliseconds -gt 0) {
+            Start-Sleep -Milliseconds ([Math]::Min(500, $remainingMilliseconds))
+        }
+    } while ($readinessTimer.Elapsed.TotalSeconds -lt $TimeoutSeconds)
     throw 'The loopback control-plane readiness check did not prove the expected release before the deadline.'
 }
 
@@ -3176,6 +3202,89 @@ function Set-DysonQualifiedClientStorageRemovalAcl {
     Set-DysonQualifiedClientDirectorySecurity -Path $directory -Security $security
 }
 
+function Restore-DysonQualifiedClientEmptyDirectorySecurity {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Sddl
+    )
+
+    $directory = Assert-DysonDeploymentPlainPathChain -Path $Path
+    [void](Assert-DysonPlainDirectory -Path $directory)
+    if (@(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop).Count -ne 0) {
+        throw 'An adopted qualified-client directory is no longer empty; ACL rollback is unsafe.'
+    }
+    Restore-DysonDeploymentDirectorySecurityPreimage -Path $directory -Sddl $Sddl
+}
+
+function Restore-DysonDeploymentDirectorySecurityPreimage {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Sddl)
+    Restore-DysonDeploymentSecurityPreimage -Path $Path -Sddl $Sddl -Directory
+}
+
+function Restore-DysonDeploymentFileSecurityPreimage {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Sddl)
+    Restore-DysonDeploymentSecurityPreimage -Path $Path -Sddl $Sddl
+}
+
+function Restore-DysonDeploymentSecurityPreimage {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Sddl,
+        [switch]$Directory
+    )
+
+    if ($Directory) {
+        $target = Assert-DysonDeploymentPlainPathChain -Path $Path
+        [void](Assert-DysonPlainDirectory -Path $target)
+    }
+    else {
+        $target = Get-DysonFullPath -Path $Path
+        [void](Assert-DysonDeploymentPlainPathChain -Path ([IO.Path]::GetDirectoryName($target)))
+        $file = Get-Item -LiteralPath $target -Force -ErrorAction Stop
+        if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'The deployment file ACL preimage target is not a plain file.'
+        }
+    }
+    $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+    if ($null -eq $descriptor.Owner -or $null -eq $descriptor.Group -or
+        $null -eq $descriptor.DiscretionaryAcl) {
+        throw 'The deployment ACL preimage is incomplete.'
+    }
+    # Directory.SetAccessControl uses automatic inheritance and can add D:AI
+    # to a legacy DACL. Restore only the captured directory descriptor without
+    # propagating to descendants; each captured descendant retains its own ACL.
+    # The same native descriptor operation also restores a captured file ACL.
+    if (-not ('DysonControl.DeploymentDirectoryAclRestore' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+namespace DysonControl {
+    public static class DeploymentDirectoryAclRestore {
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetFileSecurityW(string path, uint information, byte[] descriptor);
+    }
+}
+'@
+    }
+    # SetFileSecurity consumes AUTO_INHERIT_REQ to retain an existing AI bit;
+    # passing AUTO_INHERITED alone clears it. This does not propagate to children.
+    if ($descriptor.ControlFlags -band [System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited) {
+        $descriptor.SetFlags($descriptor.ControlFlags -bor
+            [System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInheritRequired)
+    }
+    $bytes = [byte[]]::new($descriptor.BinaryLength)
+    $descriptor.GetBinaryForm($bytes, 0)
+    # OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION.
+    # Audit rules are deliberately outside the captured and restored sections.
+    if (-not [DysonControl.DeploymentDirectoryAclRestore]::SetFileSecurityW($target, 7, $bytes)) {
+        $nativeError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "The deployment ACL preimage could not be restored (Win32 $nativeError)."
+    }
+    if ((Microsoft.PowerShell.Security\Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl -cne $Sddl) {
+        throw 'The deployment ACL differs from its exact preimage after restore.'
+    }
+}
+
 function Restore-DysonQualifiedClientStoragePreimage {
     param(
         [Parameter(Mandatory)]$Plan,
@@ -3203,9 +3312,7 @@ function Restore-DysonQualifiedClientStoragePreimage {
                 throw 'A qualified-client storage rollback target is missing.'
             }
             if (-not [bool]$state.aclReady) {
-                $security = [System.Security.AccessControl.DirectorySecurity]::new()
-                $security.SetSecurityDescriptorSddlForm([string]$state.sddl)
-                Set-DysonQualifiedClientDirectorySecurity -Path $path -Security $security
+                Restore-DysonQualifiedClientEmptyDirectorySecurity -Path $path -Sddl ([string]$state.sddl)
             }
         }
         elseif (Test-Path -LiteralPath $path) {

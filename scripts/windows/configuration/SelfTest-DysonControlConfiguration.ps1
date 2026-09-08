@@ -320,6 +320,15 @@ function Complete-TestCreate {
     return $intent
 }
 
+function Complete-TestRuntimeCreate {
+    param([Parameter(Mandatory)]$Fixture)
+    return Invoke-DysonConfigurationMutationTransaction -Storage $Fixture.storage `
+        -Source $Fixture.source -Contract $script:Contract `
+        -ExpectedLauncherBindings $Fixture.bindings -ServiceSid $script:ServiceSid `
+        -Operation create -SourceKind configuration-source `
+        -SourcePathSha256 (Get-DysonConfigurationSha256Text 'fictional-runtime-source')
+}
+
 function New-TestSnapshot {
     param(
         [Parameter(Mandatory)]$Fixture,
@@ -1317,7 +1326,10 @@ finally { $lock.Dispose() }
     }
     foreach ($crashPoint in @($replacementCrashMatrix.Keys)) {
         $fixture = New-TestFixture ('replace-crash-' + $crashPoint)
-        [void](Complete-TestCreate $fixture)
+        [void](Complete-TestRuntimeCreate $fixture)
+        Assert-SelfTest (Test-Path -LiteralPath (
+            Join-Path $fixture.storage.configRoot $script:DysonConfigurationRuntimeApprovalName
+        )) ('RUNTIME_APPROVAL_PRESENT_' + $crashPoint.ToUpperInvariant().Replace('-', '_'))
         $preimageSnapshotFixture = New-TestSnapshot -Fixture $fixture `
             -Name ('preimage-' + $crashPoint)
         $preimageSnapshot = Get-TestSnapshotEvidence -Fixture $fixture `
@@ -1333,6 +1345,9 @@ finally { $lock.Dispose() }
                 -PreimageSnapshot $preimageSnapshot -SelfTestCrashPoint $crashPoint
         } ('REPLACE_CRASH_' + $crashPoint.ToUpperInvariant().Replace('-', '_')) `
             '*SELFTEST_CRASH*'
+        Assert-SelfTest (-not (Test-Path -LiteralPath (
+            Join-Path $fixture.storage.configRoot $script:DysonConfigurationRuntimeApprovalName
+        ))) ('RUNTIME_APPROVAL_REVOKED_' + $crashPoint.ToUpperInvariant().Replace('-', '_'))
         $plan = Get-DysonConfigurationRecoveryPlan -Storage $fixture.storage `
             -ServiceSid $script:ServiceSid -Contract $script:Contract `
             -ExpectedLauncherBindings $profileB.bindings `
@@ -1608,6 +1623,32 @@ finally { $lock.Dispose() }
         }))
     Assert-SelfTest (-not $receiptText.Contains($script:SecretSentinel)) `
         'RECEIPT_CHAIN_SECRET_FREE'
+
+    $runtimeFixture = New-TestFixture 'runtime-approval'
+    [void](Complete-TestRuntimeCreate $runtimeFixture)
+    $runtimeParentAcl = Assert-DysonConfigurationParentAcl -Path $runtimeFixture.dataRoot -ServiceSid $script:ServiceSid
+    $runtimeResult = Test-DysonConfigurationRuntimeApproval -Storage $runtimeFixture.storage `
+        -Contract $script:Contract -ExpectedLauncherBindings $runtimeFixture.bindings `
+        -ServiceSid $script:ServiceSid -ParentAcl $runtimeParentAcl
+    Assert-SelfTest ($runtimeResult.healthy -and
+        $runtimeResult.protocol -ceq 'DYSON_CONTROL_CONFIGURATION_RUNTIME_TEST_RESULT_V1') 'RUNTIME_APPROVAL_VALID'
+    $runtimeApprovalPath = Join-Path $runtimeFixture.storage.configRoot $script:DysonConfigurationRuntimeApprovalName
+    $runtimeApprovalText = [IO.File]::ReadAllText($runtimeApprovalPath)
+    Assert-SelfTest (-not $runtimeApprovalText.Contains($script:SecretSentinel)) 'RUNTIME_APPROVAL_SECRET_FREE'
+    $tamperedApproval = $runtimeApprovalText | ConvertFrom-Json
+    $tamperedApproval.configurationSha256 = '0' * 64
+    [IO.File]::WriteAllText($runtimeApprovalPath, ($tamperedApproval | ConvertTo-Json -Compress), $script:Utf8)
+    Assert-SelfTestRejected {
+        Test-DysonConfigurationRuntimeApproval -Storage $runtimeFixture.storage `
+            -Contract $script:Contract -ExpectedLauncherBindings $runtimeFixture.bindings `
+            -ServiceSid $script:ServiceSid -ParentAcl $runtimeParentAcl
+    } 'RUNTIME_APPROVAL_MISMATCH_REJECTED' '*RUNTIME_APPROVAL_MISMATCH*'
+    [IO.File]::Delete($runtimeApprovalPath)
+    Assert-SelfTestRejected {
+        Test-DysonConfigurationRuntimeApproval -Storage $runtimeFixture.storage `
+            -Contract $script:Contract -ExpectedLauncherBindings $runtimeFixture.bindings `
+            -ServiceSid $script:ServiceSid -ParentAcl $runtimeParentAcl
+    } 'RUNTIME_APPROVAL_ABSENT_REJECTED'
 
     $installAst = Get-SelfTestPowerShellAst `
         (Join-Path $PSScriptRoot 'Install-DysonControlConfiguration.ps1')

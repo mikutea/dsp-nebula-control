@@ -243,11 +243,34 @@ async function runLegacyHostScript(
   arguments_: string[]
 ): Promise<string> {
   const repositoryRoot = path.resolve(import.meta.dirname, '..', '..', '..', '..')
+  // These scenarios model an empty host, not the machine running the test.
+  // Keep the production scripts intact while isolating their native queries
+  // inside this one child process (a real host may already run DSPGAME).
+  const literal = (value: string) => `'${value.replaceAll("'", "''")}'`
+  const parameters: string[] = []
+  for (let index = 0; index < arguments_.length; index += 2) {
+    const key = arguments_[index]!
+    const value = arguments_[index + 1]
+    if (!/^-[A-Za-z]+$/.test(key) || value === undefined) throw new Error('INVALID_FIXTURE_ARGUMENTS')
+    parameters.push(`${literal(key.slice(1))}=${literal(value)}`)
+  }
+  const command = `
+$ErrorActionPreference = 'Stop'
+function Get-Process { [CmdletBinding()] param([string]$Name)
+  if ($Name -cne 'DSPGAME') { throw 'Unexpected fixture process query' }
+}
+function Get-NetTCPConnection { [CmdletBinding()] param([string]$State, [int]$LocalPort) }
+function Get-ScheduledTask { [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
+  throw 'The fictional host has no scheduled tasks'
+}
+function Start-ScheduledTask { throw 'The fictional host cannot dispatch tasks' }
+$parameters = @{${parameters.join(';')}}
+& ${literal(path.join(repositoryRoot, 'scripts', 'windows', scriptName))} @parameters
+`
   try {
     const result = await execFileAsync('powershell.exe', [
       '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-      '-File', path.join(repositoryRoot, 'scripts', 'windows', scriptName),
-      ...arguments_
+      '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')
     ], { encoding: 'utf8', windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 })
     return result.stdout.trim()
   } catch {

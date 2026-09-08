@@ -37,6 +37,7 @@ describe('public release hygiene gate', () => {
       ['HIGH_ENTROPY_SECRET_ASSIGNMENT', 'scripts/public-release/scanner.mjs'],
       ['SECRET_LITERAL_ASSIGNMENT', 'scripts/public-release/scanner.mjs'],
       ['UNC_PATH', 'scripts/public-release/scanner.mjs'],
+      ['UNC_PATH', 'apps/api/src/providers/windows-update-runtime-evidence.test.ts'],
       ['SECRET_LITERAL_ASSIGNMENT', 'scripts/public-release/scanner.test.mjs'],
       ['UNC_PATH', 'scripts/windows/configuration/DysonConfiguration.Common.ps1'],
       ['UNC_PATH', 'scripts/windows/deployment/DysonDeployment.Common.ps1'],
@@ -145,6 +146,22 @@ describe('public release hygiene gate', () => {
       ['schema.json']
     )
     assert.equal(rejected.passed, false)
+  })
+
+  it('accepts the Windows task XML namespace host and rejects lookalikes', async () => {
+    const repository = await newRepository()
+    await write(repository, 'task.xml', '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task" />')
+    await commitAll(repository, 'Windows task namespace fixture')
+    const accepted = await runPublicReleaseScan({ repositoryRoot: repository, history: true })
+    assert.equal(accepted.passed, true)
+
+    for (const host of ['evil' + 'schemas.microsoft.com', 'schemas.microsoft.com' + '.unrelated.net']) {
+      await write(repository, 'task.xml', `<Task xmlns="http://${host}/windows/2004/02/mit/task" />`)
+      const rejected = await runPublicReleaseScan({ repositoryRoot: repository })
+      assert.equal(rejected.passed, false)
+      assert.deepEqual(rejected.findings.filter((entry) => entry.ruleId === 'PRODUCTION_ENDPOINT')
+        .map((entry) => entry.path), ['task.xml'])
+    }
   })
 
   it('refuses provenance when the repository has no committed HEAD', async () => {

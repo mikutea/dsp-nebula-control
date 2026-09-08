@@ -111,6 +111,14 @@ const incompleteMetricOrder: readonly ObservabilityMetricPath[] = [
   'automation.storageTask.lastResult'
 ]
 
+// Health collection appends running-process evidence after storage evidence.
+// Retain the original order for already-serialized episodes as well.
+const collectedIncompleteMetricOrder: readonly ObservabilityMetricPath[] = [
+  ...incompleteMetricOrder.slice(0, 4),
+  ...incompleteMetricOrder.slice(7),
+  ...incompleteMetricOrder.slice(4, 7)
+]
+
 export const OBSERVABILITY_ALERT_ERROR_CODES = [
   'OBSERVABILITY_ALERT_CONFIGURATION_INVALID',
   'OBSERVABILITY_ALERT_INPUT_INVALID',
@@ -716,13 +724,15 @@ function relatedMetricsAreValid(
 ): boolean {
   if (code === 'OBSERVABILITY_INCOMPLETE') {
     if (metrics.length === 0) return false
-    let previousIndex = -1
-    for (const metric of metrics) {
-      const index = incompleteMetricOrder.indexOf(metric)
-      if (index <= previousIndex) return false
-      previousIndex = index
-    }
-    return true
+    return [incompleteMetricOrder, collectedIncompleteMetricOrder].some((order) => {
+      let previousIndex = -1
+      return metrics.every((metric) => {
+        const index = order.indexOf(metric)
+        if (index <= previousIndex) return false
+        previousIndex = index
+        return true
+      })
+    })
   }
   const options = relatedMetricOptionsByCode[code] as readonly (readonly ObservabilityMetricPath[])[]
   return options.some((option) => option.length === metrics.length

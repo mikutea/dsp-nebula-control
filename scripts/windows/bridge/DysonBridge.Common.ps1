@@ -29,6 +29,7 @@ $script:DysonBridgeConfigName = 'io.github.mikutea.dyson-control-bridge.cfg'
 $script:DysonBridgeStateName = 'dyson-control-bridge.install.json'
 $script:DysonBridgeSecretName = 'dyson-control-bridge.secret'
 $script:DysonBridgeAclContract = 'DYSON_CONTROL_BRIDGE_ACL_V1'
+$script:DysonBridgePrivateRuntimeAclContract = 'DYSON_CONTROL_BRIDGE_ACL_V2'
 $script:DysonBridgeMaximumAssemblyBytes = [int64](64MB)
 
 function ConvertTo-DysonBridgeJsonLine {
@@ -631,17 +632,40 @@ function Read-DysonBridgeInstallState {
     $item = Assert-DysonBridgePlainFile -Path $Path -MaximumBytes 1MB
     try { $state = [System.IO.File]::ReadAllText($item.FullName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json }
     catch { throw 'The Bridge installation state is invalid JSON.' }
-    Assert-DysonBridgeExactProperties -Value $state -Expected @(
+    $baseProperties = @(
         'protocol', 'schemaVersion', 'guid', 'version', 'dllSha256', 'configSha256',
         'templateSha256', 'installedAtUtc', 'snapshotId', 'enabledDefault',
         'aclContract', 'installerSid', 'controlServiceSid', 'gameServiceSid'
-    ) -Name 'Bridge installation state'
-    if ([string]$state.protocol -ne $script:DysonBridgeInstallProtocol -or [int]$state.schemaVersion -ne 2 -or
+    )
+    if ('schemaVersion' -notin @($state.PSObject.Properties.Name)) {
+        throw 'The Bridge installation state contract is unsupported.'
+    }
+    $schemaVersion = [int]$state.schemaVersion
+    if ($schemaVersion -eq 2) {
+        Assert-DysonBridgeExactProperties -Value $state -Expected $baseProperties -Name 'Bridge installation state'
+    }
+    elseif ($schemaVersion -eq 3) {
+        Assert-DysonBridgeExactProperties -Value $state -Expected @(
+            $baseProperties + @('runtimeLayout', 'serverRoot', 'runtimeContainer', 'runtimeRoot', 'secretPath', 'controlRoot')
+        ) -Name 'Bridge installation state'
+    }
+    else { throw 'The Bridge installation state contract is unsupported.' }
+    $expectedAclContract = if ($schemaVersion -eq 3) { $script:DysonBridgePrivateRuntimeAclContract } else { $script:DysonBridgeAclContract }
+    if ([string]$state.protocol -ne $script:DysonBridgeInstallProtocol -or
         [string]$state.guid -ne $script:DysonBridgeGuid -or [string]$state.dllSha256 -notmatch '^[0-9a-f]{64}$' -or
         [string]$state.configSha256 -notmatch '^[0-9a-f]{64}$' -or [string]$state.templateSha256 -notmatch '^[0-9a-f]{64}$' -or
         [string]$state.snapshotId -notmatch '^[0-9]{17}-[0-9a-f]{8}$' -or [bool]$state.enabledDefault -ne $false -or
-        [string]$state.aclContract -cne $script:DysonBridgeAclContract) {
+        [string]$state.aclContract -cne $expectedAclContract) {
         throw 'The Bridge installation state contract is unsupported.'
+    }
+    if ($schemaVersion -eq 3 -and (
+        [string]$state.runtimeLayout -cne 'private-ntfs' -or
+        [string]::IsNullOrWhiteSpace([string]$state.serverRoot) -or
+        [string]::IsNullOrWhiteSpace([string]$state.runtimeContainer) -or
+        [string]::IsNullOrWhiteSpace([string]$state.runtimeRoot) -or
+        [string]::IsNullOrWhiteSpace([string]$state.secretPath) -or
+        [string]::IsNullOrWhiteSpace([string]$state.controlRoot))) {
+        throw 'The Bridge private runtime state contract is unsupported.'
     }
     foreach ($sid in @([string]$state.installerSid, [string]$state.controlServiceSid, [string]$state.gameServiceSid)) {
         [void](Assert-DysonBridgeIdentitySid -Sid $sid -Name 'Bridge installation identity')
@@ -650,6 +674,137 @@ function Read-DysonBridgeInstallState {
         -GameServiceSid ([string]$state.gameServiceSid)
     Assert-DysonBridgeVersion -Version ([string]$state.version)
     return $state
+}
+
+function Assert-DysonBridgePrivateRuntimeRoot {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$DysonServerRoot,
+        [switch]$AllowMissing
+    )
+    $runtimeRoot = Assert-DysonBridgeSafeRoot -Path $Path -Name 'Bridge private runtime root'
+    if ($runtimeRoot.StartsWith('\\', [System.StringComparison]::Ordinal) -or $runtimeRoot -notmatch '^[A-Za-z]:\\') {
+        throw 'The Bridge private runtime root must be on a local Windows volume.'
+    }
+    $volumeRoot = [System.IO.Path]::GetPathRoot($runtimeRoot)
+    try { $drive = [System.IO.DriveInfo]::new($volumeRoot) }
+    catch { throw 'The Bridge private runtime volume could not be verified.' }
+    if (-not $drive.IsReady -or $drive.DriveType -ne [System.IO.DriveType]::Fixed -or
+        -not [string]::Equals($drive.DriveFormat, 'NTFS', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The Bridge private runtime root must be on a fixed local NTFS volume.'
+    }
+    $serverRoot = Assert-DysonBridgePlainDirectory -Path $DysonServerRoot
+    if ((Test-DysonBridgePathWithin -Candidate $runtimeRoot -Parent $serverRoot -AllowEqual) -or
+        (Test-DysonBridgePathWithin -Candidate $serverRoot -Parent $runtimeRoot -AllowEqual)) {
+        throw 'The Bridge private runtime root must be isolated from the DSP server tree.'
+    }
+    $runtimeContainer = Assert-DysonBridgeSafeRoot -Path ([System.IO.Path]::GetDirectoryName($runtimeRoot)) `
+        -Name 'Bridge private runtime container'
+    if ((Test-DysonBridgePathWithin -Candidate $runtimeContainer -Parent $serverRoot -AllowEqual) -or
+        (Test-DysonBridgePathWithin -Candidate $serverRoot -Parent $runtimeContainer -AllowEqual)) {
+        throw 'The Bridge private runtime container must be isolated from the DSP server tree.'
+    }
+    [void](Assert-DysonBridgePlainDirectory -Path ([System.IO.Path]::GetDirectoryName($runtimeContainer)))
+    [void](Assert-DysonBridgePathComponentsPlain -Path $runtimeRoot -Root $volumeRoot)
+    if (Test-Path -LiteralPath $runtimeContainer) {
+        [void](Assert-DysonBridgePlainDirectory -Path $runtimeContainer)
+    }
+    elseif (-not $AllowMissing) { throw 'The Bridge private runtime container is unavailable.' }
+    if (Test-Path -LiteralPath $runtimeRoot) {
+        [void](Assert-DysonBridgePlainDirectory -Path $runtimeRoot)
+    }
+    elseif (-not $AllowMissing) { throw 'The Bridge private runtime root is unavailable.' }
+    return $runtimeRoot
+}
+
+function Get-DysonBridgePrivateRuntimeContainer {
+    param([Parameter(Mandatory)][string]$RuntimeRoot)
+    return Assert-DysonBridgeSafeRoot -Path ([System.IO.Path]::GetDirectoryName(
+        (Get-DysonBridgeFullPath -Path $RuntimeRoot)
+    )) -Name 'Bridge private runtime container'
+}
+
+function Assert-DysonBridgePrivateRuntimeContainerInventory {
+    param(
+        [Parameter(Mandatory)][string]$RuntimeContainer,
+        [Parameter(Mandatory)][string]$RuntimeRoot
+    )
+    $container = Assert-DysonBridgePlainDirectory -Path $RuntimeContainer
+    $runtime = Get-DysonBridgeFullPath -Path $RuntimeRoot
+    if (-not [string]::Equals(
+        (Get-DysonBridgePrivateRuntimeContainer -RuntimeRoot $runtime),
+        $container,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) { throw 'The Bridge private runtime root is not a direct child of its container.' }
+    foreach ($item in @(Get-ChildItem -LiteralPath $container -Force -ErrorAction Stop)) {
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw 'The Bridge private runtime container contains a redirected entry.'
+        }
+        if (-not $item.PSIsContainer -or
+            -not [string]::Equals($item.FullName, $runtime, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The Bridge private runtime container contains an unmanaged entry.'
+        }
+    }
+    return $container
+}
+
+function Assert-DysonBridgePrivateRuntimeInventory {
+    param([Parameter(Mandatory)][string]$RuntimeRoot)
+    $root = Assert-DysonBridgePlainDirectory -Path $RuntimeRoot
+    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop)) {
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw 'The Bridge private runtime root contains a redirected entry.'
+        }
+        if ([string]::Equals($item.Name, $script:DysonBridgeSecretName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            [void](Assert-DysonBridgePlainFile -Path $item.FullName -MaximumBytes 4096)
+        }
+        elseif ([string]::Equals($item.Name, 'control', [System.StringComparison]::OrdinalIgnoreCase)) {
+            [void](Assert-DysonBridgePlainDirectory -Path $item.FullName)
+        }
+        else { throw 'The Bridge private runtime root contains an unmanaged entry.' }
+    }
+    return $root
+}
+
+function Get-DysonBridgeInstallRuntimePaths {
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][string]$DysonServerRoot
+    )
+    $serverRoot = Assert-DysonBridgePlainDirectory -Path $DysonServerRoot
+    if ([int]$State.schemaVersion -eq 2) {
+        return [ordered]@{
+            layout = 'legacy-server-tree'
+            runtimeRoot = $null
+            secretPath = Get-DysonBridgeFullPath -Path (Join-Path $serverRoot ('BepInEx\config\' + $script:DysonBridgeSecretName))
+            controlRoot = Get-DysonBridgeFullPath -Path (Join-Path $serverRoot 'BepInEx\dyson-control-bridge')
+        }
+    }
+    if (-not [string]::Equals(
+        (Get-DysonBridgeFullPath -Path ([string]$State.serverRoot)),
+        $serverRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) { throw 'The Bridge private runtime state belongs to a different DSP server root.' }
+    $runtimeRoot = Assert-DysonBridgePrivateRuntimeRoot -Path ([string]$State.runtimeRoot) -DysonServerRoot $serverRoot
+    $runtimeContainer = Get-DysonBridgePrivateRuntimeContainer -RuntimeRoot $runtimeRoot
+    if (-not [string]::Equals($runtimeContainer, (Get-DysonBridgeFullPath -Path ([string]$State.runtimeContainer)), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The Bridge private runtime container does not match installation state.'
+    }
+    [void](Assert-DysonBridgePrivateRuntimeContainerInventory -RuntimeContainer $runtimeContainer -RuntimeRoot $runtimeRoot)
+    [void](Assert-DysonBridgePrivateRuntimeInventory -RuntimeRoot $runtimeRoot)
+    $secretPath = Get-DysonBridgeFullPath -Path (Join-Path $runtimeRoot $script:DysonBridgeSecretName)
+    $controlRoot = Get-DysonBridgeFullPath -Path (Join-Path $runtimeRoot 'control')
+    if (-not [string]::Equals($secretPath, (Get-DysonBridgeFullPath -Path ([string]$State.secretPath)), [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($controlRoot, (Get-DysonBridgeFullPath -Path ([string]$State.controlRoot)), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The Bridge private runtime state paths do not match their fixed layout.'
+    }
+    return [ordered]@{
+        layout = 'private-ntfs'
+        runtimeContainer = $runtimeContainer
+        runtimeRoot = $runtimeRoot
+        secretPath = $secretPath
+        controlRoot = $controlRoot
+    }
 }
 
 function Assert-DysonBridgeIdentitySid {
@@ -696,7 +851,7 @@ function Get-DysonBridgeControlTreePaths {
 
 function Get-DysonBridgeExpectedAclRules {
     param(
-        [Parameter(Mandatory)][ValidateSet('secret', 'root', 'requests', 'private', 'receipts')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('secret', 'runtime', 'root', 'requests', 'private', 'receipts')][string]$Kind,
         [Parameter(Mandatory)][string]$InstallerSid,
         [Parameter(Mandatory)][string]$ControlServiceSid,
         [Parameter(Mandatory)][string]$GameServiceSid
@@ -714,6 +869,11 @@ function Get-DysonBridgeExpectedAclRules {
         $rules += [ordered]@{ sid = $GameServiceSid; rights = [System.Security.AccessControl.FileSystemRights]::Read }
         return @($rules)
     }
+    if ($Kind -eq 'runtime') {
+        $rules += [ordered]@{ sid = $ControlServiceSid; rights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute }
+        $rules += [ordered]@{ sid = $GameServiceSid; rights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute }
+        return @($rules)
+    }
     $rules += [ordered]@{ sid = $GameServiceSid; rights = [System.Security.AccessControl.FileSystemRights]::Modify }
     if ($Kind -eq 'requests') {
         $rules += [ordered]@{ sid = $ControlServiceSid; rights = [System.Security.AccessControl.FileSystemRights]::Modify }
@@ -726,7 +886,7 @@ function Get-DysonBridgeExpectedAclRules {
 
 function New-DysonBridgeAclObject {
     param(
-        [Parameter(Mandatory)][ValidateSet('secret', 'root', 'requests', 'private', 'receipts')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('secret', 'runtime', 'root', 'requests', 'private', 'receipts')][string]$Kind,
         [Parameter(Mandatory)][string]$InstallerSid,
         [Parameter(Mandatory)][string]$ControlServiceSid,
         [Parameter(Mandatory)][string]$GameServiceSid
@@ -807,7 +967,7 @@ function Get-DysonBridgeAclRuleKey {
 function Assert-DysonBridgeExactAcl {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][ValidateSet('secret', 'root', 'requests', 'private', 'receipts')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('secret', 'runtime', 'root', 'requests', 'private', 'receipts')][string]$Kind,
         [Parameter(Mandatory)][string]$InstallerSid,
         [Parameter(Mandatory)][string]$ControlServiceSid,
         [Parameter(Mandatory)][string]$GameServiceSid
@@ -822,6 +982,33 @@ function Assert-DysonBridgeExactAcl {
         throw "The Bridge $Kind ACL does not match its exact two-identity contract."
     }
     return $acl
+}
+
+function Protect-DysonBridgePrivateRuntimeRootAcl {
+    param(
+        [Parameter(Mandatory)][string]$RuntimeRoot,
+        [Parameter(Mandatory)][string]$InstallerSid,
+        [Parameter(Mandatory)][string]$ControlServiceSid,
+        [Parameter(Mandatory)][string]$GameServiceSid
+    )
+    $root = Assert-DysonBridgePlainDirectory -Path $RuntimeRoot
+    $acl = New-DysonBridgeAclObject -Kind runtime -InstallerSid $InstallerSid `
+        -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid
+    Set-DysonBridgeExactAclObject -Path $root -Acl $acl -Directory
+    [void](Assert-DysonBridgeExactAcl -Path $root -Kind runtime -InstallerSid $InstallerSid `
+        -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid)
+}
+
+function Test-DysonBridgePrivateRuntimeContainerAcl {
+    param(
+        [Parameter(Mandatory)][string]$RuntimeContainer,
+        [Parameter(Mandatory)][string]$InstallerSid,
+        [Parameter(Mandatory)][string]$ControlServiceSid,
+        [Parameter(Mandatory)][string]$GameServiceSid
+    )
+    $container = Assert-DysonBridgePlainDirectory -Path $RuntimeContainer
+    return Assert-DysonBridgeExactAcl -Path $container -Kind runtime -InstallerSid $InstallerSid `
+        -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid
 }
 
 function Protect-DysonBridgeSecretAcl {

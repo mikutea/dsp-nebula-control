@@ -14,7 +14,42 @@ guard remains available for an explicitly confirmed restore. The operation is
 serialized by the fixed host-mutation lease and produces bounded intents and
 receipts without echoing private paths or file content.
 
+## Reversible cutover before removal
+
+The complete operator entry point is the authenticated HTTP API, not an
+independent local CLI. An administrator uses `/api/v1/cutover/preview` before
+the matching `/prepare`, `/activate`, or `/rollback` route under
+`/api/v1/cutover`; each mutation binds its request ID and confirmation to the
+returned plan fingerprint. Later rollback uses `later-operator-rollback`.
+Use `/api/v1/cutover/status` to inspect recovery state before proceeding.
+Lifecycle acceptance uses the authenticated preview, execute, and receipt
+routes in [LIFECYCLE.md](LIFECYCLE.md). Windows administrator or SSH access
+does not itself establish an application session. The `Submit-*BrokerRequest.ps1`
+scripts expose individual host capabilities; manually chaining them does not
+provide the complete coordinator, protection-point, compensation, and audit
+workflow.
+
+The previous-runtime stop path uses a transaction-bound temporary task in the
+configured game account's `Interactive`, `Limited` session. It invokes the
+release-bound stop script against the observed process identity and validates
+the durable stop receipt and stopped runtime. It preserves the captured legacy
+scripts and task definitions. Temporary-task cleanup must be verified before
+the previous authority can be re-enabled or restarted; an incomplete stop
+record requires recovery rather than a blind retry. This implementation does
+not establish that a target-host switch or rollback drill has passed. Preserve
+both the GSManager snapshot and paired-save protection point until those
+separate acceptance records exist.
+
 ## Preconditions
+
+Copy completion is not snapshot completion. The snapshot creator verifies the
+copied bytes, canonical inventory, filesystem permissions, task capture, and
+paired-save binding before publishing a final snapshot. A failed publication
+or an unpublished temporary directory is not a recovery point. Require the
+final snapshot ID and manifest hash, then run `Test-DysonGsManagerSnapshot.ps1`
+with those exact values before proceeding. Preserve the independent save
+protection point when a GSManager snapshot fails; do not remove the old manager
+or retry a deterministic inventory failure without fixing its cause.
 
 Run the Windows backend from an elevated Windows PowerShell 5.1 session only
 after the approved cutover coordinator has established all of these facts:
@@ -51,12 +86,14 @@ verified receipts rather than typed from memory.
 ```powershell
 $artifact = 'C:\GameServer\Example\Packages\DysonControl-v0.2.0'
 $project = 'C:\GameServer\Example\DSP'
-$gsm = 'C:\GameServer\Example\DSP\tools\GSManager'
-$deploymentDataRoot = 'C:\GameServer\Example\PrivateControlData'
-$data = Join-Path $deploymentDataRoot 'data'
-$profile = Join-Path $data 'authority-inventory\authority-profile.json'
-$bootstrap = 'C:\GameServer\Example\DysonRuntimeBootstrap'
-$runtimeTransactions = Join-Path $data 'runtime-task-transactions'
+$gsm = 'C:\GameServer\Example\DSP\tools\ExampleGameManager'
+$installRoot = 'C:\GameServer\Example\DysonControl'
+$deploymentDataRoot = 'C:\GameServer\Example\DysonControlData'
+$appDataRoot = Join-Path $deploymentDataRoot 'data'
+$recoverySnapshotRoot = Join-Path $appDataRoot 'migration\snapshots'
+$profile = Join-Path $appDataRoot 'authority-inventory\authority-profile.json'
+$bootstrap = Join-Path $installRoot 'bootstrap'
+$runtimeTransactions = Join-Path $deploymentDataRoot 'runtime-task-transactions'
 
 $snapshotId = '00000000-0000-4000-8000-000000000001'
 $snapshotManifestSha256 = ('a' * 64)
@@ -72,7 +109,7 @@ $restore = Join-Path $artifact 'scripts\windows\migration\Restore-DysonGsManager
 $binding = @{
   ProjectRoot = $project
   GsManagerRoot = $gsm
-  DataRoot = $data
+  DataRoot = $appDataRoot
   SnapshotId = $snapshotId
   SnapshotManifestSha256 = $snapshotManifestSha256
   PairedSaveProtectionPointId = $saveProtectionPointId
@@ -81,11 +118,17 @@ $binding = @{
   ProfileFile = $profile
   RuntimeBootstrapRoot = $bootstrap
   RuntimeTaskTransactionRoot = $runtimeTransactions
-  ServiceUser = '.\FictionalService'
-  GamePort = 18469
+  ServiceUser = '.\ExampleGameService'
+  GamePort = 27015
   AuthorityInventoryRevision = $authorityRevision
 }
 ```
+
+Reuse the same instance and bindings used for installation and authority
+initialization. The snapshot ID above must identify a verified snapshot below
+`$recoverySnapshotRoot`; create, verify, and restore that snapshot with
+`-DataRoot $appDataRoot`. Runtime task transactions default to the sibling
+`$runtimeTransactions`, not a directory inside the application data root.
 
 ## Preview and remove
 

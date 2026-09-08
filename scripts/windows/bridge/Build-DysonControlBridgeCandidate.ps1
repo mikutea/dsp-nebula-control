@@ -130,7 +130,13 @@ finally {
             -not ([System.IO.Path]::GetFileName($temporary).StartsWith('.partial-dyson-bridge-', [System.StringComparison]::Ordinal))) {
             throw 'Refusing to clean an unexpected Bridge build path.'
         }
-        Remove-Item -LiteralPath $temporary -Recurse -Force
+        # NuGet reference-assembly paths can exceed MAX_PATH even when the
+        # candidate output root is short. Preserve the checked absolute target.
+        $cleanupPath = if ($temporary.StartsWith('\\', [StringComparison]::Ordinal)) {
+            '\\?\UNC\' + $temporary.Substring(2)
+        }
+        else { '\\?\' + $temporary }
+        Remove-Item -LiteralPath $cleanupPath -Recurse -Force
     }
     if (-not $published -and (Test-Path -LiteralPath $outputFull)) {
         throw 'A failed Bridge build unexpectedly published OutputPath.'

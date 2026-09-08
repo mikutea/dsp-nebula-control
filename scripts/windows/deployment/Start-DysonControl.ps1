@@ -36,7 +36,7 @@ if (-not $active) { throw 'No Dyson Control release is active.' }
 $configurationModuleRoot = Get-DysonDeploymentConfigurationVerificationModuleRoot `
     -InstallRoot $installFull -DataRoot $dataFull `
     -SelfTestConfigurationShadowRoot $SelfTestConfigurationShadowRoot
-$configurationEvidence = Invoke-DysonDeploymentConfigurationTest `
+$configurationEvidence = Invoke-DysonDeploymentConfigurationTest -RuntimeOnly `
     -DataRoot $dataFull -ScriptRoot (Join-Path ([string]$active.releaseRoot) 'scripts\windows') `
     -RuntimeBootstrapRoot (Join-Path $installFull 'bootstrap') `
     -DeploymentVersion ([string]$active.pointer.version) `
@@ -50,7 +50,7 @@ $selfTestRuntimeAuthorization = [ordered]@{
     root = [System.Environment]::GetEnvironmentVariable('DYSON_DEPLOYMENT_SELFTEST_ROOT_IDENTITY', 'Process')
 }
 
-$configurationBeforeRead = Invoke-DysonDeploymentConfigurationTest `
+$configurationBeforeRead = Invoke-DysonDeploymentConfigurationTest -RuntimeOnly `
     -DataRoot $dataFull -ScriptRoot (Join-Path ([string]$active.releaseRoot) 'scripts\windows') `
     -RuntimeBootstrapRoot (Join-Path $installFull 'bootstrap') `
     -DeploymentVersion ([string]$active.pointer.version) `
@@ -104,7 +104,7 @@ if ([string]$selfTestRuntimeAuthorization.allow -ceq 'true' -and
     )
 }
 try {
-    $configurationAtLaunch = Invoke-DysonDeploymentConfigurationTest `
+    $configurationAtLaunch = Invoke-DysonDeploymentConfigurationTest -RuntimeOnly `
         -DataRoot $dataFull -ScriptRoot (Join-Path ([string]$active.releaseRoot) 'scripts\windows') `
         -RuntimeBootstrapRoot (Join-Path $installFull 'bootstrap') `
         -DeploymentVersion ([string]$active.pointer.version) `

@@ -6,6 +6,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+function Remove-DysonExitedPidRecord {
+    param([string]$Path, [int]$ExpectedProcessId)
+    try { $recordedPid = [IO.File]::ReadAllText($Path).Trim() }
+    catch [IO.FileNotFoundException] { return }
+    if ($recordedPid -eq [string]$ExpectedProcessId) {
+        # The stop helper may have removed the same record after our read.
+        [IO.File]::Delete($Path)
+    }
+}
 $resolvedProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot -ErrorAction Stop).ProviderPath
 $serverRoot = Join-Path $resolvedProjectRoot 'server'
 $executable = [System.IO.Path]::GetFullPath((Join-Path $serverRoot 'DSPGAME.exe'))
@@ -77,11 +86,8 @@ try {
     if ($process.ExitCode -ne 0) { throw 'The managed DSP process exited with a non-zero result.' }
 }
 finally {
-    if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
-        $recordedPid = (Get-Content -LiteralPath $pidPath -Raw).Trim()
-        $process.Refresh()
-        if ($recordedPid -eq [string]$process.Id -and $process.HasExited) {
-            Remove-Item -LiteralPath $pidPath -Force
-        }
+    $process.Refresh()
+    if ($process.HasExited) {
+        Remove-DysonExitedPidRecord -Path $pidPath -ExpectedProcessId $process.Id
     }
 }

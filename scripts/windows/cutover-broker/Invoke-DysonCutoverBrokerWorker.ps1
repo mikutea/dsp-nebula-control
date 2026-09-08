@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$BrokerRoot,
     [Parameter(Mandatory)][string]$BrokerProfileFile,
@@ -42,6 +42,9 @@ function Invoke-WorkerBoundedChild {
         $commandLine = (@($tokens | ForEach-Object { ConvertTo-WorkerCommandLineArgument ([string]$_) }) -join ' ')
         $process = Start-Process -FilePath $powerShell -ArgumentList $commandLine -NoNewWindow -PassThru `
             -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ErrorAction Stop
+        # Keep the native handle open before polling: Windows PowerShell 5.1
+        # can otherwise lose ExitCode after Refresh observes a completed child.
+        $processHandle = $process.Handle
         $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
         while (-not $process.HasExited) {
             foreach ($outputPath in @($stdoutPath, $stderrPath)) {
@@ -98,6 +101,7 @@ function Invoke-WorkerBoundedChild {
 function Assert-WorkerProductionBinding {
     param([Parameter(Mandatory)]$Request)
 
+    if ($Request.capability -ceq 'CutoverEvidence') { return } # The bound read-only child validates the full host profile without a mutation lease.
     try {
         $leaseCommon = Join-Path $Request.cutoverScriptRoot 'DysonHostMutationLease.Common.ps1'
         $hostCommon = Join-Path $Request.cutoverScriptRoot 'cutover\DysonCutoverHost.Common.ps1'
@@ -113,6 +117,9 @@ function Assert-WorkerProductionBinding {
             -AuthorityInventoryRevision $Request.authorityInventoryRevision `
             -RequestId $Request.requestId -Backend Windows -DataRoot $Request.dataRoot `
             -LeaseInstanceId $Request.leaseInstanceId -LeaseToken $Request.leaseToken
+        if ($Request.capability -ceq 'CandidateTaskTransaction' -and $Request.candidateMode -ceq 'Activate') {
+            Assert-CutoverPreviousStopClean
+        }
     }
     catch { Throw-DysonCutoverBrokerError 'DYSON_CONTROL_CUTOVER_BROKER_PROFILE_BINDING_MISMATCH' }
 }
@@ -124,7 +131,18 @@ function Assert-WorkerChildReceipt {
     )
 
     try {
-        if ($Request.capability -ceq 'CandidateTaskTransaction') {
+        if ($Request.capability -ceq 'CutoverEvidence') {
+            Assert-DysonCutoverBrokerExactProperties $ChildReceipt @('protocol','schemaVersion','requestId','authorityInventoryRevision','evidence')
+            if ($ChildReceipt.protocol -cne 'DYSON_CONTROL_CUTOVER_EVIDENCE_V1' -or $ChildReceipt.schemaVersion -ne 1 -or
+                $ChildReceipt.requestId -cne $Request.requestId -or $ChildReceipt.authorityInventoryRevision -cne $Request.authorityInventoryRevision) { throw 'evidence receipt binding' }
+            Assert-DysonCutoverBrokerExactProperties $ChildReceipt.evidence @('previousDefined','previousEnabled','candidateDefined','candidateEnabled','unexpectedAuthorityPresent','processState','portState','previousHealthy','candidateHealthy')
+            foreach ($name in @('previousDefined','previousEnabled','candidateDefined','candidateEnabled','unexpectedAuthorityPresent','previousHealthy','candidateHealthy')) {
+                if ($ChildReceipt.evidence.$name -isnot [bool]) { throw 'evidence boolean' }
+            }
+            if ($ChildReceipt.evidence.processState -cnotin @('none','previous-only','candidate-only','both','unknown') -or
+                $ChildReceipt.evidence.portState -cnotin @('closed','previous','candidate','unknown')) { throw 'evidence state' }
+        }
+        elseif ($Request.capability -ceq 'CandidateTaskTransaction') {
             Assert-DysonCutoverBrokerExactProperties $ChildReceipt @(
                 'protocol', 'schemaVersion', 'requestId', 'requestFingerprint', 'status', 'mode',
                 'serverTask', 'stopTask', 'terminalPairDigest', 'completedAt', 'reused'
@@ -156,7 +174,7 @@ function Assert-WorkerChildReceipt {
                 $ChildReceipt.requestId -isnot [string] -or [string]$ChildReceipt.requestId -cne $Request.requestId -or
                 $ChildReceipt.authorityInventoryRevision -isnot [string] -or
                 [string]$ChildReceipt.authorityInventoryRevision -cne $Request.authorityInventoryRevision -or
-                $ChildReceipt.action -isnot [string] -or [string]$ChildReceipt.action -cne $Request.capability -or
+                $ChildReceipt.action -isnot [string] -or [string]$ChildReceipt.action -cne $(if ($null -ne $Request.PSObject.Properties['previousStopReconcileOnly'] -and $Request.previousStopReconcileOnly) { 'ReconcilePreviousStop' } else { $Request.capability }) -or
                 $ChildReceipt.status -isnot [string] -or [string]$ChildReceipt.status -cne 'succeeded') {
                 throw 'action receipt'
             }
@@ -235,6 +253,13 @@ function Invoke-WorkerShadowDispatch {
     if ($mode -notin @('success', 'candidate-rollback-replay')) {
         Throw-DysonCutoverBrokerError 'DYSON_CONTROL_CUTOVER_BROKER_CHILD_OUTPUT_INVALID'
     }
+    if ($Request.capability -ceq 'CutoverEvidence') {
+        return [pscustomobject][ordered]@{
+            protocol = 'DYSON_CONTROL_CUTOVER_EVIDENCE_V1'; schemaVersion = 1; requestId = $Request.requestId
+            authorityInventoryRevision = $Request.authorityInventoryRevision
+            evidence = [pscustomobject][ordered]@{ previousDefined = $true; previousEnabled = $true; candidateDefined = $true; candidateEnabled = $false; unexpectedAuthorityPresent = $false; processState = 'previous-only'; portState = 'previous'; previousHealthy = $true; candidateHealthy = $false }
+        }
+    }
     if ($Request.capability -ceq 'CandidateTaskTransaction') {
         return [pscustomobject][ordered]@{
             protocol = 'DYSON_CONTROL_RUNTIME_TASK_RECEIPT_V2'
@@ -255,7 +280,7 @@ function Invoke-WorkerShadowDispatch {
         schemaVersion = 1
         requestId = $Request.requestId
         authorityInventoryRevision = $Request.authorityInventoryRevision
-        action = $Request.capability
+        action = $(if ($null -ne $Request.PSObject.Properties['previousStopReconcileOnly'] -and $Request.previousStopReconcileOnly) { 'ReconcilePreviousStop' } else { $Request.capability })
         status = 'succeeded'
     }
 }
@@ -267,7 +292,16 @@ function Invoke-WorkerWindowsDispatch {
         [Parameter(Mandatory)]$Storage
     )
 
-    if ($Request.capability -ceq 'CandidateTaskTransaction') {
+    if ($Request.capability -ceq 'CutoverEvidence') {
+        $scriptPath = Join-Path $Profile.cutoverScriptRoot 'cutover\Get-DysonCutoverEvidence.ps1'
+        if ($null -eq $Profile.PSObject.Properties['cutoverEvidenceScriptSha256'] -or
+            (Get-DysonCutoverBrokerSha256File $scriptPath) -cne $Profile.cutoverEvidenceScriptSha256) { Throw-DysonCutoverBrokerError 'DYSON_CONTROL_CUTOVER_BROKER_PROFILE_BINDING_MISMATCH' }
+        $arguments = @('-ProjectRoot',$Profile.projectRoot,'-ProfileFile',$Profile.authorityProfileFile,
+            '-RuntimeBootstrapRoot',$Profile.runtimeBootstrapRoot,'-RuntimeTaskTransactionRoot',$Profile.runtimeTaskTransactionRoot,
+            '-ServiceUser',$Profile.serviceUser,'-GamePort',[string]$Profile.gamePort,
+            '-AuthorityInventoryRevision',$Request.authorityInventoryRevision,'-RequestId',$Request.requestId,'-Backend','Windows')
+    }
+    elseif ($Request.capability -ceq 'CandidateTaskTransaction') {
         $scriptPath = Join-Path $Profile.cutoverScriptRoot 'Install-DysonRuntimeTasks.ps1'
         $arguments = @(
             '-ProjectRoot', $Request.projectRoot,
@@ -304,6 +338,10 @@ function Invoke-WorkerWindowsDispatch {
             '-LeaseToken', $Request.leaseToken,
             '-Confirm:$false'
         )
+        if ($null -ne $Request.PSObject.Properties['previousStopReconcileOnly'] -and $Request.previousStopReconcileOnly) { $arguments += '-PreviousStopReconcileOnly' }
+        if ($null -ne $Profile.PSObject.Properties['previousStopScriptSha256']) {
+            $arguments += @('-PreviousStopScriptSha256', [string]$Profile.previousStopScriptSha256)
+        }
     }
     return Invoke-WorkerBoundedChild -ScriptPath $scriptPath -ChildArguments $arguments -WorkRoot $Storage.workRoot
 }
@@ -374,6 +412,7 @@ function Invoke-WorkerRequest {
     $request = $null
     $paths = $null
     $intentPersisted = $false
+    $resumePreviousStop = $false
     $writeStage = {
         param([string]$Stage)
         if ($Backend -ceq 'Shadow' -and -not [string]::IsNullOrWhiteSpace($Shadow)) {
@@ -416,8 +455,11 @@ function Invoke-WorkerRequest {
                 [string]$intent.requestFingerprint -cne [string]$request.requestFingerprint) {
                 Throw-DysonCutoverBrokerError 'DYSON_CONTROL_CUTOVER_BROKER_REQUEST_CONFLICT'
             }
-            return Write-WorkerTerminalReceipt -Request $request -Paths $paths -State failed `
-                -ErrorCode 'DYSON_CONTROL_CUTOVER_BROKER_RECOVERY_REQUIRED' -ChildReceipt $null
+            if ($request.capability -in @('StopPreviousRuntime','CutoverEvidence')) { $resumePreviousStop = $true }
+            else {
+                return Write-WorkerTerminalReceipt -Request $request -Paths $paths -State failed `
+                    -ErrorCode 'DYSON_CONTROL_CUTOVER_BROKER_RECOVERY_REQUIRED' -ChildReceipt $null
+            }
         }
 
         Assert-DysonCutoverBrokerLease $request
@@ -436,8 +478,10 @@ function Invoke-WorkerRequest {
             state = 'dispatching'
             createdAt = (Get-Date).ToUniversalTime().ToString('o')
         }
-        Write-DysonCutoverBrokerJsonNew -Path $paths.intent -Value $intent `
-            -MaximumBytes $script:DysonCutoverBrokerMaximumRequestBytes
+        if (-not $resumePreviousStop) {
+            Write-DysonCutoverBrokerJsonNew -Path $paths.intent -Value $intent `
+                -MaximumBytes $script:DysonCutoverBrokerMaximumRequestBytes
+        }
         $intentPersisted = $true
         & $writeStage 'intent-persisted'
         Assert-DysonCutoverBrokerLease $request

@@ -4,6 +4,7 @@ $script:DysonConfigurationReceiptProtocol = 'DYSON_CONTROL_CONFIGURATION_RECEIPT
 $script:DysonConfigurationSnapshotProtocol = 'DYSON_CONTROL_CONFIGURATION_SNAPSHOT_V2'
 $script:DysonConfigurationSchemaVersion = 2
 $script:DysonConfigurationFileName = 'dyson-control.env'
+$script:DysonConfigurationRuntimeApprovalName = 'dyson-control.runtime.json'
 $script:DysonConfigurationContractName = 'dyson-control.environment-contract.json'
 $script:DysonConfigurationSnapshotManifestName = 'configuration-snapshot.json'
 $script:DysonConfigurationLockName = 'configuration.lock'
@@ -1775,6 +1776,7 @@ function Get-DysonConfigurationTransactionState {
     $unknownConfigEntries = @(Get-ChildItem -LiteralPath $Storage.configRoot -Force |
         Where-Object {
             $_.Name -cne $script:DysonConfigurationFileName -and
+            $_.Name -cne $script:DysonConfigurationRuntimeApprovalName -and
             $_.Name -notlike '.dyson-control.env.partial-*' -and
             $_.Name -notlike '.dyson-control.env.preimage-*'
         })
@@ -2424,6 +2426,14 @@ function Invoke-DysonConfigurationMutationTransaction {
     $lock = Enter-DysonConfigurationMutationLock -Storage $Storage `
         -TimeoutSeconds $LockTimeoutSeconds
     try {
+        # Runtime readers cannot inspect the administrator-only journal. Revoke
+        # its read-only approval before any intent or configuration publication.
+        $approvalPath = Join-Path $Storage.configRoot $script:DysonConfigurationRuntimeApprovalName
+        if (Test-Path -LiteralPath $approvalPath) {
+            [void](Assert-DysonConfigurationPlainFilePath -Path $approvalPath -MaximumBytes 65536)
+            [void](Assert-DysonConfigurationAcl -Path $approvalPath -Kind ConfigFile -ServiceSid $ServiceSid)
+            [System.IO.File]::Delete((ConvertTo-DysonConfigurationExtendedPath $approvalPath))
+        }
         if ($null -ne $PreimageSnapshot) {
             $refreshedPreimageSnapshot = Read-DysonConfigurationSnapshotInternal `
                 -SnapshotPath ([string]$PreimageSnapshot.snapshotPath) -Contract $Contract `
@@ -2680,6 +2690,10 @@ function Invoke-DysonConfigurationMutationTransaction {
         elseif ($null -ne $targetEvidence -or (Test-Path -LiteralPath $Storage.configurationPath)) {
             throw 'DYSON_CONFIGURATION_RECOVERY_ABORT_TARGET_INVALID'
         }
+        if ($null -ne $targetEvidence -and $receiptState -cne 'aborted') {
+            Publish-DysonConfigurationRuntimeApproval -Storage $Storage -Contract $Contract `
+                -ExpectedLauncherBindings $ExpectedLauncherBindings -ServiceSid $ServiceSid -TransactionState $finalState
+        }
         if ($null -eq $targetEvidence) {
             $targetEvidence = [pscustomobject][ordered]@{
                 sha256 = Get-DysonConfigurationSha256Bytes ([byte[]]::new(0))
@@ -2702,4 +2716,104 @@ function Invoke-DysonConfigurationMutationTransaction {
         }
     }
     finally { $lock.Dispose() }
+}
+
+function Publish-DysonConfigurationRuntimeApproval {
+    param($Storage, $Contract, [hashtable]$ExpectedLauncherBindings, [string]$ServiceSid, $TransactionState)
+    if (-not $TransactionState.clean -or $TransactionState.receipts.Count -lt 1) {
+        throw 'DYSON_CONFIGURATION_TRANSACTION_NOT_CLEAN'
+    }
+    $configuration = Read-DysonControlEnvironmentFile -Path $Storage.configurationPath `
+        -Contract $Contract -ExpectedLauncherBindings $ExpectedLauncherBindings -SkipSourceAcl
+    try {
+        $acl = Assert-DysonConfigurationAcl -Path $Storage.configurationPath -Kind ConfigFile -ServiceSid $ServiceSid
+        $snapshotCount = Assert-DysonConfigurationSnapshotInventory -Storage $Storage -Contract $Contract -ServiceSid $ServiceSid
+        $approval = [ordered]@{
+            protocol = 'DYSON_CONTROL_CONFIGURATION_RUNTIME_APPROVAL_V1'
+            configurationSha256 = [string]$configuration.sha256
+            configurationLength = [int64]$configuration.length
+            namesSha256 = [string]$configuration.namesSha256
+            bindingsSha256 = [string]$configuration.bindingsSha256
+            contractSha256 = [string]$Contract.sha256
+            configurationAclFingerprint = [string]$acl.fingerprint
+            configurationPathSha256 = Get-DysonConfigurationPathBindingSha256 $Storage.configurationPath
+            serviceSid = $ServiceSid
+            completedTransactionCount = [int]$TransactionState.receipts.Count
+            transactionChainHeadSha256 = [string]$TransactionState.chainHeadSha256
+            protectedSnapshotCount = [int]$snapshotCount
+        }
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($approval | ConvertTo-Json -Compress))
+        [void](Write-DysonConfigurationStagedFile `
+            -Path (Join-Path $Storage.configRoot $script:DysonConfigurationRuntimeApprovalName) `
+            -Bytes $bytes -ServiceSid $ServiceSid)
+    }
+    finally {
+        if ($configuration.privateBytes) { [Array]::Clear($configuration.privateBytes, 0, $configuration.privateBytes.Length) }
+        if ($configuration.privateValues) { $configuration.privateValues.Clear() }
+    }
+}
+
+function Test-DysonConfigurationRuntimeApproval {
+    param($Storage, $Contract, [hashtable]$ExpectedLauncherBindings, [string]$ServiceSid, $ParentAcl)
+    [void](Assert-DysonConfigurationAcl -Path $Storage.configRoot -Kind ConfigDirectory -ServiceSid $ServiceSid)
+    $approvalPath = Join-Path $Storage.configRoot $script:DysonConfigurationRuntimeApprovalName
+    [void](Assert-DysonConfigurationPlainFilePath -Path $approvalPath -MaximumBytes 65536)
+    [void](Assert-DysonConfigurationAcl -Path $approvalPath -Kind ConfigFile -ServiceSid $ServiceSid)
+    $bytes = [IO.File]::ReadAllBytes((ConvertTo-DysonConfigurationExtendedPath $approvalPath))
+    try { $approval = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) | ConvertFrom-Json }
+    catch { throw 'DYSON_CONFIGURATION_RUNTIME_APPROVAL_INVALID' }
+    Assert-DysonConfigurationExactProperties -Value $approval -Expected @(
+        'protocol', 'configurationSha256', 'configurationLength', 'namesSha256', 'bindingsSha256',
+        'contractSha256', 'configurationAclFingerprint', 'configurationPathSha256', 'serviceSid',
+        'completedTransactionCount', 'transactionChainHeadSha256', 'protectedSnapshotCount'
+    )
+    foreach ($field in @('configurationLength', 'completedTransactionCount', 'protectedSnapshotCount')) {
+        if ($approval.$field -isnot [int] -and $approval.$field -isnot [long]) {
+            throw 'DYSON_CONFIGURATION_RUNTIME_APPROVAL_INVALID'
+        }
+    }
+    $configuration = Read-DysonControlEnvironmentFile -Path $Storage.configurationPath `
+        -Contract $Contract -ExpectedLauncherBindings $ExpectedLauncherBindings -SkipSourceAcl
+    try {
+        $acl = Assert-DysonConfigurationAcl -Path $Storage.configurationPath -Kind ConfigFile -ServiceSid $ServiceSid
+        if ($approval.protocol -cne 'DYSON_CONTROL_CONFIGURATION_RUNTIME_APPROVAL_V1' -or
+            $approval.serviceSid -cne $ServiceSid -or $approval.completedTransactionCount -lt 1 -or
+            $approval.protectedSnapshotCount -lt 0 -or
+            $approval.transactionChainHeadSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $approval.configurationSha256 -cne $configuration.sha256 -or
+            $approval.configurationLength -ne $configuration.length -or
+            $approval.namesSha256 -cne $configuration.namesSha256 -or
+            $approval.bindingsSha256 -cne $configuration.bindingsSha256 -or
+            $approval.contractSha256 -cne $Contract.sha256 -or
+            $approval.configurationAclFingerprint -cne $acl.fingerprint -or
+            $approval.configurationPathSha256 -cne (Get-DysonConfigurationPathBindingSha256 $Storage.configurationPath)) {
+            throw 'DYSON_CONFIGURATION_RUNTIME_APPROVAL_MISMATCH'
+        }
+        $after = [IO.File]::ReadAllBytes((ConvertTo-DysonConfigurationExtendedPath $approvalPath))
+        [void](Assert-DysonConfigurationAcl -Path $approvalPath -Kind ConfigFile -ServiceSid $ServiceSid)
+        if ((Get-DysonConfigurationSha256Bytes $after) -cne (Get-DysonConfigurationSha256Bytes $bytes)) {
+            throw 'DYSON_CONFIGURATION_RUNTIME_APPROVAL_CHANGED'
+        }
+        return [pscustomobject][ordered]@{
+            protocol = 'DYSON_CONTROL_CONFIGURATION_RUNTIME_TEST_RESULT_V1'
+            healthy = $true
+            configurationSha256 = [string]$configuration.sha256
+            configurationLength = [int64]$configuration.length
+            namesSha256 = [string]$configuration.namesSha256
+            bindingsSha256 = [string]$configuration.bindingsSha256
+            contractSha256 = [string]$Contract.sha256
+            configurationAclFingerprint = [string]$acl.fingerprint
+            parentAclFingerprint = [string]$ParentAcl.fingerprint
+            completedTransactionCount = [int]$approval.completedTransactionCount
+            transactionChainHeadSha256 = [string]$approval.transactionChainHeadSha256
+            protectedSnapshotCount = [int]$approval.protectedSnapshotCount
+            snapshot = $null
+            restorePlan = $null
+            mutationPerformed = $false
+        }
+    }
+    finally {
+        if ($configuration.privateBytes) { [Array]::Clear($configuration.privateBytes, 0, $configuration.privateBytes.Length) }
+        if ($configuration.privateValues) { $configuration.privateValues.Clear() }
+    }
 }

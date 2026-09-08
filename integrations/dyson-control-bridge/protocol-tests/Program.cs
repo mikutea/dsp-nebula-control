@@ -291,6 +291,7 @@ namespace DysonControl.Bridge
             Assert(heartbeat == HeartbeatPayload, "heartbeat serialization");
             TestLoadedSaveEvidenceProtocol();
             TestLoadedSaveEvidencePublisherAndFaults();
+            TestLoadedSaveOriginLifecycle();
             TestSimulationTelemetryProtocol();
             TestSimulationTelemetrySampler();
 
@@ -866,6 +867,124 @@ namespace DysonControl.Bridge
             };
         }
 
+        private static void TestLoadedSaveOriginLifecycle()
+        {
+            var root = Path.Combine(Path.GetTempPath(), "dyson-loaded-origin-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            try
+            {
+                var dsv = Path.Combine(root, "_lastexit_.dsv");
+                var server = Path.Combine(root, "_lastexit_.server");
+                File.WriteAllText(dsv, "fictional imported game data");
+                File.WriteAllText(server, "fictional server state");
+                var files = ObserveLoadedPair(dsv, server, BridgeProtocol.LastExitSaveName);
+                // Normal DSP import may retain an empty or unrelated internal
+                // gameName. Only the successful load argument supplies the slot.
+                object data = new { gameName = "unrelated imported name" };
+                object session = new object();
+                var tracker = new LoadedSaveOriginTracker();
+                Assert(!tracker.TryObserve(data, session, true, out _), "an unobserved historical load stays unknown");
+                var attempt = tracker.BeginLoad();
+                tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, data, session, files);
+                Assert(!tracker.TryObserve(data, session, false, out _), "load waits for Nebula game-begin readiness");
+                Assert(tracker.TryObserve(data, session, true, out var slot) && slot == BridgeProtocol.LastExitSaveName,
+                    "successful load argument overrides no imported payload fields");
+                Assert(tracker.TryMatchFiles(data, session, files, out _), "loaded origin binds the complete pair metadata");
+                Assert(!tracker.TryObserve(new object(), session, true, out _) &&
+                       !tracker.TryObserve(data, session, true, out _), "data instance replacement permanently revokes the origin");
+
+                attempt = tracker.BeginLoad();
+                tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, data, session, files);
+                Assert(!tracker.TryObserve(data, new object(), true, out _) &&
+                       !tracker.TryObserve(data, session, true, out _), "session replacement cannot reuse a loaded origin");
+                attempt = tracker.BeginLoad();
+                tracker.CompleteLoad(attempt, false, BridgeProtocol.LastExitSaveName, data, session, files);
+                Assert(!tracker.TryObserve(data, session, true, out _), "failed load cannot retain an earlier origin");
+                attempt = tracker.BeginLoad();
+                tracker.CompleteLoad(attempt, true, "manual-save", data, session, files);
+                Assert(!tracker.TryObserve(data, session, true, out _), "successful unmanaged-slot load revokes managed evidence");
+                var outer = tracker.BeginLoad();
+                var inner = tracker.BeginLoad();
+                tracker.CompleteLoad(inner, true, BridgeProtocol.LastExitSaveName, data, session, files);
+                tracker.CompleteLoad(outer, true, BridgeProtocol.LastExitSaveName, data, session, files);
+                Assert(!tracker.TryObserve(data, session, true, out _), "reentrant loads do not choose an ambiguous successful origin");
+                attempt = tracker.BeginLoad();
+                tracker.Invalidate();
+                tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, data, session, files);
+                Assert(!tracker.TryObserve(data, session, true, out _), "new-game invalidation during a load blocks its late completion");
+                attempt = tracker.BeginLoad();
+                tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, data, session, files);
+                Assert(tracker.TryObserve(data, session, true, out _), "a fresh non-reentrant load can recover");
+                tracker.Invalidate();
+                Assert(!tracker.TryObserve(data, session, true, out _), "new game on the same data instance cannot retain evidence");
+                attempt = tracker.BeginLoad();
+                tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, data, session, files);
+                Assert(tracker.TryObserve(data, session, true, out _), "fresh origin ready");
+                Assert(!tracker.TryObserve(data, session, false, out _) &&
+                       !tracker.TryObserve(data, session, true, out _), "loss of established host readiness requires another successful load");
+                var emptyNamedData = new { gameName = "" };
+                attempt = tracker.BeginLoad();
+                tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, emptyNamedData, session, files);
+                Assert(tracker.TryObserve(emptyNamedData, session, true, out slot) && slot == BridgeProtocol.LastExitSaveName,
+                    "empty imported gameName does not erase a successful load argument");
+                tracker.Invalidate();
+                tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, emptyNamedData, session, files);
+                Assert(!tracker.TryObserve(emptyNamedData, session, true, out _),
+                    "late completion cannot revive a finalizer-invalidated generation");
+                attempt = tracker.BeginLoad();
+                tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, data, session, null);
+                Assert(!tracker.TryObserve(data, session, true, out _), "successful load without a complete pair has no origin proof");
+
+                attempt = tracker.BeginLoad();
+                tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, data, session, files);
+                var writes = 0;
+                var removals = 0;
+                TryObserveLoadedSave observe = delegate(out LoadedSaveObservation current)
+                {
+                    current = null;
+                    return tracker.TryObserve(data, session, true, out var observedName) &&
+                           tracker.TryMatchFiles(data, session, ObserveLoadedPair(dsv, server, observedName), out current);
+                };
+                using (var publisher = new LoadedSaveEvidencePublisher(observe, _ => writes++, () => removals++,
+                           "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "0.1.0", 4242,
+                           1788080000000, 1788081000000, startHash: work => Task.FromResult(work())))
+                {
+                    Assert(!publisher.Tick(1788081001000) && publisher.Tick(1788081001001) && writes == 1,
+                        "successful load publishes its pinned pair after hashing");
+                    var removalsBefore = removals;
+                    attempt = tracker.BeginLoad();
+                    publisher.InvalidateLoadedOrigin();
+                    Assert(removals == removalsBefore + 1, "load prefix revokes evidence before a later Update");
+                    tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, data, session, files);
+                    Assert(!publisher.Tick(1788081002000) && publisher.Tick(1788081002001), "new real load can republish unchanged files");
+                    File.AppendAllText(dsv, " saved after load");
+                    Assert(!publisher.Tick(1788081003000) && !publisher.Tick(1788081005000) && writes == 2,
+                        "a subsequent save does not turn new disk bytes into a loaded-generation proof");
+                    attempt = tracker.BeginLoad();
+                    tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, data, session,
+                        ObserveLoadedPair(dsv, server, BridgeProtocol.LastExitSaveName));
+                    Assert(!publisher.Tick(1788081006000) && publisher.Tick(1788081006001) && writes == 3,
+                        "only a new successful load rebinds changed file metadata");
+                }
+                var pendingHash = new TaskCompletionSource<LoadedSaveHashResult>();
+                var staleHashWrites = 0;
+                using (var publisher = new LoadedSaveEvidencePublisher(observe, _ => staleHashWrites++, () => { },
+                           "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", "0.1.0", 4242,
+                           1788080000000, 1788081000000, startHash: _ => pendingHash.Task))
+                {
+                    Assert(!publisher.Tick(1788081007000), "generation fixture starts asynchronous hashing");
+                    attempt = tracker.BeginLoad();
+                    publisher.InvalidateLoadedOrigin();
+                    tracker.CompleteLoad(attempt, true, BridgeProtocol.LastExitSaveName, data, session,
+                        ObserveLoadedPair(dsv, server, BridgeProtocol.LastExitSaveName));
+                    pendingHash.SetResult(LoadedSavePairHasher.Capture(ObserveLoadedPair(dsv, server, BridgeProtocol.LastExitSaveName)));
+                    Assert(!publisher.Tick(1788081007001) && staleHashWrites == 0,
+                        "a pre-load hash completion cannot publish into a new generation even with identical files");
+                }
+            }
+            finally { Directory.Delete(root, true); }
+        }
+
         private static void TestSimulationTelemetryProtocol()
         {
             var runtimeSession = new BridgeRuntimeSession
@@ -951,6 +1070,17 @@ namespace DysonControl.Bridge
                 "telemetry sampler resets while simulation is unavailable");
             Assert(sampler.Observe(true, 1300, 60, 1788081008000, 8000) == null,
                 "telemetry sampler requires a fresh post-unavailable baseline");
+
+            Assert(sampler.Observe(true, 1300, 60, 1788081010000, 10000, true) == null,
+                "reported pause without tick progress suppresses frame-only telemetry");
+            var dedicated = sampler.Observe(true, 1420, 59.9, 1788081012000, 12000, true);
+            Assert(dedicated != null && dedicated.TpsMilli == 60000 && dedicated.UpsMilli == 59900,
+                "dedicated host advancing ticks is measured despite vanilla pause flag");
+            Assert(sampler.Observe(true, 1420, 60, 1788081014000, 14000, true) == null,
+                "return to an actual pause stops telemetry publication");
+            var resumed = sampler.Observe(true, 1540, 60, 1788081016000, 16000, false);
+            Assert(resumed != null && resumed.TpsMilli == 60000 && resumed.WindowDurationMs == 2000,
+                "resume excludes the preceding paused window");
         }
 
         private static void TestImmediateTupleStability()

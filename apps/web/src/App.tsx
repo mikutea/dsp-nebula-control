@@ -2534,8 +2534,8 @@ export function ServerObservabilityWorkspace({ canAcknowledge = false }: { canAc
             ? snapshot.runtime.gamePort.listening.value ? 'good' : 'critical'
             : 'unknown'} />
         <ObservabilityMetricCard icon={Gauge} eyebrow="SIMULATION / ACTUAL"
-          value={`UPS ${formatObserved(snapshot.simulation.ups, compactNumber)} · TPS ${formatObserved(snapshot.simulation.tps, compactNumber)}`}
-          detail={`配置目标 ${formatObserved(snapshot.simulation.targetUps, (value) => `${compactNumber(value)} UPS`)} · 目标值不作为实测值`} />
+          value={`UPS ${snapshot.simulation.ups.status === 'available' ? compactNumber(snapshot.simulation.ups.value) : '暂无有效采样'} · TPS ${snapshot.simulation.tps.status === 'available' ? compactNumber(snapshot.simulation.tps.value) : '暂无有效采样'}`}
+          detail={`配置目标 ${formatObserved(snapshot.simulation.targetUps, (value) => `${compactNumber(value)} UPS`)} · ${snapshot.simulation.ups.status === 'unavailable' || snapshot.simulation.tps.status === 'unavailable' ? '游戏暂停或尚未形成有效采样时不显示实测值' : '目标值不作为实测值'}`} />
       </div>
 
       <div className="observability-grid">

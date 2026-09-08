@@ -363,6 +363,28 @@ function Get-DysonGsTextSha256 {
     finally { $hasher.Dispose() }
 }
 
+function Sort-DysonGsInventoryEntriesOrdinal {
+    param(
+        [Parameter(Mandatory)]$Entries,
+        [switch]$IncludeKind
+    )
+
+    $keys = New-Object 'System.Collections.Generic.List[string]'
+    $entryByKey = [System.Collections.Generic.Dictionary[string,object]]::new([System.StringComparer]::Ordinal)
+    foreach ($entry in $Entries) {
+        $key = [string]$entry.path
+        if ($IncludeKind) { $key += [char]0 + [string]$entry.kind }
+        if ($entryByKey.ContainsKey($key)) { throw 'The migration inventory contains a duplicate ordinal sort key.' }
+        $entryByKey.Add($key, $entry)
+        [void]$keys.Add($key)
+    }
+    $orderedKeys = [string[]]$keys.ToArray()
+    [System.Array]::Sort($orderedKeys, [System.StringComparer]::Ordinal)
+    $ordered = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($key in $orderedKeys) { [void]$ordered.Add($entryByKey[$key]) }
+    return @($ordered.ToArray())
+}
+
 function ConvertTo-DysonGsCanonicalSecurityDescriptorSddl {
     param([Parameter(Mandatory)][string]$SecurityDescriptorSddl)
 
@@ -507,7 +529,7 @@ function Get-DysonGsFileSystemTopologyEntries {
             if ($entries.Count -gt $MaximumEntries) { throw 'The filesystem metadata inventory exceeds its entry limit.' }
         }
     }
-    return @($entries | Sort-Object -Property @{ Expression = { $_.path } }, @{ Expression = { $_.kind } } -CaseSensitive)
+    return @(Sort-DysonGsInventoryEntriesOrdinal -Entries $entries -IncludeKind)
 }
 
 function Get-DysonGsFileSystemSecurityInventory {
@@ -810,7 +832,7 @@ function Get-DysonGsTreeInventory {
             })
         }
     }
-    $ordered = @($entries | Sort-Object -Property @{ Expression = { $_.path } } -CaseSensitive)
+    $ordered = @(Sort-DysonGsInventoryEntriesOrdinal -Entries $entries)
     return [pscustomobject][ordered]@{
         entries = $ordered
         fileCount = [int]$ordered.Count

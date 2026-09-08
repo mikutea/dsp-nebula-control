@@ -1,4 +1,4 @@
-[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+﻿[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory)][string]$RequestId,
     [Parameter(Mandatory)][string]$BrokerRoot,
@@ -136,6 +136,7 @@ function Set-InstallerFileAtomic {
     $temporary = $null
     $replacementBackup = $null
     $stream = $null
+    $fileSddl = $null
     try {
         if ($Bytes.Length -lt 1 -or $Bytes.Length -gt $MaximumBytes) { throw 'invalid bytes' }
         $directory = Assert-DysonCutoverBrokerPlainDirectory ([IO.Path]::GetDirectoryName($Path))
@@ -143,6 +144,7 @@ function Set-InstallerFileAtomic {
         if (-not (Test-DysonCutoverBrokerSamePath $expected $Path)) { throw 'invalid destination' }
         if (Test-DysonCutoverBrokerPathExists $expected) {
             [void](Assert-DysonCutoverBrokerPlainFile $expected $MaximumBytes)
+            $fileSddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $expected -ErrorAction Stop).Sddl
         }
         $temporary = Join-Path $directory ('.broker-' + [guid]::NewGuid().ToString('N') + '.tmp')
         $stream = [IO.FileStream]::new(
@@ -175,6 +177,7 @@ function Set-InstallerFileAtomic {
         }
         $temporary = $null
         $persisted = Assert-DysonCutoverBrokerPlainFile $expected $MaximumBytes
+        if ($null -ne $fileSddl) { Restore-DysonCutoverBrokerFileSecurityPreimage -Path $persisted -Sddl $fileSddl }
         if ([Convert]::ToBase64String([IO.File]::ReadAllBytes(
                 (ConvertTo-DysonCutoverBrokerExtendedPath $persisted)
             )) -cne [Convert]::ToBase64String($Bytes)) {
@@ -476,6 +479,8 @@ function New-InstallerBrokerProfile {
         installerScriptSha256 = Get-DysonCutoverBrokerSha256File (Join-Path $Scripts 'Install-DysonCutoverBrokerTask.ps1')
         workerScriptSha256 = Get-DysonCutoverBrokerSha256File (Join-Path $Scripts 'Invoke-DysonCutoverBrokerWorker.ps1')
         submitScriptSha256 = Get-DysonCutoverBrokerSha256File (Join-Path $Scripts 'Submit-DysonCutoverBrokerRequest.ps1')
+        previousStopScriptSha256 = Get-DysonCutoverBrokerSha256File (Join-Path $CutoverRoot 'Stop-DysonServer.ps1')
+        cutoverEvidenceScriptSha256 = Get-DysonCutoverBrokerSha256File (Join-Path $CutoverRoot 'cutover\Get-DysonCutoverEvidence.ps1')
     }
     $profile = [ordered]@{}
     foreach ($property in $core.PSObject.Properties) { $profile[$property.Name] = $property.Value }
@@ -968,11 +973,7 @@ try {
                     try {
                         Set-InstallerFileAtomic -Path $storage.profileFile -Bytes $oldProfileBytes `
                             -MaximumBytes $script:DysonCutoverBrokerMaximumProfileBytes
-                        $restoredProfileAcl = Microsoft.PowerShell.Security\Get-Acl `
-                            -LiteralPath $storage.profileFile -ErrorAction Stop
-                        $restoredProfileAcl.SetSecurityDescriptorSddlForm($profileSddl)
-                        Microsoft.PowerShell.Security\Set-Acl -LiteralPath $storage.profileFile `
-                            -AclObject $restoredProfileAcl -ErrorAction Stop
+                        Restore-DysonCutoverBrokerFileSecurityPreimage -Path $storage.profileFile -Sddl $profileSddl
                     }
                     catch { $compensationRollbackFailures.Add('profile') }
                 }
@@ -980,11 +981,7 @@ try {
                     try {
                         Set-InstallerFileAtomic -Path $bundleBindingPath -Bytes $oldBundleBindingBytes `
                             -MaximumBytes $script:DysonCutoverBrokerMaximumProfileBytes
-                        $restoredBindingAcl = Microsoft.PowerShell.Security\Get-Acl `
-                            -LiteralPath $bundleBindingPath -ErrorAction Stop
-                        $restoredBindingAcl.SetSecurityDescriptorSddlForm($bundleBindingSddl)
-                        Microsoft.PowerShell.Security\Set-Acl -LiteralPath $bundleBindingPath `
-                            -AclObject $restoredBindingAcl -ErrorAction Stop
+                        Restore-DysonCutoverBrokerFileSecurityPreimage -Path $bundleBindingPath -Sddl $bundleBindingSddl
                     }
                     catch { $compensationRollbackFailures.Add('bundle-binding') }
                 }

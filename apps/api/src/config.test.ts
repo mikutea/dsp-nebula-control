@@ -52,17 +52,31 @@ describe('production configuration', () => {
     expect(() => loadConfig({ NODE_ENV: 'test', DYSON_PROVIDER: 'windows' })).toThrow(/DYSON_PROJECT_ROOT/)
   })
 
+  it('allows private Bridge storage outside the game share without enabling mutations', () => {
+    const config = loadConfig({
+      NODE_ENV: 'test',
+      DYSON_PROVIDER: 'windows',
+      DYSON_PROJECT_ROOT: 'Y:\\Fictional\\Game',
+      DYSON_BRIDGE_CONTROL_ROOT: 'C:\\ProgramData\\ExampleBridge\\control',
+      DYSON_BRIDGE_SECRET_FILE: 'C:\\ProgramData\\ExampleBridge\\bridge.secret'
+    })
+    expect(config.projectRoot).toBe('Y:\\Fictional\\Game')
+    expect(config.bridgeControlRoot).toBe('C:\\ProgramData\\ExampleBridge\\control')
+    expect(config.bridgeSecretFile).toBe('C:\\ProgramData\\ExampleBridge\\bridge.secret')
+    expect(config.lifecycleEnabled).toBe(false)
+  })
+
   it('accepts only a bounded deployment release identifier', () => {
     expect(loadConfig({
-      NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: 'v0.1.0-rc.2+fixture'
-    }).deploymentVersion).toBe('v0.1.0-rc.2+fixture')
+      NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: 'v0.1.0-rc.14+fixture'
+    }).deploymentVersion).toBe('v0.1.0-rc.14+fixture')
     expect(() => loadConfig({
       NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: '../untrusted release'
     })).toThrow()
   })
 
   it('defaults the expected Bridge heartbeat to the full repository release version', () => {
-    expect(loadConfig({ NODE_ENV: 'test' }).bridgePluginVersion).toBe('0.1.0-rc.1')
+    expect(loadConfig({ NODE_ENV: 'test' }).bridgePluginVersion).toBe('0.1.0-rc.14')
   })
 
   it('keeps player notices disabled and validates the closed mutation gate', () => {

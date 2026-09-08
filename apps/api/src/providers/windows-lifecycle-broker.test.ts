@@ -20,6 +20,22 @@ const leaseBorrowFixture = 'A'.repeat(43)
 const requestFingerprint = 'c'.repeat(64)
 
 describe('fixed Windows lifecycle broker client', () => {
+  it('validates optional process telemetry and rejects mismatched identity or generation ordering', async () => {
+    const sample = { processId: 2202, startedAtUnixMs: 1_000, sampledAtUnixMs: 2_000,
+      processCoresUsed: 0.5, workingSetGiB: 1, privateMemoryGiB: 2, threadCount: 3 }
+    for (const patch of [null, { processId: 2203 }, { startedAtUnixMs: 3_000 },
+      { threadCount: -1 }, { privateMemoryGiB: null }]) {
+      const harness = createHarness()
+      harness.runner.respond = (call) => {
+        const result = resultFor(call)
+        result.receipt.evidence = { ...statusEvidence(), processTelemetry: { ...sample, ...patch } }
+        return JSON.stringify(result)
+      }
+      const read = harness.client.status({ signal: new AbortController().signal })
+      if (patch === null) expect((await read).processTelemetry).toEqual(sample)
+      else await expect(read).rejects.toMatchObject({ code: 'WINDOWS_LIFECYCLE_BROKER_RESULT_INVALID' })
+    }
+  })
   it('uses only the fixed submit script and derives stable purpose-bound request IDs', async () => {
     const harness = createHarness()
     const signal = new AbortController().signal

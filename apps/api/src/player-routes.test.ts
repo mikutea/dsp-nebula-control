@@ -354,7 +354,8 @@ describe('player roster route', () => {
   it('reuses the durable player cursor after an application restart', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'dyson-player-route-restart-'))
     temporaryDirectories.push(directory)
-    const writtenAtUnixMs = Date.parse('2026-08-31T02:00:00.000Z')
+    // Keep the event inside the real retention window; this test exercises restart cursors.
+    const writtenAtUnixMs = Date.now()
     const active = buildPlayerSnapshot({
       sessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
       writtenAtUnixMs,

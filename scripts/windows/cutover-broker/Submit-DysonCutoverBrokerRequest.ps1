@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$BrokerRoot,
     [Parameter(Mandatory)][string]$BrokerProfileFile,
@@ -14,10 +14,11 @@ param(
     [Parameter(Mandatory)][string]$RuntimeTaskTransactionRoot,
     [Parameter(Mandatory)][string]$ServiceUser,
     [Parameter(Mandatory)][int]$GamePort,
-    [Parameter(Mandatory)][string]$LeaseInstanceId,
-    [Parameter(Mandatory)][string]$LeaseToken,
+    [string]$LeaseInstanceId = '',
+    [string]$LeaseToken = '',
     [ValidateSet('PrepareDisabled', 'Activate')][string]$CandidateMode,
     [switch]$CandidateRecover,
+    [switch]$PreviousStopReconcileOnly,
     [ValidateRange(10, 300)][int]$TimeoutSeconds = 120,
     [ValidateSet('Windows', 'Shadow')][string]$SchedulerBackend = 'Windows',
     [string]$ShadowRoot
@@ -26,6 +27,36 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+
+function Start-SubmitBoundBrokerTask {
+    param([Parameter(Mandatory)]$Profile, [switch]$OnlyIfIdle)
+        try {
+            $matches = @(Get-ScheduledTask -TaskName $profile.taskName -TaskPath $profile.taskPath -ErrorAction Stop)
+            if ($matches.Count -ne 1) { throw 'task count' }
+            $task = $matches[0]
+            if ([string]$task.TaskName -cne $profile.taskName -or [string]$task.TaskPath -cne $profile.taskPath -or
+                [string]$task.Principal.UserId -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -or
+                [string]$task.Principal.LogonType -cne 'ServiceAccount' -or
+                [string]$task.Principal.RunLevel -cne 'Highest' -or
+                [string]$task.State -ceq 'Disabled') {
+                throw 'task principal'
+            }
+            $actions = @($task.Actions)
+            $expectedPowerShell = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+            if ($actions.Count -ne 1 -or
+                -not [string]::Equals(
+                    [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$actions[0].Execute)),
+                    $expectedPowerShell,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -or [string]$actions[0].Arguments -cne (Get-DysonCutoverBrokerTaskArguments $profile)) {
+                throw 'task action'
+            }
+        }
+        catch { Throw-DysonCutoverBrokerError 'DYSON_CONTROL_CUTOVER_BROKER_TASK_INVALID' }
+        if ($OnlyIfIdle -and [string]$task.State -in @('Running','Queued')) { return }
+        try { Start-ScheduledTask -TaskName $profile.taskName -TaskPath $profile.taskPath -ErrorAction Stop }
+        catch { Throw-DysonCutoverBrokerError 'DYSON_CONTROL_CUTOVER_BROKER_TASK_TRIGGER_FAILED' }
+}
 
 try {
     $commonPath = Join-Path $PSScriptRoot 'DysonCutoverBroker.Common.ps1'
@@ -58,7 +89,7 @@ try {
         -CutoverScriptRoot $CutoverScriptRoot -RuntimeBootstrapRoot $RuntimeBootstrapRoot `
         -RuntimeTaskTransactionRoot $RuntimeTaskTransactionRoot -ServiceUser $ServiceUser `
         -GamePort $GamePort -LeaseInstanceId $LeaseInstanceId -LeaseToken $LeaseToken `
-        -CandidateMode $candidateModeValue -CandidateRecover ([bool]$CandidateRecover)
+        -CandidateMode $candidateModeValue -CandidateRecover ([bool]$CandidateRecover) -PreviousStopReconcileOnly ([bool]$PreviousStopReconcileOnly)
     Assert-DysonCutoverBrokerRequestBinding -Request $request -Profile $profile
 
     $storage = Get-DysonCutoverBrokerStorage $profile.brokerRoot
@@ -106,35 +137,10 @@ try {
             -BrokerRoot $profile.brokerRoot -BrokerProfileFile $storage.profileFile `
             -SchedulerBackend Shadow -ShadowRoot $shadow -OnceBrokerRequestId $request.brokerRequestId | Out-Null
     }
-    else {
-        try {
-            $matches = @(Get-ScheduledTask -TaskName $profile.taskName -TaskPath $profile.taskPath -ErrorAction Stop)
-            if ($matches.Count -ne 1) { throw 'task count' }
-            $task = $matches[0]
-            if ([string]$task.TaskName -cne $profile.taskName -or [string]$task.TaskPath -cne $profile.taskPath -or
-                [string]$task.Principal.UserId -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -or
-                [string]$task.Principal.LogonType -cne 'ServiceAccount' -or
-                [string]$task.Principal.RunLevel -cne 'Highest' -or
-                [string]$task.State -ceq 'Disabled') {
-                throw 'task principal'
-            }
-            $actions = @($task.Actions)
-            $expectedPowerShell = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
-            if ($actions.Count -ne 1 -or
-                -not [string]::Equals(
-                    [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$actions[0].Execute)),
-                    $expectedPowerShell,
-                    [StringComparison]::OrdinalIgnoreCase
-                ) -or [string]$actions[0].Arguments -cne (Get-DysonCutoverBrokerTaskArguments $profile)) {
-                throw 'task action'
-            }
-        }
-        catch { Throw-DysonCutoverBrokerError 'DYSON_CONTROL_CUTOVER_BROKER_TASK_INVALID' }
-        try { Start-ScheduledTask -TaskName $profile.taskName -TaskPath $profile.taskPath -ErrorAction Stop }
-        catch { Throw-DysonCutoverBrokerError 'DYSON_CONTROL_CUTOVER_BROKER_TASK_TRIGGER_FAILED' }
-    }
+    else { Start-SubmitBoundBrokerTask -Profile $profile }
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $nextReadWake = [DateTime]::UtcNow.AddSeconds(1)
     do {
         $rawReceipt = Read-DysonCutoverBrokerJson -Path $paths.receipt `
             -MaximumBytes $script:DysonCutoverBrokerMaximumReceiptBytes -AllowMissing `
@@ -147,6 +153,12 @@ try {
             (ConvertTo-DysonCutoverBrokerResultEnvelope -Receipt $receipt -Reused $reused) |
                 ConvertTo-Json -Depth 32 -Compress
             exit 0
+        }
+        if ($Capability -ceq 'CutoverEvidence' -and $SchedulerBackend -ceq 'Windows' -and [DateTime]::UtcNow -ge $nextReadWake) {
+            # IgnoreNew can lose the initial wake while the preceding worker exits.
+            # Recheck the fixed task and wake only once it is idle; never replay a mutation.
+            Start-SubmitBoundBrokerTask -Profile $profile -OnlyIfIdle
+            $nextReadWake = [DateTime]::UtcNow.AddSeconds(1)
         }
         Start-Sleep -Milliseconds 100
     } while ((Get-Date) -lt $deadline)

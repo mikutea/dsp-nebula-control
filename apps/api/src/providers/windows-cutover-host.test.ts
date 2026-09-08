@@ -30,11 +30,38 @@ describe('fixed Windows cutover host client', () => {
     const result = await harness.client.inspect({ requestId: id(1), signal: controller.signal })
 
     expect(result).toEqual({ authorityInventoryRevision: revision, evidence: previousEvidence() })
-    expect(harness.runner.calls).toEqual([{
-      scriptName: 'Get-DysonCutoverEvidence.ps1',
-      arguments_: commonArguments(id(1)),
-      signal: controller.signal
-    }])
+    const call = harness.runner.calls[0]!
+    expect(call.scriptName).toBe('Submit-DysonCutoverBrokerRequest.ps1')
+    expect(argument(call.arguments_, '-Capability')).toBe('CutoverEvidence')
+    expect(call.arguments_).not.toContain('-LeaseToken')
+    expect(call.arguments_).not.toContain('-LeaseInstanceId')
+    expect(call.signal).toBe(controller.signal)
+    await harness.client.inspect({ requestId: id(1), signal: controller.signal })
+    expect(argument(harness.runner.calls[1]!.arguments_, '-BrokerRequestId')).not.toBe(argument(call.arguments_, '-BrokerRequestId'))
+  })
+
+  it('uses a new broker generation after lease recovery while retaining the stable stop intent id', async () => {
+    const harness = createHarness()
+    const first = activeScope()
+    const second = activeScope({ borrowArguments: ['-DataRoot', dataRoot, '-LeaseInstanceId', id(91), '-LeaseToken', token()] })
+    await harness.client.stopPreviousRuntime({ requestId: id(2), hostMutation: first.scope })
+    await harness.client.stopPreviousRuntime({ requestId: id(2), hostMutation: second.scope })
+    const calls = harness.runner.calls
+    expect(argument(calls[0]!.arguments_, '-BrokerRequestId')).not.toBe(argument(calls[1]!.arguments_, '-BrokerRequestId'))
+    expect(argument(calls[0]!.arguments_, '-RequestId')).toBe(id(2))
+    expect(argument(calls[1]!.arguments_, '-RequestId')).toBe(id(2))
+  })
+
+  it('binds reconcile-only to a separate request and requires its distinct cleanup receipt', async () => {
+    const harness = createHarness()
+    const active = activeScope()
+    const input = { requestId: id(93), hostMutation: active.scope }
+    await harness.client.stopPreviousRuntime(input)
+    await harness.client.stopPreviousRuntime(input, { reconcileOnly: true })
+    expect(harness.runner.calls[0]!.arguments_).not.toContain('-PreviousStopReconcileOnly')
+    expect(harness.runner.calls[1]!.arguments_).toContain('-PreviousStopReconcileOnly')
+    expect(argument(harness.runner.calls[0]!.arguments_, '-BrokerRequestId')).not.toBe(
+      argument(harness.runner.calls[1]!.arguments_, '-BrokerRequestId'))
   })
 
   it.each([
@@ -488,7 +515,9 @@ class MockRunner implements WindowsCutoverPowerShellRunner {
       const brokerRequestId = argument(arguments_, '-BrokerRequestId')
       const capability = argument(arguments_, '-Capability')
       let childReceipt: Record<string, unknown>
-      if (capability === 'CandidateTaskTransaction') {
+      if (capability === 'CutoverEvidence') {
+        childReceipt = { protocol: 'DYSON_CONTROL_CUTOVER_EVIDENCE_V1', schemaVersion: 1, requestId, authorityInventoryRevision: this.inspectionRevision, evidence: previousEvidence() }
+      } else if (capability === 'CandidateTaskTransaction') {
         childReceipt = {
           protocol: 'DYSON_CONTROL_RUNTIME_TASK_RECEIPT_V2',
           schemaVersion: 2,
@@ -511,7 +540,7 @@ class MockRunner implements WindowsCutoverPowerShellRunner {
           schemaVersion: 1,
           requestId: this.actionRequestId ?? requestId,
           authorityInventoryRevision: revision,
-          action: capability,
+          action: arguments_.includes('-PreviousStopReconcileOnly') ? 'ReconcilePreviousStop' : capability,
           status: 'succeeded'
         }
       }

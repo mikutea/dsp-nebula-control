@@ -780,6 +780,22 @@ export async function buildApplication(
         })
       : null
   )
+  let playerSnapshotRead: Promise<PlayerSnapshot> | null = null
+  let playerSnapshotCached: { value: PlayerSnapshot; readAt: number } | null = null
+  const readCurrentPlayerSnapshot = async (): Promise<PlayerSnapshot> => {
+    if (!playerSnapshotSource) throw new PlayerSnapshotError('PLAYER_SNAPSHOT_NOT_CONFIGURED')
+    if (playerSnapshotCached && Date.now() - playerSnapshotCached.readAt < 1_000 &&
+        Date.now() - playerSnapshotCached.value.writtenAtUnixMs <= config.playerSnapshotMaximumAgeMs) {
+      return playerSnapshotCached.value
+    }
+    if (!playerSnapshotRead) {
+      playerSnapshotRead = playerSnapshotSource.read().then((value) => {
+        playerSnapshotCached = { value, readAt: Date.now() }
+        return value
+      }).finally(() => { playerSnapshotRead = null })
+    }
+    return playerSnapshotRead
+  }
   const playerCapabilitySource = dependencies.playerCapabilitySource ?? (
     config.bridgeControlRoot && config.bridgeSecretFile
       ? new FilePlayerCapabilitySource({
@@ -1522,6 +1538,23 @@ export async function buildApplication(
         lastStatusAcquiredAtUnixMs = Date.now()
       }
       catch { return reply.code(503).send({ error: { code: 'STATUS_UNAVAILABLE', message: '服务器状态暂不可用' } }) }
+    }
+    if (provider.name === 'windows') {
+      let onlinePlayers: number | null = null
+      try {
+        const snapshot = await readCurrentPlayerSnapshot()
+        const age = Date.now() - snapshot.writtenAtUnixMs
+        if (snapshot.state === 'active' && !snapshot.truncated && age >= 0 &&
+            age <= config.playerSnapshotMaximumAgeMs && snapshot.playerCount === snapshot.players.length) {
+          playerHistory.ingest(snapshot)
+          const accepted = playerHistory.authoritative()
+          if (accepted?.sessionId === snapshot.sessionId && accepted.sequence === snapshot.sequence &&
+              accepted.writtenAtUnixMs === snapshot.writtenAtUnixMs && !accepted.truncated) {
+            onlinePlayers = accepted.players.length
+          }
+        }
+      } catch { /* Missing, stale, or unverifiable roster means unknown, never zero. */ }
+      status = { ...status, runtime: { ...status.runtime, onlinePlayers } }
     }
     try { await recordObservability(status) }
     catch { /* Preserve the existing status contract if observability normalization fails. */ }
@@ -2775,7 +2808,7 @@ export async function buildApplication(
       })
     }
     try {
-      const snapshot = await playerSnapshotSource.read()
+      const snapshot = await readCurrentPlayerSnapshot()
       playerHistory.ingest(snapshot)
       const accepted = snapshot.state === 'unavailable' ? null : playerHistory.authoritative()
       if (snapshot.state !== 'unavailable' && accepted === null) {

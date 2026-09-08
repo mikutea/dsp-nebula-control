@@ -15,6 +15,29 @@ function Test-Case([string]$Name,[scriptblock]$Body){
     try{& $Body;Add-Result $Name $true 'ok'}catch{Add-Result $Name $false $_.Exception.Message}
 }
 function Assert-True([bool]$Condition,[string]$Message='assertion-failed'){if(-not $Condition){throw $Message}}
+function Remove-NebulaTransactionSelfTestFixture([string]$Path){
+    $full=[IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+    if(-not $full.StartsWith($temp+'\',[StringComparison]::OrdinalIgnoreCase)-or
+        -not [IO.Path]::GetFileName($full).StartsWith('dyson-nebula-transaction-selftest-',[StringComparison]::Ordinal)){
+        throw 'selftest-cleanup-scope-invalid'
+    }
+    $lastFailure=$null
+    for($attempt=1;$attempt-le 3-and[IO.Directory]::Exists($full);$attempt++){
+        try{
+            [IO.Directory]::Delete(('\\?\'+$full),$true)
+            $lastFailure=$null
+        }
+        catch{
+            $lastFailure=$_.Exception
+            if([IO.Directory]::Exists($full)-and$attempt-lt 3){Start-Sleep -Milliseconds 50}
+        }
+    }
+    if([IO.Directory]::Exists($full)){
+        if($null-ne $lastFailure){throw $lastFailure}
+        throw 'selftest-cleanup-incomplete'
+    }
+}
 function Write-Json([string]$Path,$Value){
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))|Out-Null
     [IO.File]::WriteAllText($Path,(ConvertTo-NebulaPrivateCanonicalJson $Value)+"`n",[Text.UTF8Encoding]::new($false))
@@ -496,11 +519,24 @@ try{
             'NEBULA_PLUGIN_ROLLBACK_SOURCE_CHANGED'
     }
     Test-Case 'maintenance-window-expiry-after-intent-fails-closed' {
-        $s=New-Scenario 'window-expiry';$s.start=[datetimeoffset]::UtcNow.AddMinutes(-1);$s.end=[datetimeoffset]::UtcNow.AddSeconds(6)
+        # Plan/tree hashing and lease creation may take several seconds on a
+        # loaded VM. Complete that preparation before arming the short window;
+        # otherwise this case tests preflight expiry instead of post-intent expiry.
+        $s=New-Scenario 'window-expiry'
         [void](New-Plan $s)
-        $args=Get-ApplyArgs $s $true 'mutation';$args+=@('-TestDelayAfterIntentMilliseconds','7000')
+        [void](Use-ScenarioLease $s 'mutation')
+        $plan=Read-NebulaPluginJson $s.planPath
+        $s.start=[datetimeoffset]::UtcNow.AddMinutes(-1)
+        $s.end=[datetimeoffset]::UtcNow.AddSeconds(8)
+        $plan.maintenanceWindow.startUtc=$s.start.ToString('o')
+        $plan.maintenanceWindow.endUtc=$s.end.ToString('o')
+        Rewrite-PlanDigest $plan $s.request $s.planPath
+        $args=Get-ApplyArgs $s $true 'mutation';$args+=@('-TestDelayAfterIntentMilliseconds','10000')
         Assert-Failure (Invoke-Child (Join-Path $PSScriptRoot 'Invoke-NebulaPluginCutover.ps1') $args) `
             'NEBULA_PLUGIN_COMPENSATION_FAILED'
+        $intentPath=Join-Path $s.game ('BepInEx\.dyson-private-cutover\requests\'+$s.request+'.intent.json')
+        Assert-True (Test-Path -LiteralPath $intentPath -PathType Leaf) 'window-expired-before-durable-intent'
+        [void](Read-NebulaPluginIntent -Path $intentPath)
         [void](Assert-NebulaPluginBoundTree $s.plugins $s.preimage $s.preimageIdentity `
             (Get-NebulaPluginTargetBinding $s.game $s.role).digest 'PREIMAGE_NOT_PRESERVED')
     }
@@ -517,6 +553,22 @@ try{
         [void](Assert-NebulaPluginBoundTree $s.plugins $s.preimage $s.preimageIdentity `
             (Get-NebulaPluginTargetBinding $s.game $s.role).digest 'PREIMAGE_NOT_PRESERVED')
     }
+    Test-Case 'extended-path-selftest-fixture-cleanup' {
+        $probeRoot=Join-Path $temp ('dyson-nebula-transaction-selftest-cleanup-'+[guid]::NewGuid().ToString('N').Substring(0,8))
+        try{
+            $deep=$probeRoot
+            while(($deep+'\probe.bin').Length-le 270){$deep=Join-Path $deep 'deep-cleanup-segment'}
+            [IO.Directory]::CreateDirectory(('\\?\'+$deep))|Out-Null
+            $probe=Join-Path $deep 'probe.bin'
+            [IO.File]::WriteAllText(('\\?\'+$probe),'fixture',[Text.UTF8Encoding]::new($false))
+            Assert-True ($probe.Length-gt 260) 'cleanup-probe-not-extended-length'
+            Remove-NebulaTransactionSelfTestFixture $probeRoot
+            Assert-True (-not[IO.Directory]::Exists($probeRoot)) 'cleanup-probe-remained'
+        }
+        finally{
+            if([IO.Directory]::Exists($probeRoot)){Remove-NebulaTransactionSelfTestFixture $probeRoot}
+        }
+    }
 }
 catch{Add-Result 'selftest-harness' $false $_.Exception.Message}
 finally{
@@ -524,11 +576,8 @@ finally{
         try{Stop-ScenarioLease $scenario 'released'}catch{}
     }
     if($null-ne $fixtureRoot -and (Test-Path -LiteralPath $fixtureRoot)){
-        $full=[IO.Path]::GetFullPath($fixtureRoot);$temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
-        if($full.StartsWith($temp+'\',[StringComparison]::OrdinalIgnoreCase) -and
-            [IO.Path]::GetFileName($full).StartsWith('dyson-nebula-transaction-selftest-',[StringComparison]::Ordinal)){
-            Remove-Item -LiteralPath $full -Recurse -Force
-        }
+        try{Remove-NebulaTransactionSelfTestFixture $fixtureRoot}
+        catch{Add-Result 'selftest-cleanup' $false $_.Exception.GetType().Name}
     }
 }
 $summary=[pscustomobject][ordered]@{protocol='DYSON_NEBULA_PLUGIN_TRANSACTION_SELFTEST_V1';passed=$script:passed

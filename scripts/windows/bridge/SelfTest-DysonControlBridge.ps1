@@ -528,6 +528,39 @@ public static class ControlledDotnetFixture
     Assert-BridgeSelfTest -Condition ($global:DysonBridgeSelfTestAclShadowCalls -eq 0) `
         -Message 'a Bridge ACL operation resolved through an untrusted command shadow'
 
+    $originalConfigBytes = [IO.File]::ReadAllBytes($configPath)
+    $lfConfig = [Text.Encoding]::UTF8.GetString($originalConfigBytes).Replace("`r`n", "`n")
+    try {
+        foreach ($newline in @("`n", "`r`n")) {
+            foreach ($enabled in @($false, $true)) {
+                $text = [regex]::Replace($lfConfig, '(?m)^Enabled = false$',
+                    ('Enabled = ' + $enabled.ToString().ToLowerInvariant())).Replace("`n", $newline)
+                [IO.File]::WriteAllText($configPath, $text, [Text.UTF8Encoding]::new($false))
+                $configHashBefore = Get-DysonBridgeSha256 -Path $configPath
+                $lineEndingResult = Get-LastBridgeJson -Output (& $testScript -DysonServerRoot $serverRoot)
+                Assert-BridgeSelfTest ([bool]$lineEndingResult.ready -and $lineEndingResult.enabled -eq $enabled -and
+                    (Get-DysonBridgeSha256 -Path $configPath) -ceq $configHashBefore) `
+                    'LF/CRLF Bridge configuration failed verification or was rewritten by the read-only validator'
+            }
+        }
+        $controlLine = [regex]::Match($lfConfig, '(?m)^ControlRoot = [^\r\n]+$').Value
+        $secretLine = [regex]::Match($lfConfig, '(?m)^SecretFile = [^\r\n]+$').Value
+        foreach ($invalid in @(
+            @{ name = 'duplicate-enabled'; text = $lfConfig + "`nEnabled = true`n" },
+            @{ name = 'duplicate-invalid-enabled'; text = $lfConfig + "`nEnabled = invalid`n" },
+            @{ name = 'duplicate-control-root'; text = $lfConfig + "`n" + $controlLine + "`n" },
+            @{ name = 'duplicate-secret-file'; text = $lfConfig + "`n" + $secretLine + "`n" },
+            @{ name = 'invalid-enabled-value'; text = $lfConfig.Replace('Enabled = false', 'Enabled = TRUE') },
+            @{ name = 'control-root-drift'; text = $lfConfig.Replace($controlLine, $controlLine + '-drift') },
+            @{ name = 'secret-file-drift'; text = $lfConfig.Replace($secretLine, $secretLine + '-drift') }
+        )) {
+            [IO.File]::WriteAllText($configPath, $invalid.text.Replace("`n", "`r`n"), [Text.UTF8Encoding]::new($false))
+            Assert-BridgeRejected -Action { & $testScript -DysonServerRoot $serverRoot } `
+                -Message ('CRLF configuration accepted ' + $invalid.name)
+        }
+    }
+    finally { [IO.File]::WriteAllBytes($configPath, $originalConfigBytes) }
+
     $beforeRollbackDll = Get-DysonBridgeSha256 -Path $pluginPath
     $beforeRollbackConfig = Get-DysonBridgeSha256 -Path $configPath
     $controlRoot = Join-Path $serverRoot 'BepInEx\dyson-control-bridge'
@@ -599,6 +632,152 @@ public static class ControlledDotnetFixture
     Assert-BridgeSelfTest -Condition ($restored.state -eq 'restored' -and [bool]$restoredVerification.ready) `
         -Message 'the recoverable Bridge uninstall snapshot could not be restored'
 
+    $privateRuntimeContainer = Join-Path $testRoot 'private-runtime-container'
+    $privateRuntimeRoot = Join-Path $privateRuntimeContainer 'current'
+    $privateFailureContainer = Join-Path $testRoot 'private-runtime-failure-container'
+    $privateFailureRoot = Join-Path $privateFailureContainer 'current'
+    $privateServerRoot = Join-Path $testRoot 'private-fictional-dsp-server'
+    [System.IO.Directory]::CreateDirectory($privateServerRoot) | Out-Null
+    [System.IO.File]::Copy((Join-Path $serverRoot 'DSPGAME.exe'), (Join-Path $privateServerRoot 'DSPGAME.exe'), $false)
+    foreach ($reference in @(Get-DysonBridgeReferenceSpecifications)) {
+        $sourceReference = Join-Path $serverRoot ([string]$reference.relativePath)
+        $targetReference = Join-Path $privateServerRoot ([string]$reference.relativePath)
+        [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($targetReference)) | Out-Null
+        [System.IO.File]::Copy($sourceReference, $targetReference, $false)
+    }
+    $privatePluginPath = Join-Path $privateServerRoot ('BepInEx\plugins\dyson-control-bridge\' + $script:DysonBridgeDllName)
+    $privateConfigPath = Join-Path $privateServerRoot ('BepInEx\config\' + $script:DysonBridgeConfigName)
+    $privateStatePath = Join-Path $privateServerRoot ('BepInEx\config\' + $script:DysonBridgeStateName)
+    [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($privatePluginPath)) | Out-Null
+    [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($privateConfigPath)) | Out-Null
+    Assert-BridgeRejected -Action {
+        Assert-DysonBridgePrivateRuntimeRoot -Path '\\untrusted.invalid\share\bridge-runtime\current' `
+            -DysonServerRoot $privateServerRoot -AllowMissing
+    } -Message 'a UNC private runtime root was accepted'
+    $privatePreview = Get-LastBridgeJson -Output (& $installScript -CandidatePath $candidateRoot `
+        -DysonServerRoot $privateServerRoot -PrivateRuntimeRoot $privateRuntimeRoot `
+        -ControlServiceSid $controlServiceSid -GameServiceSid $gameServiceSid -WhatIf 6>$null)
+    Assert-BridgeSelfTest -Condition ($privatePreview.state -eq 'preview' -and
+        $privatePreview.runtimeLayout -eq 'private-ntfs' -and -not (Test-Path -LiteralPath $privateRuntimeContainer)) `
+        -Message 'private NTFS Bridge install WhatIf changed its runtime container'
+
+    $env:DYSON_BRIDGE_ALLOW_SELFTEST_FAILURE = 'true'
+    try {
+        Assert-BridgeRejected -Action {
+            & $installScript -CandidatePath $candidateRoot -DysonServerRoot $privateServerRoot `
+                -PrivateRuntimeRoot $privateFailureRoot -ControlServiceSid $controlServiceSid `
+                -GameServiceSid $gameServiceSid -SelfTestFailureAfterPluginPublish -Confirm:$false
+        } -Message 'the private NTFS install failure hook did not fail'
+    }
+    finally { Remove-Item Env:DYSON_BRIDGE_ALLOW_SELFTEST_FAILURE -ErrorAction SilentlyContinue }
+    Assert-BridgeSelfTest -Condition (
+        -not (Test-Path -LiteralPath $privateFailureContainer) -and
+        -not (Test-Path -LiteralPath $privatePluginPath) -and
+        -not (Test-Path -LiteralPath $privateConfigPath) -and
+        -not (Test-Path -LiteralPath $privateStatePath)
+    ) -Message 'a failed private NTFS Bridge install left runtime or install material'
+
+    $privateInstalled = Get-LastBridgeJson -Output (& $installScript -CandidatePath $candidateRoot `
+        -DysonServerRoot $privateServerRoot -PrivateRuntimeRoot $privateRuntimeRoot `
+        -ControlServiceSid $controlServiceSid -GameServiceSid $gameServiceSid -Confirm:$false)
+    $privateInstallation = Get-LastBridgeJson -Output (& $testScript -DysonServerRoot $privateServerRoot)
+    $privateState = Read-DysonBridgeInstallState -Path $privateStatePath
+    Assert-BridgeSelfTest -Condition ($privateInstalled.state -eq 'installed' -and
+        $privateInstalled.runtimeLayout -eq 'private-ntfs' -and [bool]$privateInstallation.ready -and
+        $privateInstallation.runtimeLayout -eq 'private-ntfs' -and
+        [bool]$privateInstallation.privateRuntimeAclProtected -and [int]$privateState.schemaVersion -eq 3 -and
+        [string]$privateState.runtimeContainer -eq $privateRuntimeContainer -and
+        [string]$privateState.serverRoot -eq $privateServerRoot -and
+        [string]$privateState.runtimeRoot -eq $privateRuntimeRoot -and
+        [string]$privateState.secretPath -eq (Join-Path $privateRuntimeRoot $script:DysonBridgeSecretName) -and
+        [string]$privateState.controlRoot -eq (Join-Path $privateRuntimeRoot 'control')) `
+        -Message 'the private NTFS Bridge layout was not state-bound and verified'
+
+    $privateBeforeFailureDll = Get-DysonBridgeSha256 -Path $privatePluginPath
+    $privateBeforeFailureConfig = Get-DysonBridgeSha256 -Path $privateConfigPath
+    $privateBeforeFailureSecretAcl = Get-DysonBridgeAccessSddl -Path `
+        (Join-Path $privateRuntimeRoot $script:DysonBridgeSecretName)
+    $env:DYSON_BRIDGE_ALLOW_SELFTEST_FAILURE = 'true'
+    try {
+        Assert-BridgeRejected -Action {
+            & $installScript -CandidatePath $candidateRoot -DysonServerRoot $privateServerRoot `
+                -PrivateRuntimeRoot $privateRuntimeRoot -ControlServiceSid $controlServiceSid `
+                -GameServiceSid $gameServiceSid -SelfTestFailureAfterPluginPublish -Confirm:$false
+        } -Message 'the owned private NTFS reinstall failure hook did not fail'
+    }
+    finally { Remove-Item Env:DYSON_BRIDGE_ALLOW_SELFTEST_FAILURE -ErrorAction SilentlyContinue }
+    Assert-BridgeSelfTest -Condition (
+        (Get-DysonBridgeSha256 -Path $privatePluginPath) -eq $privateBeforeFailureDll -and
+        (Get-DysonBridgeSha256 -Path $privateConfigPath) -eq $privateBeforeFailureConfig -and
+        (Get-DysonBridgeAccessSddl -Path (Join-Path $privateRuntimeRoot $script:DysonBridgeSecretName)) -eq
+            $privateBeforeFailureSecretAcl
+    ) -Message 'a failed owned private NTFS reinstall did not restore its bound installation'
+
+    $secondServerRoot = Join-Path $testRoot 'second-fictional-dsp-server'
+    [System.IO.Directory]::CreateDirectory($secondServerRoot) | Out-Null
+    [System.IO.File]::Copy((Join-Path $serverRoot 'DSPGAME.exe'), (Join-Path $secondServerRoot 'DSPGAME.exe'), $false)
+    foreach ($reference in @(Get-DysonBridgeReferenceSpecifications)) {
+        $sourceReference = Join-Path $serverRoot ([string]$reference.relativePath)
+        $targetReference = Join-Path $secondServerRoot ([string]$reference.relativePath)
+        [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($targetReference)) | Out-Null
+        [System.IO.File]::Copy($sourceReference, $targetReference, $false)
+    }
+    $secondPluginRoot = Join-Path $secondServerRoot 'BepInEx\plugins\dyson-control-bridge'
+    $secondConfigRoot = Join-Path $secondServerRoot 'BepInEx\config'
+    [System.IO.Directory]::CreateDirectory($secondPluginRoot) | Out-Null
+    [System.IO.Directory]::CreateDirectory($secondConfigRoot) | Out-Null
+    [System.IO.File]::Copy($privatePluginPath, (Join-Path $secondPluginRoot $script:DysonBridgeDllName), $false)
+    [System.IO.File]::Copy($privateConfigPath, (Join-Path $secondConfigRoot $script:DysonBridgeConfigName), $false)
+    [System.IO.File]::Copy($privateStatePath,
+        (Join-Path $secondConfigRoot $script:DysonBridgeStateName), $false)
+    Assert-BridgeRejected -Action {
+        & $installScript -CandidatePath $candidateRoot -DysonServerRoot $secondServerRoot `
+            -PrivateRuntimeRoot $privateRuntimeRoot -ControlServiceSid $controlServiceSid `
+            -GameServiceSid $gameServiceSid -Confirm:$false
+    } -Message 'a copied private runtime state was accepted for a different DSP instance'
+    foreach ($secondInstallPath in @(
+        (Join-Path $secondServerRoot 'BepInEx\plugins\dyson-control-bridge'),
+        (Join-Path $secondServerRoot ('BepInEx\config\' + $script:DysonBridgeConfigName)),
+        (Join-Path $secondServerRoot ('BepInEx\config\' + $script:DysonBridgeStateName))
+    )) {
+        if (Test-Path -LiteralPath $secondInstallPath) { Remove-Item -LiteralPath $secondInstallPath -Force -Recurse }
+    }
+    Assert-BridgeRejected -Action {
+        & $installScript -CandidatePath $candidateRoot -DysonServerRoot $secondServerRoot `
+            -PrivateRuntimeRoot $privateRuntimeRoot -ControlServiceSid $controlServiceSid `
+            -GameServiceSid $gameServiceSid -Confirm:$false
+    } -Message 'an unowned non-empty private runtime root was accepted for a second DSP instance'
+
+    $runtimeContainerAcl = New-DysonBridgeAclObject -Kind runtime -InstallerSid (Get-DysonBridgeCurrentInstallerSid) `
+        -ControlServiceSid $controlServiceSid -GameServiceSid $gameServiceSid
+    $runtimeContainerAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        [System.Security.Principal.SecurityIdentifier]::new($gameServiceSid),
+        [System.Security.AccessControl.FileSystemRights]::Modify,
+        [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )) | Out-Null
+    Set-DysonBridgeExactAclObject -Path $privateRuntimeContainer -Acl $runtimeContainerAcl -Directory
+    Assert-BridgeRejected -Action { & $testScript -DysonServerRoot $privateServerRoot } `
+        -Message 'a writable private runtime parent container was accepted'
+    Protect-DysonBridgePrivateRuntimeRootAcl -RuntimeRoot $privateRuntimeContainer `
+        -InstallerSid (Get-DysonBridgeCurrentInstallerSid) -ControlServiceSid $controlServiceSid `
+        -GameServiceSid $gameServiceSid
+    [void](& $testScript -DysonServerRoot $privateServerRoot)
+
+    $privateUninstalled = Get-LastBridgeJson -Output (& $uninstallScript -DysonServerRoot $privateServerRoot -Confirm:$false)
+    Assert-BridgeSelfTest -Condition ($privateUninstalled.state -eq 'uninstalled-recoverable' -and
+        -not (Test-Path -LiteralPath $privatePluginPath) -and -not (Test-Path -LiteralPath $privateConfigPath) -and
+        (Test-Path -LiteralPath (Join-Path $privateRuntimeRoot $script:DysonBridgeSecretName))) `
+        -Message 'private NTFS Bridge uninstall did not preserve its bound secret'
+    $privateRestored = Get-LastBridgeJson -Output (& $uninstallScript -DysonServerRoot $privateServerRoot `
+        -RestoreSnapshotId ([string]$privateUninstalled.snapshotId) -Confirm:$false)
+    $privateRestoredVerification = Get-LastBridgeJson -Output (& $testScript -DysonServerRoot $privateServerRoot)
+    Assert-BridgeSelfTest -Condition ($privateRestored.state -eq 'restored' -and
+        [bool]$privateRestoredVerification.ready -and
+        $privateRestoredVerification.runtimeLayout -eq 'private-ntfs') `
+        -Message 'the recoverable private NTFS Bridge snapshot could not be restored'
+
     $reparseServer = Join-Path $testRoot 'reparse-reference-server'
     [System.IO.Directory]::CreateDirectory((Join-Path $reparseServer 'BepInEx')) | Out-Null
     $reparseCore = Join-Path $reparseServer 'BepInEx\core'
@@ -636,11 +815,19 @@ public static class ControlledDotnetFixture
         signedSimulationTelemetryValidated = $true
         installWhatIfWasNonMutating = $true
         installDefaultedDisabled = $true
+        lfAndCrlfConfigurationValidated = $true
+        configurationDuplicatesInvalidValuesAndPathDriftRejected = $true
         platformSecurityModuleBound = $true
         secretWasRandomProtectedAndUndisclosed = $true
         exactTwoIdentityAclContractValidated = $true
         controlServiceFullControlDriftRejected = $true
         failedInstallRolledBack = $true
+        privateNtfsRuntimeStateBound = $true
+        privateNtfsLocalVolumeBoundaryValidated = $true
+        privateNtfsParentAndRootAclValidated = $true
+        privateNtfsFailedInstallCleaned = $true
+        privateNtfsInstanceIsolationValidated = $true
+        privateNtfsUninstallRestoreValidated = $true
         uninstallWasRecoverable = $true
         saveGameNebulaAndGsmWereUntouched = $true
         productionChanged = $false

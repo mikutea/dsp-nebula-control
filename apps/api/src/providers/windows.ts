@@ -149,8 +149,13 @@ export function applyBrokerStatus(
     ? evidence.runtime.process.pid
     : null
   const preserveProcessTelemetry = state === 'running' && processId !== null &&
-    status.runtime.processId === processId
+    status.runtime.processId === processId && evidence.processTelemetry === undefined
   const taskEvidenceTrusted = evidence.task.valid
+  const sample = evidence.processTelemetry
+  const now = Date.now()
+  const telemetry = state === 'running' && sample && sample.processId === processId &&
+    sample.startedAtUnixMs <= sample.sampledAtUnixMs && sample.sampledAtUnixMs <= now + 5_000 &&
+    now - sample.sampledAtUnixMs <= 30_000 ? sample : null
   return {
     ...status,
     state,
@@ -163,7 +168,15 @@ export function applyBrokerStatus(
       threadCount: preserveProcessTelemetry ? status.runtime.threadCount : null,
       priority: preserveProcessTelemetry ? status.runtime.priority : null,
       startedAt: preserveProcessTelemetry ? status.runtime.startedAt : null,
-      uptimeSeconds: preserveProcessTelemetry ? status.runtime.uptimeSeconds : null
+      uptimeSeconds: preserveProcessTelemetry ? status.runtime.uptimeSeconds : null,
+      ...(telemetry ? {
+        processCoresUsed: telemetry.processCoresUsed,
+        workingSetGiB: telemetry.workingSetGiB,
+        privateMemoryGiB: telemetry.privateMemoryGiB,
+        threadCount: telemetry.threadCount,
+        startedAt: new Date(telemetry.startedAtUnixMs).toISOString(),
+        uptimeSeconds: Math.max(0, Math.floor((telemetry.sampledAtUnixMs - telemetry.startedAtUnixMs) / 1_000))
+      } : {})
     },
     automation: {
       ...status.automation,

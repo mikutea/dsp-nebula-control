@@ -20,7 +20,10 @@ namespace DysonControl.Bridge
         private readonly FieldInfo saveExtensionField;
         private readonly MethodInfo saveCurrentGameMethod;
         private readonly PropertyInfo lastSaveTimeProperty;
-        private readonly PropertyInfo gameMainGameNameProperty;
+        private readonly FieldInfo gameMainDataField;
+        private readonly LoadedSaveOriginTracker loadedSaveOrigin = new LoadedSaveOriginTracker();
+        internal MethodInfo LoadCurrentGameMethod { get; }
+        internal MethodInfo NewGameMethod { get; }
 
         private GameSaveAdapter(
             PropertyInfo nebulaInstalledProperty,
@@ -36,7 +39,9 @@ namespace DysonControl.Bridge
             FieldInfo saveExtensionField,
             MethodInfo saveCurrentGameMethod,
             PropertyInfo lastSaveTimeProperty,
-            PropertyInfo gameMainGameNameProperty)
+            FieldInfo gameMainDataField,
+            MethodInfo loadCurrentGameMethod,
+            MethodInfo newGameMethod)
         {
             this.nebulaInstalledProperty = nebulaInstalledProperty;
             this.multiplayerActiveProperty = multiplayerActiveProperty;
@@ -51,7 +56,9 @@ namespace DysonControl.Bridge
             this.saveExtensionField = saveExtensionField;
             this.saveCurrentGameMethod = saveCurrentGameMethod;
             this.lastSaveTimeProperty = lastSaveTimeProperty;
-            this.gameMainGameNameProperty = gameMainGameNameProperty;
+            this.gameMainDataField = gameMainDataField;
+            LoadCurrentGameMethod = loadCurrentGameMethod;
+            NewGameMethod = newGameMethod;
         }
 
         internal static bool TryCreate(out GameSaveAdapter adapter, out string errorCode)
@@ -66,9 +73,10 @@ namespace DysonControl.Bridge
                 var gameConfigType = AccessTools.TypeByName("GameConfig");
                 var gameSaveType = AccessTools.TypeByName("GameSave");
                 var gameMainType = AccessTools.TypeByName("GameMain");
+                var gameDataType = AccessTools.TypeByName("GameData");
                 var gameStatesType = AccessTools.TypeByName("NebulaWorld.GameStates.GameStatesManager");
                 if (apiType == null || sessionInterface == null || localPlayerInterface == null ||
-                    gameConfigType == null || gameSaveType == null || gameMainType == null || gameStatesType == null)
+                    gameConfigType == null || gameSaveType == null || gameMainType == null || gameDataType == null || gameStatesType == null)
                 {
                     return false;
                 }
@@ -87,7 +95,9 @@ namespace DysonControl.Bridge
                     AccessTools.Field(gameSaveType, "saveExt"),
                     AccessTools.Method(gameSaveType, "SaveCurrentGame", new[] { typeof(string) }),
                     AccessTools.Property(gameStatesType, "LastSaveTime"),
-                    AccessTools.Property(gameMainType, "gameName"));
+                    AccessTools.Field(gameMainType, "data"),
+                    AccessTools.Method(gameSaveType, "LoadCurrentGame", new[] { typeof(string) }),
+                    AccessTools.Method(gameDataType, "NewGame"));
 
                 if (!candidate.AllMembersResolved())
                 {
@@ -179,42 +189,46 @@ namespace DysonControl.Bridge
         }
 
         /// <summary>
-        /// Reads the save name retained by DSP's live GameMain.data instance.
-        /// Assembly-CSharp's successful LoadCurrentGame(string) assigns the
-        /// sanitized load argument to this property after import; Save As also
-        /// updates it before writing. No directory scan or latest-file heuristic
-        /// participates in this observation.
+        /// Reads a successful load-call origin bound to the current data and
+        /// multiplayer-session instances. GameMain.gameName is an imported
+        /// payload value in normal loads, not an authoritative filename.
         /// </summary>
         internal bool TryObserveLoadedSave(out LoadedSaveObservation observation)
         {
             observation = null;
             try
             {
-                if (!GetBoolean(nebulaInstalledProperty, null) || !GetBoolean(multiplayerActiveProperty, null))
-                {
-                    return false;
-                }
+                var currentData = gameMainDataField.GetValue(null);
                 var session = multiplayerSessionProperty.GetValue(null, null);
-                if (session == null || !GetBoolean(sessionIsDedicatedProperty, session) ||
-                    !GetBoolean(sessionIsServerProperty, session) ||
-                    !GetBoolean(sessionIsGameLoadedProperty, session))
+                var localPlayer = session == null ? null : sessionLocalPlayerProperty.GetValue(session, null);
+                var hostGameLoaded = GetBoolean(nebulaInstalledProperty, null) && GetBoolean(multiplayerActiveProperty, null) &&
+                    session != null && GetBoolean(sessionIsDedicatedProperty, session) &&
+                    GetBoolean(sessionIsServerProperty, session) && GetBoolean(sessionIsGameLoadedProperty, session) &&
+                    localPlayer != null && GetBoolean(localPlayerIsHostProperty, localPlayer);
+                if (!loadedSaveOrigin.TryObserve(currentData, session, hostGameLoaded, out var saveName))
                 {
                     return false;
                 }
-                var localPlayer = sessionLocalPlayerProperty.GetValue(session, null);
-                if (localPlayer == null || !GetBoolean(localPlayerIsHostProperty, localPlayer))
-                {
-                    return false;
-                }
+                return loadedSaveOrigin.TryMatchFiles(currentData, session,
+                    CaptureLoadedSaveFiles(saveName), out observation);
+            }
+            catch
+            {
+                loadedSaveOrigin.Invalidate();
+                observation = null;
+                return false;
+            }
+        }
 
-                var saveName = gameMainGameNameProperty.GetValue(null, null) as string;
+        private LoadedSaveObservation CaptureLoadedSaveFiles(string saveName)
+        {
                 var saveFolder = gameSaveFolderProperty.GetValue(null, null) as string;
                 var saveExtension = saveExtensionField.GetValue(null) as string;
                 if (!BridgeProtocol.IsValidSaveName(saveName) || string.IsNullOrWhiteSpace(saveFolder) ||
                     string.IsNullOrWhiteSpace(saveExtension) ||
                     !string.Equals(saveExtension, ".dsv", StringComparison.OrdinalIgnoreCase))
                 {
-                    return false;
+                    return null;
                 }
                 var normalizedFolder = Path.GetFullPath(saveFolder).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
                 var dsvPath = Path.GetFullPath(Path.Combine(normalizedFolder, saveName + saveExtension));
@@ -222,7 +236,7 @@ namespace DysonControl.Bridge
                 if (!dsvPath.StartsWith(normalizedFolder, StringComparison.OrdinalIgnoreCase) ||
                     !serverPath.StartsWith(normalizedFolder, StringComparison.OrdinalIgnoreCase))
                 {
-                    return false;
+                    return null;
                 }
 
                 var dsv = new FileInfo(dsvPath);
@@ -235,9 +249,9 @@ namespace DysonControl.Bridge
                     (dsv.Attributes & FileAttributes.ReparsePoint) != 0 ||
                     (server.Attributes & FileAttributes.ReparsePoint) != 0)
                 {
-                    return false;
+                    return null;
                 }
-                observation = new LoadedSaveObservation
+                return new LoadedSaveObservation
                 {
                     SaveName = saveName,
                     DsvPath = dsvPath,
@@ -249,14 +263,27 @@ namespace DysonControl.Bridge
                     ServerWriteTimeUtcTicks = server.LastWriteTimeUtc.Ticks,
                     ServerCreationTimeUtcTicks = server.CreationTimeUtc.Ticks
                 };
-                return true;
+        }
+
+        internal LoadedSaveOriginTracker.LoadAttempt BeginLoadObservation() => loadedSaveOrigin.BeginLoad();
+
+        internal void CompleteLoadObservation(LoadedSaveOriginTracker.LoadAttempt attempt, bool succeeded, string actualLoadArgument)
+        {
+            try
+            {
+                loadedSaveOrigin.CompleteLoad(attempt, succeeded, actualLoadArgument,
+                    succeeded ? gameMainDataField.GetValue(null) : null,
+                    succeeded ? multiplayerSessionProperty.GetValue(null, null) : null,
+                    succeeded ? CaptureLoadedSaveFiles(actualLoadArgument) : null);
             }
             catch
             {
-                observation = null;
-                return false;
+                loadedSaveOrigin.CompleteLoad(attempt, false, null, null, null, null);
+                throw;
             }
         }
+
+        internal void InvalidateLoadObservation() => loadedSaveOrigin.Invalidate();
 
         internal bool TryInvokeSave(
             SaveContext context,
@@ -350,10 +377,9 @@ namespace DysonControl.Bridge
                    gameSaveFolderProperty.GetGetMethod().IsStatic &&
                    lastExitField != null && saveExtensionField != null &&
                    saveCurrentGameMethod != null && saveCurrentGameMethod.ReturnType == typeof(bool) &&
-                   lastSaveTimeProperty != null && gameMainGameNameProperty != null &&
-                   gameMainGameNameProperty.PropertyType == typeof(string) &&
-                   gameMainGameNameProperty.GetGetMethod() != null &&
-                   gameMainGameNameProperty.GetGetMethod().IsStatic;
+                   lastSaveTimeProperty != null && gameMainDataField != null && gameMainDataField.IsStatic &&
+                   LoadCurrentGameMethod != null && LoadCurrentGameMethod.IsStatic &&
+                   LoadCurrentGameMethod.ReturnType == typeof(bool) && NewGameMethod != null;
         }
 
         private static bool GetBoolean(PropertyInfo property, object instance)

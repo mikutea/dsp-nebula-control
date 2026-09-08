@@ -35,6 +35,237 @@ function Assert-SelfTest {
     if (-not $Condition) { throw "SELFTEST_FAILED: $Message" }
 }
 
+function Test-DysonBrokerProfileFileAclRestore {
+    param([Parameter(Mandatory)][string]$Root)
+    $errors=$null; $tokens=$null
+    $ast=[Management.Automation.Language.Parser]::ParseFile($installScript,[ref]$tokens,[ref]$errors)
+    Assert-SelfTest -Condition ($errors.Count -eq 0) -Message 'installer parse failed'
+    foreach($name in @('Assert-DysonDeploymentPlainFile','Set-DysonLifecycleBrokerDeploymentFileBytesAtomic',
+        'Restore-DysonLifecycleBrokerDeploymentPreimage','Set-DysonCutoverBrokerDeploymentFileBytesAtomic',
+        'Restore-DysonCutoverBrokerDeploymentFileAcls')) {
+        $definition=@($ast.FindAll({param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+        },$false))
+        if($definition.Count -eq 1){ . ([scriptblock]::Create($definition[0].Extent.Text)) }
+        elseif(-not (Get-Command $name -ErrorAction SilentlyContinue)){ throw 'profile ACL test dependency unavailable' }
+    }
+    $fixture=Join-Path $Root 'profile-file-acl'
+    [void][IO.Directory]::CreateDirectory($fixture)
+    $profile=Join-Path $fixture 'broker-profile.json'
+    $intent=Join-Path $fixture 'broker-profile.sddl'
+    $task=Join-Path $fixture 'broker-task.json'
+    foreach($file in @($profile,$intent,$task)){[IO.File]::WriteAllText($file,'original fixture state')}
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $acl=Get-Acl -LiteralPath $profile
+    $acl.SetSecurityDescriptorSddlForm(('D:P(A;;FA;;;{0})(A;;FR;;;LS)' -f $identity),
+        [Security.AccessControl.AccessControlSections]::Access)
+    Set-Acl -LiteralPath $profile -AclObject $acl
+    $originalSddl=(Get-Acl -LiteralPath $profile).Sddl
+    $state=[pscustomobject]@{
+        profilePath=$profile; profileBytes=[IO.File]::ReadAllBytes($profile)
+        profileFileSddl=$originalSddl; profileSddl='separate shadow policy intent'; directoryAcls=@()
+        profileAclPath=$intent; profileAclBytes=[IO.File]::ReadAllBytes($intent)
+        taskPath=$task; taskBytes=[IO.File]::ReadAllBytes($task)
+    }
+    $acl=Get-Acl -LiteralPath $profile
+    $acl.SetSecurityDescriptorSddlForm(('D:P(A;;FA;;;{0})(A;;FRFX;;;LS)' -f $identity),
+        [Security.AccessControl.AccessControlSections]::Access)
+    Set-Acl -LiteralPath $profile -AclObject $acl
+    [IO.File]::WriteAllText($profile,'replacement fixture state')
+    Assert-SelfTest -Condition ((Get-Acl -LiteralPath $profile).Sddl -cne $originalSddl) `
+        -Message 'profile ACL regression did not introduce an actual file ACL change'
+    Restore-DysonLifecycleBrokerDeploymentPreimage -State $state -ShadowRoot $fixture
+    Assert-SelfTest -Condition ((Get-Acl -LiteralPath $profile).Sddl -ceq $originalSddl -and
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($profile)) -ceq
+            [Convert]::ToBase64String($state.profileBytes)) `
+        -Message 'shadow profile rollback did not restore the real file ACL independently of its policy intent'
+    $binding=Join-Path $fixture 'broker-bundle.json'
+    [IO.File]::WriteAllText($binding,'original bundle binding')
+    $cutoverState=[pscustomobject]@{
+        profilePath=$profile; profileBytes=[IO.File]::ReadAllBytes($profile); profileSddl=$originalSddl
+        bindingPath=$binding; bindingBytes=[IO.File]::ReadAllBytes($binding)
+        bindingSddl=(Get-Acl -LiteralPath $binding).Sddl; directoryAcls=@()
+    }
+    foreach($file in @($profile,$binding)) {
+        $acl=Get-Acl -LiteralPath $file
+        $acl.SetSecurityDescriptorSddlForm(('D:P(A;;FA;;;{0})(A;;FRFX;;;LS)' -f $identity),
+            [Security.AccessControl.AccessControlSections]::Access)
+        Set-Acl -LiteralPath $file -AclObject $acl
+        [IO.File]::WriteAllText($file,'replacement cutover state')
+    }
+    Restore-DysonCutoverBrokerDeploymentFileAcls -State $cutoverState
+    Assert-SelfTest -Condition ((Get-Acl -LiteralPath $profile).Sddl -ceq $cutoverState.profileSddl -and
+        (Get-Acl -LiteralPath $binding).Sddl -ceq $cutoverState.bindingSddl -and
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($profile)) -ceq
+            [Convert]::ToBase64String($cutoverState.profileBytes) -and
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($binding)) -ceq
+            [Convert]::ToBase64String($cutoverState.bindingBytes)) `
+        -Message 'parent cutover compensation did not restore profile and binding file bytes and exact ACLs'
+    $uninstallAst=[Management.Automation.Language.Parser]::ParseFile($uninstallScript,[ref]$tokens,[ref]$errors)
+    Assert-SelfTest -Condition ($errors.Count -eq 0) -Message 'uninstaller parse failed'
+    foreach($name in @('Assert-DysonUninstallPlainFile','Set-DysonUninstallLifecycleFileBytesAtomic',
+        'Set-DysonUninstallBrokerFileBytesAtomic','Restore-DysonUninstallLifecyclePreimageAclsAndTask',
+        'Restore-DysonUninstallBrokerPreimageAclsAndTask')) {
+        $definition=@($uninstallAst.FindAll({param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+        },$false))
+        Assert-SelfTest -Condition ($definition.Count -eq 1) -Message 'uninstall ACL regression dependency unavailable'
+        . ([scriptblock]::Create($definition[0].Extent.Text))
+    }
+    $directoryDescriptor=[Security.AccessControl.RawSecurityDescriptor]::new((Get-Acl -LiteralPath $fixture).Sddl)
+    $autoInheritanceFlags=[int][Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited -bor
+        [int][Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInheritRequired
+    $directoryDescriptor.SetFlags([Security.AccessControl.ControlFlags](
+        [int]$directoryDescriptor.ControlFlags -band (-bnot $autoInheritanceFlags)))
+    $legacyDirectorySddl=$directoryDescriptor.GetSddlForm([Security.AccessControl.AccessControlSections]'Access,Owner,Group')
+    Restore-DysonDeploymentDirectorySecurityPreimage -Path $fixture -Sddl $legacyDirectorySddl
+    $history=Join-Path $fixture 'preserved-history.txt'
+    [IO.File]::WriteAllText($history,'immutable history fixture')
+    $historySddl=(Get-Acl -LiteralPath $history).Sddl
+    $state.directoryAcls=@([pscustomobject]@{path=$fixture;sddl=$legacyDirectorySddl})
+    $cutoverState.directoryAcls=$state.directoryAcls
+    Restore-DysonUninstallLifecyclePreimageAclsAndTask -State $state -ShadowRoot $fixture
+    Restore-DysonUninstallBrokerPreimageAclsAndTask -State $cutoverState -ShadowRoot $fixture
+    Assert-SelfTest -Condition ((Get-Acl -LiteralPath $fixture).Sddl -ceq $legacyDirectorySddl -and
+        (Get-Acl -LiteralPath $profile).Sddl -ceq $originalSddl -and
+        (Get-Acl -LiteralPath $binding).Sddl -ceq $cutoverState.bindingSddl -and
+        (Get-Acl -LiteralPath $history).Sddl -ceq $historySddl -and
+        [IO.File]::ReadAllText($history) -ceq 'immutable history fixture') `
+        -Message 'uninstall compensation changed a captured legacy directory descriptor or its durable descendants'
+    $directoryRejected=$false
+    try { Restore-DysonDeploymentFileSecurityPreimage -Path $fixture -Sddl $originalSddl }
+    catch { $directoryRejected=$true }
+    Assert-SelfTest -Condition $directoryRejected -Message 'file ACL restore accepted a directory target'
+}
+
+function Test-DysonDeploymentBrokerQuiescence {
+    $errors=$null; $tokens=$null
+    $ast=[Management.Automation.Language.Parser]::ParseFile($installScript,[ref]$tokens,[ref]$errors)
+    Assert-SelfTest -Condition ($errors.Count -eq 0) -Message 'installer parse failed'
+    foreach($name in @('Stop-DysonDeploymentControlTaskForBrokerUpgrade','Wait-DysonDeploymentBrokerWorkersIdle')) {
+        $definition=@($ast.FindAll({param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+        },$false))
+        Assert-SelfTest -Condition ($definition.Count -eq 1) -Message 'quiescence helper was not unique'
+        . ([scriptblock]::Create($definition[0].Extent.Text))
+    }
+    $control=[pscustomobject]@{TaskName='Fixture-Control';TaskPath='\';State='Running'}
+    $observed=[pscustomobject]@{stopCalls=0;workerSamples=0}
+    function Get-DysonScheduledTasksByExactName { param($TaskName) return $control }
+    function Export-ScheduledTask { [CmdletBinding()] param($TaskName,$TaskPath) return '<FixtureTask />' }
+    function Stop-ScheduledTask {
+        [CmdletBinding()] param($InputObject)
+        Assert-SelfTest -Condition ($InputObject.TaskName -ceq 'Fixture-Control') -Message 'quiescence stopped a broker worker'
+        $observed.stopCalls += 1; $control.State='Ready'
+    }
+    function Get-DysonLifecycleBrokerStaticWorkerTasks {
+        $observed.workerSamples += 1
+        [pscustomobject]@{State=$(if($observed.workerSamples -le 2){'Running'}else{'Ready'})}
+    }
+    function Get-DysonCutoverBrokerDeploymentTasks { return @() }
+    function Start-Sleep { param($Milliseconds) }
+    $before=[pscustomobject]@{present=$true;taskPath='\';xmlSha256=(Get-DysonTextSha256 '<FixtureTask />')}
+    Stop-DysonDeploymentControlTaskForBrokerUpgrade -State $before -TaskName 'Fixture-Control'
+    Wait-DysonDeploymentBrokerWorkersIdle
+    Assert-SelfTest -Condition ($observed.stopCalls -eq 1 -and $observed.workerSamples -eq 4 -and
+        $control.State -ceq 'Ready') -Message 'quiescence did not let the status worker finish before two idle observations'
+}
+
+function Test-DysonDeploymentPendingStatusPreflight {
+    . (Join-Path $PSScriptRoot '..\lifecycle-broker\DysonLifecycleBroker.Common.ps1')
+    $root = Join-Path $testRoot 'pending-status-preflight'
+    $storage = [pscustomobject]@{
+        requests = Join-Path $root 'requests'
+        receipts = Join-Path $root 'receipts'
+        intents = Join-Path $root 'intents'
+    }
+    foreach ($directory in @($storage.requests, $storage.receipts, $storage.intents)) {
+        [void][IO.Directory]::CreateDirectory($directory)
+    }
+    $id = [guid]::NewGuid().ToString('D')
+    $requestPath = Join-Path $storage.requests ($id + '.json')
+    $request = New-DysonLifecycleBrokerRequest -BrokerRequestId $id -Capability LifecycleStatus `
+        -ProfileHash ('a' * 64) -Input ([pscustomobject]@{})
+    $statusJson = $request | ConvertTo-Json -Depth 6 -Compress
+    [IO.File]::WriteAllText($requestPath, $statusJson)
+    $rejected = $false
+    try { Assert-DysonLifecycleBrokerStaticNoPendingWork -Storage $storage } catch { $rejected = $true }
+    Assert-SelfTest $rejected 'Strict post-quiescence validation accepted an unfinished status request.'
+    Assert-DysonLifecycleBrokerStaticNoPendingWork -Storage $storage -AllowPendingStatusRequests
+    Assert-SelfTest ([IO.File]::ReadAllText($requestPath) -ceq $statusJson) 'Read-only preflight changed the pending request.'
+    $dispatch = New-DysonLifecycleBrokerRequest -BrokerRequestId $id -Capability LifecycleDispatch `
+        -ProfileHash ('a' * 64) -Input ([pscustomobject]@{operation='start';leaseInstanceId=[guid]::NewGuid().ToString('D');leaseToken=('x' * 43)})
+    [IO.File]::WriteAllText($requestPath, ($dispatch | ConvertTo-Json -Depth 6 -Compress))
+    $rejected = $false
+    try { Assert-DysonLifecycleBrokerStaticNoPendingWork -Storage $storage -AllowPendingStatusRequests } catch { $rejected = $true }
+    Assert-SelfTest $rejected 'Preflight accepted an unfinished mutating request.'
+    $request.requestFingerprint = ('b' * 64)
+    [IO.File]::WriteAllText($requestPath, ($request | ConvertTo-Json -Depth 6 -Compress))
+    $rejected = $false
+    try { Assert-DysonLifecycleBrokerStaticNoPendingWork -Storage $storage -AllowPendingStatusRequests } catch { $rejected = $true }
+    Assert-SelfTest $rejected 'Preflight accepted a tampered status request.'
+    [IO.File]::WriteAllText($requestPath, $statusJson)
+    [IO.File]::WriteAllText((Join-Path $storage.intents ($id + '.json')), '{}')
+    $rejected = $false
+    try { Assert-DysonLifecycleBrokerStaticNoPendingWork -Storage $storage -AllowPendingStatusRequests } catch { $rejected = $true }
+    Assert-SelfTest $rejected 'Preflight accepted an unfinished intent.'
+}
+
+function Test-DysonCutoverBrokerNativeTaskCollections {
+    # Execute the production validator without executing the installer. Native
+    # CIM tasks may expose scalar Actions and null Triggers rather than arrays.
+    Set-StrictMode -Version Latest
+    $parseErrors = $null
+    $parseTokens = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($installScript,
+        [ref]$parseTokens, [ref]$parseErrors)
+    Assert-SelfTest -Condition ($parseErrors.Count -eq 0) -Message 'installer parse failed'
+    $validator = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-DysonCutoverBrokerDeploymentTask'
+    }, $false))
+    Assert-SelfTest -Condition ($validator.Count -eq 1) -Message 'native task validator was not unique'
+    . ([scriptblock]::Create($validator[0].Extent.Text))
+    function Get-DysonCutoverBrokerDeploymentTasks { return $nativeTasks }
+    function Get-DysonCutoverBrokerTaskArguments { param($Profile) return '-fictional-fixed-arguments' }
+
+    foreach ($scenario in @('null-triggers', 'empty-triggers', 'null-array-triggers',
+        'missing-action', 'multiple-actions', 'unexpected-trigger', 'wrong-principal',
+        'wrong-arguments', 'disabled', 'wrong-path', 'duplicate-task')) {
+        $action = [pscustomobject]@{
+            Execute = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            Arguments = '-fictional-fixed-arguments'; WorkingDirectory = ''
+        }
+        $task = [pscustomobject]@{
+            TaskPath = '\'; Actions = $action; Triggers = $null
+            Principal = [pscustomobject]@{ UserId = 'S-1-5-18'; LogonType = 'ServiceAccount'; RunLevel = 'Highest' }
+            Settings = [pscustomobject]@{ MultipleInstances = 'IgnoreNew'; ExecutionTimeLimit = 'PT10M'; Enabled = $true }
+            Description = 'Fixed SYSTEM mutation broker for Dyson Control cutover operations.'
+        }
+        $nativeTasks = @($task)
+        switch ($scenario) {
+            'empty-triggers' { $task.Triggers = @() }
+            'null-array-triggers' { $task.Triggers = @($null) }
+            'missing-action' { $task.Actions = $null }
+            'multiple-actions' { $task.Actions = @($action, $action) }
+            'unexpected-trigger' { $task.Triggers = [pscustomobject]@{ Enabled = $true } }
+            'wrong-principal' { $task.Principal.UserId = 'FictionalOtherUser' }
+            'wrong-arguments' { $action.Arguments += ' -unexpected' }
+            'disabled' { $task.Settings.Enabled = $false }
+            'wrong-path' { $task.TaskPath = '\Other\' }
+            'duplicate-task' { $nativeTasks = @($task, $task) }
+        }
+        $errorMessage = $null
+        try { Assert-DysonCutoverBrokerDeploymentTask -Profile ([pscustomobject]@{}) }
+        catch { $errorMessage = $_.Exception.Message }
+        $shouldAccept = $scenario -in @('null-triggers', 'empty-triggers', 'null-array-triggers')
+        Assert-SelfTest -Condition (($shouldAccept -and $null -eq $errorMessage) -or
+            (-not $shouldAccept -and $errorMessage -ceq
+                'The fixed cutover broker task is inconsistent with its active profile.')) `
+            -Message ("native cutover task case {0} failed: {1}" -f $scenario, $errorMessage)
+    }
+}
+
 function ConvertTo-DysonDeploymentSelfTestExtendedPath {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -609,7 +840,7 @@ $evidence = Get-FixtureConfigurationEvidence -ConfigurationPath $target `
     -DataRoot $DataRoot -ScriptRoot $ScriptRoot `
     -RuntimeBootstrapRoot $RuntimeBootstrapRoot -DeploymentVersion $DeploymentVersion
 $snapshotId = [guid]::NewGuid().ToString('D')
-$snapshotPath = Join-Path (Join-Path $dataFull 'config\snapshots') $snapshotId
+$snapshotPath = Join-Path (Join-Path $dataFull 'configuration-snapshots') $snapshotId
 [System.IO.Directory]::CreateDirectory($snapshotPath) | Out-Null
 [System.IO.File]::WriteAllBytes((Join-Path $snapshotPath 'dyson-control.env'),
     [System.IO.File]::ReadAllBytes($target))
@@ -703,7 +934,8 @@ param(
     [Parameter(Mandatory)][string]$ScriptRoot,
     [Parameter(Mandatory)][string]$RuntimeBootstrapRoot,
     [Parameter(Mandatory)][string]$DeploymentVersion,
-    [Parameter(Mandatory)][string]$ServiceAccount
+    [Parameter(Mandatory)][string]$ServiceAccount,
+    [switch]$RuntimeOnly
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'DysonConfiguration.Common.ps1')
@@ -713,7 +945,10 @@ $evidence = Get-FixtureConfigurationEvidence -ConfigurationPath $target `
     -DataRoot $DataRoot -ScriptRoot $ScriptRoot `
     -RuntimeBootstrapRoot $RuntimeBootstrapRoot -DeploymentVersion $DeploymentVersion
 [pscustomobject][ordered]@{
-    protocol = 'DYSON_CONTROL_CONFIGURATION_TEST_RESULT_V1'
+    protocol = if ($RuntimeOnly) {
+        'DYSON_CONTROL_CONFIGURATION_RUNTIME_TEST_RESULT_V1'
+    }
+    else { 'DYSON_CONTROL_CONFIGURATION_TEST_RESULT_V1' }
     healthy = $true
     mutationPerformed = $false
     configurationSha256 = [string]$evidence.configurationSha256
@@ -842,7 +1077,7 @@ console.log('fictional-dyson-control-$ContentMarker');
         [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($destination)) | Out-Null
         [System.IO.File]::Copy($source, $destination, $true)
     }
-    foreach ($deploymentName in @('DysonDeployment.Common.ps1', 'Start-DysonControl.ps1')) {
+    foreach ($deploymentName in @('DysonDeployment.Common.ps1', 'DysonDeployment.Configuration.ps1', 'Start-DysonControl.ps1')) {
         $source = Join-Path $PSScriptRoot $deploymentName
         $destination = Join-Path $Root ('scripts\windows\deployment\' + $deploymentName)
         [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($destination)) | Out-Null
@@ -1624,7 +1859,41 @@ function New-DeploymentBrokerAuthorityProfile {
 }
 
 try {
+    # Installers query fixed broker tasks even when this scenario installs no
+    # tasks. Isolate the scheduler before the first installer call, including
+    # the identity-only scenarios, so an installed host broker cannot leak into
+    # an otherwise empty temporary deployment preimage.
+    Enable-DysonTaskSchedulerFixture
+    $taskFixtureEnabled = $true
+    Test-DysonCutoverBrokerNativeTaskCollections
+    Test-DysonDeploymentBrokerQuiescence
+    Test-DysonDeploymentPendingStatusPreflight
+    foreach ($brokerTaskName in @('Dyson-Control-Lifecycle-Broker', 'Dyson-Control-Cutover-Broker')) {
+        Assert-SelfTest -Condition (@(Get-DysonScheduledTasksByExactName -TaskName $brokerTaskName).Count -eq 0) `
+            -Message 'the initial deployment fixture did not isolate a fixed broker task query'
+    }
+    $unsupportedCandidateName = 'DysonControl-Candidate-Fixture-' + [guid]::NewGuid().ToString('N')
+    $unsupportedInstallRoot = Join-Path $env:ProgramFiles $unsupportedCandidateName
+    $unsupportedDataRoot = Join-Path $env:ProgramData $unsupportedCandidateName
+    foreach ($previewOnly in @($true, $false)) {
+        $unsupportedLayoutMessage = $null
+        try {
+            & $installScript -SourcePath (Join-Path $testRoot 'missing-artifact') -Version '0.1.0-rc.1' `
+                -ExpectedArtifactPayloadSha256 ('a' * 64) -RuntimeRoot (Join-Path $testRoot 'missing-runtime') `
+                -NodeExecutable (Join-Path $testRoot 'missing-runtime\node.exe') -ExpectedNodeSha256 ('b' * 64) `
+                -ConfigurationSource (Join-Path $testRoot 'missing.env') `
+                -InstallRoot $unsupportedInstallRoot -DataRoot $unsupportedDataRoot `
+                -WhatIf:$previewOnly -Confirm:$false | Out-Null
+        }
+        catch { $unsupportedLayoutMessage = $_.Exception.Message }
+        Assert-SelfTest -Condition (
+            $unsupportedLayoutMessage -eq 'A destructive deployment root inside Program Files or ProgramData must use the canonical DysonControl directory.' -and
+            -not (Test-Path -LiteralPath $unsupportedInstallRoot) -and
+            -not (Test-Path -LiteralPath $unsupportedDataRoot)
+        ) -Message 'installer did not reject an unsupported rollback layout before reading artifacts or creating roots'
+    }
     [System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
+    Test-DysonBrokerProfileFileAclRestore -Root $testRoot
     $finalCleanupSelfTest = Test-DysonControlDeploymentSelfTestCleanup -OuterRoot $testRoot
     $ordinarySamePrefixRoot = Join-Path $env:USERPROFILE `
         ('dyson-control-deployment-selftest-' + [guid]::NewGuid().ToString('N'))
@@ -2238,6 +2507,12 @@ try {
             -Message "the protected configuration bootstrap file was not installed: $configurationBootstrapName"
     }
     $installedBootstrapLayoutPath = Join-Path $installerRoot 'bootstrap\bootstrap-layout.json'
+    foreach ($launcherDependency in @('Start-DysonControl.ps1', 'DysonDeployment.Configuration.ps1')) {
+        Assert-SelfTest -Condition (
+            (Get-FileHash -LiteralPath (Join-Path $installerRoot ('bootstrap\' + $launcherDependency))).Hash -ceq
+            (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $launcherDependency)).Hash
+        ) -Message 'the launcher and configuration adapter did not retain the current source contract'
+    }
     Assert-SelfTest -Condition (Test-Path -LiteralPath $installedBootstrapLayoutPath -PathType Leaf) `
         -Message 'the installer did not persist the stable bootstrap layout descriptor'
     $installedBootstrapLayout = [System.IO.File]::ReadAllText(
@@ -2344,8 +2619,6 @@ try {
     $closedListener.Stop()
     $closedReadinessUri = [uri]("http://127.0.0.1:$closedPort/readyz")
 
-    Enable-DysonTaskSchedulerFixture
-    $taskFixtureEnabled = $true
     $missingLifecycleBrokerTasks = @(Get-DysonLifecycleBrokerStaticWorkerTasks)
     Assert-SelfTest -Condition ($missingLifecycleBrokerTasks.Count -eq 0) `
         -Message 'an absent fixed lifecycle broker task was not represented as an empty exact-name query result'
@@ -2406,7 +2679,7 @@ try {
         $replacementRollbackError = $_.Exception.Message
     }
     $replacementSnapshots = @(Get-ChildItem -LiteralPath (
-            Join-Path $installerData 'config\snapshots'
+            Join-Path $installerData 'configuration-snapshots'
         ) -Directory -Force -ErrorAction Stop)
     $replacementRollbackState = [ordered]@{
         rejected = $replacementRollbackRejected
@@ -2834,6 +3107,68 @@ try {
         $global:DysonDeploymentTaskFixtureUnregisterCalls.Count -eq $firstInstallUpgradeUnregisterCount) `
         -Message 'a first-install broker upgrade switch was not rejected before every persistent mutation'
 
+    # The real child completes its task/profile transaction, then a fictional
+    # receipt defect is injected in the artifact. The parent must reject it
+    # without leaving a first-install broker behind or trusting its wrong path.
+    $receiptFixtureInstaller = Join-Path $payloadBrokerInstaller 'scripts\windows\lifecycle-broker\Install-DysonLifecycleBrokerTask.ps1'
+    $receiptFixtureManifest = Join-Path $payloadBrokerInstaller 'artifact-manifest.json'
+    $receiptFixtureInstallerBytes = [IO.File]::ReadAllBytes($receiptFixtureInstaller)
+    $receiptFixtureManifestBytes = [IO.File]::ReadAllBytes($receiptFixtureManifest)
+    $receiptFixtureOriginalDigest = $brokerInstallArguments.ExpectedArtifactPayloadSha256
+    $receiptFixtureOriginalText = [Text.Encoding]::UTF8.GetString($receiptFixtureInstallerBytes)
+    $receiptFixtureMarker = Join-Path $lifecycleShadowRoot 'completed-child-with-invalid-receipt'
+    $receiptFixturePattern = '(?m)(New-InstallerReceipt -Operation installed[^\r\n]*\|)'
+    Assert-SelfTest ([regex]::Matches($receiptFixtureOriginalText, $receiptFixturePattern).Count -eq 1) `
+        'the lifecycle receipt fixture did not identify exactly one successful first-install receipt'
+    $receiptFixtureRelease = Join-Path $brokerInstallerRoot 'releases\4.0.0'
+    Assert-SelfTest (-not (Test-Path -LiteralPath $receiptFixtureRelease)) `
+        'the invalid-receipt fixture must own its initially absent staged release'
+    foreach ($receiptFault in @('acl-intent', 'broker-root')) {
+        $receiptFaultCompensated = $false
+        try {
+            $faultExpression = if ($receiptFault -ceq 'acl-intent') {
+                '$_.aclIntent.requests = @($_.aclIntent.requests | Where-Object { $_ -cne ''CREATOR OWNER:Read+Delete (files only)'' });'
+            }
+            else { '$_.brokerRoot = ''C:\Fictional-Unrelated-Broker'';' }
+            $faultPipeline = ' ForEach-Object { ' + $faultExpression +
+                ' [IO.File]::WriteAllText((Join-Path $ShadowRoot ''completed-child-with-invalid-receipt''), ''completed''); $_ } |'
+            $faultSource = [regex]::Replace($receiptFixtureOriginalText, $receiptFixturePattern,
+                [Text.RegularExpressions.MatchEvaluator]{ param($match) $match.Value + $faultPipeline })
+            [IO.File]::WriteAllText($receiptFixtureInstaller, $faultSource, [Text.UTF8Encoding]::new($false))
+            [void](Write-DysonArtifactManifest -ArtifactRoot $payloadBrokerInstaller -Version '4.0.0' -DevDependenciesExcluded @())
+            $brokerInstallArguments.ExpectedArtifactPayloadSha256 = Get-FictionalPayloadSha256 $payloadBrokerInstaller
+            $receiptFaultRejected = $false
+            $receiptFaultError = $null
+            try { & $installScript @brokerInstallArguments -Confirm:$false | Out-Null }
+            catch { $receiptFaultRejected = $true; $receiptFaultError = $_.Exception.Message }
+            Assert-SelfTest -Condition ($receiptFaultRejected -and
+                $receiptFaultError -match 'unsupported receipt' -and
+                $receiptFaultError -notmatch 'automatic rollback was incomplete' -and
+                (Test-Path -LiteralPath $receiptFixtureMarker -PathType Leaf) -and
+                -not (Test-Path -LiteralPath (Join-Path $brokerApplicationData 'lifecycle-broker\broker-profile.json')) -and
+                -not (Test-Path -LiteralPath (Join-Path $lifecycleShadowRoot 'broker-task.json')) -and
+                -not (Test-Path -LiteralPath (Join-Path $lifecycleShadowRoot 'broker-profile.sddl')) -and
+                -not (Test-Path -LiteralPath (Join-Path $brokerInstallerData 'config\dyson-control.env')) -and
+                -not (Test-Path -LiteralPath (Join-Path $brokerInstallerRoot 'bootstrap')) -and
+                $null -eq (Get-ActiveVersionAt -DataRoot $brokerInstallerData)) `
+                -Message ('a successful child with an invalid ' + $receiptFault + ' receipt was not fully compensated: ' + $receiptFaultError)
+            $receiptFaultCompensated = $true
+        }
+        finally {
+            [IO.File]::WriteAllBytes($receiptFixtureInstaller, $receiptFixtureInstallerBytes)
+            [IO.File]::WriteAllBytes($receiptFixtureManifest, $receiptFixtureManifestBytes)
+            $brokerInstallArguments.ExpectedArtifactPayloadSha256 = $receiptFixtureOriginalDigest
+            if (Test-Path -LiteralPath $receiptFixtureMarker) { [IO.File]::Delete($receiptFixtureMarker) }
+            # Rollback intentionally retains staged immutable releases. Remove
+            # only this successfully compensated, disposable altered fixture so
+            # the next fixture can stage the same fictional version's own bytes.
+            if ($receiptFaultCompensated -and (Test-Path -LiteralPath $receiptFixtureRelease)) {
+                Remove-DysonDeploymentPlainTree -Path $receiptFixtureRelease `
+                    -ExpectedParent (Join-Path $brokerInstallerRoot 'releases') -ExpectedLeafPattern '^4\.0\.0$'
+            }
+        }
+    }
+
     $lifecycleInstallerControl = Join-Path $lifecycleShadowRoot 'installer-control.json'
     [IO.File]::WriteAllText(
         $lifecycleInstallerControl, '{"failStage":"after-profile-published"}',
@@ -2853,20 +3188,19 @@ try {
         )
     }
     Assert-SelfTest -Condition ($lifecycleFirstInstallFailureRejected -and
-        (Get-ActiveVersionAt -DataRoot $brokerInstallerData) -ceq '4.0.0' -and
-        $lifecycleFirstInstallFailureError -like `
-            '*protected-configuration-restore-executor-unavailable*' -and
-        (Test-Path -LiteralPath (Join-Path $brokerInstallerData `
-            'config\dyson-control.env') -PathType Leaf) -and
-        (Test-Path -LiteralPath (Join-Path $brokerInstallerRoot `
-            'bootstrap\configuration\Test-DysonControlConfiguration.ps1') -PathType Leaf) -and
+        $null -eq (Get-ActiveVersionAt -DataRoot $brokerInstallerData) -and
+        $lifecycleFirstInstallFailureError -notmatch 'automatic rollback was incomplete' -and
+        -not (Test-Path -LiteralPath (Join-Path $brokerInstallerData `
+            'config\dyson-control.env')) -and
+        -not (Test-Path -LiteralPath (Join-Path $brokerInstallerRoot 'bootstrap')) -and
         -not (Test-Path -LiteralPath (Join-Path $brokerApplicationData `
             'lifecycle-broker\broker-profile.json')) -and
         -not (Test-Path -LiteralPath (Join-Path $lifecycleShadowRoot 'broker-task.json')) -and
         -not (Test-Path -LiteralPath (Join-Path $brokerApplicationData `
             'cutover-broker\broker-profile.json')) -and
         -not (Test-Path -LiteralPath (Join-Path $brokerShadowRoot 'task-intent.json'))) `
-        -Message 'lifecycle first-install failure did not retain coherent config/release state while compensating broker state'
+        -Message ('lifecycle first-install failure did not restore the absent release/configuration preimage while compensating broker state: ' +
+            $lifecycleFirstInstallFailureError)
 
     $cutoverFirstInstallFailureRejected = $false
     $cutoverFirstInstallFailureError = $null
@@ -2886,7 +3220,11 @@ try {
         )
     }
     Assert-SelfTest -Condition ($cutoverFirstInstallFailureRejected -and
-        (Get-ActiveVersionAt -DataRoot $brokerInstallerData) -ceq '4.0.0' -and
+        $null -eq (Get-ActiveVersionAt -DataRoot $brokerInstallerData) -and
+        $cutoverFirstInstallFailureError -notmatch 'automatic rollback was incomplete' -and
+        -not (Test-Path -LiteralPath (Join-Path $brokerInstallerData `
+            'config\dyson-control.env')) -and
+        -not (Test-Path -LiteralPath (Join-Path $brokerInstallerRoot 'bootstrap')) -and
         -not (Test-Path -LiteralPath (Join-Path $brokerApplicationData `
             'lifecycle-broker\broker-profile.json')) -and
         -not (Test-Path -LiteralPath (Join-Path $lifecycleShadowRoot 'broker-task.json')) -and
@@ -2925,7 +3263,12 @@ try {
         rejected = $brokerFirstInstallReadinessRejected
         startAttempted = $global:DysonDeploymentTaskFixtureStartCalls.Count -eq ($brokerFirstInstallStartCount + 1)
         controlTaskRemoved = -not $global:DysonDeploymentTaskFixture.ContainsKey($brokerReadinessTaskName)
-        activePointerPreserved = (Get-ActiveVersionAt -DataRoot $brokerInstallerData) -ceq '4.0.0'
+        absentActivePointerRestored = $null -eq (Get-ActiveVersionAt -DataRoot $brokerInstallerData)
+        absentConfigurationRestored = -not (Test-Path -LiteralPath (
+            Join-Path $brokerInstallerData 'config\dyson-control.env'
+        ))
+        rollbackComplete = $brokerFirstInstallReadinessError -notmatch `
+            'automatic rollback was incomplete'
         cutoverProfileRemoved = -not (Test-Path -LiteralPath $brokerProfileAfterFirstInstallReadiness)
         cutoverBindingRemoved = -not (Test-Path -LiteralPath $brokerBindingAfterFirstInstallReadiness)
         lifecycleProfileRemoved = -not (Test-Path -LiteralPath $lifecycleProfileAfterFirstInstallReadiness)
@@ -2949,6 +3292,29 @@ try {
             [string]::Join(',', $brokerFirstInstallReadinessFailures) + '; error=' +
             $brokerFirstInstallReadinessError)
 
+    # Add the brokers to an existing read-only installation. Its old configuration
+    # deliberately has no broker profile bindings; the new source supplies them.
+    $readOnlyBrokerConfiguration = Join-Path $testRoot 'fictional-before-brokers.env'
+    $readOnlyLines = @($brokerConfigurationLines | Where-Object { $_ -notmatch '^DYSON_(?:LIFECYCLE|CUTOVER)_' }) +
+        @('DYSON_LIFECYCLE_ENABLED=false', 'DYSON_CUTOVER_ENABLED=false', 'DYSON_CUTOVER_RECOVERY_ENABLED=false')
+    [IO.File]::WriteAllText($readOnlyBrokerConfiguration, ($readOnlyLines -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+    $readOnlyInstallArguments = @{}
+    foreach ($key in $brokerInstallArguments.Keys) {
+        if ($key -notin @('InstallLifecycleBrokerTask', 'ProjectRoot', 'RuntimeBootstrapRoot', 'ServiceUser',
+            'GamePort', 'DispatchReadyTimeout', 'SelfTestShadow', 'InstallCutoverBrokerTask',
+            'CutoverProjectRoot', 'CutoverAuthorityProfileFile', 'CutoverAuthorityInventoryRevision',
+            'CutoverRuntimeTaskTransactionRoot', 'CutoverServiceUser', 'CutoverGamePort',
+            'CutoverRuntimeBootstrapRoot', 'SelfTestCutoverBrokerShadowRoot')) {
+            $readOnlyInstallArguments[$key] = $brokerInstallArguments[$key]
+        }
+    }
+    $readOnlyInstallArguments.ConfigurationSource = $readOnlyBrokerConfiguration
+    $readOnlyInstallOutput = & $installScript @readOnlyInstallArguments -Confirm:$false
+    $readOnlyInstallResult = ($readOnlyInstallOutput | Out-String).Trim() | ConvertFrom-Json
+    Assert-SelfTest -Condition ($readOnlyInstallResult.state -eq 'installed' -and
+        -not (Test-Path (Join-Path $brokerApplicationData 'lifecycle-broker\broker-profile.json')) -and
+        -not (Test-Path (Join-Path $brokerApplicationData 'cutover-broker\broker-profile.json'))) `
+        -Message 'read-only baseline unexpectedly installed broker profiles'
     $brokerInstallerOutput = & $installScript @brokerInstallArguments -Confirm:$false
     $brokerInstallerResult = ($brokerInstallerOutput | Out-String).Trim() | ConvertFrom-Json
     Assert-SelfTest -Condition ($brokerInstallerResult.state -eq 'installed' -and
@@ -2969,6 +3335,39 @@ try {
         [string]$brokerInstallerResult.cutoverBrokerTaskSddlSha256 -match '^[0-9a-f]{64}$' -and
         -not [bool]$brokerInstallerResult.cutoverBrokerUpgraded) `
         -Message 'the explicitly enabled cutover broker install did not return a complete redacted receipt'
+    . (Join-Path (Split-Path $PSScriptRoot -Parent) 'DysonHostMutationLease.Common.ps1')
+    $busyHostLease = Enter-DysonHostMutationLease -DataRoot $brokerApplicationData `
+        -Owner 'deployment-fixture' -Operation 'active-game-mutation' `
+        -RequestId ([guid]::NewGuid().ToString('D')) -OwnerPid $PID -TimeoutMilliseconds 0
+    $busyLeaseRoot = (Get-DysonHostMutationLeasePathInfo -DataRoot $brokerApplicationData).LockRoot
+    function Get-BusyFixtureDataFingerprint {
+        # The fixture intentionally owns an exclusive lease. Hash every other
+        # deployment entry, plus the root ACL and complete entry-name inventory,
+        # without attempting to reopen that exclusively locked lease file.
+        $entries = @(Get-ChildItem -LiteralPath $brokerInstallerData -Force | Sort-Object Name)
+        $parts = @((Get-Acl -LiteralPath $brokerInstallerData).Sddl, ($entries.Name -join '|'))
+        foreach ($entry in $entries) {
+            if ([string]::Equals($entry.FullName, $busyLeaseRoot, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $parts += $entry.Name + '|' + (Get-SelfTestTreeFingerprint $entry.FullName)
+        }
+        return Get-DysonTextSha256 ($parts -join "`n")
+    }
+    try {
+        $busyStopCount = $global:DysonDeploymentTaskFixtureStopCalls.Count
+        $busyStartCount = $global:DysonDeploymentTaskFixtureStartCalls.Count
+        $busyInstallBefore = Get-SelfTestTreeFingerprint $brokerInstallerRoot
+        $busyDataBefore = Get-BusyFixtureDataFingerprint
+        $busyLeaseMessage = $null
+        try { & $installScript @brokerInstallArguments -Confirm:$false | Out-Null }
+        catch { $busyLeaseMessage = $_.Exception.Message }
+        Assert-SelfTest -Condition ($busyLeaseMessage -ceq 'DYSON_HOST_MUTATION_LEASE_BUSY' -and
+            $global:DysonDeploymentTaskFixtureStopCalls.Count -eq $busyStopCount -and
+            $global:DysonDeploymentTaskFixtureStartCalls.Count -eq $busyStartCount -and
+            (Get-SelfTestTreeFingerprint $brokerInstallerRoot) -ceq $busyInstallBefore -and
+            (Get-BusyFixtureDataFingerprint) -ceq $busyDataBefore) `
+            -Message 'broker quiescence interrupted a host mutation or changed deployment state while its lease was busy'
+    }
+    finally { Exit-DysonHostMutationLease -Lease $busyHostLease | Out-Null }
     $installedBrokerScriptRoot = Join-Path $brokerInstallerRoot 'releases\4.0.0\scripts\windows\cutover-broker'
     $installedBrokerScriptNames = @(
         Get-ChildItem -LiteralPath $installedBrokerScriptRoot -File -Force -ErrorAction Stop |
@@ -3108,6 +3507,56 @@ try {
         -not $brokerInstallReceiptText.Contains($brokerInstallerData) -and
         -not $brokerInstallReceiptText.Contains($brokerServiceUser)) `
         -Message 'the cutover broker deployment receipt disclosed a path or service identity'
+
+    # Initial installation above exercises the active pair. Qualify upgrades,
+    # rollback, and uninstall while the candidate pair is prepared but disabled,
+    # as it remains while the previous manager owns the running game.
+    $preparedRuntimeTaskBytes = @{}
+    foreach ($kind in @('server', 'stop')) {
+        $runtimeTaskPath = Join-Path $lifecycleShadowRoot ($kind + '-task.json')
+        $runtimeTaskRecord = [IO.File]::ReadAllText($runtimeTaskPath) | ConvertFrom-Json
+        $runtimeTaskRecord.descriptor.enabled = $false
+        $runtimeTaskRecord.state = 'Disabled'
+        [IO.File]::WriteAllText($runtimeTaskPath,
+            ($runtimeTaskRecord | ConvertTo-Json -Depth 10 -Compress) + "`n",
+            [Text.UTF8Encoding]::new($false))
+        $preparedRuntimeTaskBytes[$runtimeTaskPath] = [IO.File]::ReadAllBytes($runtimeTaskPath)
+    }
+    foreach ($invalidPair in @('mixed-enabled', 'descriptor-drift')) {
+        $invalidTaskPath = Join-Path $lifecycleShadowRoot 'stop-task.json'
+        $invalidTask = [IO.File]::ReadAllText($invalidTaskPath) | ConvertFrom-Json
+        if ($invalidPair -ceq 'mixed-enabled') {
+            $invalidTask.descriptor.enabled = $true
+            $invalidTask.state = 'Ready'
+        }
+        else { $invalidTask.descriptor.arguments += ' -TimeoutSeconds 151' }
+        [IO.File]::WriteAllText($invalidTaskPath,
+            ($invalidTask | ConvertTo-Json -Depth 10 -Compress) + "`n",
+            [Text.UTF8Encoding]::new($false))
+        try {
+            $invalidPairBefore = Get-SelfTestTreeFingerprint $testRoot
+            foreach ($operation in @('install', 'uninstall')) {
+                $invalidPairError = $null
+                try {
+                    if ($operation -ceq 'install') {
+                        & $installScript @brokerInstallArguments -WhatIf 6>$null | Out-Null
+                    }
+                    else {
+                        & $uninstallScript -InstallRoot $brokerInstallerRoot -DataRoot $brokerInstallerData `
+                            -TaskName 'Dyson-Control-Plane-SelfTest-Brokers' -SelfTestSkipAdministratorCheck `
+                            -SelfTestShadow $lifecycleShadowRoot `
+                            -SelfTestCutoverBrokerShadowRoot $brokerShadowRoot -WhatIf 6>$null | Out-Null
+                    }
+                }
+                catch { $invalidPairError = $_.Exception.Message }
+                Assert-SelfTest -Condition ($invalidPairError -ceq 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID' -and
+                    (Get-SelfTestTreeFingerprint $testRoot) -ceq $invalidPairBefore) `
+                    -Message ("the {0} preimage accepted or mutated the {1} runtime task pair: {2}" -f `
+                        $operation, $invalidPair, $invalidPairError)
+            }
+        }
+        finally { [IO.File]::WriteAllBytes($invalidTaskPath, $preparedRuntimeTaskBytes[$invalidTaskPath]) }
+    }
 
     $brokerProfileBeforeUpgrade = [System.IO.File]::ReadAllBytes($installedBrokerProfilePath)
     $brokerProfileAclBeforeUpgrade = (Get-Acl -LiteralPath $installedBrokerProfilePath).Sddl
@@ -3336,47 +3785,58 @@ try {
         else { $null }
         $brokerReceiptNamesAfterFailure = @(Get-ChildItem -LiteralPath $brokerInstallationReceiptRoot -File |
             ForEach-Object { $_.Name } | Sort-Object -CaseSensitive)
-        Assert-SelfTest -Condition ($brokerUpgradeRejected -and
-            $brokerUpgradeFailureMessage -like "*at isolated self-test stage $brokerFailureStage*" -and
-            (Get-ActiveVersionAt -DataRoot $brokerInstallerData) -ceq '4.0.0' -and
-            $global:DysonDeploymentTaskFixture.ContainsKey('Dyson-Control-Plane-SelfTest-Brokers') -and
-            [string]$global:DysonDeploymentTaskFixture['Dyson-Control-Plane-SelfTest-Brokers'].Xml -ceq
-                $brokerControlTaskXmlBeforeUpgrade -and
-            [string]$global:DysonDeploymentTaskFixture['Dyson-Control-Plane-SelfTest-Brokers'].State -ceq 'Running' -and
-            $newFailureTransactions.Count -eq 1 -and
-            [string]$failedBrokerTransaction.state -ceq 'rolled-back' -and
-            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($installedBrokerProfilePath)) -ceq
-                [Convert]::ToBase64String($brokerProfileBeforeUpgrade) -and
-            (Get-Acl -LiteralPath $installedBrokerProfilePath).Sddl -ceq $brokerProfileAclBeforeUpgrade -and
-            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($brokerBundleBindingPath)) -ceq
-                [Convert]::ToBase64String($brokerBundleBindingBeforeUpgrade) -and
-            (Get-Acl -LiteralPath $brokerBundleBindingPath).Sddl -ceq $brokerBundleBindingAclBeforeUpgrade -and
-            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($brokerTaskIntentPath)) -ceq
-                [Convert]::ToBase64String($brokerTaskIntentBeforeUpgrade) -and
-            (Get-Acl -LiteralPath $brokerTaskIntentPath).Sddl -ceq $brokerTaskIntentAclBeforeUpgrade -and
-            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($brokerDirectoryAclIntentPath)) -ceq
-                [Convert]::ToBase64String($brokerDirectoryAclIntentBeforeUpgrade) -and
-            (Get-Acl -LiteralPath $brokerDirectoryAclIntentPath).Sddl -ceq `
-                $brokerDirectoryAclIntentFileAclBeforeUpgrade -and
-            @($brokerStorageAclsBeforeUpgrade.Keys | Where-Object {
+        $brokerRollbackChecks = [ordered]@{
+            rejected = { $brokerUpgradeRejected }
+            expectedFailureStage = { $brokerUpgradeFailureMessage -like "*at isolated self-test stage $brokerFailureStage*" }
+            activeVersion = { (Get-ActiveVersionAt -DataRoot $brokerInstallerData) -ceq '4.0.0' }
+            controlTaskPresent = { $global:DysonDeploymentTaskFixture.ContainsKey('Dyson-Control-Plane-SelfTest-Brokers') }
+            controlTaskXml = { [string]$global:DysonDeploymentTaskFixture['Dyson-Control-Plane-SelfTest-Brokers'].Xml -ceq
+                $brokerControlTaskXmlBeforeUpgrade }
+            controlTaskRunning = { [string]$global:DysonDeploymentTaskFixture['Dyson-Control-Plane-SelfTest-Brokers'].State -ceq 'Running' }
+            oneFailureTransaction = { $newFailureTransactions.Count -eq 1 }
+            transactionRolledBack = { [string]$failedBrokerTransaction.state -ceq 'rolled-back' }
+            cutoverProfileBytes = { [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($installedBrokerProfilePath)) -ceq
+                [Convert]::ToBase64String($brokerProfileBeforeUpgrade) }
+            cutoverProfileAcl = { (Get-Acl -LiteralPath $installedBrokerProfilePath).Sddl -ceq $brokerProfileAclBeforeUpgrade }
+            cutoverBindingBytes = { [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($brokerBundleBindingPath)) -ceq
+                [Convert]::ToBase64String($brokerBundleBindingBeforeUpgrade) }
+            cutoverBindingAcl = { (Get-Acl -LiteralPath $brokerBundleBindingPath).Sddl -ceq $brokerBundleBindingAclBeforeUpgrade }
+            cutoverTaskBytes = { [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($brokerTaskIntentPath)) -ceq
+                [Convert]::ToBase64String($brokerTaskIntentBeforeUpgrade) }
+            cutoverTaskAcl = { (Get-Acl -LiteralPath $brokerTaskIntentPath).Sddl -ceq $brokerTaskIntentAclBeforeUpgrade }
+            cutoverDirectoryIntentBytes = { [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($brokerDirectoryAclIntentPath)) -ceq
+                [Convert]::ToBase64String($brokerDirectoryAclIntentBeforeUpgrade) }
+            cutoverDirectoryIntentAcl = { (Get-Acl -LiteralPath $brokerDirectoryAclIntentPath).Sddl -ceq `
+                $brokerDirectoryAclIntentFileAclBeforeUpgrade }
+            cutoverStorageAcls = { @($brokerStorageAclsBeforeUpgrade.Keys | Where-Object {
                 (Get-Acl -LiteralPath $_).Sddl -cne $brokerStorageAclsBeforeUpgrade[$_]
-            }).Count -eq 0 -and
-            [Convert]::ToBase64String([IO.File]::ReadAllBytes($installedLifecycleProfilePath)) -ceq
-                [Convert]::ToBase64String($lifecycleProfileBeforeUpgrade) -and
-            (Get-Acl -LiteralPath $installedLifecycleProfilePath).Sddl -ceq `
-                $lifecycleProfileFileAclBeforeUpgrade -and
-            [Convert]::ToBase64String([IO.File]::ReadAllBytes($lifecycleProfileAclPath)) -ceq
-                [Convert]::ToBase64String($lifecycleProfileAclBeforeUpgrade) -and
-            [Convert]::ToBase64String([IO.File]::ReadAllBytes($lifecycleTaskRecordPath)) -ceq
-                [Convert]::ToBase64String($lifecycleTaskBeforeUpgrade) -and
-            @($lifecycleStorageAclsBeforeUpgrade.Keys | Where-Object {
+            }).Count -eq 0 }
+            lifecycleProfileBytes = { [Convert]::ToBase64String([IO.File]::ReadAllBytes($installedLifecycleProfilePath)) -ceq
+                [Convert]::ToBase64String($lifecycleProfileBeforeUpgrade) }
+            lifecycleProfileAcl = { (Get-Acl -LiteralPath $installedLifecycleProfilePath).Sddl -ceq `
+                $lifecycleProfileFileAclBeforeUpgrade }
+            lifecycleAclIntentBytes = { [Convert]::ToBase64String([IO.File]::ReadAllBytes($lifecycleProfileAclPath)) -ceq
+                [Convert]::ToBase64String($lifecycleProfileAclBeforeUpgrade) }
+            lifecycleTaskBytes = { [Convert]::ToBase64String([IO.File]::ReadAllBytes($lifecycleTaskRecordPath)) -ceq
+                [Convert]::ToBase64String($lifecycleTaskBeforeUpgrade) }
+            lifecycleStorageAcls = { @($lifecycleStorageAclsBeforeUpgrade.Keys | Where-Object {
                 (Get-Acl -LiteralPath $_).Sddl -cne $lifecycleStorageAclsBeforeUpgrade[$_]
-            }).Count -eq 0 -and
-            ($brokerReceiptNamesAfterFailure -join '|') -ceq ($brokerReceiptNamesBeforeUpgrade -join '|')) `
-            -Message ("cross-release broker rollback failed at {0}: {1}" -f `
-                $brokerFailureStage, $brokerUpgradeFailureMessage)
+            }).Count -eq 0 }
+            closedReceiptInventory = { ($brokerReceiptNamesAfterFailure -join '|') -ceq ($brokerReceiptNamesBeforeUpgrade -join '|') }
+        }
+        $brokerRollbackFailures = @(foreach ($check in $brokerRollbackChecks.GetEnumerator()) {
+            try { if (-not (& $check.Value)) { $check.Key } }
+            catch { $check.Key + '-check-error' }
+        })
+        Assert-SelfTest -Condition ($brokerRollbackFailures.Count -eq 0) `
+            -Message ("cross-release broker rollback failed at {0} [{1}]: {2}" -f `
+                $brokerFailureStage, ($brokerRollbackFailures -join ','), $brokerUpgradeFailureMessage)
         Assert-NoInstallPartials -InstallRoot $brokerInstallerRoot -DataRoot $brokerInstallerData `
             -Message "the broker rollback at $brokerFailureStage left installer partial directories"
+        Assert-SelfTest -Condition (@($preparedRuntimeTaskBytes.Keys | Where-Object {
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($_)) -cne
+                [Convert]::ToBase64String($preparedRuntimeTaskBytes[$_])
+        }).Count -eq 0) -Message 'broker upgrade rollback changed the prepared disabled runtime pair'
         if ($brokerFailureStage -ceq 'after-snapshot') {
             Assert-SelfTest -Condition ($global:DysonDeploymentTaskFixtureStartCalls.Count -eq
                 ($controlPlaneStartCountBeforeFailure + 1) -and
@@ -3517,6 +3977,10 @@ try {
         ) -ge 0) `
         -Message 'the cross-release broker transaction did not commit the new active release/profile/bundle/task atomically'
 
+    Assert-SelfTest -Condition (@($preparedRuntimeTaskBytes.Keys | Where-Object {
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($_)) -cne
+            [Convert]::ToBase64String($preparedRuntimeTaskBytes[$_])
+    }).Count -eq 0) -Message 'broker upgrade activated or changed the prepared disabled runtime pair'
     $brokerProfileBeforeRepeat = [System.IO.File]::ReadAllBytes($installedBrokerProfilePath)
     $brokerProfileAclBeforeRepeat = (Get-Acl -LiteralPath $installedBrokerProfilePath).Sddl
     $brokerBindingBeforeRepeat = [System.IO.File]::ReadAllBytes($brokerBundleBindingPath)
@@ -3883,6 +4347,10 @@ try {
         -SelfTestCutoverBrokerShadowRoot $brokerShadowRoot `
         -Confirm:$false
     $brokerUninstallResult = ($brokerUninstallOutput | Out-String).Trim() | ConvertFrom-Json
+    Assert-SelfTest -Condition (@($preparedRuntimeTaskBytes.Keys | Where-Object {
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($_)) -cne
+            [Convert]::ToBase64String($preparedRuntimeTaskBytes[$_])
+    }).Count -eq 0) -Message 'broker uninstall changed the prepared disabled runtime pair'
     Assert-SelfTest -Condition ($brokerUninstallResult.state -ceq 'uninstalled' -and
         [bool]$brokerUninstallResult.taskRemoved -and
         [bool]$brokerUninstallResult.lifecycleBrokerRemoved -and
@@ -4205,16 +4673,19 @@ try {
     }
     Assert-SelfTest -Condition $existingTaskRollbackObserved `
         -Message 'a post-task readiness failure did not fail the installer'
-    Assert-SelfTest -Condition (-not $global:DysonDeploymentTaskFixture.ContainsKey($existingTaskName) -and
-        $existingTaskRollbackError -match 'protected-configuration-restore-executor-unavailable' -and
-        $existingTaskRollbackError -match 'previous-task-restore-blocked') `
-        -Message ('a post-task readiness failure did not fail closed after protected configuration creation; installer error: ' + $existingTaskRollbackError)
-    Assert-SelfTest -Condition ((Get-ActiveVersionAt -DataRoot $taskRollbackExistingData) -eq '2.0.0' -and
-        (Test-Path -LiteralPath (Join-Path $taskRollbackExistingRoot `
-            'bootstrap\configuration\Test-DysonControlConfiguration.ps1') -PathType Leaf) -and
-        (Test-Path -LiteralPath (Join-Path $taskRollbackExistingData `
-            'config\dyson-control.env') -PathType Leaf)) `
-        -Message 'the existing-task failure did not retain a coherent protected release/configuration boundary'
+    Assert-SelfTest -Condition ($global:DysonDeploymentTaskFixture.ContainsKey($existingTaskName) -and
+        $global:DysonDeploymentTaskFixture[$existingTaskName].Xml -ceq $existingTaskXml -and
+        $global:DysonDeploymentTaskFixture[$existingTaskName].State -eq 'Running' -and
+        $existingTaskRollbackError -notmatch 'automatic rollback was incomplete') `
+        -Message ('a post-task readiness failure did not restore the exact previous task; installer error: ' + $existingTaskRollbackError)
+    Assert-SelfTest -Condition ((Get-ActiveVersionAt -DataRoot $taskRollbackExistingData) -eq '1.0.0' -and
+        -not (Test-Path -LiteralPath (Join-Path $taskRollbackExistingRoot 'bootstrap')) -and
+        -not (Test-Path -LiteralPath (Join-Path $taskRollbackExistingData `
+            'config\dyson-control.env')) -and
+        [System.IO.File]::ReadAllText($existingPointerPath, [System.Text.Encoding]::UTF8) -ceq
+            $existingPointerBefore -and
+        (Get-Acl -LiteralPath $taskRollbackExistingData -ErrorAction Stop).Sddl -eq $existingAclBefore) `
+        -Message 'the existing-task failure did not restore the exact release/configuration/ACL preimage'
     Assert-NoInstallPartials -InstallRoot $taskRollbackExistingRoot -DataRoot $taskRollbackExistingData `
         -Message 'the existing-task rollback left a partial deployment directory'
 
@@ -4239,14 +4710,16 @@ try {
     Assert-SelfTest -Condition $newTaskRollbackObserved `
         -Message 'a post-new-task readiness failure did not fail the installer'
     Assert-SelfTest -Condition (-not $global:DysonDeploymentTaskFixture.ContainsKey($newTaskName) -and
-        $newTaskRollbackError -match 'protected-configuration-restore-executor-unavailable') `
-        -Message 'a post-task readiness failure did not remove the newly created task and report blocked config restore'
-    Assert-SelfTest -Condition ((Get-ActiveVersionAt -DataRoot $taskRollbackNewData) -eq '2.0.0' -and
-        (Test-Path -LiteralPath (Join-Path $taskRollbackNewRoot `
-            'bootstrap\configuration\Test-DysonControlConfiguration.ps1') -PathType Leaf) -and
-        (Test-Path -LiteralPath (Join-Path $taskRollbackNewData `
-            'config\dyson-control.env') -PathType Leaf)) `
-        -Message 'the new-task failure did not retain a coherent protected release/configuration boundary'
+        $newTaskRollbackError -notmatch 'automatic rollback was incomplete') `
+        -Message 'a post-task readiness failure did not remove the newly created task and complete rollback'
+    Assert-SelfTest -Condition ((Get-ActiveVersionAt -DataRoot $taskRollbackNewData) -eq '1.0.0' -and
+        -not (Test-Path -LiteralPath (Join-Path $taskRollbackNewRoot 'bootstrap')) -and
+        -not (Test-Path -LiteralPath (Join-Path $taskRollbackNewData `
+            'config\dyson-control.env')) -and
+        [System.IO.File]::ReadAllText($newPointerPath, [System.Text.Encoding]::UTF8) -ceq
+            $newPointerBefore -and
+        (Get-Acl -LiteralPath $taskRollbackNewData -ErrorAction Stop).Sddl -eq $newAclBefore) `
+        -Message 'the new-task failure did not restore the exact release/configuration/ACL preimage'
     Assert-NoInstallPartials -InstallRoot $taskRollbackNewRoot -DataRoot $taskRollbackNewData `
         -Message 'the new-task rollback left a partial deployment directory'
 
@@ -4269,7 +4742,7 @@ try {
     finally { $global:DysonDeploymentTaskFixtureFailRemovalFor = $null }
     Assert-SelfTest -Condition ($removalFailureObserved -and
         $removalFailureError -match 'replacement-task-stop-remove' -and
-        $removalFailureError -match 'protected-configuration-restore-executor-unavailable' -and
+        $removalFailureError -match 'protected-configuration-first-install-restore-blocked-by-task' -and
         $removalFailureError -match 'bootstrap-configuration-blocked' -and
         $removalFailureError -match 'previous-task-restore-blocked') `
         -Message ('a replacement-task removal failure did not report every blocked compensation phase: ' +
@@ -4506,6 +4979,11 @@ try {
         lifecycleBrokerReadinessFailureCompensated = $true
         lifecycleBrokerBoundToActivatedImmutableRelease = $true
         lifecycleBrokerCrossReleaseRollbackWasByteExact = $true
+        lifecycleBrokerShadowRollbackRestoredActualProfileFileAcl = $true
+        cutoverBrokerParentRestoredProfileAndBindingFileAcls = $true
+        brokerUninstallCompensationPreservedLegacyDirectoryAclAndHistory = $true
+        lifecycleBrokerPreparedDisabledUpgradeRollbackUninstallValidated = $true
+        lifecycleBrokerPreparedMixedAndDriftRejected = $true
         lifecycleBrokerSameReleaseWasByteExact = $true
         lifecycleBrokerDirectDeploymentBypassRejected = $true
         lifecycleBrokerUninstallPendingAndDriftRejected = $true
@@ -4513,6 +4991,9 @@ try {
         lifecycleBrokerUninstallPreservedHistoryAndAudit = $true
         lifecycleBrokerRemoveDataRejectedHistory = $true
         cutoverBrokerDefaultWasNonInstalling = $true
+        cutoverBrokerNativeTaskCollectionsValidated = $true
+        brokerQuiescencePreservedWorkerAndWaitedForIdle = $true
+        brokerQuiescenceRejectedActiveHostMutationWithoutStoppingPanel = $true
         cutoverBrokerDisabledConfigurationRejectedBeforeMutation = $true
         cutoverBrokerWhatIfWasNonMutating = $true
         cutoverBrokerTaskInstalledWithProtectedChannelReceipt = $true

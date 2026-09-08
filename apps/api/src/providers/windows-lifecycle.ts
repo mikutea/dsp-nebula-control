@@ -76,7 +76,7 @@ export class WindowsLifecycleAdapter implements LifecycleMutationAdapter {
     }
     this.#options = {
       ...options,
-      bridgePluginVersion: options.bridgePluginVersion ?? '0.1.0-rc.1',
+      bridgePluginVersion: options.bridgePluginVersion ?? '0.1.0-rc.14',
       serverTaskName: options.serverTaskName ?? 'Dyson-Nebula-Server',
       stopTaskName: options.stopTaskName ?? 'Dyson-Nebula-Stop',
       gamePort: options.gamePort ?? 8469

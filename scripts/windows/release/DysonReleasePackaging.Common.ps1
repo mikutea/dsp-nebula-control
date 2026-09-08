@@ -97,6 +97,7 @@ $script:DysonArtifactRequiredDeploymentScripts = @(
     'scripts/windows/deployment/Install-DysonControl.ps1',
     'scripts/windows/deployment/Install-DysonControlTask.ps1',
     'scripts/windows/deployment/Install-DysonNodeRuntime.ps1',
+    'scripts/windows/deployment/Set-DysonGameBootstrapAccess.ps1',
     'scripts/windows/deployment/Invoke-DysonControlDeployment.ps1',
     'scripts/windows/deployment/New-DysonRebootAcceptanceCheckpoint.ps1',
     'scripts/windows/deployment/Repair-DysonNodeRuntime.ps1',

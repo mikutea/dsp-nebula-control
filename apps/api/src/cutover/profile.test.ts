@@ -37,6 +37,33 @@ describe('cutover authority profile', () => {
     expect(Object.isFrozen(profile.candidateAuthority)).toBe(true)
   })
 
+  it('preserves reconstructed template provenance and the disabled candidate preimage', () => {
+    mutateProfile(fixture.options.profileFile, (profile) => {
+      profile.candidateAuthority.legacyPreimage.expectedEnabledBeforeIsolation = false
+      profile.authoritySource = 'reconstructed-template'
+      profile.legacyTemplateSha256 = sha256Text('template bytes')
+      resign(profile)
+    })
+    const profile = readCutoverAuthorityProfile(fixture.options)
+    expect(profile.authoritySource).toBe('reconstructed-template')
+    expect(profile.candidateAuthority.legacyPreimage.expectedEnabledBeforeIsolation).toBe(false)
+  })
+
+  it.each(['missing-source', 'missing-hash', 'wrong-enabled', 'unmarked-disabled'])(
+    'rejects inconsistent reconstructed provenance: %s', (variant) => {
+      mutateProfile(fixture.options.profileFile, (profile) => {
+        profile.candidateAuthority.legacyPreimage.expectedEnabledBeforeIsolation = false
+        profile.authoritySource = 'reconstructed-template'
+        profile.legacyTemplateSha256 = sha256Text('template bytes')
+        if (variant === 'missing-source' || variant === 'unmarked-disabled') delete profile.authoritySource
+        if (variant === 'missing-hash' || variant === 'unmarked-disabled') delete profile.legacyTemplateSha256
+        if (variant === 'wrong-enabled') profile.candidateAuthority.legacyPreimage.expectedEnabledBeforeIsolation = true
+        resign(profile)
+      })
+      expectCode(fixture.options, 'CUTOVER_PROFILE_SCHEMA_INVALID')
+    }
+  )
+
   it('rejects an alternate profile location even when its bytes are valid', () => {
     const alternate = path.join(root, 'alternate-profile.json')
     fs.copyFileSync(fixture.options.profileFile, alternate)

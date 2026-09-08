@@ -1,4 +1,4 @@
-Set-StrictMode -Version 2.0
+﻿Set-StrictMode -Version 2.0
 
 function Get-DysonFixedTaskReadExecuteSddl {
     return 'D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;LS)'
@@ -17,15 +17,16 @@ function Assert-DysonFixedTaskReadExecuteAclIntent {
             $null -eq $descriptor.DiscretionaryAcl -or $descriptor.DiscretionaryAcl.Count -ne 3) {
             throw 'DACL is not fixed and protected'
         }
+        # Task Scheduler maps generic rights to these exact file access masks.
         $expected = @{
-            'S-1-5-18' = [int32]268435456
-            'S-1-5-32-544' = [int32]268435456
-            'S-1-5-19' = [int32]-1610612736
+            'S-1-5-18' = @([int32]268435456, [int32]0x1f01ff)
+            'S-1-5-32-544' = @([int32]268435456, [int32]0x1f01ff)
+            'S-1-5-19' = @([int32]-1610612736, [int32]0x1200a9)
         }
         foreach ($ace in $descriptor.DiscretionaryAcl) {
             if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed -or
                 -not $expected.ContainsKey($ace.SecurityIdentifier.Value) -or
-                [int32]$ace.AccessMask -ne [int32]$expected[$ace.SecurityIdentifier.Value]) {
+                [int32]$ace.AccessMask -notin $expected[$ace.SecurityIdentifier.Value]) {
                 throw 'DACL grants unexpected rights'
             }
             $expected.Remove($ace.SecurityIdentifier.Value)
@@ -64,7 +65,7 @@ function Set-DysonFixedTaskReadExecuteAcl {
         [void](Assert-DysonFixedTaskReadExecuteAclIntent $sddl)
         $service = New-Object -ComObject 'Schedule.Service'
         $service.Connect()
-        $folder = $service.GetFolder($TaskPath)
+        $folder = $service.GetFolder($(if ($TaskPath -eq '\') { '\' } else { $TaskPath.TrimEnd('\') }))
         $task = $folder.GetTask($TaskName)
         # TASK_DONT_ADD_PRINCIPAL_ACE keeps the explicit SYSTEM/Admin/LocalService DACL exact.
         $task.SetSecurityDescriptor($sddl, 0x10)
@@ -103,7 +104,7 @@ function Get-DysonFixedTaskSecurityDescriptor {
     try {
         $service = New-Object -ComObject 'Schedule.Service'
         $service.Connect()
-        $folder = $service.GetFolder($TaskPath)
+        $folder = $service.GetFolder($(if ($TaskPath -eq '\') { '\' } else { $TaskPath.TrimEnd('\') }))
         $task = $folder.GetTask($TaskName)
         return [string]$task.GetSecurityDescriptor(0x7)
     }
@@ -130,7 +131,7 @@ function Restore-DysonFixedTaskSecurityDescriptor {
     try {
         $service = New-Object -ComObject 'Schedule.Service'
         $service.Connect()
-        $folder = $service.GetFolder($TaskPath)
+        $folder = $service.GetFolder($(if ($TaskPath -eq '\') { '\' } else { $TaskPath.TrimEnd('\') }))
         $task = $folder.GetTask($TaskName)
         $task.SetSecurityDescriptor($Sddl, 0x10)
     }
@@ -140,5 +141,41 @@ function Restore-DysonFixedTaskSecurityDescriptor {
                 [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($comObject)
             }
         }
+    }
+}
+
+function Restore-DysonCutoverBrokerFileSecurityPreimage {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Sddl)
+    $target = Assert-DysonCutoverBrokerPlainFile $Path ([int64]::MaxValue)
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+    if ($null -eq $descriptor.Owner -or $null -eq $descriptor.Group -or $null -eq $descriptor.DiscretionaryAcl) {
+        throw 'The broker file ACL preimage is incomplete.'
+    }
+    if (-not ('DysonControl.CutoverBrokerFileAclRestore' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+namespace DysonControl {
+    public static class CutoverBrokerFileAclRestore {
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetFileSecurityW(string path, uint information, byte[] descriptor);
+    }
+}
+'@
+    }
+    # File.Replace can change inheritance bookkeeping. AUTO_INHERIT_REQ is
+    # required to retain an existing AUTO_INHERITED flag with SetFileSecurity.
+    if ($descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited) {
+        $descriptor.SetFlags($descriptor.ControlFlags -bor [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInheritRequired)
+    }
+    $bytes = [byte[]]::new($descriptor.BinaryLength)
+    $descriptor.GetBinaryForm($bytes, 0)
+    if (-not [DysonControl.CutoverBrokerFileAclRestore]::SetFileSecurityW(
+        (ConvertTo-DysonCutoverBrokerExtendedPath $target), 7, $bytes)) {
+        $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "The broker file ACL preimage could not be restored (Win32 $nativeError)."
+    }
+    if ((Microsoft.PowerShell.Security\Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl -cne $Sddl) {
+        throw 'The broker file ACL differs from its exact preimage after restore.'
     }
 }

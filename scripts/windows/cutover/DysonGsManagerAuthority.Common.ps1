@@ -253,13 +253,150 @@ function Get-GsAuthorityTaskDescriptor {
     if ($actions.Count -ne 1 -or $exec.Count -ne 1 -or $null -eq $principal -or $null -eq $settings) {
         Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TASK_INVALID'
     }
+    # Task Scheduler omits RunLevel when it uses the schema's LeastPrivilege
+    # default. Do not use PowerShell's XML property adapter for optional nodes
+    # under StrictMode, and do not infer a missing identity or logon mode.
+    $runLevelNode = $principal.SelectSingleNode('t:RunLevel', $manager)
+    $runLevel = if ($null -eq $runLevelNode) { 'LeastPrivilege' } else { [string]$runLevelNode.InnerText }
+    $userNode = $principal.SelectSingleNode('t:UserId', $manager)
+    $logonNode = $principal.SelectSingleNode('t:LogonType', $manager)
+    if ($null -eq $userNode -or $null -eq $logonNode) {
+        Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TASK_INVALID'
+    }
     return [pscustomobject][ordered]@{
         actionCount = $actions.Count; execute = [string]$exec[0].Command
-        arguments = [string]$exec[0].Arguments; userId = [string]$principal.UserId
-        logonType = [string]$principal.LogonType; runLevel = [string]$principal.RunLevel
+        arguments = [string]$exec[0].Arguments; userId = [string]$userNode.InnerText
+        logonType = [string]$logonNode.InnerText; runLevel = $runLevel
         triggerCount = $triggers.Count; principalXml = [string]$principal.OuterXml
         settingsXml = [string]$settings.OuterXml
     }
+}
+
+function Test-GsAuthoritySameUser {
+    param([string]$Actual, [string]$Expected)
+    if ([string]::IsNullOrWhiteSpace($Actual) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
+    if ([string]::Equals($Actual, $Expected, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    # Export-ScheduledTask may serialize a local account as a SID or MACHINE\user.
+    # Resolve both names rather than accepting a matching unqualified username.
+    try {
+        $sids = foreach ($name in @($Actual, $Expected)) {
+            if ($name -match '^S-1-') { ([Security.Principal.SecurityIdentifier]::new($name)).Value }
+            else {
+                $qualified = if ($name.StartsWith('.\', [StringComparison]::Ordinal)) {
+                    $env:COMPUTERNAME + $name.Substring(1)
+                } else { $name }
+                ([Security.Principal.NTAccount]::new($qualified)).Translate([Security.Principal.SecurityIdentifier]).Value
+            }
+        }
+        return [string]::Equals($sids[0], $sids[1], [StringComparison]::OrdinalIgnoreCase)
+    }
+    catch { return $false }
+}
+
+function Read-GsAuthorityTemplateBundle {
+    param([string]$Root, [string]$ExpectedSha256, [string]$ArchivePath, [switch]$UseArchive)
+    if ($UseArchive -and (Test-Path -LiteralPath $ArchivePath -PathType Leaf)) {
+        $bundle = Read-GsAuthorityJson $ArchivePath
+    }
+    elseif ($UseArchive -and (Test-Path -LiteralPath $script:GsAuthorityIntentPath -PathType Leaf)) {
+        # The intent is durable before the archive; a crash in that small gap
+        # must not require the operator's external template directory to survive.
+        $pending = Read-GsAuthorityJson $script:GsAuthorityIntentPath
+        $bundle = $pending.target.legacyTemplates
+    }
+    else {
+        $directory = Assert-GsAuthorityPlainDirectory $Root
+        $entries = @(Get-ChildItem -LiteralPath $directory -Force)
+        if ($entries.Count -ne 2 -or @($entries | Where-Object { $_.Name -cnotin @('legacy-server.xml', 'legacy-stop.xml') }).Count) {
+            Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TEMPLATE_INVALID'
+        }
+        $bundle = [pscustomobject][ordered]@{
+            protocol = 'DYSON_GSMANAGER_RECONSTRUCTED_TEMPLATES_V1'
+            provenance = 'operator-provided-reconstruction-not-original-backup'
+            server = Get-GsAuthorityFileImage (Assert-GsAuthorityPlainFile (Join-Path $directory 'legacy-server.xml') 131072)
+            stop = Get-GsAuthorityFileImage (Assert-GsAuthorityPlainFile (Join-Path $directory 'legacy-stop.xml') 131072)
+        }
+    }
+    if ([string]$bundle.protocol -cne 'DYSON_GSMANAGER_RECONSTRUCTED_TEMPLATES_V1' -or
+        [string]$bundle.provenance -cne 'operator-provided-reconstruction-not-original-backup') {
+        Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TEMPLATE_INVALID'
+    }
+    foreach ($entry in @($bundle.server, $bundle.stop)) {
+        $bytes = [Convert]::FromBase64String([string]$entry.bytesBase64)
+        if (-not $entry.present -or $bytes.Length -lt 1 -or $bytes.Length -gt 131072 -or
+            (Get-GsAuthoritySha256Bytes $bytes) -cne [string]$entry.sha256) {
+            Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TEMPLATE_INVALID'
+        }
+    }
+    # Hash is SHA256(UTF8(lowercase server SHA256 + ':' + lowercase stop SHA256)).
+    if ((Get-GsAuthoritySha256Text ($bundle.server.sha256 + ':' + $bundle.stop.sha256)) -cne $ExpectedSha256) {
+        Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TEMPLATE_HASH_MISMATCH'
+    }
+    return $bundle
+}
+
+function ConvertTo-GsAuthorityTemplateImage {
+    param($Template)
+    $stream = [IO.MemoryStream]::new([Convert]::FromBase64String([string]$Template.bytesBase64))
+    $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false, $true), $true)
+    try { $parsed = ConvertFrom-GsAuthorityTaskXml $reader.ReadToEnd() }
+    finally { $reader.Dispose(); $stream.Dispose() }
+    if (@($parsed.Document.SelectNodes('/t:Task/t:Principals/t:Principal', $parsed.NamespaceManager)).Count -ne 1) {
+        Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TEMPLATE_INVALID'
+    }
+    $settings = $parsed.Document.SelectSingleNode('/t:Task/t:Settings', $parsed.NamespaceManager)
+    if ($null -eq $settings) { Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TEMPLATE_INVALID' }
+    $enabled = $settings.SelectSingleNode('t:Enabled', $parsed.NamespaceManager)
+    if ($null -ne $enabled) { $enabled.InnerText = 'true' }
+    $image = [pscustomobject]@{
+        present = $true; enabled = $true; running = $false
+        xmlBase64 = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($parsed.Document.OuterXml))
+        descriptor = $null
+    }
+    $priorBackend = $script:GsAuthorityBackend
+    try { $script:GsAuthorityBackend = 'Windows'; $descriptor = Get-GsAuthorityTaskDescriptor $image }
+    finally { $script:GsAuthorityBackend = $priorBackend }
+    $descriptor | Add-Member -NotePropertyName principal -NotePropertyValue $descriptor.principalXml
+    $descriptor | Add-Member -NotePropertyName settings -NotePropertyValue $descriptor.settingsXml
+    $image.descriptor = $descriptor
+    return $image
+}
+
+function Assert-GsAuthorityPreparedTask {
+    param($Image, $Expected)
+    if (-not $Image.present -or $Image.enabled -or $Image.running) {
+        Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_PREPARED_TASK_MISMATCH'
+    }
+    if ($script:GsAuthorityBackend -ceq 'Shadow') {
+        if ((ConvertTo-GsAuthorityJson $Image.descriptor) -cne (ConvertTo-GsAuthorityJson $Expected)) {
+            Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_PREPARED_TASK_MISMATCH'
+        }
+        return
+    }
+    $task = @(Get-ScheduledTask -TaskName $Expected.taskName -TaskPath '\' -ErrorAction Stop)
+    if ($task.Count -ne 1) { Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_PREPARED_TASK_MISMATCH' }
+    $actions = @($task[0].Actions | Where-Object { $null -ne $_ })
+    $triggers = @($task[0].Triggers | Where-Object { $null -ne $_ })
+    if ($actions.Count -ne 1 -or [string]$actions[0].Execute -cne [string]$Expected.execute -or
+        [string]$actions[0].Arguments -cne [string]$Expected.arguments -or
+        -not [string]::IsNullOrWhiteSpace([string]$actions[0].WorkingDirectory) -or
+        -not (Test-GsAuthoritySameUser $task[0].Principal.UserId $Expected.userId) -or
+        [string]$task[0].Principal.LogonType -cne 'Interactive' -or [string]$task[0].Principal.RunLevel -cne 'Limited' -or
+        [bool]$task[0].Settings.Enabled -or [string]$task[0].Settings.MultipleInstances -cne 'IgnoreNew' -or
+        [string]$task[0].Settings.ExecutionTimeLimit -cne $Expected.executionTimeLimit -or
+        [int]$task[0].Settings.RestartCount -ne $Expected.restartCount -or
+        [string]$task[0].Settings.RestartInterval -cne [string]$Expected.restartInterval -or
+        [bool]$task[0].Settings.StartWhenAvailable -ne $Expected.startWhenAvailable) {
+        Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_PREPARED_TASK_MISMATCH'
+    }
+    if ($Expected.trigger -ceq 'AtLogOn') {
+        if ($triggers.Count -ne 1 -or $triggers[0].CimClass.CimClassName -cne 'MSFT_TaskLogonTrigger' -or
+            -not (Test-GsAuthoritySameUser $triggers[0].UserId $Expected.triggerUserId) -or
+            [string]$triggers[0].Delay -cne $Expected.triggerDelay) {
+            Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_PREPARED_TASK_MISMATCH'
+        }
+    }
+    elseif ($triggers.Count -ne 0) { Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_PREPARED_TASK_MISMATCH' }
 }
 
 function Assert-GsAuthorityLegacyTask {
@@ -275,21 +412,29 @@ function Assert-GsAuthorityLegacyTask {
     $expectedPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if ([int]$descriptor.actionCount -ne 1 -or [int]$descriptor.triggerCount -ne 0 -or
         -not [string]::Equals([IO.Path]::GetFullPath([string]$descriptor.execute), [IO.Path]::GetFullPath($expectedPowerShell), [StringComparison]::OrdinalIgnoreCase) -or
-        -not [string]::Equals([string]$descriptor.userId, $ServiceUser, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-GsAuthoritySameUser ([string]$descriptor.userId) $ServiceUser) -or
         [string]$descriptor.logonType -notin @('Interactive', 'InteractiveToken') -or
         [string]$descriptor.runLevel -notin @('Limited', 'LeastPrivilege')) {
         Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TASK_DEFINITION_MISMATCH'
     }
     $argumentMatch = [regex]::Match([string]$descriptor.arguments,
-        '^(?<prefix>(?:(?:-NoLogo|-NoProfile|-NonInteractive|-ExecutionPolicy\s+Bypass)\s+)*)-File\s+"(?<path>[^"\r\n]+)"\s*$',
+        '\A(?<prefix>(?:(?:-NoLogo|-NoProfile|-NonInteractive|-ExecutionPolicy[ \t]+Bypass)[ \t]+)*)-File[ \t]+"(?<path>[^"\r\n]+)"(?<suffix>[ \t]*(?:-(?:Ups[ \t]+60|TimeoutSeconds[ \t]+120)[ \t]*)?)\z',
         [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if (-not $argumentMatch.Success -or
         -not [string]::Equals([IO.Path]::GetFullPath($argumentMatch.Groups['path'].Value), [IO.Path]::GetFullPath($ExpectedScript), [StringComparison]::OrdinalIgnoreCase)) {
         Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TASK_DEFINITION_MISMATCH'
     }
+    $suffix = [string]$argumentMatch.Groups['suffix'].Value
+    $scriptName = [IO.Path]::GetFileName($ExpectedScript)
+    if (($suffix.Trim() -and $scriptName -notin @('start-dyson-server.ps1', 'stop-dyson-server.ps1')) -or
+        ($scriptName -ieq 'start-dyson-server.ps1' -and $suffix.Trim() -and $suffix -notmatch '\A[ \t]+-Ups[ \t]+60[ \t]*\z') -or
+        ($scriptName -ieq 'stop-dyson-server.ps1' -and $suffix.Trim() -and $suffix -notmatch '\A[ \t]+-TimeoutSeconds[ \t]+120[ \t]*\z')) {
+        Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TASK_DEFINITION_MISMATCH'
+    }
     return [pscustomobject][ordered]@{
         descriptor = $descriptor
         argumentPrefix = [string]$argumentMatch.Groups['prefix'].Value
+        argumentSuffix = $suffix
     }
 }
 
@@ -300,7 +445,7 @@ function New-GsAuthorityTargetImage {
         [Parameter(Mandatory)][string]$TargetScript,
         [Parameter(Mandatory)]$LegacyDefinition
     )
-    $arguments = [string]$LegacyDefinition.argumentPrefix + '-File "' + $TargetScript + '"'
+    $arguments = [string]$LegacyDefinition.argumentPrefix + '-File "' + $TargetScript + '"' + [string]$LegacyDefinition.argumentSuffix
     if ($script:GsAuthorityBackend -ceq 'Shadow') {
         $source = $SourceImage.descriptor
         $descriptor = [pscustomobject][ordered]@{
@@ -331,6 +476,20 @@ function New-GsAuthorityTargetImage {
     }
 }
 
+function ConvertTo-GsAuthorityComparableSettingsXml {
+    param([Parameter(Mandatory)][string]$Xml)
+    $parsed = ConvertFrom-GsAuthorityTaskXml $Xml
+    # Native Register/Export drops this one explicit schema default. Retain
+    # every other node, attribute, ordering and non-default Enabled value.
+    $nodes = @($parsed.Document.SelectNodes('/t:Settings/t:Enabled', $parsed.NamespaceManager))
+    if ($nodes.Count -eq 1 -and $nodes[0].Attributes.Count -eq 0 -and
+        $nodes[0].ChildNodes.Count -eq 1 -and $nodes[0].FirstChild.NodeType -eq [Xml.XmlNodeType]::Text -and
+        $nodes[0].InnerText -ceq 'true') {
+        [void]$nodes[0].ParentNode.RemoveChild($nodes[0])
+    }
+    return [string]$parsed.Document.OuterXml
+}
+
 function Assert-GsAuthorityTargetTask {
     param(
         [Parameter(Mandatory)][string]$TaskName,
@@ -346,15 +505,16 @@ function Assert-GsAuthorityTargetTask {
     $expectedPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if ([int]$actual.actionCount -ne 1 -or [int]$actual.triggerCount -ne 0 -or
         -not [string]::Equals([IO.Path]::GetFullPath([string]$actual.execute), [IO.Path]::GetFullPath($expectedPowerShell), [StringComparison]::OrdinalIgnoreCase) -or
-        -not [string]::Equals([string]$actual.userId, $ServiceUser, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-GsAuthoritySameUser ([string]$actual.userId) $ServiceUser) -or
         [string]$actual.logonType -notin @('Interactive', 'InteractiveToken') -or
         [string]$actual.runLevel -notin @('Limited', 'LeastPrivilege')) {
         Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TARGET_VERIFY_FAILED'
     }
     $match = [regex]::Match([string]$actual.arguments,
-        '^(?<prefix>(?:(?:-NoLogo|-NoProfile|-NonInteractive|-ExecutionPolicy\s+Bypass)\s+)*)-File\s+"(?<path>[^"\r\n]+)"\s*$',
+        '\A(?<prefix>(?:(?:-NoLogo|-NoProfile|-NonInteractive|-ExecutionPolicy[ \t]+Bypass)[ \t]+)*)-File[ \t]+"(?<path>[^"\r\n]+)"(?<suffix>[ \t]*(?:-(?:Ups[ \t]+60|TimeoutSeconds[ \t]+120)[ \t]*)?)\z',
         [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if (-not $match.Success -or [string]$match.Groups['prefix'].Value -cne [string]$LegacyDefinition.argumentPrefix -or
+        [string]$match.Groups['suffix'].Value -cne [string]$LegacyDefinition.argumentSuffix -or
         -not [string]::Equals([IO.Path]::GetFullPath($match.Groups['path'].Value), [IO.Path]::GetFullPath($TargetScript), [StringComparison]::OrdinalIgnoreCase)) {
         Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TARGET_VERIFY_FAILED'
     }
@@ -365,7 +525,8 @@ function Assert-GsAuthorityTargetTask {
         }
     }
     elseif ([string]$actual.principalXml -cne [string]$LegacyDefinition.descriptor.principalXml -or
-        [string]$actual.settingsXml -cne [string]$LegacyDefinition.descriptor.settingsXml) {
+        (ConvertTo-GsAuthorityComparableSettingsXml ([string]$actual.settingsXml)) -cne
+            (ConvertTo-GsAuthorityComparableSettingsXml ([string]$LegacyDefinition.descriptor.settingsXml))) {
         Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TARGET_VERIFY_FAILED'
     }
 }
@@ -659,6 +820,13 @@ function Restore-GsAuthorityPreimage {
         Restore-GsAuthorityFileImage $Intent.preimage.stopCopy $script:GsAuthorityStopCopy
         Restore-GsAuthorityFileImage $Intent.preimage.profile $script:GsAuthorityProfilePath
         foreach ($property in @('oldStart', 'oldStop', 'newStart', 'newStop', 'panel')) {
+            if ($property -in @('oldStart', 'oldStop') -and
+                $null -ne $Intent.target.PSObject.Properties['authoritySource'] -and
+                $Intent.target.authoritySource -ceq 'reconstructed-template') {
+                # Prepared candidates were never changed; do not re-register them
+                # and risk losing their existing task permissions during compensation.
+                continue
+            }
             Set-GsAuthorityTaskImage $Intent.preimage.tasks.$property
         }
         if ([bool]$Intent.preimage.panelRunning) {

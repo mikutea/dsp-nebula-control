@@ -102,10 +102,11 @@ function New-SelfTestTask {
 
 function New-SelfTestLegacyDescriptor {
     param([Parameter(Mandatory)][string]$ScriptPath)
+    $suffix = if ([IO.Path]::GetFileName($ScriptPath) -ieq 'start-dyson-server.ps1') { ' -Ups 60' } else { ' -TimeoutSeconds 120' }
     return [pscustomobject][ordered]@{
         actionCount = 1
         execute = $powerShellExe
-        arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $ScriptPath + '"'
+        arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $ScriptPath + '"' + $suffix
         userId = $serviceUser
         logonType = 'Interactive'
         runLevel = 'Limited'
@@ -113,6 +114,108 @@ function New-SelfTestLegacyDescriptor {
         principal = [pscustomobject][ordered]@{ userId = $serviceUser; logonType = 'Interactive'; runLevel = 'Limited' }
         settings = [pscustomobject][ordered]@{ multipleInstances = 'IgnoreNew'; executionTimeLimit = 'PT0S' }
     }
+}
+
+function Assert-SelfTestLegacyArguments {
+    $script:GsAuthorityBackend = 'Shadow'
+    $script:GsAuthorityTaskPath = '\'
+    function New-SelfTestTaskImage {
+        param($Name, $Descriptor, $Enabled, $Running)
+        $image = New-SelfTestTask $Name $Descriptor $Enabled $Running
+        $image | Add-Member -NotePropertyName present -NotePropertyValue $true
+        return $image
+    }
+    function Get-GsAuthorityTaskImage { param($TaskName) return $script:GsAuthorityArgumentTestImage }
+    foreach ($kind in @('start', 'stop')) {
+        $sourcePath = 'C:\Fictional Server\ops\' + $kind + '-dyson-server.ps1'
+        $targetPath = 'C:\Fictional Control\private\' + $kind + '-dyson-server.ps1'
+        $valid = if ($kind -ceq 'start') { ' -Ups 60' } else { ' -TimeoutSeconds 120' }
+        foreach ($suffix in @('', $valid, ($valid + '  '))) {
+            $descriptor = New-SelfTestLegacyDescriptor $sourcePath
+            $descriptor.arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $sourcePath + '"' + $suffix
+            $image = New-SelfTestTaskImage 'Fictional-Legacy' $descriptor $true $false
+            $definition = Assert-GsAuthorityLegacyTask $image $sourcePath $serviceUser
+            Assert-SelfTest ($definition.argumentSuffix -ceq $suffix) 'Legacy suffix spelling or whitespace changed.'
+            $target = New-GsAuthorityTargetImage $image 'Fictional-Copy' $targetPath $definition
+            Assert-SelfTest ($target.descriptor.arguments -ceq $descriptor.arguments.Replace($sourcePath, $targetPath)) 'Copied legacy arguments were not preserved.'
+            $script:GsAuthorityArgumentTestImage = $target
+            Assert-GsAuthorityTargetTask 'Fictional-Copy' $targetPath $definition $serviceUser
+            $target.descriptor.arguments += ' -Force'
+            $rejected = $false
+            try { Assert-GsAuthorityTargetTask 'Fictional-Copy' $targetPath $definition $serviceUser }
+            catch { $rejected = $true }
+            Assert-SelfTest $rejected 'Target argument drift was accepted.'
+        }
+        $invalidSuffixes = @(' -Ups 30', ' -TimeoutSeconds 150', ' -Ups 60 -Ups 60',
+            ' -TimeoutSeconds 120 -Force', ' -Command whoami', ' -Ups 60;whoami', " -Ups 60`n", '-Ups 60')
+        $invalidSuffixes += $(if ($kind -ceq 'start') { ' -TimeoutSeconds 120' } else { ' -Ups 60' })
+        foreach ($suffix in $invalidSuffixes) {
+            $descriptor = New-SelfTestLegacyDescriptor $sourcePath
+            $descriptor.arguments = '-NoProfile -File "' + $sourcePath + '"' + $suffix
+            $rejected = $false
+            try { [void](Assert-GsAuthorityLegacyTask (New-SelfTestTaskImage 'Fictional-Legacy' $descriptor $true $false) $sourcePath $serviceUser) }
+            catch { $rejected = $true }
+            Assert-SelfTest $rejected ('Unexpected legacy suffix accepted: ' + $suffix)
+        }
+        $descriptor = New-SelfTestLegacyDescriptor $sourcePath
+        $descriptor.triggerCount = 1
+        $rejected = $false
+        try { [void](Assert-GsAuthorityLegacyTask (New-SelfTestTaskImage 'Fictional-Legacy' $descriptor $true $false) $sourcePath $serviceUser) }
+        catch { $rejected = $true }
+        Assert-SelfTest $rejected 'Triggered legacy task was silently accepted.'
+    }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    Assert-SelfTest (Test-GsAuthoritySameUser $identity.User.Value $identity.Name) 'Exported SID did not match its account name.'
+    Assert-SelfTest (-not (Test-GsAuthoritySameUser 'S-1-5-18' 'S-1-5-19')) 'Different task identities matched.'
+    Assert-SelfTest (-not (Test-GsAuthoritySameUser 'FictionalDomain\AbsentAccount' '.\AbsentAccount')) 'Unresolvable account aliases matched.'
+    # Exercise native Export-ScheduledTask XML without accessing the scheduler.
+    $script:GsAuthorityBackend = 'Windows'
+    $sourcePath = 'C:\Fictional Server\ops\start-dyson-server.ps1'
+    $targetPath = 'C:\Fictional Control\private\start-dyson-server.ps1'
+    $xml = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers />' +
+        '<Principals><Principal id="Author"><UserId>' + $identity.User.Value +
+        '</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>' +
+        '<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings><Actions Context="Author"><Exec><Command>' +
+        [Security.SecurityElement]::Escape($powerShellExe) + '</Command><Arguments>' +
+        [Security.SecurityElement]::Escape('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $sourcePath + '" -Ups 60') +
+        '</Arguments></Exec></Actions></Task>'
+    $image = [pscustomobject]@{ present = $true; enabled = $true; running = $false
+        xmlBase64 = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($xml)) }
+    $definition = Assert-GsAuthorityLegacyTask $image $sourcePath $identity.Name
+    $script:GsAuthorityArgumentTestImage = New-GsAuthorityTargetImage $image 'Fictional-Copy' $targetPath $definition
+    Assert-GsAuthorityTargetTask 'Fictional-Copy' $targetPath $definition $identity.Name
+    Assert-SelfTest ((Get-GsAuthorityTaskDescriptor $script:GsAuthorityArgumentTestImage).arguments.EndsWith(' -Ups 60')) 'Native XML copy lost bounded arguments.'
+    $omittedRunLevel = $xml.Replace('<RunLevel>LeastPrivilege</RunLevel>', '')
+    $image.xmlBase64 = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($omittedRunLevel))
+    $definition = Assert-GsAuthorityLegacyTask $image $sourcePath $identity.Name
+    Assert-SelfTest ($definition.descriptor.runLevel -ceq 'LeastPrivilege') 'Omitted native RunLevel did not use LeastPrivilege.'
+    $script:GsAuthorityArgumentTestImage = New-GsAuthorityTargetImage $image 'Fictional-Copy' $targetPath $definition
+    Assert-GsAuthorityTargetTask 'Fictional-Copy' $targetPath $definition $identity.Name
+    $sourceWithEnabled = $omittedRunLevel.Replace('<Settings>', '<Settings><Enabled>true</Enabled>')
+    $image.xmlBase64 = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($sourceWithEnabled))
+    $definition = Assert-GsAuthorityLegacyTask $image $sourcePath $identity.Name
+    $script:GsAuthorityArgumentTestImage = New-GsAuthorityTargetImage $image 'Fictional-Copy' $targetPath $definition
+    $targetXml = [Text.UTF8Encoding]::new($false).GetString([Convert]::FromBase64String($script:GsAuthorityArgumentTestImage.xmlBase64))
+    $script:GsAuthorityArgumentTestImage.xmlBase64 = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($targetXml.Replace('<Enabled>true</Enabled>', '')))
+    Assert-GsAuthorityTargetTask 'Fictional-Copy' $targetPath $definition $identity.Name
+    foreach ($changedSettings in @($targetXml.Replace('<Enabled>true</Enabled>', '<Enabled>false</Enabled>'),
+        $targetXml.Replace('IgnoreNew', 'Parallel'), $targetXml.Replace('</Settings>', '<Unexpected>true</Unexpected></Settings>'))) {
+        $script:GsAuthorityArgumentTestImage.xmlBase64 = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($changedSettings))
+        $rejected = $false
+        try { Assert-GsAuthorityTargetTask 'Fictional-Copy' $targetPath $definition $identity.Name }
+        catch { $rejected = $true }
+        Assert-SelfTest $rejected 'Non-default or unrelated native setting drift was accepted.'
+    }
+    foreach ($invalidXml in @($xml.Replace('LeastPrivilege', 'HighestAvailable'),
+        $omittedRunLevel.Replace('<LogonType>InteractiveToken</LogonType>', ''))) {
+        $image.xmlBase64 = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($invalidXml))
+        $rejected = $false
+        try { [void](Assert-GsAuthorityLegacyTask $image $sourcePath $identity.Name) }
+        catch { $rejected = $true }
+        Assert-SelfTest $rejected 'Unsupported native principal defaults were accepted.'
+    }
+    $script:GsAuthorityBackend = 'Shadow'
+    Remove-Variable -Name GsAuthorityArgumentTestImage -Scope Script
 }
 
 function New-SelfTestFixture {
@@ -164,6 +267,46 @@ function Quote-SelfTestPowerShellLiteral {
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
+function New-SelfTestPreparedFixture {
+    param([string]$Name)
+    $fixture = New-SelfTestFixture $Name
+    $scheduler = Join-Path $fixture.Root 'prepared-runtime'
+    $prepared = Invoke-SelfTestRuntimeInstaller $fixture 'PrepareDisabled' ([guid]::NewGuid().ToString('D')) $scheduler
+    Assert-SelfTest ($prepared.ExitCode -eq 0) ('Prepared candidate setup failed: ' + $prepared.Stdout + $prepared.Stderr)
+    $statePath = Join-Path $fixture.Shadow 'tasks.json'
+    $state = Get-Content $statePath -Raw | ConvertFrom-Json
+    foreach ($pair in @(@('Dyson-Nebula-Server', 'start-task.json'), @('Dyson-Nebula-Stop', 'stop-task.json'))) {
+        $preparedTask = Get-Content (Join-Path $scheduler $pair[1]) -Raw | ConvertFrom-Json
+        $task = @($state.tasks | Where-Object { $_.taskName -ceq $pair[0] })[0]
+        $task.descriptor = $preparedTask.descriptor
+        $task.enabled = $false
+        $task.xmlBase64 = $preparedTask.xmlBase64
+    }
+    Write-SelfTestJson $statePath $state
+    $fixture.OriginalTasks = [IO.File]::ReadAllBytes($statePath)
+    $templates = Join-Path $fixture.Root 'legacy-templates'
+    [void][IO.Directory]::CreateDirectory($templates)
+    foreach ($kind in @('server', 'stop')) {
+        $baseName = if ($kind -ceq 'server') { 'start' } else { 'stop' }
+        $scriptPath = Join-Path $fixture.Project ('ops\' + $baseName + '-dyson-server.ps1')
+        $descriptor = New-SelfTestLegacyDescriptor $scriptPath
+        $xml = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers />' +
+            '<Principals><Principal id="Author"><UserId>' + [Security.SecurityElement]::Escape($serviceUser) +
+            '</UserId><LogonType>InteractiveToken</LogonType></Principal></Principals>' +
+            '<Settings><Enabled>false</Enabled><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings>' +
+            '<Actions Context="Author"><Exec><Command>' + [Security.SecurityElement]::Escape($powerShellExe) +
+            '</Command><Arguments>' + [Security.SecurityElement]::Escape($descriptor.arguments) + '</Arguments></Exec></Actions></Task>'
+        $encoding = if ($kind -ceq 'stop') { [Text.Encoding]::Unicode } else { [Text.UTF8Encoding]::new($false) }
+        [IO.File]::WriteAllText((Join-Path $templates ('legacy-' + $kind + '.xml')), $xml, $encoding)
+    }
+    $digest = Get-GsAuthoritySha256Text (
+        (Get-GsAuthorityFileImage (Join-Path $templates 'legacy-server.xml')).sha256 + ':' +
+        (Get-GsAuthorityFileImage (Join-Path $templates 'legacy-stop.xml')).sha256)
+    $fixture | Add-Member -NotePropertyName TemplateRoot -NotePropertyValue $templates
+    $fixture | Add-Member -NotePropertyName TemplateDigest -NotePropertyValue $digest
+    return $fixture
+}
+
 function Invoke-SelfTestSubject {
     param(
         [Parameter(Mandatory)]$Fixture,
@@ -188,6 +331,10 @@ function Invoke-SelfTestSubject {
         '-Confirm:$false'
     )
     if ($Recover) { $parts += '-Recover' }
+    if ($null -ne $Fixture.PSObject.Properties['TemplateRoot']) {
+        $parts += @('-PreparedLegacyTemplateRoot', (Quote-SelfTestPowerShellLiteral $Fixture.TemplateRoot),
+            '-ExpectedLegacyTemplateSha256', (Quote-SelfTestPowerShellLiteral $Fixture.TemplateDigest))
+    }
     if ($WhatIf) { $parts += '-WhatIf' }
     if (-not [string]::IsNullOrWhiteSpace($LeaseInstanceId)) {
         $parts += @('-LeaseInstanceId', (Quote-SelfTestPowerShellLiteral $LeaseInstanceId))
@@ -300,7 +447,61 @@ function Assert-SelfTestLivePreimage {
 
 try {
     Assert-SelfTestAuthorityAclModel
+    Assert-SelfTestLegacyArguments
     [void][IO.Directory]::CreateDirectory($scratch)
+
+    $templateFixture = New-SelfTestPreparedFixture 'prepared-template-success'
+    $templateRequest = [guid]::NewGuid().ToString('D')
+    $templatePreview = Invoke-SelfTestSubject $templateFixture $templateRequest -WhatIf
+    Assert-SelfTest ($templatePreview.ExitCode -eq 0 -and $templatePreview.Json.dryRun) ('Template preview failed: ' + $templatePreview.Stdout + $templatePreview.Stderr)
+    Assert-SelfTestLivePreimage $templateFixture
+    $templateResult = Invoke-SelfTestSubject $templateFixture $templateRequest
+    Assert-SelfTest ($templateResult.ExitCode -eq 0 -and $templateResult.Json.authoritySource -ceq 'reconstructed-template') ('Template initialization failed: ' + $templateResult.Stdout + $templateResult.Stderr)
+    $templateProfile = Get-Content (Join-Path $templateFixture.Data 'authority-inventory\authority-profile.json') -Raw | ConvertFrom-Json
+    Assert-SelfTest (-not $templateProfile.candidateAuthority.legacyPreimage.expectedEnabledBeforeIsolation -and
+        $templateProfile.legacyTemplateSha256 -ceq $templateFixture.TemplateDigest) 'Template provenance was not retained.'
+    $writes = [IO.File]::ReadAllLines((Join-Path $templateFixture.Shadow 'writes.log'))
+    Assert-SelfTest (@($writes | Where-Object { $_ -in @('task:Dyson-Nebula-Server', 'task:Dyson-Nebula-Stop') }).Count -eq 0) 'Prepared candidates were re-registered.'
+    $archive = Join-Path $templateFixture.Data ('private\gsmanager-authority-transactions\receipts\' + $templateRequest + '.legacy-templates.json')
+    Assert-SelfTest (Test-Path -LiteralPath $archive) 'Reconstruction templates were not privately persisted.'
+    $templateFixture.TemplateRoot = Join-Path $templateFixture.Root 'not-present'
+    $reusedTemplate = Invoke-SelfTestSubject $templateFixture $templateRequest
+    Assert-SelfTest ($reusedTemplate.ExitCode -eq 0 -and $reusedTemplate.Json.reused) 'Archived template reuse failed.'
+
+    foreach ($case in @('wrong-hash', 'enabled', 'running', 'bootstrap-drift', 'wrong-template', 'rollback', 'crash-recovery', 'prearchive-crash')) {
+        $fixture = New-SelfTestPreparedFixture ('prepared-' + $case)
+        $request = [guid]::NewGuid().ToString('D')
+        if ($case -ceq 'wrong-hash') { $fixture.TemplateDigest = '0' * 64 }
+        elseif ($case -in @('enabled', 'running', 'bootstrap-drift')) {
+            $statePath = Join-Path $fixture.Shadow 'tasks.json'
+            $state = Get-Content $statePath -Raw | ConvertFrom-Json
+            $task = @($state.tasks | Where-Object { $_.taskName -ceq 'Dyson-Nebula-Server' })[0]
+            if ($case -ceq 'enabled') { $task.enabled = $true }
+            elseif ($case -ceq 'running') { $task.running = $true }
+            else { $task.descriptor.arguments += ' -Unexpected' }
+            Write-SelfTestJson $statePath $state
+            $fixture.OriginalTasks = [IO.File]::ReadAllBytes($statePath)
+        }
+        elseif ($case -ceq 'wrong-template') {
+            $path = Join-Path $fixture.TemplateRoot 'legacy-server.xml'
+            $text = [IO.File]::ReadAllText($path).Replace('-Ups 60', '-Ups 30')
+            Write-SelfTestText $path $text
+            $fixture.TemplateDigest = Get-GsAuthoritySha256Text ((Get-GsAuthorityFileImage $path).sha256 + ':' +
+                (Get-GsAuthorityFileImage (Join-Path $fixture.TemplateRoot 'legacy-stop.xml')).sha256)
+        }
+        $fault = if ($case -ceq 'rollback') { 'SecondTaskRegister' } elseif ($case -ceq 'crash-recovery') { 'HardExitAfterEnv' }
+            elseif ($case -ceq 'prearchive-crash') { 'HardExitBeforeTemplateArchive' } else { '' }
+        $result = Invoke-SelfTestSubject $fixture $request -FailPoint $fault
+        Assert-SelfTest ($result.ExitCode -ne 0) ('Invalid template or injected fault unexpectedly passed: ' + $case)
+        if ($case -in @('crash-recovery', 'prearchive-crash')) {
+            $fixture.TemplateRoot = Join-Path $fixture.Root 'not-present'
+            $recovery = Invoke-SelfTestSubject $fixture $request -Recover
+            Assert-SelfTest ($recovery.ExitCode -eq 0 -and $recovery.Json.status -ceq 'rolled-back') ('Prepared recovery failed: ' + $recovery.Stdout + $recovery.Stderr)
+        }
+        Assert-SelfTestLivePreimage $fixture
+        $writes = [IO.File]::ReadAllLines((Join-Path $fixture.Shadow 'writes.log'))
+        Assert-SelfTest (@($writes | Where-Object { $_ -in @('task:Dyson-Nebula-Server', 'task:Dyson-Nebula-Stop') }).Count -eq 0) 'Prepared candidates were changed on failure.'
+    }
 
     $whatIfFixture = New-SelfTestFixture 'whatif'
     $whatIfRequest = [guid]::NewGuid().ToString('D')
@@ -317,6 +518,8 @@ try {
     Assert-SelfTest (-not [bool](Get-SelfTestTask $successFixture 'Dyson-Nebula-Stop').enabled) 'Legacy stop task was not disabled.'
     Assert-SelfTest ([bool](Get-SelfTestTask $successFixture 'Dyson-GSManager-Server').enabled) 'Previous start task was not enabled.'
     Assert-SelfTest ([bool](Get-SelfTestTask $successFixture 'Dyson-GSManager-Stop').enabled) 'Previous stop task was not enabled.'
+    Assert-SelfTest ((Get-SelfTestTask $successFixture 'Dyson-GSManager-Server').descriptor.arguments.EndsWith(' -Ups 60')) 'Start UPS argument was lost.'
+    Assert-SelfTest ((Get-SelfTestTask $successFixture 'Dyson-GSManager-Stop').descriptor.arguments.EndsWith(' -TimeoutSeconds 120')) 'Stop timeout argument was lost.'
     $updatedEnv = [IO.File]::ReadAllText($successFixture.EnvPath, [Text.UTF8Encoding]::new($false))
     Assert-SelfTest ($updatedEnv -match '(?m)^KEEP=value\r?$') 'Unrelated env content changed.'
     Assert-SelfTest ($updatedEnv -match '(?m)^DYSON_SERVER_TASK=Dyson-GSManager-Server\r?$') 'Server task env was not updated.'

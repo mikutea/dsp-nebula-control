@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)][string]$CandidatePath,
     [Parameter(Mandatory)][string]$DysonServerRoot,
     [string]$ConfigurationTemplate,
+    [string]$PrivateRuntimeRoot,
     [Parameter(Mandatory)][string]$ControlServiceSid,
     [Parameter(Mandatory)][string]$GameServiceSid,
     [Parameter(DontShow)][switch]$SelfTestFailureAfterPluginPublish
@@ -34,14 +35,31 @@ $pluginPath = Join-Path $pluginRoot $script:DysonBridgeDllName
 $configRoot = Assert-DysonBridgePlainDirectory -Path (Join-Path $serverRoot 'BepInEx\config')
 $configPath = Join-Path $configRoot $script:DysonBridgeConfigName
 $statePath = Join-Path $configRoot $script:DysonBridgeStateName
-$secretPath = Join-Path $configRoot $script:DysonBridgeSecretName
-$controlRoot = Get-DysonBridgeFullPath -Path (Join-Path $serverRoot 'BepInEx\dyson-control-bridge')
+$usesPrivateRuntime = -not [string]::IsNullOrWhiteSpace($PrivateRuntimeRoot)
+$runtimeContainer = $null
+$runtimeRoot = $null
+if ($usesPrivateRuntime) {
+    $runtimeRoot = Assert-DysonBridgePrivateRuntimeRoot -Path $PrivateRuntimeRoot -DysonServerRoot $serverRoot -AllowMissing
+    $runtimeContainer = Get-DysonBridgePrivateRuntimeContainer -RuntimeRoot $runtimeRoot
+    $secretPath = Get-DysonBridgeFullPath -Path (Join-Path $runtimeRoot $script:DysonBridgeSecretName)
+    $controlRoot = Get-DysonBridgeFullPath -Path (Join-Path $runtimeRoot 'control')
+}
+else {
+    $secretPath = Join-Path $configRoot $script:DysonBridgeSecretName
+    $controlRoot = Get-DysonBridgeFullPath -Path (Join-Path $serverRoot 'BepInEx\dyson-control-bridge')
+}
 $controlTreePaths = Get-DysonBridgeControlTreePaths -ControlRoot $controlRoot
 $snapshotParent = Get-DysonBridgeFullPath -Path (Join-Path $configRoot 'dyson-control-bridge-snapshots')
 $auditPath = Join-Path $configRoot 'dyson-control-bridge.audit.jsonl'
-foreach ($fixed in @($pluginRoot, $pluginPath, $configPath, $statePath, $secretPath, $controlRoot, $snapshotParent, $auditPath)) {
+foreach ($fixed in @($pluginRoot, $pluginPath, $configPath, $statePath, $snapshotParent, $auditPath)) {
     if (-not (Test-DysonBridgePathWithin -Candidate $fixed -Parent $serverRoot)) { throw 'A fixed Bridge installation path escaped the DSP server root.' }
     [void](Assert-DysonBridgePathComponentsPlain -Path $fixed -Root $serverRoot)
+}
+if (-not $usesPrivateRuntime) {
+    foreach ($fixed in @($secretPath, $controlRoot)) {
+        if (-not (Test-DysonBridgePathWithin -Candidate $fixed -Parent $serverRoot)) { throw 'A fixed Bridge runtime path escaped the DSP server root.' }
+        [void](Assert-DysonBridgePathComponentsPlain -Path $fixed -Root $serverRoot)
+    }
 }
 
 $plan = [ordered]@{
@@ -50,6 +68,7 @@ $plan = [ordered]@{
     dryRun = $true
     version = $candidate.version
     enabled = $false
+    runtimeLayout = if ($usesPrivateRuntime) { 'private-ntfs' } else { 'legacy-server-tree' }
     exactGameProcessStopped = $true
     oldPluginAndConfigWillBeSnapshotted = $true
     gameWillBeRestarted = $false
@@ -70,14 +89,50 @@ $configExisted = Test-Path -LiteralPath $configPath -PathType Leaf
 $stateExisted = Test-Path -LiteralPath $statePath -PathType Leaf
 $secretExisted = Test-Path -LiteralPath $secretPath -PathType Leaf
 $originalSecretSddl = $null
+$runtimeContainerExisted = $usesPrivateRuntime -and (Test-Path -LiteralPath $runtimeContainer -PathType Container)
+$originalRuntimeContainerSddl = $null
+$runtimeRootExisted = $usesPrivateRuntime -and (Test-Path -LiteralPath $runtimeRoot -PathType Container)
+$originalRuntimeRootSddl = $null
 $controlTreeAclSnapshots = @()
 $mutationStarted = $false
 try {
+    if ($stateExisted) {
+        $priorState = Read-DysonBridgeInstallState -Path $statePath
+        $priorRuntime = Get-DysonBridgeInstallRuntimePaths -State $priorState -DysonServerRoot $serverRoot
+        if (($usesPrivateRuntime -and [string]$priorRuntime.layout -cne 'private-ntfs') -or
+            (-not $usesPrivateRuntime -and [string]$priorRuntime.layout -cne 'legacy-server-tree') -or
+            ($usesPrivateRuntime -and -not [string]::Equals(
+                [string]$priorRuntime.runtimeRoot,
+                $runtimeRoot,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ))) {
+            throw 'The existing Bridge installation is bound to a different runtime root.'
+        }
+    }
+    elseif ($usesPrivateRuntime) {
+        if ($runtimeContainerExisted) {
+            [void](Assert-DysonBridgePrivateRuntimeContainerInventory -RuntimeContainer $runtimeContainer -RuntimeRoot $runtimeRoot)
+        }
+        if ($runtimeRootExisted) {
+            [void](Assert-DysonBridgePrivateRuntimeInventory -RuntimeRoot $runtimeRoot)
+            if (@(Get-ChildItem -LiteralPath $runtimeRoot -Force -ErrorAction Stop).Count -ne 0) {
+                throw 'An unowned Bridge private runtime root cannot be reused.'
+            }
+        }
+    }
     foreach ($existing in @($pluginPath, $configPath, $statePath, $secretPath)) {
         if (Test-Path -LiteralPath $existing) { [void](Assert-DysonBridgePlainFile -Path $existing -MaximumBytes 64MB) }
     }
     if ($secretExisted) {
         $originalSecretSddl = Get-DysonBridgeAccessSddl -Path $secretPath
+    }
+    if ($runtimeRootExisted) {
+        [void](Assert-DysonBridgePrivateRuntimeInventory -RuntimeRoot $runtimeRoot)
+        $originalRuntimeRootSddl = Get-DysonBridgeAccessSddl -Path $runtimeRoot
+    }
+    if ($runtimeContainerExisted) {
+        [void](Assert-DysonBridgePrivateRuntimeContainerInventory -RuntimeContainer $runtimeContainer -RuntimeRoot $runtimeRoot)
+        $originalRuntimeContainerSddl = Get-DysonBridgeAccessSddl -Path $runtimeContainer
     }
     foreach ($name in @('root', 'requests', 'processing', 'receipts', 'processed', 'rejected')) {
         $path = [string]$controlTreePaths[$name]
@@ -101,6 +156,18 @@ try {
     [System.IO.Directory]::CreateDirectory($snapshotRoot) | Out-Null
     [void](Assert-DysonBridgePlainDirectory -Path $snapshotRoot)
     $mutationStarted = $true
+    if ($usesPrivateRuntime) {
+        [System.IO.Directory]::CreateDirectory($runtimeContainer) | Out-Null
+        [void](Assert-DysonBridgePlainDirectory -Path $runtimeContainer)
+        Protect-DysonBridgePrivateRuntimeRootAcl -RuntimeRoot $runtimeContainer -InstallerSid $installerSid `
+            -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid
+        [System.IO.Directory]::CreateDirectory($runtimeRoot) | Out-Null
+        [void](Assert-DysonBridgePlainDirectory -Path $runtimeRoot)
+        Protect-DysonBridgePrivateRuntimeRootAcl -RuntimeRoot $runtimeRoot -InstallerSid $installerSid `
+            -ControlServiceSid $ControlServiceSid -GameServiceSid $GameServiceSid
+        [void](Assert-DysonBridgePrivateRuntimeContainerInventory -RuntimeContainer $runtimeContainer -RuntimeRoot $runtimeRoot)
+        [void](Assert-DysonBridgePrivateRuntimeInventory -RuntimeRoot $runtimeRoot)
+    }
     foreach ($entry in @(
         [ordered]@{ source = $pluginPath; name = $script:DysonBridgeDllName },
         [ordered]@{ source = $configPath; name = $script:DysonBridgeConfigName },
@@ -137,7 +204,7 @@ try {
     Write-DysonBridgeAtomicText -Path $configPath -Value $renderedConfig
     $state = [ordered]@{
         protocol = $script:DysonBridgeInstallProtocol
-        schemaVersion = 2
+        schemaVersion = if ($usesPrivateRuntime) { 3 } else { 2 }
         guid = $script:DysonBridgeGuid
         version = $candidate.version
         dllSha256 = $candidate.dllSha256
@@ -146,10 +213,18 @@ try {
         installedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
         snapshotId = $snapshotId
         enabledDefault = $false
-        aclContract = $script:DysonBridgeAclContract
+        aclContract = if ($usesPrivateRuntime) { $script:DysonBridgePrivateRuntimeAclContract } else { $script:DysonBridgeAclContract }
         installerSid = $installerSid
         controlServiceSid = $ControlServiceSid
         gameServiceSid = $GameServiceSid
+    }
+    if ($usesPrivateRuntime) {
+        $state.runtimeLayout = 'private-ntfs'
+        $state.serverRoot = $serverRoot
+        $state.runtimeContainer = $runtimeContainer
+        $state.runtimeRoot = $runtimeRoot
+        $state.secretPath = $secretPath
+        $state.controlRoot = $controlRoot
     }
     Write-DysonBridgeAtomicText -Path $statePath -Value (($state | ConvertTo-Json -Depth 8 -Compress) + "`r`n")
     [void](Read-DysonBridgeInstallState -Path $statePath)
@@ -202,6 +277,28 @@ catch {
                 }
             }
         }
+        if ($usesPrivateRuntime -and $runtimeRootExisted -and $originalRuntimeRootSddl -and
+            (Test-Path -LiteralPath $runtimeRoot -PathType Container)) {
+            Restore-DysonBridgeAccessSddl -Path $runtimeRoot -Sddl $originalRuntimeRootSddl -Directory
+        }
+        elseif ($usesPrivateRuntime -and -not $runtimeRootExisted -and
+            (Test-Path -LiteralPath $runtimeRoot -PathType Container)) {
+            [void](Assert-DysonBridgePlainDirectory -Path $runtimeRoot)
+            if (@(Get-ChildItem -LiteralPath $runtimeRoot -Force -ErrorAction Stop).Count -eq 0) {
+                [System.IO.Directory]::Delete($runtimeRoot, $false)
+            }
+        }
+        if ($usesPrivateRuntime -and $runtimeContainerExisted -and $originalRuntimeContainerSddl -and
+            (Test-Path -LiteralPath $runtimeContainer -PathType Container)) {
+            Restore-DysonBridgeAccessSddl -Path $runtimeContainer -Sddl $originalRuntimeContainerSddl -Directory
+        }
+        elseif ($usesPrivateRuntime -and -not $runtimeContainerExisted -and
+            (Test-Path -LiteralPath $runtimeContainer -PathType Container)) {
+            [void](Assert-DysonBridgePlainDirectory -Path $runtimeContainer)
+            if (@(Get-ChildItem -LiteralPath $runtimeContainer -Force -ErrorAction Stop).Count -eq 0) {
+                [System.IO.Directory]::Delete($runtimeContainer, $false)
+            }
+        }
     }
     throw $installError
 }
@@ -212,6 +309,7 @@ catch {
     version = $candidate.version
     guid = $script:DysonBridgeGuid
     enabled = $false
+    runtimeLayout = if ($usesPrivateRuntime) { 'private-ntfs' } else { 'legacy-server-tree' }
     snapshotId = $snapshotId
     secretGeneratedOrPreserved = $true
     secretDisclosed = $false

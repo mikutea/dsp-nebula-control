@@ -14,6 +14,44 @@ $commonPath = Join-Path $PSScriptRoot 'DysonLifecycleBroker.Common.ps1'
 if (-not (Test-Path -LiteralPath $commonPath -PathType Leaf)) { throw 'DYSON_CONTROL_LIFECYCLE_BROKER_INTERNAL_ERROR' }
 . $commonPath
 
+function Get-WorkerProcessTelemetry {
+    param($Profile, $Runtime)
+    if ($Backend -cne 'Windows' -or $Runtime.lifecycleState -cne 'running_verified' -or
+        $Runtime.process.status -cne 'verified') { return $null }
+    $process = $null
+    try {
+        $process = Get-Process -Id ([int]$Runtime.process.pid) -ErrorAction Stop
+        [void]$process.Handle
+        $started = [DateTimeOffset]::new($process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+        $expected = Join-Path ([string]$Profile.projectRoot) 'server\DSPGAME.exe'
+        if ($process.HasExited -or $process.SessionId -ne $Runtime.process.sessionId -or
+            -not (Test-WorkerProcessExecutable -Actual $process.Path -Expected $expected -Profile $Profile)) { return $null }
+        $cpuBefore = $process.TotalProcessorTime.TotalSeconds
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        Start-Sleep -Milliseconds 500
+        $process.Refresh()
+        $elapsed = $timer.Elapsed.TotalSeconds
+        if ($process.HasExited -or
+            [DateTimeOffset]::new($process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() -ne $started) { return $null }
+        $cores = ($process.TotalProcessorTime.TotalSeconds - $cpuBefore) / $elapsed
+        if ([double]::IsNaN($cores) -or [double]::IsInfinity($cores) -or $cores -lt 0) { return $null }
+        $after = Get-WorkerLifecycleEvidence $Profile
+        if ($after.lifecycleState -cne 'running_verified' -or $after.process.status -cne 'verified' -or
+            $after.process.pid -ne $Runtime.process.pid -or $after.process.sessionId -ne $Runtime.process.sessionId -or
+            $after.process.owner -cne $Runtime.process.owner -or $process.HasExited) { return $null }
+        return [pscustomobject][ordered]@{
+            processId = [int]$process.Id; startedAtUnixMs = [long]$started
+            sampledAtUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            processCoresUsed = [math]::Round($cores, 3)
+            workingSetGiB = [math]::Round($process.WorkingSet64 / 1GB, 3)
+            privateMemoryGiB = [math]::Round($process.PrivateMemorySize64 / 1GB, 3)
+            threadCount = [int]$process.Threads.Count
+        }
+    }
+    catch { return $null }
+    finally { if ($null -ne $process) { $process.Dispose() } }
+}
+
 function Get-WorkerLeafUser {
     param([AllowNull()][string]$User)
     if ([string]::IsNullOrWhiteSpace($User)) { return '' }
@@ -91,7 +129,9 @@ function Get-WorkerRuntimeRecord {
             }
             if ([string]$candidate.Name -ceq 'DSPGAME.exe') { [void]$processes.Add($record) }
             elseif ([string]$candidate.Name -ceq 'steam.exe') { [void]$steam.Add($record) }
-            elseif ([string]$candidate.Name -ceq 'explorer.exe' -and [int]$candidate.SessionId -gt 0 -and
+            # Server Core may run Steam/DSP in an interactive session without
+            # explorer.exe. The same verified owner/session evidence applies.
+            if ([int]$candidate.SessionId -gt 0 -and
                 (Get-WorkerLeafUser $owner) -ceq (Get-WorkerLeafUser $Profile.serviceUser)) {
                 [void]$sessions.Add([pscustomobject][ordered]@{
                     id = [int]$candidate.SessionId
@@ -101,7 +141,11 @@ function Get-WorkerRuntimeRecord {
             }
         }
         $uniqueSessions = @($sessions | Sort-Object id -Unique)
-        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort ([int]$Profile.gamePort) -ErrorAction Stop | ForEach-Object {
+        # A missing filtered port is reported as an error by the native cmdlet.
+        # Enumerate successfully first so an idle server has zero listeners.
+        $listeners = @(Get-NetTCPConnection -ErrorAction Stop | Where-Object {
+            [string]$_.State -eq 'Listen' -and [int]$_.LocalPort -eq [int]$Profile.gamePort
+        } | ForEach-Object {
             [pscustomobject][ordered]@{ port = [int]$_.LocalPort; pid = [int]$_.OwningProcess }
         })
         return (ConvertTo-WorkerBoundedRuntimeRecord ([pscustomobject][ordered]@{
@@ -113,10 +157,42 @@ function Get-WorkerRuntimeRecord {
     }
 }
 
+function Test-WorkerProcessExecutable {
+    param([Parameter(Mandatory)][string]$Actual, [Parameter(Mandatory)][string]$Expected,
+        [Parameter(Mandatory)]$Profile)
+    if (Test-DysonLifecycleBrokerSamePath $Actual $Expected) { return $true }
+    $actualStream = $null
+    $expectedStream = $null
+    try {
+        if (-not [IO.Path]::IsPathRooted($Actual) -or -not [IO.Path]::IsPathRooted($Expected)) { return $false }
+        # Resolve only executable aliases, through the already profile-pinned
+        # lease dependency. General configuration/task path rules stay literal.
+        $leasePath = Join-Path ([string]$Profile.installedWindowsRoot) 'DysonHostMutationLease.Common.ps1'
+        $entry = @($Profile.dependencyHashes | Where-Object { [string]$_.name -ceq 'DysonHostMutationLease.Common.ps1' })
+        if ($entry.Count -ne 1 -or (Get-DysonLifecycleBrokerSha256File $leasePath) -cne [string]$entry[0].sha256) {
+            return $false
+        }
+        . $leasePath
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $actualStream = [IO.File]::Open($Actual, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $expectedStream = [IO.File]::Open($Expected, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $actualFinal = Get-DysonHostMutationLeaseFinalPathFromHandle -Handle $actualStream.SafeFileHandle
+        $expectedFinal = Get-DysonHostMutationLeaseFinalPathFromHandle -Handle $expectedStream.SafeFileHandle
+        return -not [string]::IsNullOrWhiteSpace($actualFinal) -and
+            -not [string]::IsNullOrWhiteSpace($expectedFinal) -and
+            [string]::Equals($actualFinal, $expectedFinal, [StringComparison]::OrdinalIgnoreCase)
+    }
+    catch { return $false }
+    finally {
+        if ($null -ne $expectedStream) { $expectedStream.Dispose() }
+        if ($null -ne $actualStream) { $actualStream.Dispose() }
+    }
+}
+
 function Get-WorkerPidEvidence {
     param([Parameter(Mandatory)]$Profile)
     $path = Join-Path ([string]$Profile.projectRoot) 'run\dspgame.pid'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return [pscustomobject]@{ present = $false; pid = 0; valid = $true } }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return [pscustomobject]@{ present = $false; pid = 0; valid = $false } }
     try {
         $resolved = Assert-DysonLifecycleBrokerPlainFile -Path $path -MaximumBytes 32
         $text = [IO.File]::ReadAllText($resolved, [Text.UTF8Encoding]::new($false)).Trim()
@@ -152,7 +228,7 @@ function Get-WorkerLifecycleEvidence {
     elseif ($dsp.Count -eq 1) {
         $candidate = $dsp[0]
         $pathMatches = $false
-        try { $pathMatches = [IO.Path]::GetFullPath([string]$candidate.path).Equals($expectedExecutable, [StringComparison]::OrdinalIgnoreCase) }
+        try { $pathMatches = Test-WorkerProcessExecutable -Actual ([string]$candidate.path) -Expected $expectedExecutable -Profile $Profile }
         catch { $pathMatches = $false }
         $ownerMatches = (Get-WorkerLeafUser ([string]$candidate.owner) -ceq $serviceLeaf)
         $sessionMatches = $sessionStatus -ceq 'verified' -and [int]$candidate.sessionId -eq [int]$sessionId
@@ -190,9 +266,10 @@ function Get-WorkerLifecycleEvidence {
 }
 
 function Get-WorkerTaskEvidence {
-    param([Parameter(Mandatory)]$Profile)
+    param([Parameter(Mandatory)]$Profile, [switch]$AllowPreparedDisabled)
     try {
-        $pair = Assert-DysonLifecycleBrokerTaskPair -Profile $Profile -Backend $Backend -ShadowRoot $ShadowRoot
+        $pair = Assert-DysonLifecycleBrokerTaskPair -Profile $Profile -Backend $Backend -ShadowRoot $ShadowRoot `
+            -AllowPreparedDisabled:$AllowPreparedDisabled
         return [pscustomobject][ordered]@{
             valid = $true
             server = [ordered]@{ name = 'Dyson-Nebula-Server'; path = '\'; state = [string]$pair.server.state }
@@ -453,12 +530,12 @@ function Invoke-WorkerRequest {
                 }
             }
             'LifecycleStatus' {
-                $task = Get-WorkerTaskEvidence $Profile
+                $task = Get-WorkerTaskEvidence $Profile -AllowPreparedDisabled
                 $runtime = Get-WorkerLifecycleEvidence $Profile
                 if (-not $task.valid) { $runtime.lifecycleState = 'unknown_unverifiable' }
                 $outcome = [pscustomobject]@{
                     status = 'succeeded'; errorCode = $null
-                    evidence = [pscustomobject][ordered]@{ lifecycleState = [string]$runtime.lifecycleState; task = $task; runtime = $runtime }
+                    evidence = [pscustomobject][ordered]@{ lifecycleState = [string]$runtime.lifecycleState; task = $task; runtime = $runtime; processTelemetry = Get-WorkerProcessTelemetry $Profile $runtime }
                 }
             }
         }

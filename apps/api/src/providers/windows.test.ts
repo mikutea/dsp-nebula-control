@@ -6,7 +6,7 @@ import path from 'node:path'
 import { serverStatusSchema } from '../domain.js'
 import { DemoProvider } from './demo.js'
 import { applyBrokerStatus, WindowsProvider } from './windows.js'
-import type { WindowsLifecycleBrokerClient } from './windows-lifecycle-broker.js'
+import type { WindowsLifecycleBrokerClient, LifecycleBrokerStatusEvidence } from './windows-lifecycle-broker.js'
 
 const temporaryRoots: string[] = []
 
@@ -15,6 +15,30 @@ afterEach(async () => {
 })
 
 describe('Windows status provider', () => {
+  it('uses fresh broker process measurements when the unprivileged collector cannot read the process', async () => {
+    const collected = await new DemoProvider().collectStatus()
+    collected.runtime.processId = null
+    const base = await new FixtureLifecycleBrokerClient().status()
+    const now = Date.now()
+    const evidence: LifecycleBrokerStatusEvidence = {
+      ...base, lifecycleState: 'running_verified',
+      runtime: { ...base.runtime, lifecycleState: 'running_verified',
+        process: { status: 'verified', pid: 2202, owner: 'FictionalGame', sessionId: 3 } },
+      processTelemetry: { processId: 2202, startedAtUnixMs: now - 60_000, sampledAtUnixMs: now,
+        processCoresUsed: 1.25, workingSetGiB: 2, privateMemoryGiB: 3, threadCount: 42 }
+    }
+    expect(applyBrokerStatus(collected, evidence).runtime).toMatchObject({
+      processId: 2202, processCoresUsed: 1.25, privateMemoryGiB: 3, threadCount: 42, uptimeSeconds: 60
+    })
+    for (const patch of [{ processId: 9999 }, { sampledAtUnixMs: now - 31_000 },
+      { sampledAtUnixMs: now + 60_000 }, { startedAtUnixMs: now + 1 }]) {
+      const bad = { ...evidence, processTelemetry: { ...evidence.processTelemetry!, ...patch } }
+      expect(applyBrokerStatus(collected, bad).runtime).toMatchObject({
+        processId: 2202, processCoresUsed: null, privateMemoryGiB: null, threadCount: null, uptimeSeconds: null
+      })
+    }
+    expect(applyBrokerStatus(collected, { ...evidence, processTelemetry: null }).runtime.privateMemoryGiB).toBeNull()
+  })
   it('rejects non-finite, negative, partial, identifying, and inconsistent host telemetry', async () => {
     const baseline = await new DemoProvider().collectStatus()
     const invalid = [
@@ -123,9 +147,10 @@ describe('Windows status provider', () => {
 
     const repositoryRoot = path.resolve(import.meta.dirname, '..', '..', '..', '..')
     const broker = new FixtureLifecycleBrokerClient()
+    const scriptRoot = await createIsolatedStatusScripts(projectRoot, repositoryRoot)
     const provider = new WindowsProvider({
       projectRoot,
-      scriptRoot: path.join(repositoryRoot, 'scripts', 'windows'),
+      scriptRoot,
       runtimeBootstrapRoot: path.join(repositoryRoot, 'scripts', 'windows', 'bootstrap'),
       timeoutMs: 30_000,
       gamePort: 65432,
@@ -237,6 +262,37 @@ describe('Windows status provider', () => {
       .toMatchObject({ status: 'unknown' })
   }, 45_000)
 })
+
+async function createIsolatedStatusScripts(projectRoot: string, repositoryRoot: string): Promise<string> {
+  const root = path.join(projectRoot, 'fixture-scripts')
+  await mkdir(root)
+  const productionRoot = path.join(repositoryRoot, 'scripts', 'windows')
+  const literal = (value: string) => `'${value.replaceAll("'", "''")}'`
+  for (const name of ['Get-DysonStatus.ps1', 'Get-DysonLifecyclePreflight.ps1']) {
+    // Retain the real collectors, file parsing, and native host metrics. Only
+    // the fictional game's process/port/task inventory belongs to the fixture.
+    await writeFile(path.join(root, name), `
+param([string]$ProjectRoot, [int]$GamePort, [string]$ServerTaskName, [string]$StopTaskName,
+  [string]$AllowedScriptRoot, [string]$AllowedTaskScriptRoot, [string]$Action)
+$ErrorActionPreference = 'Stop'
+function Get-Process { [CmdletBinding()] param([string]$Name)
+  if ($Name -cne 'DSPGAME') { throw 'Unexpected fixture process query' }
+}
+function Get-NetTCPConnection { [CmdletBinding()] param([string]$State, [int]$LocalPort) }
+function Get-ScheduledTask { [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
+  throw 'The fictional host has no scheduled tasks'
+}
+function Get-ScheduledTaskInfo { [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
+  throw 'The fictional host has no scheduled tasks'
+}
+if ($PSBoundParameters.ContainsKey('AllowedScriptRoot')) {
+  $PSBoundParameters['AllowedScriptRoot'] = ${literal(productionRoot)}
+}
+& ${literal(path.join(productionRoot, name))} @PSBoundParameters
+`, 'utf8')
+  }
+  return root
+}
 
 class FixtureLifecycleBrokerClient implements WindowsLifecycleBrokerClient {
   unavailable = false

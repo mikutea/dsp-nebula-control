@@ -250,6 +250,45 @@ $script:leaseId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
 $script:leaseBorrowFixture = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
 
 try {
+    # Exercise the real status-only sampler with a retained process handle;
+    # isolate runtime identity observations without starting a game or task.
+    & {
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PSScriptRoot 'Invoke-DysonLifecycleBrokerWorker.ps1'), [ref]$tokens, [ref]$errors)
+        $definition = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-WorkerProcessTelemetry'
+        }, $false)
+        . ([scriptblock]::Create($definition.Extent.Text))
+        $Backend = 'Windows'
+        $selfProcess = Get-Process -Id $PID
+        $runtime = [pscustomobject]@{ lifecycleState = 'running_verified'; process = [pscustomobject]@{
+            status = 'verified'; pid = $PID; sessionId = $selfProcess.SessionId; owner = 'fixture' } }
+        function Test-WorkerProcessExecutable { return $true }
+        function Get-WorkerLifecycleEvidence { return $runtime }
+        $profile = [pscustomobject]@{ projectRoot = $env:TEMP }
+        $sample = Get-WorkerProcessTelemetry $profile $runtime
+        Assert-SelfTest ($null -ne $sample -and $sample.processId -eq $PID -and
+            $sample.startedAtUnixMs -le $sample.sampledAtUnixMs -and $sample.threadCount -gt 0) 'status sampler returns bound real process measurements'
+        function Get-WorkerLifecycleEvidence {
+            return [pscustomobject]@{ lifecycleState = 'running_verified'; process = [pscustomobject]@{
+                status = 'verified'; pid = 2147483647; sessionId = $runtime.process.sessionId; owner = 'fixture' } }
+        }
+        Assert-SelfTest ($null -eq (Get-WorkerProcessTelemetry $profile $runtime)) 'status sampler rejects changed process identity after sampling'
+        function Test-WorkerProcessExecutable { throw 'fixture access denied' }
+        Assert-SelfTest ($null -eq (Get-WorkerProcessTelemetry $profile $runtime)) 'status sampler retains unknown on process access failure'
+        function Test-WorkerProcessExecutable { return $true }
+        $generationProcess = [pscustomobject]@{
+            Id = $PID; Handle = 1; StartTime = [datetime]::UtcNow.AddMinutes(-1)
+            SessionId = $runtime.process.sessionId; HasExited = $false; Path = 'fixture.exe'
+            TotalProcessorTime = [timespan]::FromSeconds(1)
+        }
+        $generationProcess | Add-Member ScriptMethod Refresh { $this.StartTime = $this.StartTime.AddSeconds(1) }
+        $generationProcess | Add-Member ScriptMethod Dispose { }
+        function Get-Process { return $generationProcess }
+        Assert-SelfTest ($null -eq (Get-WorkerProcessTelemetry $profile $runtime)) 'status sampler rejects PID generation change during sampling'
+        $selfProcess.Dispose()
+    }
     foreach ($path in @(
         $script:brokerScripts, $script:broker, $script:shadow, $script:data,
         (Join-Path $script:project 'server'), (Join-Path $script:project 'run')
@@ -290,6 +329,10 @@ try {
     Set-SelfTestLease
     $script:install = Join-Path $script:brokerScripts 'Install-DysonLifecycleBrokerTask.ps1'
     $script:submit = Join-Path $script:brokerScripts 'Submit-DysonLifecycleBrokerRequest.ps1'
+    $serverDescriptor.enabled = $false
+    $stopDescriptor.enabled = $false
+    Write-SelfTestJson (Join-Path $script:shadow 'server-task.json') ([ordered]@{ descriptor = $serverDescriptor; state = 'Disabled' })
+    Write-SelfTestJson (Join-Path $script:shadow 'stop-task.json') ([ordered]@{ descriptor = $stopDescriptor; state = 'Disabled' })
     $installRun = Invoke-SelfTestInstall -Script $script:install -InstalledRoot $script:installed `
         -Broker $script:broker -Data $script:data -Shadow $script:shadow
     $installEnvelope = ConvertFrom-SelfTestOutput $installRun.stdout
@@ -300,6 +343,37 @@ try {
     $script:stage = 'installer transaction'
     $profileBytes = [IO.File]::ReadAllBytes($script:profileFile)
     $initialProfile = Read-DysonLifecycleBrokerProfile $script:profileFile
+    $preparedPair = Assert-DysonLifecycleBrokerTaskPair -Profile $initialProfile -Backend Shadow -ShadowRoot $script:shadow -AllowPreparedDisabled
+    Assert-SelfTest ($preparedPair.preparedDisabled -and -not $preparedPair.server.descriptor.enabled) 'installation preserves prepared disabled state'
+    $disabledRejected = $false
+    try { [void](Assert-DysonLifecycleBrokerTaskPair -Profile $initialProfile -Backend Shadow -ShadowRoot $script:shadow) }
+    catch { $disabledRejected = $true }
+    Assert-SelfTest $disabledRejected 'runtime validation rejects prepared disabled tasks'
+    $preparedStatus = Invoke-SelfTestSubmit -Id ([guid]::NewGuid().ToString('D')) -Capability LifecycleStatus
+    $preparedStatusEnvelope = ConvertFrom-SelfTestOutput $preparedStatus.stdout
+    Assert-SelfTest ($preparedStatus.exitCode -eq 0 -and $preparedStatusEnvelope.receipt.status -eq 'succeeded' -and
+        $preparedStatusEnvelope.receipt.evidence.task.valid -and
+        $preparedStatusEnvelope.receipt.evidence.task.server.state -eq 'Disabled' -and
+        $preparedStatusEnvelope.receipt.evidence.lifecycleState -eq 'stopped_verified' -and
+        -not $preparedStatusEnvelope.receipt.evidence.runtime.pidFile.present -and
+        -not $preparedStatusEnvelope.receipt.evidence.runtime.pidFile.valid) 'read-only status observes prepared disabled tasks with no validated PID'
+    $stopDescriptor.enabled = $true
+    Write-SelfTestJson (Join-Path $script:shadow 'stop-task.json') ([ordered]@{ descriptor = $stopDescriptor; state = 'Ready' })
+    $mixedInstall = Invoke-SelfTestInstall -Script $script:install -InstalledRoot $script:installed -Broker $script:broker -Data $script:data -Shadow $script:shadow
+    Assert-SelfTest ($mixedInstall.exitCode -ne 0 -and (Test-SelfTestBytesEqual $profileBytes ([IO.File]::ReadAllBytes($script:profileFile)))) 'mixed enabled pair cannot reinstall broker'
+    $stopDescriptor.enabled = $false
+    Write-SelfTestJson (Join-Path $script:shadow 'stop-task.json') ([ordered]@{ descriptor = $stopDescriptor; state = 'Disabled' })
+    Write-SelfTestJson (Join-Path $script:shadow 'server-task.json') ([ordered]@{ descriptor = $serverDescriptor; state = 'Running' })
+    $runningRejected = $false
+    try { [void](Assert-DysonLifecycleBrokerTaskPair -Profile $initialProfile -Backend Shadow -ShadowRoot $script:shadow -AllowPreparedDisabled) }
+    catch { $runningRejected = $true }
+    Assert-SelfTest $runningRejected 'prepared task with running state is rejected'
+    $serverDescriptor.enabled = $true
+    $stopDescriptor.enabled = $true
+    Write-SelfTestJson (Join-Path $script:shadow 'server-task.json') ([ordered]@{ descriptor = $serverDescriptor; state = 'Ready' })
+    Write-SelfTestJson (Join-Path $script:shadow 'stop-task.json') ([ordered]@{ descriptor = $stopDescriptor; state = 'Ready' })
+    $activePair = Assert-DysonLifecycleBrokerTaskPair -Profile $initialProfile -Backend Shadow -ShadowRoot $script:shadow
+    Assert-SelfTest (-not $activePair.preparedDisabled) 'activation matches the installed expected-active profile'
     $reinstall = Invoke-SelfTestInstall -Script $script:install -InstalledRoot $script:installed `
         -Broker $script:broker -Data $script:data -Shadow $script:shadow
     $reinstallEnvelope = ConvertFrom-SelfTestOutput $reinstall.stdout
@@ -841,6 +915,36 @@ try {
     $script:install = $candidateInstall
     $script:submit = Join-Path $candidateBrokerScripts 'Submit-DysonLifecycleBrokerRequest.ps1'
 
+    $script:stage = 'process executable aliases'
+    $executableAliasRoot = Join-Path $script:root 'runtime-executable-alias'
+    $differentExecutableRoot = Join-Path $script:root 'different-runtime-executable'
+    [void][IO.Directory]::CreateDirectory($differentExecutableRoot)
+    $differentExecutable = Join-Path $differentExecutableRoot 'DSPGAME.exe'
+    [IO.File]::WriteAllBytes($differentExecutable, [IO.File]::ReadAllBytes((Join-Path $script:project 'server\DSPGAME.exe')))
+    try {
+        [void](New-Item -ItemType Junction -Path $executableAliasRoot -Target (Join-Path $script:project 'server') -ErrorAction Stop)
+        Set-SelfTestRuntime running
+        $runtimePath = Join-Path $script:shadow 'runtime.json'
+        $aliasRuntime = [IO.File]::ReadAllText($runtimePath) | ConvertFrom-Json
+        foreach ($case in @(
+            @{ path = (Join-Path $executableAliasRoot 'DSPGAME.exe'); expected = 'running_verified'; name = 'final-path executable alias' },
+            @{ path = $differentExecutable; expected = 'unknown_unverifiable'; name = 'distinct same-name same-content executable' },
+            @{ path = (Join-Path $executableAliasRoot 'missing.exe'); expected = 'unknown_unverifiable'; name = 'unresolvable executable path' }
+        )) {
+            $aliasRuntime.processes[0].path = $case.path
+            Write-SelfTestJson $runtimePath $aliasRuntime
+            $aliasStatus = Invoke-SelfTestSubmit -Id ([guid]::NewGuid().ToString('D')) -Capability LifecycleStatus
+            $aliasEnvelope = ConvertFrom-SelfTestOutput $aliasStatus.stdout
+            Assert-SelfTest ($aliasStatus.exitCode -eq 0 -and $aliasEnvelope.receipt.status -ceq 'succeeded' -and
+                $aliasEnvelope.receipt.evidence.lifecycleState -ceq $case.expected) `
+                ('worker process binding: ' + $case.name)
+        }
+    }
+    finally {
+        Set-SelfTestRuntime stopped
+        if (Test-Path -LiteralPath $executableAliasRoot) { [IO.Directory]::Delete($executableAliasRoot, $false) }
+    }
+
     $preflightId = [guid]::NewGuid().ToString('D')
     $preflight = Invoke-SelfTestSubmit -Id $preflightId -Capability LifecyclePreflight -Action start
     $preflightEnvelope = ConvertFrom-SelfTestOutput $preflight.stdout
@@ -975,6 +1079,12 @@ try {
     $script:stage = 'ACL and source audit'
     $aclIntent = Get-DysonLifecycleBrokerAclIntent 'S-1-5-19'
     $taskAcl = Get-DysonLifecycleBrokerTaskAclIntent
+    $nativeAcl = Assert-DysonLifecycleBrokerTaskAclIntent 'D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;LS)'
+    Assert-SelfTest (-not $nativeAcl.localServiceWrite) 'native mapped task rights retain the declared access'
+    $extraRightsRejected = $false
+    try { [void](Assert-DysonLifecycleBrokerTaskAclIntent 'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)') }
+    catch { $extraRightsRejected = $true }
+    Assert-SelfTest $extraRightsRejected 'mapped task rights reject extra Local Service write access'
     Assert-SelfTest (($aclIntent.intents -join '|') -notmatch 'LocalService' -and $taskAcl.localServiceWrite -eq $false -and
         $taskAcl.localServiceDelete -eq $false) 'protected ACL intent'
 

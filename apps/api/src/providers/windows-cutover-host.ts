@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { z } from 'zod'
 import type { HostMutationOperationScope } from '../host-mutation/operation-coordinator.js'
@@ -64,7 +64,7 @@ const actionValues = [
 ] as const
 const actionSchema = z.enum(actionValues)
 type WindowsCutoverFixedAction = z.output<typeof actionSchema>
-const brokerCapabilitySchema = z.enum(['CandidateTaskTransaction', ...actionValues])
+const brokerCapabilitySchema = z.enum(['CandidateTaskTransaction', 'CutoverEvidence', ...actionValues])
 type WindowsCutoverBrokerCapability = z.output<typeof brokerCapabilitySchema>
 
 const actionReceiptSchema = z.strictObject({
@@ -72,7 +72,7 @@ const actionReceiptSchema = z.strictObject({
   schemaVersion: z.literal(1),
   requestId: requestIdSchema,
   authorityInventoryRevision: sha256Schema,
-  action: actionSchema,
+  action: z.enum([...actionValues, 'ReconcilePreviousStop']),
   status: z.literal('succeeded')
 })
 
@@ -242,13 +242,17 @@ export class FixedWindowsCutoverHostClient implements WindowsCutoverHostClient {
     const request = parseRequest(inspectionRequestSchema, input)
     assertInspectionSignal(request.signal)
     try {
+      // Each observation needs fresh SYSTEM evidence, even for the same outer request.
+      const brokerRequestId = randomUUID()
       const output = await this.#runner.run(
-        evidenceScriptName,
-        this.#commonArguments(request.requestId),
+        brokerSubmitScriptName,
+        this.#brokerArguments(brokerRequestId, 'CutoverEvidence', request.requestId, []),
         request.signal
       )
       assertInspectionSignal(request.signal)
-      const receipt = inspectionReceiptSchema.parse(parseJson(output))
+      const receipt = inspectionReceiptSchema.parse(this.#parseBrokerResult(
+        output, brokerRequestId, 'CutoverEvidence', request.requestId
+      ).childReceipt)
       if (receipt.requestId !== request.requestId) {
         throw new WindowsCutoverHostClientError('WINDOWS_CUTOVER_HOST_INSPECTION_FAILED')
       }
@@ -365,8 +369,8 @@ export class FixedWindowsCutoverHostClient implements WindowsCutoverHostClient {
     return this.#runFixedMutation('DisablePreviousAuthority', input)
   }
 
-  stopPreviousRuntime(input: Readonly<WindowsCutoverFixedMutationRequest>): Promise<unknown> {
-    return this.#runFixedMutation('StopPreviousRuntime', input)
+  stopPreviousRuntime(input: Readonly<WindowsCutoverFixedMutationRequest>, options?: Readonly<{ reconcileOnly: true }>): Promise<unknown> {
+    return this.#runFixedMutation('StopPreviousRuntime', input, options)
   }
 
   enablePreviousAuthority(input: Readonly<WindowsCutoverFixedMutationRequest>): Promise<unknown> {
@@ -387,7 +391,8 @@ export class FixedWindowsCutoverHostClient implements WindowsCutoverHostClient {
 
   async #runFixedMutation(
     action: WindowsCutoverFixedAction,
-    input: Readonly<WindowsCutoverFixedMutationRequest>
+    input: Readonly<WindowsCutoverFixedMutationRequest>,
+    options?: Readonly<{ reconcileOnly: true }>
   ): Promise<unknown> {
     const request = parseRequest(fixedMutationRequestSchema, input)
     const scope = request.hostMutation
@@ -397,11 +402,14 @@ export class FixedWindowsCutoverHostClient implements WindowsCutoverHostClient {
       const brokerRequestId = deriveBrokerRequestId([
         action,
         request.requestId,
-        this.#authorityInventoryRevision
+        this.#authorityInventoryRevision,
+        ...(action === 'StopPreviousRuntime' ? [borrowArguments[3]!] : []),
+        ...(options?.reconcileOnly ? ['reconcile-only'] : [])
       ])
       const output = await this.#runner.run(
         brokerSubmitScriptName,
-        this.#brokerArguments(brokerRequestId, action, request.requestId, borrowArguments),
+        [...this.#brokerArguments(brokerRequestId, action, request.requestId, borrowArguments),
+          ...(options?.reconcileOnly ? ['-PreviousStopReconcileOnly'] : [])],
         scope.signal
       )
       scope.assertActive()
@@ -412,7 +420,7 @@ export class FixedWindowsCutoverHostClient implements WindowsCutoverHostClient {
         request.requestId
       )
       const receipt = actionReceiptSchema.parse(brokerResult.childReceipt)
-      if (receipt.requestId !== request.requestId || receipt.action !== action) {
+      if (receipt.requestId !== request.requestId || receipt.action !== (options?.reconcileOnly ? 'ReconcilePreviousStop' : action)) {
         throw new WindowsCutoverHostClientError('WINDOWS_CUTOVER_HOST_MUTATION_FAILED')
       }
       this.#assertInventoryRevision(receipt.authorityInventoryRevision)
@@ -422,19 +430,6 @@ export class FixedWindowsCutoverHostClient implements WindowsCutoverHostClient {
       scope.assertActive()
       throw new WindowsCutoverHostClientError('WINDOWS_CUTOVER_HOST_MUTATION_FAILED')
     }
-  }
-
-  #commonArguments(requestId: string): string[] {
-    return [
-      '-ProjectRoot', this.#projectRoot,
-      '-ProfileFile', this.#profileFile,
-      '-RuntimeBootstrapRoot', this.#runtimeBootstrapRoot,
-      '-RuntimeTaskTransactionRoot', this.#runtimeTaskTransactionRoot,
-      '-ServiceUser', this.#serviceUser,
-      '-GamePort', String(this.#gamePort),
-      '-AuthorityInventoryRevision', this.#authorityInventoryRevision,
-      '-RequestId', requestId
-    ]
   }
 
   #brokerArguments(
@@ -458,8 +453,10 @@ export class FixedWindowsCutoverHostClient implements WindowsCutoverHostClient {
       '-RuntimeTaskTransactionRoot', this.#runtimeTaskTransactionRoot,
       '-ServiceUser', this.#serviceUser,
       '-GamePort', String(this.#gamePort),
-      '-LeaseInstanceId', borrowArguments[3]!,
-      '-LeaseToken', borrowArguments[5]!
+      ...(capability === 'CutoverEvidence' ? [] : [
+        '-LeaseInstanceId', borrowArguments[3]!,
+        '-LeaseToken', borrowArguments[5]!
+      ])
     ]
   }
 

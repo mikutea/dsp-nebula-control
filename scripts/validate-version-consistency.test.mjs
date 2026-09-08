@@ -452,7 +452,7 @@ test('CLI exits nonzero with a bounded diagnostic on an expected-version mismatc
   assert.equal(result.stdout, '')
 })
 
-test('root check runs both version gates before build', async () => {
+test('root check validates versions then builds before artifact-dependent self-tests', async () => {
   const rootPackage = JSON.parse(await readFile(path.join(repositoryRoot, 'package.json'), 'utf8'))
   const check = rootPackage.scripts?.check
   assert.equal(typeof check, 'string')
@@ -461,6 +461,11 @@ test('root check runs both version gates before build', async () => {
   const build = check.indexOf('npm run build')
   assert.ok(consistency >= 0 && consistency < selftest, 'version consistency must run before its self-test')
   assert.ok(selftest < build, 'both version gates must run before build')
+  for (const consumer of ['deployment:selftest', 'release:selftest', 'release:package-selftest']) {
+    const position = check.indexOf(`npm run ${consumer}`)
+    assert.ok(position > build, `${consumer} needs compiled files in a clean checkout`)
+  }
+  assert.equal(check.split('npm run build').length - 1, 1, 'the complete gate should build once')
 })
 
 async function createFixture(version) {

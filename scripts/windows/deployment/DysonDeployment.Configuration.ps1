@@ -552,7 +552,7 @@ function New-DysonDeploymentConfigurationSnapshot {
         throw 'The configuration snapshot creator returned an invalid configuration length.'
     }
     $snapshotFull = Assert-DysonDeploymentPlainPathChain -Path ([string]$result.snapshotPath)
-    $snapshotRoot = Join-Path (Join-Path (Get-DysonFullPath -Path $DataRoot) 'config') 'snapshots'
+    $snapshotRoot = Join-Path (Get-DysonFullPath -Path $DataRoot) 'configuration-snapshots'
     if (-not (Test-DysonDeploymentSamePath `
             -Left ([System.IO.Path]::GetDirectoryName($snapshotFull)) -Right $snapshotRoot) -or
         [string]::Equals($snapshotFull, $snapshotRoot,
@@ -640,18 +640,22 @@ function Invoke-DysonDeploymentConfigurationTest {
         [Parameter(Mandatory)][string]$RuntimeBootstrapRoot,
         [Parameter(Mandatory)][string]$DeploymentVersion,
         [Parameter(Mandatory)][string]$ServiceAccount,
-        [string]$ConfigurationModuleRoot
+        [string]$ConfigurationModuleRoot,
+        [switch]$RuntimeOnly
     )
 
     $moduleRoot = Get-DysonDeploymentConfigurationModuleRoot `
         -ConfigurationModuleRoot $ConfigurationModuleRoot
-    $output = @(& (Join-Path $moduleRoot 'Test-DysonControlConfiguration.ps1') `
+    $runtimeArguments = @{}
+    if ($RuntimeOnly) { $runtimeArguments.RuntimeOnly = $true }
+    $output = @(& (Join-Path $moduleRoot 'Test-DysonControlConfiguration.ps1') @runtimeArguments `
         -DataRoot $DataRoot -ScriptRoot $ScriptRoot `
         -RuntimeBootstrapRoot $RuntimeBootstrapRoot -DeploymentVersion $DeploymentVersion `
         -ServiceAccount $ServiceAccount)
     if ($output.Count -lt 1) { throw 'The configuration verifier returned no result.' }
     $result = $output[$output.Count - 1]
-    if ([string]$result.protocol -cne $script:DysonDeploymentConfigurationTestProtocol -or
+    $expectedProtocol = if ($RuntimeOnly) { 'DYSON_CONTROL_CONFIGURATION_RUNTIME_TEST_RESULT_V1' } else { $script:DysonDeploymentConfigurationTestProtocol }
+    if ([string]$result.protocol -cne $expectedProtocol -or
         $result.healthy -isnot [bool] -or -not [bool]$result.healthy -or
         $result.mutationPerformed -isnot [bool] -or [bool]$result.mutationPerformed -or
         $null -ne $result.snapshot -or $null -ne $result.restorePlan) {

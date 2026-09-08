@@ -231,6 +231,53 @@ try {
         @(Get-ChildItem -LiteralPath $adoptionContainer -Force -ErrorAction Stop).Count -eq 0
     ) 'qualified-client rollback did not restore an adopted empty container exactly'
 
+    # Exercise legacy and protected descriptors explicitly; the TEMP parent's
+    # inheritance model varies between CI, desktop Windows, and the server.
+    foreach ($aclCase in @(
+        @{ protected = $false; autoInherited = $false },
+        @{ protected = $true; autoInherited = $false },
+        @{ protected = $false; autoInherited = $true },
+        @{ protected = $true; autoInherited = $true }
+    )) {
+        $protected = [bool]$aclCase.protected
+        $aclFixture = Join-Path $testRoot ('acl-preimage-' + $protected + '-' + $aclCase.autoInherited)
+        [void][System.IO.Directory]::CreateDirectory($aclFixture)
+        $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new(
+            (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $aclFixture).Sddl)
+        $flags = $raw.ControlFlags -band (-bnot (
+            [System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited -bor
+            [System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInheritRequired -bor
+            [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected))
+        if ($aclCase.autoInherited) { $flags = $flags -bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited }
+        if ($protected) { $flags = $flags -bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected }
+        $raw.SetFlags($flags)
+        $expectedSddl = $raw.GetSddlForm([System.Security.AccessControl.AccessControlSections]'Owner, Group, Access')
+        Restore-DysonQualifiedClientEmptyDirectorySecurity -Path $aclFixture -Sddl $expectedSddl
+        Set-DysonQualifiedClientStorageRemovalAcl -Path $aclFixture
+        Restore-DysonQualifiedClientEmptyDirectorySecurity -Path $aclFixture -Sddl $expectedSddl
+        Assert-ConfigurationIntegrationFixture (
+            (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $aclFixture).Sddl -ceq $expectedSddl
+        ) 'ACL rollback changed the captured inheritance control bits'
+        [System.IO.File]::WriteAllText((Join-Path $aclFixture 'arrived.txt'), 'fictional concurrent data')
+        $populatedRejected = $false
+        try { Restore-DysonQualifiedClientEmptyDirectorySecurity -Path $aclFixture -Sddl $expectedSddl }
+        catch { $populatedRejected = $true }
+        Assert-ConfigurationIntegrationFixture ($populatedRejected -and
+            (Test-Path -LiteralPath (Join-Path $aclFixture 'arrived.txt')) -and
+            (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $aclFixture).Sddl -ceq $expectedSddl
+        ) 'ACL rollback accepted a populated adopted directory or altered its preimage'
+        $childDirectory = Join-Path $aclFixture 'managed-child'
+        [void][System.IO.Directory]::CreateDirectory($childDirectory)
+        Set-DysonQualifiedClientStorageRemovalAcl -Path $aclFixture
+        $childSddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $childDirectory).Sddl
+        Restore-DysonDeploymentDirectorySecurityPreimage -Path $aclFixture -Sddl $expectedSddl
+        Assert-ConfigurationIntegrationFixture (
+            (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $aclFixture).Sddl -ceq $expectedSddl -and
+            (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $childDirectory).Sddl -ceq $childSddl -and
+            [System.IO.File]::ReadAllText((Join-Path $aclFixture 'arrived.txt')) -ceq 'fictional concurrent data'
+        ) 'managed directory rollback propagated ACL changes or altered descendant bytes'
+    }
+
     $partialRejected = $false
     try {
         [void](Get-DysonQualifiedClientStoragePlan `

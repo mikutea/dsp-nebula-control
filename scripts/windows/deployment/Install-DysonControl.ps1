@@ -58,6 +58,197 @@ function Test-DysonDeploymentSamePath {
     )
 }
 
+function Remove-DysonDeploymentCreatedConfiguration {
+    param(
+        [Parameter(Mandatory)][string]$DataRoot,
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [Parameter(Mandatory)][string]$RuntimeBootstrapRoot,
+        [Parameter(Mandatory)][string]$DeploymentVersion,
+        [Parameter(Mandatory)][string]$ServiceAccount,
+        [Parameter(Mandatory)]$ExpectedPreflight,
+        [Parameter(Mandatory)][string]$ConfigurationModuleRoot,
+        [switch]$AllowSelfTestAdministrator
+    )
+
+    $moduleRoot = Resolve-DysonDeploymentConfigurationModuleRoot `
+        -ModuleRoot $ConfigurationModuleRoot
+    . (Join-Path $moduleRoot 'DysonConfiguration.Common.ps1')
+    $configurationPath = Join-Path (Join-Path (Get-DysonFullPath -Path $DataRoot) 'config') `
+        'dyson-control.env'
+
+    if ($AllowSelfTestAdministrator) {
+        Assert-DysonDeploymentTaskSelfTestScope -InstallRoot $DataRoot -DataRoot $DataRoot
+        if (-not (Test-Path -LiteralPath (Join-Path $moduleRoot `
+                    '.dyson-configuration-selftest') -PathType Leaf)) {
+            throw 'The isolated configuration rollback fixture is unavailable.'
+        }
+        $fixtureConfigRoot = Assert-DysonPlainDirectory `
+            -Path ([System.IO.Path]::GetDirectoryName($configurationPath))
+        $fixtureEntries = @(Get-ChildItem -LiteralPath $fixtureConfigRoot -Force -ErrorAction Stop)
+        if ($fixtureEntries.Count -ne 1 -or $fixtureEntries[0].PSIsContainer -or
+            -not (Test-DysonDeploymentSamePath -Left $fixtureEntries[0].FullName `
+                -Right $configurationPath)) {
+            throw 'The isolated created-configuration rollback fixture is inconsistent.'
+        }
+        $fixtureEvidence = Get-FixtureConfigurationEvidence -ConfigurationPath $configurationPath `
+            -DataRoot $DataRoot -ScriptRoot $ScriptRoot `
+            -RuntimeBootstrapRoot $RuntimeBootstrapRoot -DeploymentVersion $DeploymentVersion
+        if ([string]$fixtureEvidence.configurationSha256 -cne [string]$ExpectedPreflight.sourceSha256 -or
+            [int64]$fixtureEvidence.configurationLength -ne [int64]$ExpectedPreflight.sourceLength -or
+            [string]$fixtureEvidence.namesSha256 -cne [string]$ExpectedPreflight.namesSha256 -or
+            [string]$fixtureEvidence.bindingsSha256 -cne [string]$ExpectedPreflight.bindingsSha256 -or
+            [string]$fixtureEvidence.contractSha256 -cne [string]$ExpectedPreflight.contractSha256) {
+            throw 'The isolated created-configuration rollback target changed after installation.'
+        }
+        [System.IO.File]::Delete($fixtureEntries[0].FullName)
+        [System.IO.Directory]::Delete($fixtureConfigRoot, $false)
+        if ((Test-Path -LiteralPath $configurationPath) -or
+            (Test-Path -LiteralPath $fixtureConfigRoot)) {
+            throw 'The isolated created-configuration rollback did not restore an absent preimage.'
+        }
+        return
+    }
+
+    $dataFull = Assert-DysonConfigurationPlainDirectoryChain $DataRoot
+    $serviceSid = Resolve-DysonConfigurationServiceSid $ServiceAccount
+    $contract = Get-DysonConfigurationContract -ContractPath (
+        Join-Path $moduleRoot 'dyson-control.environment-contract.json'
+    )
+    $bindings = Get-DysonDeploymentConfigurationBindings -DataRoot $dataFull `
+        -ScriptRoot $ScriptRoot -RuntimeBootstrapRoot $RuntimeBootstrapRoot `
+        -DeploymentVersion $DeploymentVersion
+    $storage = Get-DysonConfigurationStoragePaths -DataRoot $dataFull
+    $approvalPath = Join-Path $storage.configRoot $script:DysonConfigurationRuntimeApprovalName
+    foreach ($directory in @(
+            $storage.configRoot, $storage.transactionRoot, $storage.intentsRoot,
+            $storage.receiptsRoot, $storage.snapshotRoot
+        )) {
+        [void](Assert-DysonConfigurationPlainDirectoryChain $directory)
+    }
+    [void](Assert-DysonConfigurationAcl -Path $storage.configRoot `
+        -Kind ConfigDirectory -ServiceSid $serviceSid)
+    foreach ($directory in @(
+            $storage.transactionRoot, $storage.intentsRoot, $storage.receiptsRoot,
+            $storage.snapshotRoot
+        )) {
+        [void](Assert-DysonConfigurationAcl -Path $directory -Kind PrivateDirectory)
+    }
+
+    $configurationLock = Enter-DysonConfigurationMutationLock -Storage $storage
+    try {
+        $state = Get-DysonConfigurationTransactionState -Storage $storage `
+            -ServiceSid $serviceSid -Contract $contract `
+            -ExpectedLauncherBindings $bindings -LockHeld
+        $intentEntries = @($state.intents.Values)
+        $receiptEntries = @($state.receipts.Values)
+        if (-not [bool]$state.clean -or $intentEntries.Count -ne 1 -or
+            $receiptEntries.Count -ne 1 -or [int64]$state.nextSequence -ne 2 -or
+            [int64]$state.terminalSequence -ne 1 -or
+            [string]$state.terminalReceiptState -cne 'installed' -or
+            -not [bool]$state.terminalTargetPresent -or
+            [string]$state.terminalTargetSha256 -cne [string]$ExpectedPreflight.sourceSha256 -or
+            [int64]$state.terminalTargetLength -ne [int64]$ExpectedPreflight.sourceLength -or
+            [string]$state.terminalBindingsSha256 -cne [string]$ExpectedPreflight.bindingsSha256 -or
+            [string]$state.terminalContractSha256 -cne [string]$ExpectedPreflight.contractSha256 -or
+            [string]$state.terminalTargetPathSha256 -cne
+                (Get-DysonConfigurationPathBindingSha256 $storage.configurationPath)) {
+            throw 'The created protected configuration is not the exact single-transaction postimage.'
+        }
+        $intent = $intentEntries[0]
+        $receipt = $receiptEntries[0]
+        if ([string]$intent.record.operation -cne 'create' -or
+            [bool]$intent.record.preimagePresent -or [int64]$intent.record.sequence -ne 1 -or
+            [string]$intent.record.sourceSha256 -cne [string]$ExpectedPreflight.sourceSha256 -or
+            [int64]$intent.record.sourceLength -ne [int64]$ExpectedPreflight.sourceLength -or
+            [string]$intent.record.bindingsSha256 -cne [string]$ExpectedPreflight.bindingsSha256 -or
+            [string]$intent.record.contractSha256 -cne [string]$ExpectedPreflight.contractSha256 -or
+            [string]$receipt.record.state -cne 'installed' -or
+            [int64]$receipt.record.sequence -ne 1 -or
+            [string]$receipt.record.transactionId -cne [string]$intent.record.transactionId -or
+            [string]$receipt.record.targetSha256 -cne [string]$ExpectedPreflight.sourceSha256 -or
+            [int64]$receipt.record.targetLength -ne [int64]$ExpectedPreflight.sourceLength) {
+            throw 'The created protected configuration transaction does not match its validated source.'
+        }
+        $approvalPresent = Test-Path -LiteralPath $approvalPath -PathType Leaf
+        if ($approvalPresent) {
+            $parentAcl = Assert-DysonConfigurationParentAcl -Path $dataFull -ServiceSid $serviceSid
+            $runtimeApproval = Test-DysonConfigurationRuntimeApproval -Storage $storage `
+                -Contract $contract -ExpectedLauncherBindings $bindings `
+                -ServiceSid $serviceSid -ParentAcl $parentAcl
+            if ([string]$runtimeApproval.configurationSha256 -cne [string]$ExpectedPreflight.sourceSha256 -or
+                [int64]$runtimeApproval.configurationLength -ne [int64]$ExpectedPreflight.sourceLength -or
+                [string]$runtimeApproval.namesSha256 -cne [string]$ExpectedPreflight.namesSha256 -or
+                [string]$runtimeApproval.bindingsSha256 -cne [string]$ExpectedPreflight.bindingsSha256 -or
+                [string]$runtimeApproval.contractSha256 -cne [string]$ExpectedPreflight.contractSha256 -or
+                [int]$runtimeApproval.completedTransactionCount -ne 1 -or
+                [int]$runtimeApproval.protectedSnapshotCount -ne 0) {
+                throw 'The created protected configuration runtime approval does not match its transaction.'
+            }
+        }
+        $configEntries = @(Get-ChildItem -LiteralPath $storage.configRoot -Force -ErrorAction Stop)
+        $transactionEntries = @(Get-ChildItem -LiteralPath $storage.transactionRoot -Force -ErrorAction Stop)
+        $intentFiles = @(Get-ChildItem -LiteralPath $storage.intentsRoot -Force -ErrorAction Stop)
+        $receiptFiles = @(Get-ChildItem -LiteralPath $storage.receiptsRoot -Force -ErrorAction Stop)
+        $snapshotEntries = @(Get-ChildItem -LiteralPath $storage.snapshotRoot -Force -ErrorAction Stop)
+        $configNames = @($configEntries.Name | Sort-Object -CaseSensitive)
+        $expectedConfigNames = @(
+            @('dyson-control.env') + $(if ($approvalPresent) {
+                @($script:DysonConfigurationRuntimeApprovalName)
+            } else { @() }) | Sort-Object -CaseSensitive
+        )
+        if ($configEntries.Count -ne $expectedConfigNames.Count -or
+            ($configNames -join '|') -cne ($expectedConfigNames -join '|') -or
+            @($configEntries | Where-Object { $_.PSIsContainer }).Count -ne 0 -or
+            $transactionEntries.Count -ne 3 -or
+            (@($transactionEntries.Name | Sort-Object -CaseSensitive) -join '|') -cne
+                (@('configuration.lock', 'intents', 'receipts') -join '|') -or
+            $intentFiles.Count -ne 1 -or $receiptFiles.Count -ne 1 -or
+            $snapshotEntries.Count -ne 0 -or
+            -not (Test-DysonDeploymentSamePath -Left $intentFiles[0].FullName -Right $intent.path) -or
+            -not (Test-DysonDeploymentSamePath -Left $receiptFiles[0].FullName -Right $receipt.path)) {
+            throw 'The created protected configuration storage contains an unexpected entry.'
+        }
+        if ($approvalPresent) {
+            [System.IO.File]::Delete((ConvertTo-DysonConfigurationExtendedPath $approvalPath))
+        }
+        [System.IO.File]::Delete(
+            (ConvertTo-DysonConfigurationExtendedPath $storage.configurationPath)
+        )
+        [System.IO.File]::Delete((ConvertTo-DysonConfigurationExtendedPath $receipt.path))
+        [System.IO.File]::Delete((ConvertTo-DysonConfigurationExtendedPath $intent.path))
+        if ([System.IO.File]::Exists(
+                (ConvertTo-DysonConfigurationExtendedPath $storage.configurationPath)
+            ) -or @(Get-ChildItem -LiteralPath $storage.intentsRoot -Force -ErrorAction Stop).Count -ne 0 -or
+            @(Get-ChildItem -LiteralPath $storage.receiptsRoot -Force -ErrorAction Stop).Count -ne 0) {
+            throw 'The created protected configuration files were not removed.'
+        }
+    }
+    finally { $configurationLock.Dispose() }
+
+    [void](Assert-DysonConfigurationAcl -Path $storage.lockPath -Kind PrivateFile)
+    [System.IO.File]::Delete((ConvertTo-DysonConfigurationExtendedPath $storage.lockPath))
+    foreach ($directory in @(
+            $storage.receiptsRoot, $storage.intentsRoot, $storage.transactionRoot,
+            $storage.snapshotRoot, $storage.configRoot
+        )) {
+        [void](Assert-DysonConfigurationPlainDirectoryChain $directory)
+        if (@(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop).Count -ne 0) {
+            throw 'The created protected configuration storage changed during rollback.'
+        }
+        [System.IO.Directory]::Delete(
+            (ConvertTo-DysonConfigurationExtendedPath $directory), $false
+        )
+    }
+    foreach ($path in @(
+            $storage.configurationPath, $storage.configRoot, $storage.transactionRoot,
+            $storage.snapshotRoot
+        )) {
+        if (Test-Path -LiteralPath $path) {
+            throw 'The created protected configuration rollback did not restore an absent preimage.'
+        }
+    }
+}
+
 function Assert-DysonDeploymentPlainFile {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -155,6 +346,51 @@ function ConvertTo-DysonCutoverBrokerDeploymentBinding {
     return $Raw
 }
 
+function Stop-DysonDeploymentControlTaskForBrokerUpgrade {
+    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][string]$TaskName)
+
+    if (-not [bool]$State.present) { return }
+    $task = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
+    if ($task.Count -ne 1 -or [string]$task[0].TaskPath -cne [string]$State.taskPath -or
+        (Get-DysonTextSha256 ([string](Export-ScheduledTask -TaskName $TaskName `
+            -TaskPath $State.taskPath -ErrorAction Stop))) -cne [string]$State.xmlSha256) {
+        throw 'The previous control-plane task changed before broker quiescence.'
+    }
+    if ([string]$task[0].State -ceq 'Running') {
+        Stop-ScheduledTask -InputObject $task[0] -ErrorAction Stop
+    }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $task = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
+        if ($task.Count -ne 1 -or [string]$task[0].TaskPath -cne [string]$State.taskPath) {
+            throw 'The previous control-plane task identity changed during broker quiescence.'
+        }
+        if ([string]$task[0].State -cne 'Running') { return }
+        Start-Sleep -Milliseconds 250
+    } while ($timer.Elapsed.TotalSeconds -lt 20)
+    throw 'The previous control-plane task did not stop before broker quiescence.'
+}
+
+function Wait-DysonDeploymentBrokerWorkersIdle {
+    # Do not stop SYSTEM workers: a dispatched read-only status request must
+    # finish its receipt publication and history retention naturally. Pending
+    # records remain subject to the unchanged strict preimage checks afterward.
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $quietSamples = 0
+    do {
+        $lifecycle = @(Get-DysonLifecycleBrokerStaticWorkerTasks)
+        $cutover = @(Get-DysonCutoverBrokerDeploymentTasks)
+        if ($lifecycle.Count -gt 1 -or $cutover.Count -gt 1) {
+            throw 'A fixed broker task identity is ambiguous during quiescence.'
+        }
+        $running = @(@($lifecycle) + @($cutover) | Where-Object { [string]$_.State -ceq 'Running' })
+        if ($running.Count -eq 0) { $quietSamples += 1 } else { $quietSamples = 0 }
+        if ($quietSamples -ge 2) { return }
+        Start-Sleep -Milliseconds 500
+    } while ($timer.Elapsed.TotalSeconds -lt 30)
+    throw 'The fixed broker workers did not become idle before the deployment deadline.'
+}
+
 function Assert-DysonCutoverBrokerDeploymentNoPendingWork {
     param([Parameter(Mandatory)]$Storage)
 
@@ -212,8 +448,8 @@ function Assert-DysonCutoverBrokerDeploymentTask {
     }
 
     $tasks = @(Get-DysonCutoverBrokerDeploymentTasks)
-    $actions = if ($tasks.Count -eq 1) { @($tasks[0].Actions) } else { @() }
-    $triggers = if ($tasks.Count -eq 1) { @($tasks[0].Triggers | Where-Object { $null -ne $_ }) } else { @() }
+    $actions = @(if ($tasks.Count -eq 1) { $tasks[0].Actions | Where-Object { $null -ne $_ } })
+    $triggers = @(if ($tasks.Count -eq 1) { $tasks[0].Triggers | Where-Object { $null -ne $_ } })
     $expectedPowerShell = [IO.Path]::GetFullPath(
         (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
     )
@@ -268,7 +504,8 @@ function Assert-DysonBrokerPreflightStateUnchanged {
     if ($null -eq $Before) { return }
     $same = if ($Kind -ceq 'lifecycle') {
         [string]$Before.activeVersion -ceq [string]$After.activeVersion -and
-        [string]$Before.profileHash -ceq [string]$After.profileHash
+        [string]$Before.profileHash -ceq [string]$After.profileHash -and
+        [string]$Before.profileFileSddl -ceq [string]$After.profileFileSddl
     }
     else {
         [string]$Before.activeVersion -ceq [string]$After.activeVersion -and
@@ -654,9 +891,7 @@ function Restore-DysonCutoverBrokerDeploymentFileAcls {
 
     foreach ($directoryAcl in @($State.directoryAcls)) {
         $path = Assert-DysonPlainDirectory -Path ([string]$directoryAcl.path)
-        $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $path -ErrorAction Stop
-        $acl.SetSecurityDescriptorSddlForm([string]$directoryAcl.sddl)
-        Microsoft.PowerShell.Security\Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+        Restore-DysonDeploymentDirectorySecurityPreimage -Path $path -Sddl ([string]$directoryAcl.sddl)
         if ((Microsoft.PowerShell.Security\Get-Acl -LiteralPath $path -ErrorAction Stop).Sddl -cne
             [string]$directoryAcl.sddl) {
             throw 'A restored cutover broker storage directory did not return to its exact ACL preimage.'
@@ -670,9 +905,7 @@ function Restore-DysonCutoverBrokerDeploymentFileAcls {
             -Path ([string]$binding[0]) -Bytes ([byte[]]$binding[1])
         $path = Assert-DysonDeploymentPlainFile -Path ([string]$binding[0]) -MaximumBytes 32768 `
             -Message 'A restored cutover broker state file is unavailable or redirected.'
-        $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $path -ErrorAction Stop
-        $acl.SetSecurityDescriptorSddlForm([string]$binding[2])
-        Microsoft.PowerShell.Security\Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+        Restore-DysonDeploymentFileSecurityPreimage -Path $path -Sddl ([string]$binding[2])
         $restoredSddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $path -ErrorAction Stop).Sddl
         if ($restoredSddl -cne [string]$binding[2]) {
             throw 'A restored cutover broker state file did not return to its exact ACL preimage.'
@@ -804,11 +1037,56 @@ function Invoke-DysonLifecycleBrokerDeploymentInstaller {
     return $receipt
 }
 
+function Restore-DysonLifecycleBrokerDeploymentFirstInstall {
+    param(
+        [Parameter(Mandatory)][string]$Installer,
+        [Parameter(Mandatory)][hashtable]$InstallArguments,
+        [Parameter(Mandatory)][string]$DeploymentDataRoot,
+        [string]$ShadowRoot,
+        [string]$ExpectedProfileHash
+    )
+
+    $profilePath = Assert-DysonDeploymentPlainFile -Path (
+        Join-Path ([string]$InstallArguments.BrokerRoot) 'broker-profile.json'
+    ) -MaximumBytes 262144 -Message 'The first-install lifecycle broker profile is unavailable.'
+    $profileHash = Get-DysonFileSha256 -Path $profilePath
+    if ($ExpectedProfileHash -and $profileHash -cne $ExpectedProfileHash) {
+        throw 'The first-install lifecycle broker profile changed before compensation.'
+    }
+    $arguments = @{}
+    foreach ($key in $InstallArguments.Keys) { $arguments[$key] = $InstallArguments[$key] }
+    [void]$arguments.Remove('UpgradeExisting')
+    $arguments['CompensateFirstInstall'] = $true
+    # The fixed child reconstructs the candidate from these original trusted
+    # bindings and validates its exact profile/task before removing anything.
+    # No cleanup path or operation is taken from an unaccepted install receipt.
+    $receipt = Invoke-DysonLifecycleBrokerDeploymentInstaller -Installer $Installer `
+        -Arguments $arguments -ShadowRoot $ShadowRoot
+    Assert-DysonLifecycleBrokerDeploymentExactProperties -Value $receipt -Names @(
+        'protocol', 'schemaVersion', 'operation', 'brokerRoot', 'removedProfileHash',
+        'workerTaskName', 'workerTaskPath', 'profileRemoved', 'taskRemoved',
+        'preservedRequestCount', 'preservedReceiptCount', 'backend', 'compensatedAt'
+    ) -Message 'The lifecycle broker first-install compensation receipt is invalid.'
+    if ([string]$receipt.protocol -cne 'DYSON_CONTROL_LIFECYCLE_BROKER_COMPENSATION_RECEIPT_V1' -or
+        [int]$receipt.schemaVersion -ne 1 -or [string]$receipt.operation -cne 'compensated-first-install' -or
+        [string]$receipt.removedProfileHash -cne $profileHash -or
+        -not (Test-DysonDeploymentSamePath ([string]$receipt.brokerRoot) ([string]$InstallArguments.BrokerRoot)) -or
+        [string]$receipt.workerTaskName -cne 'Dyson-Control-Lifecycle-Broker' -or
+        [string]$receipt.workerTaskPath -cne '\DysonControl\' -or
+        $receipt.profileRemoved -isnot [bool] -or -not [bool]$receipt.profileRemoved -or
+        $receipt.taskRemoved -isnot [bool] -or -not [bool]$receipt.taskRemoved) {
+        throw 'The lifecycle broker first-install compensation receipt is invalid.'
+    }
+    Assert-DysonLifecycleBrokerDeploymentPreimageRestored -DeploymentDataRoot $DeploymentDataRoot `
+        -State $null -ShadowRoot $ShadowRoot
+}
+
 function Get-DysonLifecycleBrokerDeploymentPreimage {
     param(
         [Parameter(Mandatory)][string]$DeploymentDataRoot,
         $ActiveRelease,
-        [string]$ShadowRoot
+        [string]$ShadowRoot,
+        [switch]$AllowPendingStatusRequests
     )
 
     $dataRoot = Join-Path $DeploymentDataRoot 'data'
@@ -863,7 +1141,8 @@ function Get-DysonLifecycleBrokerDeploymentPreimage {
     }
     [void](Assert-DysonLifecycleBrokerDependencies -Profile $profile)
     $storage = Get-DysonLifecycleBrokerStorage -BrokerRoot $brokerRoot
-    [void](Assert-DysonLifecycleBrokerStaticNoPendingWork -Storage $storage)
+    [void](Assert-DysonLifecycleBrokerStaticNoPendingWork -Storage $storage `
+        -AllowPendingStatusRequests:$AllowPendingStatusRequests)
 
     $previousMarker = [Environment]::GetEnvironmentVariable(
         'DYSON_LIFECYCLE_BROKER_SELFTEST', [EnvironmentVariableTarget]::Process
@@ -875,7 +1154,8 @@ function Get-DysonLifecycleBrokerDeploymentPreimage {
             )
         }
         [void](Assert-DysonLifecycleBrokerTaskPair -Profile $profile `
-            -Backend $(if ($ShadowRoot) { 'Shadow' } else { 'Windows' }) -ShadowRoot $ShadowRoot)
+            -Backend $(if ($ShadowRoot) { 'Shadow' } else { 'Windows' }) -ShadowRoot $ShadowRoot `
+            -AllowPreparedDisabled)
     }
     finally {
         if ($ShadowRoot) {
@@ -949,6 +1229,7 @@ function Get-DysonLifecycleBrokerDeploymentPreimage {
         profileHash = Get-DysonLifecycleBrokerProfileHash -ProfileFile $profileFile
         profileBytes = [IO.File]::ReadAllBytes($profileFile)
         profileSddl = $profileSddl
+        profileFileSddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $profileFile -ErrorAction Stop).Sddl
         profileAclPath = $shadowProfileAclPath
         profileAclBytes = $profileAclBytes
         taskPath = $shadowTaskPath
@@ -999,12 +1280,14 @@ function Restore-DysonLifecycleBrokerDeploymentPreimage {
 
     foreach ($directoryAcl in @($State.directoryAcls)) {
         $path = Assert-DysonPlainDirectory -Path ([string]$directoryAcl.path)
-        $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $path -ErrorAction Stop
-        $acl.SetSecurityDescriptorSddlForm([string]$directoryAcl.sddl)
-        Microsoft.PowerShell.Security\Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+        Restore-DysonDeploymentDirectorySecurityPreimage -Path $path -Sddl ([string]$directoryAcl.sddl)
     }
     Set-DysonLifecycleBrokerDeploymentFileBytesAtomic `
         -Path ([string]$State.profilePath) -Bytes ([byte[]]$State.profileBytes)
+    # Shadow task/profile ACL intent files model scheduler policy, not the ACL
+    # of this real profile file. Restore the actual file descriptor in both modes.
+    Restore-DysonDeploymentFileSecurityPreimage -Path ([string]$State.profilePath) `
+        -Sddl ([string]$State.profileFileSddl)
     if ($ShadowRoot) {
         Set-DysonLifecycleBrokerDeploymentFileBytesAtomic -Path ([string]$State.profileAclPath) `
             -Bytes ([byte[]]$State.profileAclBytes) -MaximumBytes 8192
@@ -1013,10 +1296,6 @@ function Restore-DysonLifecycleBrokerDeploymentPreimage {
     }
     else {
         $null = . ([string]$State.taskAclHelper)
-        $profileAcl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath ([string]$State.profilePath) -ErrorAction Stop
-        $profileAcl.SetSecurityDescriptorSddlForm([string]$State.profileSddl)
-        Microsoft.PowerShell.Security\Set-Acl -LiteralPath ([string]$State.profilePath) `
-            -AclObject $profileAcl -ErrorAction Stop
         Register-ScheduledTask -TaskName 'Dyson-Control-Lifecycle-Broker' -TaskPath '\DysonControl\' `
             -Xml ([string]$State.taskXml) -Force -ErrorAction Stop | Out-Null
         Restore-DysonLifecycleBrokerTaskSecurityDescriptor `
@@ -1048,6 +1327,10 @@ function Assert-DysonLifecycleBrokerDeploymentPreimageRestored {
             -Left ([IO.File]::ReadAllBytes([string]$State.profilePath)) `
             -Right ([byte[]]$State.profileBytes))) {
         throw 'The lifecycle broker profile did not return to its byte-exact preimage.'
+    }
+    if ((Microsoft.PowerShell.Security\Get-Acl -LiteralPath ([string]$State.profilePath) -ErrorAction Stop).Sddl -cne
+        [string]$State.profileFileSddl) {
+        throw 'The lifecycle broker profile file did not return to its exact ACL preimage.'
     }
     foreach ($directoryAcl in @($State.directoryAcls)) {
         if ((Microsoft.PowerShell.Security\Get-Acl -LiteralPath ([string]$directoryAcl.path) -ErrorAction Stop).Sddl -cne
@@ -1154,7 +1437,8 @@ function Assert-DysonLifecycleBrokerInstallReceipt {
     $expectedAclIntent = [ordered]@{
         root = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl', 'S-1-5-19:ReadAndExecute')
         requests = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl',
-            'S-1-5-19:CreateFiles+AppendData+ListDirectory+ReadAttributes+Synchronize')
+            'S-1-5-19:CreateFiles+AppendData+ListDirectory+ReadAttributes+Synchronize',
+            'CREATOR OWNER:Read+Delete (files only)')
         intents = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl')
         receipts = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl', 'S-1-5-19:ReadAndExecute')
         profile = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl', 'S-1-5-19:Read')
@@ -1315,6 +1599,9 @@ function Assert-DysonLifecycleBrokerEnvironment {
 
 $installFull = Assert-DysonSafeRoot -Path $InstallRoot -Name 'InstallRoot'
 $dataFull = Assert-DysonSafeRoot -Path $DataRoot -Name 'DataRoot'
+# Installation must use a layout that its rollback and uninstall can also
+# handle. Reject unsupported roots before artifact reads or filesystem writes.
+[void](Assert-DysonDeploymentDestructiveRootLayout -InstallRoot $installFull -DataRoot $dataFull)
 $sourceFull = Assert-DysonPlainDirectory -Path $SourcePath
 Assert-DysonVersion -Version $Version
 Assert-DysonRelativePath -Path $EntryPointRelativePath -Name 'EntryPointRelativePath'
@@ -1471,7 +1758,8 @@ if ($InstallLifecycleBrokerTask) {
         ExpectedGamePort = [int]$GamePort
     }
     Assert-DysonLifecycleBrokerEnvironment -Configured $sourceEnvironment @lifecycleEnvironmentArguments
-    if (Test-Path -LiteralPath $prospectiveConfigurationPath -PathType Leaf) {
+    if ((Test-Path -LiteralPath $prospectiveConfigurationPath -PathType Leaf) -and
+        (Test-Path -LiteralPath $expectedLifecycleProfile -PathType Leaf)) {
         $installedEnvironment = Read-DysonDeploymentEnvironmentFile -Path $prospectiveConfigurationPath
         Assert-DysonLifecycleBrokerEnvironment -Configured $installedEnvironment @lifecycleEnvironmentArguments
     }
@@ -1567,7 +1855,8 @@ if ($InstallCutoverBrokerTask) {
         ExpectedGamePort = [int]$CutoverGamePort
     }
     Assert-DysonCutoverBrokerEnvironment -Configured $sourceEnvironment @brokerEnvironmentArguments
-    if (Test-Path -LiteralPath $prospectiveConfigurationPath -PathType Leaf) {
+    if ((Test-Path -LiteralPath $prospectiveConfigurationPath -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $dataFull 'data\cutover-broker\broker-profile.json') -PathType Leaf)) {
         $installedEnvironment = Read-DysonDeploymentEnvironmentFile -Path $prospectiveConfigurationPath
         Assert-DysonCutoverBrokerEnvironment -Configured $installedEnvironment @brokerEnvironmentArguments
     }
@@ -1600,7 +1889,8 @@ if ($InstallCutoverBrokerTask) {
 $preflightActiveRelease = Get-DysonActiveRelease -InstallRoot $installFull -DataRoot $dataFull
 $lifecycleBrokerPreflightState = Get-DysonLifecycleBrokerDeploymentPreimage `
     -DeploymentDataRoot $dataFull -ActiveRelease $preflightActiveRelease `
-    -ShadowRoot $lifecycleBrokerShadowFull
+    -ShadowRoot $lifecycleBrokerShadowFull `
+    -AllowPendingStatusRequests:($RegisterStartupTask -and $InstallLifecycleBrokerTask -and $UpgradeLifecycleBrokerExisting)
 if ($null -ne $lifecycleBrokerPreflightState -and -not $InstallLifecycleBrokerTask) {
     throw 'An installed lifecycle broker requires explicit lifecycle broker handling for a control-plane release change.'
 }
@@ -1730,6 +2020,9 @@ $configurationAfterDataRoot = Get-DysonDeploymentConfigurationPreflight `
 Assert-DysonDeploymentConfigurationPreflightUnchanged `
     -Expected $configurationBeforeMutation -Actual $configurationAfterDataRoot
 
+$brokerQuiescenceLease = $null
+$brokerQuiescenceAttempted = $false
+$brokerQuiescenceCompleted = $false
 $deploymentLock = Enter-DysonDeploymentLock -DataRoot $dataFull -TimeoutSeconds $LockTimeoutSeconds
 try {
 $configurationPath = Join-Path (Join-Path $dataFull 'config') 'dyson-control.env'
@@ -1759,6 +2052,7 @@ $deploymentResult = $null
 $taskRollbackState = $null
 $taskRollbackPrepared = $false
 $lifecycleBrokerInstallReceipt = $null
+$lifecycleBrokerInstallAttempted = $false
 $lifecycleBrokerInstallArguments = $null
 $lifecycleBrokerInstaller = $null
 $lifecycleBrokerPreviousState = $null
@@ -1768,6 +2062,20 @@ $cutoverBrokerInstaller = $null
 $cutoverBrokerPreviousState = $null
 $activeReleaseBeforeInstall = $null
 try {
+    if ($RegisterStartupTask -and ($InstallLifecycleBrokerTask -or $InstallCutoverBrokerTask)) {
+        # This runs only after ShouldProcess and under the deployment lock. The
+        # shared application lease rejects active mutations before stopping the
+        # old panel; status workers do not require that lease and may drain.
+        $brokerQuiescenceAttempted = $true
+        . (Join-Path (Split-Path $PSScriptRoot -Parent) 'DysonHostMutationLease.Common.ps1')
+        $brokerQuiescenceLease = Enter-DysonHostMutationLease -DataRoot (Join-Path $dataFull 'data') `
+            -Owner 'control-deployment' -Operation 'broker-upgrade' `
+            -RequestId ([guid]::NewGuid().ToString('D')) -OwnerPid $PID -TimeoutMilliseconds 0
+        $taskRollbackState = Get-DysonControlTaskRollbackState -TaskName $TaskName
+        $taskRollbackPrepared = $true
+        Stop-DysonDeploymentControlTaskForBrokerUpgrade -State $taskRollbackState -TaskName $TaskName
+        Wait-DysonDeploymentBrokerWorkersIdle
+    }
     $configurationUnderLock = Get-DysonDeploymentConfigurationPreflight `
         -ConfigurationSource $configurationFull -DataRoot $dataFull `
         -ScriptRoot $prospectiveScriptRoot -RuntimeBootstrapRoot $prospectiveBootstrapRoot `
@@ -1791,22 +2099,6 @@ try {
         [int64]$configurationUnderLock.existing.configurationLength -ne
             [int64]$configurationUnderLock.sourceLength)
     )
-    if ($configurationReplacementRequired) {
-        $configurationPreimageSnapshot = New-DysonDeploymentConfigurationSnapshot `
-            -DataRoot $dataFull -ScriptRoot $existingConfigurationScriptRoot `
-            -RuntimeBootstrapRoot $existingConfigurationBootstrapRoot `
-            -DeploymentVersion $existingConfigurationDeploymentVersion `
-            -ServiceAccount $ServiceAccount `
-            -ConfigurationModuleRoot $configurationApplyModuleRoot
-        if ([string]$configurationPreimageSnapshot.configurationSha256 -cne
-                [string]$configurationUnderLock.existing.configurationSha256 -or
-            [int64]$configurationPreimageSnapshot.configurationLength -ne
-                [int64]$configurationUnderLock.existing.configurationLength -or
-            [string]$configurationPreimageSnapshot.configurationAclFingerprint -cne
-                [string]$configurationUnderLock.existing.configurationAclFingerprint) {
-            throw 'The protected configuration preimage snapshot does not match the under-lock target.'
-        }
-    }
     $activeReleaseBeforeInstall = Get-DysonActiveRelease -InstallRoot $installFull -DataRoot $dataFull
     $lifecycleBrokerPreviousState = Get-DysonLifecycleBrokerDeploymentPreimage `
         -DeploymentDataRoot $dataFull -ActiveRelease $activeReleaseBeforeInstall `
@@ -1841,6 +2133,23 @@ try {
         -RuntimeTaskTransactionRoot $cutoverRuntimeTaskTransactionFull `
         -ServiceUser $CutoverServiceUser -GamePort $CutoverGamePort
     [void](New-DysonDirectory -Path $installFull)
+    $brokerQuiescenceCompleted = $brokerQuiescenceAttempted
+    if ($configurationReplacementRequired) {
+        $configurationPreimageSnapshot = New-DysonDeploymentConfigurationSnapshot `
+            -DataRoot $dataFull -ScriptRoot $existingConfigurationScriptRoot `
+            -RuntimeBootstrapRoot $existingConfigurationBootstrapRoot `
+            -DeploymentVersion $existingConfigurationDeploymentVersion `
+            -ServiceAccount $ServiceAccount `
+            -ConfigurationModuleRoot $configurationApplyModuleRoot
+        if ([string]$configurationPreimageSnapshot.configurationSha256 -cne
+                [string]$configurationUnderLock.existing.configurationSha256 -or
+            [int64]$configurationPreimageSnapshot.configurationLength -ne
+                [int64]$configurationUnderLock.existing.configurationLength -or
+            [string]$configurationPreimageSnapshot.configurationAclFingerprint -cne
+                [string]$configurationUnderLock.existing.configurationAclFingerprint) {
+            throw 'The protected configuration preimage snapshot does not match the under-lock target.'
+        }
+    }
     foreach ($relative in @('data', 'data\cutover', 'logs', 'state', 'snapshots', 'audit')) {
         [void](New-DysonDirectory -Path (Join-Path $dataFull $relative))
     }
@@ -1983,8 +2292,10 @@ try {
         -AllowSelfTestAdministrator:$SelfTestSkipAdministratorCheck
 
     if ($RegisterStartupTask) {
-        $taskRollbackState = Get-DysonControlTaskRollbackState -TaskName $TaskName
-        $taskRollbackPrepared = $true
+        if (-not $taskRollbackPrepared) {
+            $taskRollbackState = Get-DysonControlTaskRollbackState -TaskName $TaskName
+            $taskRollbackPrepared = $true
+        }
         if ([bool]$taskRollbackState.present) {
             Remove-DysonControlTaskForRollback -TaskName $TaskName
         }
@@ -2062,6 +2373,7 @@ try {
             $lifecycleBrokerInstallArguments['Backend'] = 'Shadow'
             $lifecycleBrokerInstallArguments['ShadowRoot'] = $lifecycleBrokerShadowFull
         }
+        $lifecycleBrokerInstallAttempted = $true
         $candidateLifecycleBrokerReceipt = Invoke-DysonLifecycleBrokerDeploymentInstaller `
             -Installer $lifecycleBrokerInstaller -Arguments $lifecycleBrokerInstallArguments `
             -ShadowRoot $lifecycleBrokerShadowFull
@@ -2226,6 +2538,12 @@ try {
         $cutoverBrokerInstallReceipt = $candidateCutoverBrokerInstallReceipt
     }
     if ($StartAfterInstall) {
+        # Startup recovery may use the same host lease. Broker/configuration
+        # publication is complete; release it before launching the new panel.
+        if ($null -ne $brokerQuiescenceLease) {
+            Exit-DysonHostMutationLease -Lease $brokerQuiescenceLease | Out-Null
+            $brokerQuiescenceLease = $null
+        }
         Start-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonControlTaskPath -ErrorAction Stop
         $requiredReadinessChecks = @()
         if ($InstallLifecycleBrokerTask) { $requiredReadinessChecks += 'lifecycleBroker' }
@@ -2236,14 +2554,44 @@ try {
 }
 catch {
     $installError = $_
+    if ($brokerQuiescenceAttempted -and -not $brokerQuiescenceCompleted) {
+        # No deployment snapshot/configuration/broker mutation has begun yet.
+        # A busy lease or an undrained status request must not strand the old UI
+        # or be confused with a partially installed broker requiring rollback.
+        if ($null -ne $brokerQuiescenceLease) {
+            Exit-DysonHostMutationLease -Lease $brokerQuiescenceLease | Out-Null
+            $brokerQuiescenceLease = $null
+        }
+        if ($taskRollbackPrepared) {
+            try { [void](Restore-DysonControlTaskRollbackState -State $taskRollbackState -TaskName $TaskName) }
+            catch { throw 'Broker quiescence failed; the previous control-plane task could not be restored.' }
+        }
+        throw $installError
+    }
+    if ($brokerQuiescenceCompleted -and $null -eq $brokerQuiescenceLease) {
+        # The new panel may have acquired a host lease during startup recovery.
+        # If so, do not interrupt it or run compensating mutations concurrently.
+        try {
+            $brokerQuiescenceLease = Enter-DysonHostMutationLease -DataRoot (Join-Path $dataFull 'data') `
+                -Owner 'control-deployment' -Operation 'broker-rollback' `
+                -RequestId ([guid]::NewGuid().ToString('D')) -OwnerPid $PID -TimeoutMilliseconds 0
+        }
+        catch { throw 'Installation failed; automatic rollback is deferred because the host mutation lease is unavailable.' }
+    }
     $rollbackFailures = New-Object System.Collections.Generic.List[string]
     $replacementTaskRemoved = -not $taskRollbackPrepared
     if ($taskRollbackPrepared) {
         try {
             Remove-DysonControlTaskForRollback -TaskName $TaskName
+            if ($brokerQuiescenceCompleted) { Wait-DysonDeploymentBrokerWorkersIdle }
             $replacementTaskRemoved = $true
         }
-        catch { $rollbackFailures.Add('replacement-task-stop-remove') }
+        catch {
+            if ($brokerQuiescenceCompleted) {
+                throw 'Installation failed; automatic rollback is deferred because the control plane or broker workers are not idle.'
+            }
+            $rollbackFailures.Add('replacement-task-stop-remove')
+        }
     }
 
     $qualifiedClientStorageStateRestored = -not $qualifiedClientStorageApplied
@@ -2340,34 +2688,10 @@ catch {
             }
             'installed' {
                 try {
-                    $compensationArguments = @{}
-                    foreach ($key in $lifecycleBrokerInstallArguments.Keys) {
-                        $compensationArguments[$key] = $lifecycleBrokerInstallArguments[$key]
-                    }
-                    [void]$compensationArguments.Remove('UpgradeExisting')
-                    $compensationArguments['CompensateFirstInstall'] = $true
-                    $compensationReceipt = Invoke-DysonLifecycleBrokerDeploymentInstaller `
-                        -Installer $lifecycleBrokerInstaller -Arguments $compensationArguments `
-                        -ShadowRoot $lifecycleBrokerShadowFull
-                    Assert-DysonLifecycleBrokerDeploymentExactProperties -Value $compensationReceipt -Names @(
-                        'protocol', 'schemaVersion', 'operation', 'brokerRoot', 'removedProfileHash',
-                        'workerTaskName', 'workerTaskPath', 'profileRemoved', 'taskRemoved',
-                        'preservedRequestCount', 'preservedReceiptCount', 'backend', 'compensatedAt'
-                    ) -Message 'The lifecycle broker first-install compensation receipt is invalid.'
-                    if ([string]$compensationReceipt.protocol -cne `
-                            'DYSON_CONTROL_LIFECYCLE_BROKER_COMPENSATION_RECEIPT_V1' -or
-                        [int]$compensationReceipt.schemaVersion -ne 1 -or
-                        [string]$compensationReceipt.operation -cne 'compensated-first-install' -or
-                        [string]$compensationReceipt.removedProfileHash -cne `
-                            [string]$lifecycleBrokerInstallReceipt.profileHash -or
-                        [string]$compensationReceipt.workerTaskName -cne 'Dyson-Control-Lifecycle-Broker' -or
-                        [string]$compensationReceipt.workerTaskPath -cne '\DysonControl\' -or
-                        -not [bool]$compensationReceipt.profileRemoved -or
-                        -not [bool]$compensationReceipt.taskRemoved) {
-                        throw 'The lifecycle broker first-install compensation receipt is invalid.'
-                    }
-                    Assert-DysonLifecycleBrokerDeploymentPreimageRestored -DeploymentDataRoot $dataFull `
-                        -State $lifecycleBrokerPreviousState -ShadowRoot $lifecycleBrokerShadowFull
+                    Restore-DysonLifecycleBrokerDeploymentFirstInstall -Installer $lifecycleBrokerInstaller `
+                        -InstallArguments $lifecycleBrokerInstallArguments -DeploymentDataRoot $dataFull `
+                        -ShadowRoot $lifecycleBrokerShadowFull `
+                        -ExpectedProfileHash ([string]$lifecycleBrokerInstallReceipt.profileHash)
                     $lifecycleBrokerStateRestored = $true
                 }
                 catch { $rollbackFailures.Add('lifecycle-broker-first-install-compensation:' + $_.Exception.Message) }
@@ -2387,13 +2711,47 @@ catch {
                 -State $lifecycleBrokerPreviousState -ShadowRoot $lifecycleBrokerShadowFull
             $lifecycleBrokerStateRestored = $true
         }
-        catch { $rollbackFailures.Add('lifecycle-broker-install-rollback-verification') }
+        catch {
+            $lifecycleBrokerStateRestored = $false
+            if ($lifecycleBrokerInstallAttempted -and $null -eq $lifecycleBrokerPreviousState -and
+                $null -ne $lifecycleBrokerInstallArguments -and $lifecycleBrokerInstaller) {
+                try {
+                    Restore-DysonLifecycleBrokerDeploymentFirstInstall -Installer $lifecycleBrokerInstaller `
+                        -InstallArguments $lifecycleBrokerInstallArguments -DeploymentDataRoot $dataFull `
+                        -ShadowRoot $lifecycleBrokerShadowFull
+                    $lifecycleBrokerStateRestored = $true
+                }
+                catch { $rollbackFailures.Add('lifecycle-broker-unaccepted-receipt-compensation:' + $_.Exception.Message) }
+            }
+            else { $rollbackFailures.Add('lifecycle-broker-install-rollback-verification') }
+        }
     }
 
     $configurationStateRestored = $true
     if ($configurationCreated -and (Test-Path -LiteralPath $configurationPath)) {
         $configurationStateRestored = $false
-        $rollbackFailures.Add('protected-configuration-restore-executor-unavailable')
+        if (-not $replacementTaskRemoved) {
+            $rollbackFailures.Add('protected-configuration-first-install-restore-blocked-by-task')
+        }
+        else {
+            try {
+                if ([string]::IsNullOrWhiteSpace([string]$configurationRuntimeModuleRoot)) {
+                    throw 'The created protected configuration runtime module is unavailable.'
+                }
+                Remove-DysonDeploymentCreatedConfiguration -DataRoot $dataFull `
+                    -ScriptRoot $prospectiveScriptRoot -RuntimeBootstrapRoot $bootstrapRoot `
+                    -DeploymentVersion $Version -ServiceAccount $ServiceAccount `
+                    -ExpectedPreflight $configurationPreflight `
+                    -ConfigurationModuleRoot $configurationRuntimeModuleRoot `
+                    -AllowSelfTestAdministrator:$SelfTestSkipAdministratorCheck
+                $configurationStateRestored = $true
+            }
+            catch {
+                $rollbackFailures.Add(
+                    'protected-configuration-first-install-restore:' + $_.Exception.Message
+                )
+            }
+        }
     }
     elseif ($configurationReplaced) {
         try {
@@ -2556,8 +2914,11 @@ catch {
     }
     else { $rollbackFailures.Add('bootstrap-configuration-blocked') }
 
-    $configurationRollbackFinalVerified = (-not $configurationReplaced) -or
-        ($configurationStateRestored -and $null -eq $configurationInstallEvidence)
+    $configurationRollbackFinalVerified = if ($configurationCreated) {
+        $configurationStateRestored -and -not (Test-Path -LiteralPath $configurationPath)
+    }
+    elseif (-not $configurationReplaced) { $true }
+    else { $configurationStateRestored -and $null -eq $configurationInstallEvidence }
     if (-not $configurationRollbackFinalVerified) {
         if ($configurationStateRestored -and $deploymentStateRestored -and
             $bootstrapConfigurationRestored) {
@@ -2692,6 +3053,10 @@ catch {
         $taskDataAclPreimageRestored -and
         $lifecycleBrokerStateRestored -and $cutoverBrokerStateRestored) {
         try {
+            if ($null -ne $brokerQuiescenceLease) {
+                Exit-DysonHostMutationLease -Lease $brokerQuiescenceLease | Out-Null
+                $brokerQuiescenceLease = $null
+            }
             [void](Restore-DysonControlTaskRollbackState -State $taskRollbackState -TaskName $TaskName)
         }
         catch { $rollbackFailures.Add('previous-task-restore') }
@@ -2773,5 +3138,10 @@ Write-DysonDeploymentAudit -DataRoot $dataFull -Operation 'install' -Outcome 'su
     } | ConvertTo-DysonJsonLine
 }
 finally {
-    if ($deploymentLock) { $deploymentLock.Dispose() }
+    try {
+        if ($null -ne $brokerQuiescenceLease) {
+            Exit-DysonHostMutationLease -Lease $brokerQuiescenceLease | Out-Null
+        }
+    }
+    finally { if ($deploymentLock) { $deploymentLock.Dispose() } }
 }

@@ -1,4 +1,4 @@
-Set-StrictMode -Version 2.0
+﻿Set-StrictMode -Version 2.0
 
 $script:CutoverHostPreviousPanelTask = 'Dyson-GSManager'
 $script:CutoverHostPreviousStartTask = 'Dyson-GSManager-Server'
@@ -11,6 +11,9 @@ $script:CutoverHostActionProtocol = 'DYSON_CONTROL_CUTOVER_ACTION_RECEIPT_V1'
 $script:CutoverHostOwnerProtocol = 'DYSON_CONTROL_CUTOVER_RUNTIME_OWNER_V1'
 $script:CutoverHostMaximumJsonBytes = 131072
 $script:CutoverHostRuntimeTimeoutSeconds = 180
+$script:CutoverHostWindowsRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$script:CutoverHostPreviousStopScriptSha256 = $null
+$script:CutoverHostPreviousStopReconcileOnly = $false
 
 function New-CutoverHostError {
     param([Parameter(Mandatory)][string]$Code)
@@ -275,6 +278,20 @@ function ConvertTo-CutoverHostValidatedProfile {
         'runtimeTaskTransactionRootIdentity', 'serviceUser', 'gamePort', 'previousAuthority',
         'candidateAuthority', 'previousScriptBundleRevision', 'inventoryRevision'
     )
+    $hasAuthoritySource = $null -ne $Raw.PSObject.Properties['authoritySource']
+    $hasLegacyTemplate = $null -ne $Raw.PSObject.Properties['legacyTemplateSha256']
+    if ($hasAuthoritySource -ne $hasLegacyTemplate) {
+        Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_PROFILE_INVALID'
+    }
+    if ($hasAuthoritySource) {
+        $topNames += @('authoritySource', 'legacyTemplateSha256')
+        if ($Raw.authoritySource -isnot [string] -or
+            [string]$Raw.authoritySource -cne 'reconstructed-template' -or
+            $Raw.legacyTemplateSha256 -isnot [string] -or
+            [string]$Raw.legacyTemplateSha256 -cnotmatch '^[0-9a-f]{64}$') {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_PROFILE_INVALID'
+        }
+    }
     Assert-CutoverHostExactProperties $Raw $topNames
     $parsedId = [guid]::Empty
     if ($Raw.protocol -isnot [string] -or [string]$Raw.protocol -cne 'DYSON_GSMANAGER_AUTHORITY_PROFILE_V1' -or
@@ -305,7 +322,7 @@ function ConvertTo-CutoverHostValidatedProfile {
         $candidate.stopTaskName -isnot [string] -or [string]$candidate.stopTaskName -cne $script:CutoverHostCandidateStopTask -or
         $candidate.taskPath -isnot [string] -or [string]$candidate.taskPath -cne '\' -or
         $candidate.legacyPreimage.expectedEnabledBeforeIsolation -isnot [bool] -or
-        -not [bool]$candidate.legacyPreimage.expectedEnabledBeforeIsolation -or
+        [bool]$candidate.legacyPreimage.expectedEnabledBeforeIsolation -ne (-not $hasAuthoritySource) -or
         $candidate.legacyPreimage.expectedEnabledAfterIsolation -isnot [bool] -or
         [bool]$candidate.legacyPreimage.expectedEnabledAfterIsolation) {
         Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_PROFILE_INVALID'
@@ -341,7 +358,7 @@ function ConvertTo-CutoverHostValidatedProfile {
             legacyPreimage = [pscustomobject][ordered]@{
                 startDefinitionSha256 = Assert-CutoverHostSha256 $candidate.legacyPreimage.startDefinitionSha256
                 stopDefinitionSha256 = Assert-CutoverHostSha256 $candidate.legacyPreimage.stopDefinitionSha256
-                expectedEnabledBeforeIsolation = $true
+                expectedEnabledBeforeIsolation = [bool]$candidate.legacyPreimage.expectedEnabledBeforeIsolation
                 expectedEnabledAfterIsolation = $false
             }
             expectedPreparedDisabled = [pscustomobject][ordered]@{
@@ -355,8 +372,12 @@ function ConvertTo-CutoverHostValidatedProfile {
             allowedTransitions = @('legacy-preimage-disabled', 'prepared-disabled', 'active')
         }
         previousScriptBundleRevision = Assert-CutoverHostSha256 $Raw.previousScriptBundleRevision
-        inventoryRevision = Assert-CutoverHostSha256 $Raw.inventoryRevision
     }
+    if ($hasAuthoritySource) {
+        $profile | Add-Member NoteProperty authoritySource ([string]$Raw.authoritySource)
+        $profile | Add-Member NoteProperty legacyTemplateSha256 ([string]$Raw.legacyTemplateSha256)
+    }
+    $profile | Add-Member NoteProperty inventoryRevision (Assert-CutoverHostSha256 $Raw.inventoryRevision)
     $core = [ordered]@{}
     foreach ($property in $profile.PSObject.Properties) {
         if ($property.Name -cne 'inventoryRevision') { $core[$property.Name] = $property.Value }
@@ -533,6 +554,18 @@ function Get-CutoverHostTaskDefinitionSha256 {
     catch { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_TASK_INVALID' }
 }
 
+function Test-CutoverHostTaskUserEqual {
+    param([string]$Actual, [string]$Expected)
+    try {
+        $sids = @(foreach ($value in @($Actual, $Expected)) {
+            if ($value -match '^S-1-') { ([Security.Principal.SecurityIdentifier]::new($value)).Value }
+            else { ([Security.Principal.NTAccount]::new($value)).Translate([Security.Principal.SecurityIdentifier]).Value }
+        })
+        return $sids[0] -ceq $sids[1]
+    }
+    catch { return $false }
+}
+
 function Test-CutoverHostCandidateTask {
     param([Parameter(Mandatory)]$Image, [Parameter(Mandatory)]$Expected)
     if (-not [bool]$Image.present -or [bool]$Image.enabled -ne [bool]$Expected.enabled) { return $false }
@@ -542,12 +575,12 @@ function Test-CutoverHostCandidateTask {
     }
     $task = $Image.nativeTask
     try {
-        $actions = @($task.Actions)
-        $triggers = @($task.Triggers)
+        $actions = @($task.Actions | Where-Object { $null -ne $_ })
+        $triggers = @($task.Triggers | Where-Object { $null -ne $_ })
         if ($actions.Count -ne 1 -or -not [string]::IsNullOrWhiteSpace([string]$actions[0].WorkingDirectory) -or
             -not (Test-CutoverHostSamePath ([Environment]::ExpandEnvironmentVariables([string]$actions[0].Execute)) ([string]$Expected.execute)) -or
             [string]$actions[0].Arguments -cne [string]$Expected.arguments -or
-            -not [string]::Equals([string]$task.Principal.UserId, [string]$Expected.userId, [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-CutoverHostTaskUserEqual ([string]$task.Principal.UserId) ([string]$Expected.userId)) -or
             [string]$task.Principal.LogonType -cne [string]$Expected.logonType -or
             [string]$task.Principal.RunLevel -cne [string]$Expected.runLevel -or
             [string]$task.Settings.MultipleInstances -cne [string]$Expected.multipleInstances -or
@@ -559,7 +592,7 @@ function Test-CutoverHostCandidateTask {
         if ($actualRestartInterval -ne $Expected.restartInterval) { return $false }
         if ([string]$Expected.trigger -ceq 'AtLogOn') {
             return $triggers.Count -eq 1 -and
-                [string]::Equals([string]$triggers[0].UserId, [string]$Expected.triggerUserId, [StringComparison]::OrdinalIgnoreCase) -and
+                (Test-CutoverHostTaskUserEqual ([string]$triggers[0].UserId) ([string]$Expected.triggerUserId)) -and
                 [string]$triggers[0].Delay -ceq [string]$Expected.triggerDelay
         }
         return $triggers.Count -eq 0
@@ -597,7 +630,11 @@ function Get-CutoverHostAuthorityObservation {
         (Test-CutoverHostCandidateTask $candidateStop $active.stop)
     $candidateStopTemporarilyEnabled = (Test-CutoverHostCandidateTask $candidateStart $prepared.start) -and
         (Test-CutoverHostCandidateTask $candidateStop $active.stop)
-    $legacyExact = [bool]$candidateStart.present -and [bool]$candidateStop.present -and
+    # A prepared candidate may be the disabled preimage in reconstructed mode.
+    # Its current descriptor identifies candidate authority, not historical code.
+    $legacyExact = -not $candidatePrepared -and -not $candidateActive -and
+        -not $candidateStopTemporarilyEnabled -and
+        [bool]$candidateStart.present -and [bool]$candidateStop.present -and
         -not [bool]$candidateStart.enabled -and -not [bool]$candidateStop.enabled -and
         (Get-CutoverHostTaskDefinitionSha256 $candidateStart) -ceq [string]$Profile.candidateAuthority.legacyPreimage.startDefinitionSha256 -and
         (Get-CutoverHostTaskDefinitionSha256 $candidateStop) -ceq [string]$Profile.candidateAuthority.legacyPreimage.stopDefinitionSha256
@@ -644,9 +681,16 @@ function Test-CutoverHostUnexpectedManagedTask {
             }
             else { @($task.Actions) }
             foreach ($action in $actions) {
-                $execute = [Environment]::ExpandEnvironmentVariables([string]$action.Execute)
+                # Native task enumeration also returns COM-handler actions,
+                # which have ClassId/Data rather than Execute/Arguments.
+                if ($null -eq $action) { continue }
+                $executeProperty = $action.PSObject.Properties['Execute']
+                if ($null -eq $executeProperty -or
+                    [string]::IsNullOrWhiteSpace([string]$executeProperty.Value)) { continue }
+                $execute = [Environment]::ExpandEnvironmentVariables([string]$executeProperty.Value)
                 if (Test-CutoverHostSamePath $execute $script:CutoverHostExpectedExecutable) { return $true }
-                $arguments = [string]$action.Arguments
+                $argumentsProperty = $action.PSObject.Properties['Arguments']
+                $arguments = if ($null -ne $argumentsProperty) { [string]$argumentsProperty.Value } else { '' }
                 $match = [regex]::Match($arguments,
                     '(?i)(?:^|\s)-File(?:\s+|:)(?:"(?<double>[^"\r\n]+)"|''(?<single>[^''\r\n]+)''|(?<bare>[^\s"\r\n]+))')
                 if ($match.Success) {
@@ -718,8 +762,15 @@ function Get-CutoverHostNativeRuntime {
             }
             catch { $pidInvalid = $true }
         }
-        $tcpOwners = @(Get-NetTCPConnection -LocalPort $script:CutoverHostGamePort -State Listen -ErrorAction Stop | ForEach-Object { [int]$_.OwningProcess })
-        $udpOwners = @(Get-NetUDPEndpoint -LocalPort $script:CutoverHostGamePort -ErrorAction Stop | ForEach-Object { [int]$_.OwningProcess })
+        # Filter only after a successful enumeration: the native cmdlets throw
+        # not-found for an empty filtered query, which is normal while stopped.
+        # Enumeration errors remain fatal rather than becoming false port closure.
+        $tcpOwners = @(Get-NetTCPConnection -ErrorAction Stop | Where-Object {
+            [int]$_.LocalPort -eq $script:CutoverHostGamePort -and [string]$_.State -ceq 'Listen'
+        } | ForEach-Object { [int]$_.OwningProcess })
+        $udpOwners = @(Get-NetUDPEndpoint -ErrorAction Stop | Where-Object {
+            [int]$_.LocalPort -eq $script:CutoverHostGamePort
+        } | ForEach-Object { [int]$_.OwningProcess })
         return [pscustomobject][ordered]@{
             processes = @($processes); unverifiedProcess = [bool]$unverified
             pidRecord = $pidRecord; pidInvalid = [bool]$pidInvalid
@@ -727,6 +778,29 @@ function Get-CutoverHostNativeRuntime {
         }
     }
     catch { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_RUNTIME_PROBE_FAILED' }
+}
+
+function Test-CutoverHostProcessExecutable {
+    param([Parameter(Mandatory)][string]$Actual, [Parameter(Mandatory)][string]$Expected)
+    if (Test-CutoverHostSamePath $Actual $Expected) { return $true }
+    $actualStream = $null
+    $expectedStream = $null
+    try {
+        if (-not [IO.Path]::IsPathRooted($Actual) -or -not [IO.Path]::IsPathRooted($Expected)) { return $false }
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $actualStream = [IO.File]::Open($Actual, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $expectedStream = [IO.File]::Open($Expected, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $actualFinal = Get-DysonHostMutationLeaseFinalPathFromHandle -Handle $actualStream.SafeFileHandle
+        $expectedFinal = Get-DysonHostMutationLeaseFinalPathFromHandle -Handle $expectedStream.SafeFileHandle
+        return -not [string]::IsNullOrWhiteSpace($actualFinal) -and
+            -not [string]::IsNullOrWhiteSpace($expectedFinal) -and
+            [string]::Equals($actualFinal, $expectedFinal, [StringComparison]::OrdinalIgnoreCase)
+    }
+    catch { return $false }
+    finally {
+        if ($null -ne $expectedStream) { $expectedStream.Dispose() }
+        if ($null -ne $actualStream) { $actualStream.Dispose() }
+    }
 }
 
 function Get-CutoverHostRuntimeObservation {
@@ -776,7 +850,7 @@ function Get-CutoverHostRuntimeObservation {
     }
     if ($processes.Count -ne 1 -or [bool]$native.unverifiedProcess -or [bool]$native.pidInvalid -or $ownersInvalid -or
         $null -eq $native.pidRecord -or [int]$native.pidRecord -ne [int]$processes[0].id -or
-        -not (Test-CutoverHostSamePath ([string]$processes[0].path) $script:CutoverHostExpectedExecutable)) {
+        -not (Test-CutoverHostProcessExecutable ([string]$processes[0].path) $script:CutoverHostExpectedExecutable)) {
         return [pscustomobject][ordered]@{ kind = 'unknown'; pid = $null; coherentPort = $false; portsClosed = [bool]$portsClosed }
     }
     $processId = [int]$processes[0].id
@@ -1070,6 +1144,467 @@ function Wait-CutoverHostStopTaskTerminal {
     Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_TASK_TIMEOUT'
 }
 
+function Write-CutoverPreviousStopRecord {
+    param([string]$Path, $Value)
+    $text = ConvertTo-CutoverHostJson $Value
+    if (Test-Path -LiteralPath $Path) {
+        if ((ConvertTo-CutoverHostJson (Read-CutoverHostJsonFile $Path)) -cne $text) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT'
+        }
+        return
+    }
+    $temporary = $Path + '.partial-' + [guid]::NewGuid().ToString('N')
+    try {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text + "`n")
+        $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        [IO.File]::Move($temporary, $Path)
+    }
+    finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
+
+function Initialize-CutoverPreviousStopDirectory {
+    param([string]$Path, [string]$GameSid, [switch]$Receipts)
+    $existed = Test-Path -LiteralPath $Path
+    $full = Assert-CutoverHostPlainDirectory -Path $Path -Create
+    if ($script:CutoverHostBackend -ceq 'Shadow') { return $full }
+    $security = [Security.AccessControl.DirectorySecurity]::new()
+    $security.SetAccessRuleProtection($true, $false)
+    $security.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544', $GameSid)) {
+        $rights = if ($sid -ceq $GameSid) {
+            if ($Receipts) { [Security.AccessControl.FileSystemRights]::Modify } else { [Security.AccessControl.FileSystemRights]::ReadAndExecute }
+        } else { [Security.AccessControl.FileSystemRights]::FullControl }
+        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            [Security.Principal.SecurityIdentifier]::new($sid), $rights,
+            [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+            [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+    }
+    if (-not $existed) { Microsoft.PowerShell.Security\Set-Acl -LiteralPath $full -AclObject $security }
+    $actual = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $full
+    $ruleKey = { '{0}:{1}:{2}:{3}:{4}:{5}' -f $_.IdentityReference.Value, [int]$_.AccessControlType,
+        [int64]$_.FileSystemRights, [int]$_.InheritanceFlags, [int]$_.PropagationFlags, [bool]$_.IsInherited }
+    $actualRules = @($actual.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | ForEach-Object $ruleKey | Sort-Object)
+    $expectedRules = @($security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | ForEach-Object $ruleKey | Sort-Object)
+    if (-not $actual.AreAccessRulesProtected -or $actual.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne 'S-1-5-32-544' -or
+        ($actualRules -join '|') -cne ($expectedRules -join '|')) {
+        Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_STORAGE_INVALID'
+    }
+    return $full
+}
+
+function Invoke-CutoverPreviousStopTaskCom {
+    param($Intent, [scriptblock]$Operation)
+    $service = $null; $folder = $null; $task = $null
+    try {
+        $service = New-Object -ComObject 'Schedule.Service'
+        $service.Connect(); $folder = $service.GetFolder('\'); $task = $folder.GetTask([string]$Intent.taskName)
+        & $Operation $task
+    }
+    finally {
+        foreach ($value in @($task, $folder, $service)) {
+            if ($null -ne $value -and [Runtime.InteropServices.Marshal]::IsComObject($value)) {
+                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($value)
+            }
+        }
+    }
+}
+
+function Get-CutoverPreviousStopTask {
+    param($Intent, [string]$Root, [switch]$RepairUnstartedAcl)
+    if ($script:CutoverHostBackend -ceq 'Shadow') {
+        $path = Join-Path $Root 'task-shadow.json'
+        if (-not (Test-Path -LiteralPath $path)) { return $null }
+        $task = Read-CutoverHostJsonFile $path
+        Assert-CutoverHostExactProperties $task @('taskName','arguments','state','lastRunUtc','lastResult')
+        if ([string]$task.arguments -cne [string]$Intent.arguments -or [string]$task.taskName -cne [string]$Intent.taskName) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_TASK_CONFLICT'
+        }
+        return $task
+    }
+    $matches = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -ceq $Intent.taskName -and $_.TaskPath -ceq '\' })
+    if ($matches.Count -eq 0) { return $null }
+    if ($matches.Count -ne 1) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_TASK_CONFLICT' }
+    $task = $matches[0]
+    $actions = @($task.Actions | Where-Object { $null -ne $_ })
+    $triggers = @($task.Triggers | Where-Object { $null -ne $_ })
+    if ($actions.Count -ne 1 -or $triggers.Count -ne 0 -or $task.TaskPath -cne '\' -or
+        $task.TaskName -cne $Intent.taskName -or -not (Test-CutoverHostSamePath $actions[0].Execute $Intent.execute) -or
+        $actions[0].Arguments -cne $Intent.arguments -or -not [string]::IsNullOrWhiteSpace($actions[0].WorkingDirectory) -or
+        -not (Test-CutoverHostTaskUserEqual $task.Principal.UserId $script:CutoverHostServiceUser) -or
+        [string]$task.Principal.LogonType -cne 'Interactive' -or [string]$task.Principal.RunLevel -cne 'Limited' -or
+        -not [bool]$task.Settings.Enabled -or [string]$task.Settings.MultipleInstances -cne 'IgnoreNew' -or
+        [int]$task.Settings.RestartCount -ne 0 -or [string]$task.Settings.ExecutionTimeLimit -cne 'PT3M') {
+        Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_TASK_CONFLICT'
+    }
+    if ($task.Description -cne ('Dyson Control bound previous stop ' + $Intent.requestId)) {
+        Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_TASK_CONFLICT'
+    }
+    $info = Get-ScheduledTaskInfo -TaskName ([string]$Intent.taskName) -TaskPath '\' -ErrorAction Stop
+    if ($RepairUnstartedAcl -and $info.LastRunTime.Year -lt 2000 -and [string]$task.State -ceq 'Ready') {
+        Assert-CutoverHostMutationLease
+        [void](Invoke-CutoverPreviousStopTaskCom $Intent { param($registered)
+            $registered.SetSecurityDescriptor(('D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;' + $Intent.gameSid + ')'), 0x10)
+        })
+    }
+    [void](Invoke-CutoverPreviousStopTaskCom $Intent {
+        param($registered)
+        $acl = [Security.AccessControl.CommonSecurityDescriptor]::new($false, $false, [string]$registered.GetSecurityDescriptor(4))
+        $expected = @{ 'S-1-5-18' = @(268435456, 0x1f01ff); 'S-1-5-32-544' = @(268435456, 0x1f01ff) }
+        $expected[[string]$Intent.gameSid] = @(-1610612736, 0x1200a9)
+        if (-not ($acl.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -or $acl.DiscretionaryAcl.Count -ne 3) { throw 'task DACL' }
+        foreach ($ace in $acl.DiscretionaryAcl) {
+            if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed -or
+                -not $expected.ContainsKey($ace.SecurityIdentifier.Value) -or $ace.AccessMask -notin $expected[$ace.SecurityIdentifier.Value]) { throw 'task DACL' }
+            $expected.Remove($ace.SecurityIdentifier.Value)
+        }
+        if ($expected.Count -ne 0) { throw 'task DACL' }
+    })
+    return [pscustomobject]@{ state = [string]$task.State; lastRunUtc = $info.LastRunTime.ToUniversalTime().ToString('o'); lastResult = [int64]$info.LastTaskResult }
+}
+
+function Test-CutoverPreviousStopFault {
+    param([string]$Point)
+    if ($script:CutoverHostBackend -ceq 'Shadow' -and
+        $env:DYSON_CUTOVER_HOST_SELFTEST_FAIL_POINT -ceq ('PreviousStop-' + $Point)) {
+        Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_TEST_INTERRUPTED'
+    }
+}
+
+function Close-CutoverPreviousStopFailure {
+    param($Intent, [string]$Root, [string]$Fingerprint, [string]$Code)
+    Assert-CutoverHostMutationLease
+    $task = Get-CutoverPreviousStopTask $Intent $Root
+    if ($null -eq $task) {
+        $failurePath = Join-Path $Root 'failure.json'
+        if (-not (Test-Path -LiteralPath $failurePath)) { return }
+        $failure = Read-CutoverHostJsonFile $failurePath
+        if ($failure.intentSha256 -cne $Fingerprint -or $failure.errorCode -cne $Code) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT' }
+        Write-CutoverPreviousStopRecord (Join-Path $Root 'completed.json') ([ordered]@{
+            intentSha256 = $Fingerprint; status = 'failed'; taskRemoved = $true; errorCode = $Code
+        })
+        return
+    }
+    if ($task.state -cne 'Ready' -or
+        [DateTimeOffset]::Parse($task.lastRunUtc) -lt [DateTimeOffset]::Parse($Intent.createdAtUtc)) { return }
+    Write-CutoverPreviousStopRecord (Join-Path $Root 'failure.json') ([ordered]@{
+        intentSha256 = $Fingerprint; errorCode = $Code; lastResult = $task.lastResult; lastRunUtc = $task.lastRunUtc
+    })
+    if ($script:CutoverHostBackend -ceq 'Shadow') { [IO.File]::Delete((Join-Path $Root 'task-shadow.json')) }
+    else { Unregister-ScheduledTask -TaskName $Intent.taskName -TaskPath '\' -Confirm:$false -ErrorAction Stop }
+    if ($null -ne (Get-CutoverPreviousStopTask $Intent $Root)) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_CLEANUP_FAILED' }
+    Test-CutoverPreviousStopFault 'AfterFailedCleanup'
+    Write-CutoverPreviousStopRecord (Join-Path $Root 'completed.json') ([ordered]@{
+        intentSha256 = $Fingerprint; status = 'failed'; taskRemoved = $true; errorCode = $Code
+    })
+}
+
+function Invoke-CutoverPreviousStopTransaction {
+    Assert-CutoverHostMutationLease
+    $stopHash = $script:CutoverHostPreviousStopScriptSha256
+    if ($stopHash -cnotmatch '^[0-9a-f]{64}$') { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_BINDING_REQUIRED' }
+    $stopScript = Assert-CutoverHostPlainFile (Join-Path $script:CutoverHostWindowsRoot 'Stop-DysonServer.ps1')
+    if ((Get-CutoverHostSha256File $stopScript) -cne $stopHash) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_SCRIPT_DRIFT' }
+    $gameSid = if ($script:CutoverHostBackend -ceq 'Shadow') { 'S-1-5-21-42424242-42424242-42424242-1001' }
+        else { ([Security.Principal.NTAccount]::new($script:CutoverHostServiceUser)).Translate([Security.Principal.SecurityIdentifier]).Value }
+    $storageRoot = Initialize-CutoverPreviousStopDirectory -Path (Join-Path $script:CutoverHostRuntimeOwnerRoot 'previous-stop') -GameSid $gameSid
+    foreach ($other in @(Get-ChildItem -LiteralPath $storageRoot -Directory -Force)) {
+        if ($other.Name -cne $script:CutoverHostRequestId -and
+            (Test-Path -LiteralPath (Join-Path $other.FullName 'intent.json')) -and
+            -not (Test-Path -LiteralPath (Join-Path $other.FullName 'completed.json'))) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECOVERY_REQUIRED'
+        }
+    }
+    $root = Initialize-CutoverPreviousStopDirectory -Path (Join-Path $storageRoot $script:CutoverHostRequestId) -GameSid $gameSid
+    $receipts = Initialize-CutoverPreviousStopDirectory -Path (Join-Path $root 'receipts') -GameSid $gameSid -Receipts
+    $intentPath = Join-Path $root 'intent.json'
+    $receiptPath = Join-Path $receipts 'stop.json'
+    $terminalPath = Join-Path $root 'terminal.json'
+    $dispatchPath = Join-Path $root 'dispatch.json'
+    $completedPath = Join-Path $root 'completed.json'
+    $intent = $null
+    if (Test-Path -LiteralPath $intentPath) {
+        $intent = Read-CutoverHostJsonFile $intentPath
+        Assert-CutoverHostExactProperties $intent @('protocol','requestId','authorityRevision','stopSha256','gameSid',
+            'processId','processStartedAtUnixMs','taskName','execute','arguments','createdAtUtc')
+        if ($intent.protocol -cne 'DYSON_CONTROL_PREVIOUS_STOP_INTENT_V1' -or
+            $intent.requestId -cne $script:CutoverHostRequestId -or $intent.authorityRevision -cne $script:CutoverHostExpectedInventoryRevision -or
+            $intent.stopSha256 -cne $stopHash -or $intent.gameSid -cne $gameSid -or
+            $intent.taskName -cne ('Dyson-Cutover-Previous-Stop-' + $script:CutoverHostRequestId)) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT'
+        }
+    }
+    else {
+        $runtime = Get-CutoverHostRuntimeObservation
+        if ($runtime.kind -cne 'managed' -or -not $runtime.coherentPort) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_RUNTIME_AMBIGUOUS' }
+        $started = if ($script:CutoverHostBackend -ceq 'Shadow') { 1788081000000L } else {
+            $process = Get-Process -Id ([int]$runtime.pid) -ErrorAction Stop
+            try { [void]$process.Handle; [DateTimeOffset]::new($process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() }
+            finally { $process.Dispose() }
+        }
+        $execute = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $arguments = '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -ProjectRoot "{1}" -TimeoutSeconds 150 -StopRequestId {2} -ExpectedProcessId {3} -ExpectedProcessStartedAtUnixMs {4} -ExpectedScriptSha256 {5} -ReceiptPath "{6}"' -f
+            $stopScript, $script:CutoverHostProjectRoot, $script:CutoverHostRequestId, $runtime.pid, $started, $stopHash, $receiptPath
+        $intent = [pscustomobject][ordered]@{
+            protocol = 'DYSON_CONTROL_PREVIOUS_STOP_INTENT_V1'; requestId = $script:CutoverHostRequestId
+            authorityRevision = $script:CutoverHostExpectedInventoryRevision; stopSha256 = $stopHash; gameSid = $gameSid
+            processId = [int]$runtime.pid; processStartedAtUnixMs = [long]$started
+            taskName = 'Dyson-Cutover-Previous-Stop-' + $script:CutoverHostRequestId
+            execute = $execute; arguments = $arguments; createdAtUtc = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        }
+        if ($null -ne (Get-CutoverPreviousStopTask $intent $root)) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_TASK_CONFLICT' }
+        Write-CutoverPreviousStopRecord $intentPath $intent
+        Test-CutoverPreviousStopFault 'AfterIntent'
+    }
+    if (($intent.processId -isnot [int] -and $intent.processId -isnot [long]) -or $intent.processId -le 0 -or
+        ($intent.processStartedAtUnixMs -isnot [int] -and $intent.processStartedAtUnixMs -isnot [long]) -or
+        $intent.processStartedAtUnixMs -le 0) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT' }
+    $expectedArguments = '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -ProjectRoot "{1}" -TimeoutSeconds 150 -StopRequestId {2} -ExpectedProcessId {3} -ExpectedProcessStartedAtUnixMs {4} -ExpectedScriptSha256 {5} -ReceiptPath "{6}"' -f
+        $stopScript, $script:CutoverHostProjectRoot, $script:CutoverHostRequestId, $intent.processId, $intent.processStartedAtUnixMs, $stopHash, $receiptPath
+    if ($intent.execute -cne (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -or
+        $intent.arguments -cne $expectedArguments) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT' }
+    $fingerprint = Get-CutoverHostSha256Text (ConvertTo-CutoverHostJson $intent)
+    $dispatched = Test-Path -LiteralPath $dispatchPath
+    if ($dispatched) {
+        $dispatch = Read-CutoverHostJsonFile $dispatchPath
+        if ($dispatch.intentSha256 -cne $fingerprint) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT' }
+    }
+    if (Test-Path -LiteralPath (Join-Path $root 'failure.json')) {
+        $failure = Read-CutoverHostJsonFile (Join-Path $root 'failure.json')
+        if ($failure.intentSha256 -cne $fingerprint -or $failure.errorCode -cnotin
+            @('DYSON_CONTROL_CUTOVER_HOST_TASK_FAILED','DYSON_CONTROL_CUTOVER_HOST_STOP_RECEIPT_INVALID')) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT'
+        }
+        Close-CutoverPreviousStopFailure $intent $root $fingerprint $failure.errorCode
+        Throw-CutoverHostError $failure.errorCode
+    }
+    if (Test-Path -LiteralPath $completedPath) {
+        $completed = Read-CutoverHostJsonFile $completedPath
+        if ($completed.intentSha256 -cne $fingerprint -or
+            $completed.taskRemoved -isnot [bool] -or -not $completed.taskRemoved -or
+            $null -ne (Get-CutoverPreviousStopTask $intent $root)) { throw 'completed stop drift' }
+        if ($completed.status -cne 'succeeded') { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_TASK_FAILED' }
+        $savedTerminal = Read-CutoverHostJsonFile $terminalPath
+        if ($savedTerminal.intentSha256 -cne $fingerprint -or $savedTerminal.lastResult -ne 0 -or
+            $savedTerminal.receiptSha256 -cne (Get-CutoverHostSha256File (Assert-CutoverHostPlainFile $receiptPath))) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT'
+        }
+        $currentRuntime = Get-CutoverHostRuntimeObservation
+        if ($currentRuntime.kind -cne 'none' -or -not $currentRuntime.portsClosed) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT' }
+        return
+    }
+    if (-not (Test-Path -LiteralPath $terminalPath)) {
+        $task = Get-CutoverPreviousStopTask $intent $root -RepairUnstartedAcl
+        if ($null -eq $task) {
+            if ($dispatched) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_DISPATCH_UNCERTAIN' }
+            Assert-CutoverHostMutationLease
+            if ($script:CutoverHostBackend -ceq 'Shadow') {
+                Write-CutoverPreviousStopRecord (Join-Path $root 'task-shadow.json') ([ordered]@{
+                    taskName = $intent.taskName; arguments = $intent.arguments; state = 'Ready'; lastRunUtc = '1970-01-01T00:00:00Z'; lastResult = 0
+                })
+            }
+            else {
+                $action = New-ScheduledTaskAction -Execute $intent.execute -Argument $intent.arguments
+                $principal = New-ScheduledTaskPrincipal -UserId $script:CutoverHostServiceUser -LogonType Interactive -RunLevel Limited
+                $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(3))
+                Register-ScheduledTask -TaskName $intent.taskName -TaskPath '\' -Action $action -Principal $principal -Settings $settings `
+                    -Description ('Dyson Control bound previous stop ' + $intent.requestId) -ErrorAction Stop | Out-Null
+                [void](Invoke-CutoverPreviousStopTaskCom $intent { param($registered)
+                    $registered.SetSecurityDescriptor(('D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;' + $intent.gameSid + ')'), 0x10)
+                })
+            }
+            Test-CutoverPreviousStopFault 'AfterTaskRegistered'
+            $task = Get-CutoverPreviousStopTask $intent $root
+        }
+        if ([DateTimeOffset]::Parse($task.lastRunUtc) -lt [DateTimeOffset]::Parse($intent.createdAtUtc)) {
+            if ($dispatched -and $task.state -notin @('Running','Queued')) {
+                Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_DISPATCH_UNCERTAIN'
+            }
+            if (-not $dispatched) {
+            if (Test-Path -LiteralPath $receiptPath) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT' }
+            Assert-CutoverHostMutationLease
+            Write-CutoverPreviousStopRecord $dispatchPath ([ordered]@{
+                intentSha256 = $fingerprint; requestedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+            })
+            Test-CutoverPreviousStopFault 'AfterDispatchIntent'
+            if ($script:CutoverHostBackend -ceq 'Shadow') {
+                if ($env:DYSON_CUTOVER_HOST_SELFTEST_FAIL_POINT -ceq 'PreviousStop-Timeout') {
+                    [IO.File]::Delete((Join-Path $root 'task-shadow.json'))
+                    Write-CutoverPreviousStopRecord (Join-Path $root 'task-shadow.json') ([ordered]@{
+                        taskName = $intent.taskName; arguments = $intent.arguments; state = 'Running'; lastRunUtc = [DateTimeOffset]::UtcNow.ToString('o'); lastResult = 267009
+                    })
+                }
+                else {
+                Set-CutoverHostShadowRuntimeForStop previous
+                Set-CutoverHostShadowTaskState -TaskName $script:CutoverHostPreviousStartTask -Enabled $null -Running $false -WriteKind 'complete:previous-compatible-stop'
+                Write-CutoverPreviousStopRecord $receiptPath ([ordered]@{
+                    protocol = 'DYSON_CONTROL_BOUND_STOP_RECEIPT_V1'; schemaVersion = 1; requestId = $intent.requestId
+                    expectedProcessId = $intent.processId; expectedProcessStartedAtUnixMs = $intent.processStartedAtUnixMs
+                    scriptSha256 = $stopHash; status = 'succeeded'; errorCode = 'NONE'; signalSent = $true; processExited = $true
+                    processExitCode = -1073741510; forcedKill = $false; completedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+                })
+                [IO.File]::Delete((Join-Path $root 'task-shadow.json'))
+                Write-CutoverPreviousStopRecord (Join-Path $root 'task-shadow.json') ([ordered]@{
+                    taskName = $intent.taskName; arguments = $intent.arguments; state = 'Ready'; lastRunUtc = [DateTimeOffset]::UtcNow.ToString('o'); lastResult = 0
+                })
+                }
+            }
+            else { Start-ScheduledTask -TaskName $intent.taskName -TaskPath '\' -ErrorAction Stop }
+            Test-CutoverPreviousStopFault 'AfterTaskStarted'
+            }
+        }
+        $waitSeconds = if ($script:CutoverHostBackend -ceq 'Shadow' -and $env:DYSON_CUTOVER_HOST_SELFTEST_FAIL_POINT -ceq 'PreviousStop-Timeout') { 1 } else { $script:CutoverHostRuntimeTimeoutSeconds }
+        $deadline = [DateTime]::UtcNow.AddSeconds($waitSeconds)
+        do {
+            Assert-CutoverHostMutationLease
+            [void](Assert-CutoverHostProfileRevision)
+            if ((Get-CutoverHostSha256File $stopScript) -cne $stopHash) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_SCRIPT_DRIFT' }
+            $task = Get-CutoverPreviousStopTask $intent $root
+            if ($null -eq $task) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_TASK_CONFLICT' }
+            if ($task.state -ceq 'Ready' -and [DateTimeOffset]::Parse($task.lastRunUtc) -ge [DateTimeOffset]::Parse($intent.createdAtUtc)) {
+                if ($task.lastResult -ne 0) {
+                    Close-CutoverPreviousStopFailure $intent $root $fingerprint 'DYSON_CONTROL_CUTOVER_HOST_TASK_FAILED'
+                    Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_TASK_FAILED'
+                }
+                break
+            }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if ($task.state -cne 'Ready' -or [DateTimeOffset]::Parse($task.lastRunUtc) -lt [DateTimeOffset]::Parse($intent.createdAtUtc)) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_TASK_TIMEOUT' }
+        try {
+        $receipt = Read-CutoverHostJsonFile $receiptPath
+        Assert-CutoverHostExactProperties $receipt @('protocol','schemaVersion','requestId','expectedProcessId',
+            'expectedProcessStartedAtUnixMs','scriptSha256','status','errorCode','signalSent','processExited','processExitCode','forcedKill','completedAtUtc')
+        if ($receipt.protocol -cne 'DYSON_CONTROL_BOUND_STOP_RECEIPT_V1' -or $receipt.schemaVersion -ne 1 -or
+            $receipt.requestId -cne $intent.requestId -or $receipt.expectedProcessId -ne $intent.processId -or
+            $receipt.expectedProcessStartedAtUnixMs -ne $intent.processStartedAtUnixMs -or $receipt.scriptSha256 -cne $stopHash -or
+            $receipt.status -cne 'succeeded' -or $receipt.errorCode -cne 'NONE' -or
+            ($receipt.expectedProcessId -isnot [int] -and $receipt.expectedProcessId -isnot [long]) -or
+            ($receipt.expectedProcessStartedAtUnixMs -isnot [int] -and $receipt.expectedProcessStartedAtUnixMs -isnot [long]) -or
+            ($receipt.processExitCode -isnot [int] -and $receipt.processExitCode -isnot [long]) -or
+            $receipt.processExitCode -lt [int]::MinValue -or $receipt.processExitCode -gt [int]::MaxValue -or
+            $receipt.signalSent -isnot [bool] -or -not $receipt.signalSent -or
+            $receipt.processExited -isnot [bool] -or -not $receipt.processExited -or
+            $receipt.forcedKill -isnot [bool] -or $receipt.forcedKill -or
+            [DateTimeOffset]::Parse($receipt.completedAtUtc) -lt [DateTimeOffset]::Parse($intent.createdAtUtc) -or
+            [DateTimeOffset]::Parse($receipt.completedAtUtc) -gt [DateTimeOffset]::UtcNow.AddSeconds(5)) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECEIPT_INVALID'
+        }
+        }
+        catch {
+            Close-CutoverPreviousStopFailure $intent $root $fingerprint 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECEIPT_INVALID'
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECEIPT_INVALID'
+        }
+        [void](Wait-CutoverHostRuntime stopped)
+        Write-CutoverPreviousStopRecord $terminalPath ([ordered]@{
+            intentSha256 = $fingerprint; receiptSha256 = Get-CutoverHostSha256File $receiptPath
+            lastRunUtc = $task.lastRunUtc; lastResult = 0
+        })
+        Test-CutoverPreviousStopFault 'AfterTerminal'
+    }
+    $terminal = Read-CutoverHostJsonFile $terminalPath
+    Assert-CutoverHostExactProperties $terminal @('intentSha256','receiptSha256','lastRunUtc','lastResult')
+    if ($terminal.intentSha256 -cne $fingerprint -or $terminal.lastResult -ne 0 -or
+        $terminal.receiptSha256 -cne (Get-CutoverHostSha256File (Assert-CutoverHostPlainFile $receiptPath))) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT' }
+    [void](Wait-CutoverHostRuntime stopped)
+    Assert-CutoverHostMutationLease
+    Test-CutoverPreviousStopFault 'BeforeCleanup'
+    $task = Get-CutoverPreviousStopTask $intent $root
+    if ($null -ne $task) {
+        if ($task.state -cne 'Ready' -or $task.lastResult -ne 0 -or $task.lastRunUtc -cne $terminal.lastRunUtc) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_TASK_CONFLICT'
+        }
+        if ($script:CutoverHostBackend -ceq 'Shadow') { [IO.File]::Delete((Join-Path $root 'task-shadow.json')) }
+        else { Unregister-ScheduledTask -TaskName $intent.taskName -TaskPath '\' -Confirm:$false -ErrorAction Stop }
+    }
+    if ($null -ne (Get-CutoverPreviousStopTask $intent $root)) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_CLEANUP_FAILED' }
+    Assert-CutoverHostMutationLease
+    Test-CutoverPreviousStopFault 'AfterCleanup'
+    Write-CutoverPreviousStopRecord $completedPath ([ordered]@{ intentSha256 = $fingerprint; status = 'succeeded'; taskRemoved = $true })
+}
+
+function Assert-CutoverPreviousStopClean {
+    $storage = Join-Path $script:CutoverHostRuntimeOwnerRoot 'previous-stop'
+    if (-not (Test-Path -LiteralPath $storage)) { return }
+    [void](Assert-CutoverHostPlainDirectory $storage)
+    $nativeTasks = if ($script:CutoverHostBackend -ceq 'Windows') { @(Get-ScheduledTask -ErrorAction Stop) } else { @() }
+    foreach ($directory in @(Get-ChildItem -LiteralPath $storage -Directory -Force)) {
+        if (-not (Test-Path -LiteralPath (Join-Path $directory.FullName 'intent.json'))) { continue }
+        $completedPath = Join-Path $directory.FullName 'completed.json'
+        if (-not (Test-Path -LiteralPath $completedPath)) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECOVERY_REQUIRED' }
+        $completed = Read-CutoverHostJsonFile $completedPath
+        if ($completed.taskRemoved -isnot [bool] -or -not $completed.taskRemoved -or
+            $completed.status -cnotin @('succeeded','failed','cancelled') -or
+            (Test-Path -LiteralPath (Join-Path $directory.FullName 'task-shadow.json')) -or
+            @($nativeTasks | Where-Object { $_.TaskPath -ceq '\' -and $_.TaskName -ceq ('Dyson-Cutover-Previous-Stop-' + $directory.Name) }).Count -ne 0) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECOVERY_REQUIRED'
+        }
+    }
+}
+
+function Cancel-CutoverUnstartedPreviousStop {
+    $storage = Join-Path $script:CutoverHostRuntimeOwnerRoot 'previous-stop'
+    if (-not (Test-Path -LiteralPath $storage)) { return }
+    foreach ($directory in @(Get-ChildItem -LiteralPath $storage -Directory -Force)) {
+        $intentPath = Join-Path $directory.FullName 'intent.json'
+        if (-not (Test-Path -LiteralPath $intentPath) -or (Test-Path -LiteralPath (Join-Path $directory.FullName 'completed.json'))) { continue }
+        Assert-CutoverHostMutationLease
+        $intent = Read-CutoverHostJsonFile $intentPath
+        Assert-CutoverHostExactProperties $intent @('protocol','requestId','authorityRevision','stopSha256','gameSid',
+            'processId','processStartedAtUnixMs','taskName','execute','arguments','createdAtUtc')
+        $requestGuid = [guid]::Empty
+        if (-not [guid]::TryParseExact($directory.Name, 'D', [ref]$requestGuid) -or $intent.requestId -cne $directory.Name -or
+            $intent.taskName -cne ('Dyson-Cutover-Previous-Stop-' + $directory.Name) -or
+            $intent.authorityRevision -cne $script:CutoverHostExpectedInventoryRevision -or
+            $intent.stopSha256 -cne $script:CutoverHostPreviousStopScriptSha256) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT'
+        }
+        $leaf = Assert-CutoverHostPlainFile (Join-Path $script:CutoverHostWindowsRoot 'Stop-DysonServer.ps1')
+        $receiptPath = Join-Path $directory.FullName 'receipts\stop.json'
+        $expectedArguments = '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -ProjectRoot "{1}" -TimeoutSeconds 150 -StopRequestId {2} -ExpectedProcessId {3} -ExpectedProcessStartedAtUnixMs {4} -ExpectedScriptSha256 {5} -ReceiptPath "{6}"' -f
+            $leaf, $script:CutoverHostProjectRoot, $directory.Name, $intent.processId, $intent.processStartedAtUnixMs, $intent.stopSha256, $receiptPath
+        if ((Get-CutoverHostSha256File $leaf) -cne $intent.stopSha256 -or $intent.arguments -cne $expectedArguments -or
+            $intent.execute -cne (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECORD_CONFLICT'
+        }
+        if ($intent.requestId -cne $script:CutoverHostRequestId) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECOVERY_REQUIRED' }
+        $task = Get-CutoverPreviousStopTask $intent $directory.FullName -RepairUnstartedAcl
+        if (Test-Path -LiteralPath (Join-Path $directory.FullName 'dispatch.json')) {
+            # Reconcile only an already-dispatched transaction. This path cannot register
+            # or start a task: dispatch uncertainty is rejected by the transaction reader.
+            if ($null -ne $task -and ($task.state -cne 'Ready' -or
+                [DateTimeOffset]::Parse($task.lastRunUtc) -lt [DateTimeOffset]::Parse($intent.createdAtUtc))) {
+                Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECOVERY_REQUIRED'
+            }
+            try { Invoke-CutoverPreviousStopTransaction }
+            catch {
+                $completedPath = Join-Path $directory.FullName 'completed.json'
+                if (-not (Test-Path -LiteralPath $completedPath)) { throw }
+                $completed = Read-CutoverHostJsonFile $completedPath
+                $fingerprint = Get-CutoverHostSha256Text (ConvertTo-CutoverHostJson $intent)
+                if ($completed.intentSha256 -cne $fingerprint -or $completed.status -cne 'failed' -or
+                    $completed.taskRemoved -isnot [bool] -or -not $completed.taskRemoved -or
+                    $null -ne (Get-CutoverPreviousStopTask $intent $directory.FullName)) { throw }
+                # The immutable failure remains a failure; only its cleanup completed.
+            }
+            continue
+        }
+        if ((Test-Path -LiteralPath (Join-Path $directory.FullName 'dispatch.json')) -or
+            (Test-Path -LiteralPath (Join-Path $directory.FullName 'receipts\stop.json')) -or
+            ($null -ne $task -and ($task.state -cne 'Ready' -or [DateTimeOffset]::Parse($task.lastRunUtc).Year -ge 2000))) {
+            Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_RECOVERY_REQUIRED'
+        }
+        if ($null -ne $task) {
+            if ($script:CutoverHostBackend -ceq 'Shadow') { [IO.File]::Delete((Join-Path $directory.FullName 'task-shadow.json')) }
+            else { Unregister-ScheduledTask -TaskName $intent.taskName -TaskPath '\' -Confirm:$false -ErrorAction Stop }
+        }
+        if ($null -ne (Get-CutoverPreviousStopTask $intent $directory.FullName)) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_STOP_CLEANUP_FAILED' }
+        Write-CutoverPreviousStopRecord (Join-Path $directory.FullName 'completed.json') ([ordered]@{
+            intentSha256 = Get-CutoverHostSha256Text (ConvertTo-CutoverHostJson $intent); status = 'cancelled'; taskRemoved = $true
+        })
+    }
+}
+
 function Assert-CutoverHostNoStructuralDrift {
     param([Parameter(Mandatory)]$Authority, [switch]$AllowCandidateStopTransition)
     if ([bool]$Authority.structuralDrift -and
@@ -1116,10 +1651,21 @@ function Invoke-CutoverHostStopPreviousRuntime {
         Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_ACTION_PRECONDITION_FAILED'
     }
     $before = Get-CutoverHostEvidence
+    if ($script:CutoverHostPreviousStopReconcileOnly) {
+        if ([string]$before.processState -notin @('none', 'previous-only')) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_ACTION_PRECONDITION_FAILED' }
+        Cancel-CutoverUnstartedPreviousStop
+        Assert-CutoverPreviousStopClean
+        Assert-CutoverHostMutationBoundary
+        $after = Get-CutoverHostEvidence
+        if ([bool]$after.previousEnabled -or [bool]$after.candidateEnabled -or [bool]$after.unexpectedAuthorityPresent -or
+            [string]$after.processState -notin @('none', 'previous-only')) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_ACTION_POSTCONDITION_FAILED' }
+        return
+    }
     if ([string]$before.processState -ceq 'previous-only') {
-        Invoke-CutoverHostFixedRuntimeTask previous stop
-        [void](Wait-CutoverHostRuntime stopped)
-        Wait-CutoverHostStopTaskTerminal $script:CutoverHostPreviousStopTask
+        Invoke-CutoverPreviousStopTransaction
+    }
+    elseif (Test-Path -LiteralPath (Join-Path $script:CutoverHostRuntimeOwnerRoot ('previous-stop\' + $script:CutoverHostRequestId + '\intent.json'))) {
+        Invoke-CutoverPreviousStopTransaction
     }
     elseif (-not (Test-CutoverHostStoppedEvidence $before)) { Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_ACTION_PRECONDITION_FAILED' }
     Remove-CutoverHostRuntimeOwner
@@ -1141,6 +1687,8 @@ function Invoke-CutoverHostEnablePreviousAuthority {
     if ([string]$before.processState -notin @('none', 'previous-only')) {
         Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_ACTION_PRECONDITION_FAILED'
     }
+    Cancel-CutoverUnstartedPreviousStop
+    Assert-CutoverPreviousStopClean
     if (-not [bool]$authority.panel.enabled) { Set-CutoverHostTaskEnabled $script:CutoverHostPreviousPanelTask $true }
     if (-not [bool](Get-CutoverHostTaskImage $script:CutoverHostPreviousPanelTask).running) { Set-CutoverHostPanelRunning $true }
     Assert-CutoverHostMutationBoundary
@@ -1155,6 +1703,7 @@ function Invoke-CutoverHostStartRuntime {
     param([ValidateSet('previous', 'candidate')][string]$Owner)
     $authority = Get-CutoverHostAuthorityObservation (Assert-CutoverHostProfileRevision)
     Assert-CutoverHostNoStructuralDrift $authority
+    Assert-CutoverPreviousStopClean
     if ($Owner -ceq 'previous') {
         if (-not [bool]$authority.previousLive -or [bool]$authority.candidateActive -or -not [bool]$authority.candidatePrepared) {
             Throw-CutoverHostError 'DYSON_CONTROL_CUTOVER_HOST_ACTION_PRECONDITION_FAILED'

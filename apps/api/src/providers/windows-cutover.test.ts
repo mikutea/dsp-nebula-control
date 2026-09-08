@@ -108,6 +108,30 @@ describe('broker-independent Windows cutover adapter', () => {
     expect(active.assertions()).toBeGreaterThanOrEqual(2)
   })
 
+  it.each([undefined, { reconcileOnly: true } as const])(
+    'preserves the previous-stop reconciliation option without changing the mutation binding: %j',
+    async (options) => {
+      const harness = createHarness()
+      const active = activeScope()
+      const request = {
+        requestId: id(7),
+        signal: active.scope.signal,
+        hostMutation: active.scope
+      }
+
+      if (options === undefined) await harness.adapter.stopPreviousRuntime(request)
+      else await harness.adapter.stopPreviousRuntime(request, options)
+
+      expect(harness.host.previousStopOptions).toStrictEqual([options])
+      expect(harness.host.fixedCalls).toStrictEqual([{
+        method: 'stopPreviousRuntime',
+        request: { requestId: id(7), hostMutation: active.scope }
+      }])
+      expect(harness.host.fixedCalls[0]!.request.hostMutation).toBe(active.scope)
+      expect(active.assertions()).toBeGreaterThanOrEqual(2)
+    }
+  )
+
   it('binds the terminal digest to every child invocation identity field', async () => {
     const harness = createHarness()
     const outerRequestId = id(24)
@@ -581,6 +605,7 @@ class RecordingHostClient implements WindowsCutoverHostClient {
   readonly inspectionCalls: WindowsCutoverInspectionRequest[] = []
   readonly candidateCalls: WindowsCutoverCandidateTaskRequest[] = []
   readonly fixedCalls: Array<{ method: string; request: WindowsCutoverFixedMutationRequest }> = []
+  readonly previousStopOptions: Array<Readonly<{ reconcileOnly: true }> | undefined> = []
 
   async inspect(request: Readonly<WindowsCutoverInspectionRequest>): Promise<unknown> {
     this.inspectionCalls.push({ ...request })
@@ -601,7 +626,11 @@ class RecordingHostClient implements WindowsCutoverHostClient {
     return this.fixed('disablePreviousAuthority', request)
   }
 
-  stopPreviousRuntime(request: Readonly<WindowsCutoverFixedMutationRequest>): Promise<unknown> {
+  stopPreviousRuntime(
+    request: Readonly<WindowsCutoverFixedMutationRequest>,
+    options?: Readonly<{ reconcileOnly: true }>
+  ): Promise<unknown> {
+    this.previousStopOptions.push(options)
     return this.fixed('stopPreviousRuntime', request)
   }
 

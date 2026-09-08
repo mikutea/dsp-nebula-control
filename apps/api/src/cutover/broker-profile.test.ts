@@ -26,6 +26,33 @@ describe('cutover broker profile', () => {
     expect(Object.isFrozen(result)).toBe(true)
   })
 
+  it('preserves legacy fingerprints and optionally pins the compatible previous-stop leaf', () => {
+    const fixture = createFixture()
+    expect(readCutoverBrokerProfile(fixture.options).profileFingerprint).toBe(fixture.profile.profileFingerprint)
+    const stop = path.join(fixture.scriptRoot, 'Stop-DysonServer.ps1')
+    fs.writeFileSync(stop, '# fixed bound stop fixture\n')
+    const { profileFingerprint: _previous, ...oldCore } = fixture.profile
+    const core = { ...oldCore, previousStopScriptSha256: sha256File(stop) }
+    writeProfile(fixture.options.profileFile, { ...core, profileFingerprint: sha256Text(JSON.stringify(core)) })
+    expect(readCutoverBrokerProfile(fixture.options).previousStopScriptSha256).toBe(core.previousStopScriptSha256)
+    fs.appendFileSync(stop, '# drift\n')
+    expect(() => readCutoverBrokerProfile(fixture.options)).toThrowError(
+      expect.objectContaining({ code: 'CUTOVER_BROKER_PROFILE_BINDING_MISMATCH' })
+    )
+  })
+
+  it('pins the optional read-only evidence entrypoint without changing legacy profiles', () => {
+    const fixture = createFixture()
+    const leaf = path.join(fixture.scriptRoot, 'cutover', 'Get-DysonCutoverEvidence.ps1')
+    fs.writeFileSync(leaf, '# fixed read-only evidence fixture\n')
+    const { profileFingerprint: _old, ...oldCore } = fixture.profile
+    const core = { ...oldCore, cutoverEvidenceScriptSha256: sha256File(leaf) }
+    writeProfile(fixture.options.profileFile, { ...core, profileFingerprint: sha256Text(JSON.stringify(core)) })
+    expect(readCutoverBrokerProfile(fixture.options).cutoverEvidenceScriptSha256).toBe(core.cutoverEvidenceScriptSha256)
+    fs.appendFileSync(leaf, '# drift\n')
+    expect(() => readCutoverBrokerProfile(fixture.options)).toThrowError(expect.objectContaining({ code: 'CUTOVER_BROKER_PROFILE_BINDING_MISMATCH' }))
+  })
+
   it.each([
     'DysonHostMutationLease.Common.ps1',
     'cutover/DysonCutoverHost.Common.ps1',

@@ -50,7 +50,7 @@ namespace DysonControl.Bridge
             long gameTick,
             double currentUps,
             long nowUnixMs,
-            long nowMonotonicTicks)
+            long nowMonotonicTicks, bool pauseReported = false)
         {
             if (!simulationReady || gameTick < 0 || nowUnixMs <= 0 || nowMonotonicTicks < 0 ||
                 double.IsNaN(currentUps) || double.IsInfinity(currentUps) || currentUps < 0 ||
@@ -88,6 +88,14 @@ namespace DysonControl.Bridge
                 elapsedTicks * 1000.0 / monotonicFrequency,
                 MidpointRounding.AwayFromZero);
             var tickDelta = gameTick - baseline.GameTick;
+            // Nebula's dedicated host can retain the vanilla pause flag while
+            // advancing game ticks. Require actual progress only when paused
+            // is reported, so idle frame-rate updates are not simulation data.
+            if (pauseReported && tickDelta == 0)
+            {
+                baseline = new Baseline(gameTick, nowUnixMs, nowMonotonicTicks);
+                return null;
+            }
             var upsMilli = (long)Math.Round(currentUps * 1000.0, MidpointRounding.AwayFromZero);
             var tpsMilli = (long)Math.Round(
                 tickDelta * 1000000.0 / windowDurationMs,

@@ -49,25 +49,49 @@ Assembly/File versions use `0.1.0.0`, because those consumers require numeric
 `System.Version` values. Activation compares the full ProductVersion exactly and
 never treats the numeric Assembly/File version as equivalent to an RC release.
 
+### Client compatibility
+
+The validated Nebula 0.9.22.2 stack requires the Bridge plugin to be present on
+joining clients as part of its mod handshake. Include the matching Bridge DLL
+in the client package, with `Enabled = false` and empty `ControlRoot` and
+`SecretFile` values. The disabled client copy performs no management work.
+Never distribute the host configuration, shared secret, control directory,
+player snapshots, or saves with a client package.
+
 ## Authoritative loaded-save evidence
 
 The bridge maintains one atomically replaced signed file named
 `loaded-save-evidence` using `DYSON_CONTROL_LOADED_SAVE_EVIDENCE_V1`. It does
 not scan the save directory, sort by timestamp, infer a `latest` `.dsv`, or use
-the bridge save-request target as the observation source. The runtime name is
-read from DSP's public `GameMain.gameName` property after Nebula reports that
-the dedicated server game is loaded and this process is the host.
+the bridge save-request target as the observation source. A Harmony prefix
+revokes the previous load generation, and a postfix records the actual argument
+only when `GameSave.LoadCurrentGame(string)` returns `true`. The origin is bound
+to the resulting `GameMain.data` and Nebula session instances. Publication still
+waits until Nebula reports that the dedicated server game is loaded and this
+process is its host. A load predating hook registration remains unknown.
 
 This API contract was verified against the local `Assembly-CSharp.dll` used by
 the private bridge build: `GameMain.gameName` returns
-`GameMain.data.gameName`, and a successful `GameSave.LoadCurrentGame(string)`
-overwrites that field with the sanitized load argument after import. DSP's Save
-As flow also updates the same property before writing. Nebula writes
+`GameMain.data.gameName`. Normal loads (`GameSave.AllowRecursive == false`, the
+default) retain the name imported from the save payload; only recursive-path
+loads overwrite it with the sanitized load argument. It may therefore be empty
+or unrelated to the filename and is not used as loaded-slot authority. Nebula writes
 `<saveName>.server` from the same `SaveCurrentGame(saveName)` argument. The
 managed lifecycle contract is intentionally narrower: evidence is published
-only when the *observed* runtime value is exactly `_lastexit_` and both
+only when the *successful load argument* is exactly `_lastexit_` and both
 `_lastexit_.dsv` and `_lastexit_.server` are present, ordinary files, and stable
-across complete SHA-256 reads.
+across complete SHA-256 reads. Paths come from the real `GameConfig.gameSaveFolder`
+and retain the existing managed-directory verification; they are not substituted
+with a configured or guessed directory.
+
+The successful load fixes each paired file's path, length, write time and creation
+time before asynchronous hashing. Later file disappearance or metadata drift
+revokes that origin until another successful load; saving new bytes to the same
+slot does not relabel them as the loaded generation. Save receipts remain a
+separate proof. Failed/exceptional/reentrant loads, new-game entry, replacement
+data/session instances, and loss of established host readiness revoke the origin.
+AutoPause does not itself revoke a loaded origin while those loaded-host checks
+remain valid. The plugin unregisters its own load/new-game hooks on destruction.
 
 The payload binds the random per-plugin-start session ID, plugin version, OS
 process ID and process start time, bridge start time, a strictly increasing
@@ -108,8 +132,12 @@ Actual UPS comes from DSP's stopwatch-backed `FPSController.currentUPS`.
 Actual TPS is independently calculated from the change in `GameMain.gameTick`
 over a monotonic `Stopwatch` window. The configured command-line `-ups` target
 is not an input to either calculation and is not present in the telemetry
-protocol. Samples are emitted only while a game is running and unpaused;
-missing, malformed, out-of-range, stale, replayed, differently signed, or
+protocol. Samples require a loaded, running game. Nebula dedicated hosts can
+retain the vanilla pause flag while their game ticks advance. When that flag
+is set, the sampler requires positive tick progress in the measured window;
+a genuinely paused window produces no sample and resets the baseline. Missing
+samples produce a bounded diagnostic at most once every 30 seconds.
+Missing, malformed, out-of-range, stale, replayed, differently signed, or
 session/PID/process-generation-mismatched samples are unavailable rather than
 being replaced with the target UPS.
 

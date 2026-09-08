@@ -42,7 +42,7 @@ const profileSchema = z.strictObject({
     legacyPreimage: z.strictObject({
       startDefinitionSha256: sha256Schema,
       stopDefinitionSha256: sha256Schema,
-      expectedEnabledBeforeIsolation: z.literal(true),
+      expectedEnabledBeforeIsolation: z.boolean(),
       expectedEnabledAfterIsolation: z.literal(false)
     }),
     expectedPreparedDisabled: z.strictObject({
@@ -60,7 +60,15 @@ const profileSchema = z.strictObject({
     ])
   }),
   previousScriptBundleRevision: sha256Schema,
+  authoritySource: z.literal('reconstructed-template').optional(),
+  legacyTemplateSha256: sha256Schema.optional(),
   inventoryRevision: sha256Schema
+}).superRefine((profile, context) => {
+  const reconstructed = profile.authoritySource === 'reconstructed-template'
+  if (reconstructed !== (profile.legacyTemplateSha256 !== undefined) ||
+      profile.candidateAuthority.legacyPreimage.expectedEnabledBeforeIsolation !== !reconstructed) {
+    context.addIssue({ code: 'custom', message: 'Authority source and preimage state disagree' })
+  }
 })
 
 export type CutoverAuthorityProfile = Readonly<z.output<typeof profileSchema>>

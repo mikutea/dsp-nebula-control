@@ -12,15 +12,16 @@ function Assert-DysonLifecycleBrokerTaskAclIntent {
             $null -eq $descriptor.DiscretionaryAcl -or $descriptor.DiscretionaryAcl.Count -ne 3) {
             throw 'unexpected DACL shape'
         }
+        # Task Scheduler maps generic rights to these exact file access masks.
         $expected = @{
-            'S-1-5-18' = [int32]268435456
-            'S-1-5-32-544' = [int32]268435456
-            'S-1-5-19' = [int32]-1610612736
+            'S-1-5-18' = @([int32]268435456, [int32]0x1f01ff)
+            'S-1-5-32-544' = @([int32]268435456, [int32]0x1f01ff)
+            'S-1-5-19' = @([int32]-1610612736, [int32]0x1200a9)
         }
         foreach ($ace in $descriptor.DiscretionaryAcl) {
             if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed -or
                 -not $expected.ContainsKey($ace.SecurityIdentifier.Value) -or
-                [int32]$ace.AccessMask -ne [int32]$expected[$ace.SecurityIdentifier.Value]) {
+                [int32]$ace.AccessMask -notin $expected[$ace.SecurityIdentifier.Value]) {
                 throw 'unexpected task right'
             }
             $expected.Remove($ace.SecurityIdentifier.Value)
@@ -60,7 +61,7 @@ function Set-DysonLifecycleBrokerTaskAcl {
         [void](Assert-DysonLifecycleBrokerTaskAclIntent $sddl)
         $service = New-Object -ComObject 'Schedule.Service'
         $service.Connect()
-        $folder = $service.GetFolder($TaskPath)
+        $folder = $service.GetFolder($(if ($TaskPath -eq '\') { '\' } else { $TaskPath.TrimEnd('\') }))
         $task = $folder.GetTask($TaskName)
         $task.SetSecurityDescriptor($sddl, 0x10)
         $actual = [string]$task.GetSecurityDescriptor(0x4)
@@ -89,7 +90,7 @@ function Get-DysonLifecycleBrokerTaskSecurityDescriptor {
     try {
         $service = New-Object -ComObject 'Schedule.Service'
         $service.Connect()
-        $folder = $service.GetFolder($TaskPath)
+        $folder = $service.GetFolder($(if ($TaskPath -eq '\') { '\' } else { $TaskPath.TrimEnd('\') }))
         $task = $folder.GetTask($TaskName)
         return [string]$task.GetSecurityDescriptor(0x7)
     }
@@ -113,7 +114,7 @@ function Restore-DysonLifecycleBrokerTaskSecurityDescriptor {
     try {
         $service = New-Object -ComObject 'Schedule.Service'
         $service.Connect()
-        $folder = $service.GetFolder($TaskPath)
+        $folder = $service.GetFolder($(if ($TaskPath -eq '\') { '\' } else { $TaskPath.TrimEnd('\') }))
         $task = $folder.GetTask($TaskName)
         $task.SetSecurityDescriptor($Sddl, 0x10)
     }

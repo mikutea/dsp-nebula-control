@@ -1,4 +1,4 @@
-Set-StrictMode -Version 2.0
+﻿Set-StrictMode -Version 2.0
 
 $script:DysonCutoverBrokerProfileProtocol = 'DYSON_CONTROL_CUTOVER_BROKER_PROFILE_V1'
 $script:DysonCutoverBrokerRequestProtocol = 'DYSON_CONTROL_CUTOVER_BROKER_REQUEST_V1'
@@ -16,6 +16,7 @@ $script:DysonCutoverBrokerTaskPath = '\'
 $script:DysonCutoverBrokerTaskSddl = 'D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;LS)'
 $script:DysonCutoverBrokerCapabilities = @(
     'CandidateTaskTransaction',
+    'CutoverEvidence',
     'DisablePreviousAuthority',
     'StopPreviousRuntime',
     'EnablePreviousAuthority',
@@ -497,14 +498,28 @@ function ConvertTo-DysonCutoverBrokerValidatedProfile {
     param([Parameter(Mandatory)]$Raw)
 
     try {
-        Assert-DysonCutoverBrokerExactProperties $Raw @(
+        $profileProperties = @(
             'protocol', 'schemaVersion', 'brokerRoot', 'brokerScriptRoot', 'projectRoot', 'dataRoot',
             'authorityProfileFile', 'authorityProfileSha256', 'cutoverScriptRoot', 'leaseCommonSha256',
             'cutoverHostCommonSha256', 'cutoverActionScriptSha256', 'runtimeTaskInstallerSha256', 'runtimeBootstrapRoot',
             'runtimeTaskTransactionRoot', 'serviceUser', 'gamePort', 'taskName', 'taskPath',
             'localServiceSid', 'commonScriptSha256', 'taskAclScriptSha256', 'installerScriptSha256',
-            'workerScriptSha256', 'submitScriptSha256', 'profileFingerprint'
+            'workerScriptSha256', 'submitScriptSha256'
         )
+        $hasPreviousStop = $null -ne $Raw.PSObject.Properties['previousStopScriptSha256']
+        if ($hasPreviousStop) {
+            $profileProperties += 'previousStopScriptSha256'
+            if ($Raw.previousStopScriptSha256 -isnot [string] -or $Raw.previousStopScriptSha256 -cnotmatch '^[0-9a-f]{64}$') {
+                throw 'previous stop binding'
+            }
+        }
+        $hasEvidence = $null -ne $Raw.PSObject.Properties['cutoverEvidenceScriptSha256']
+        if ($hasEvidence) {
+            $profileProperties += 'cutoverEvidenceScriptSha256'
+            if ($Raw.cutoverEvidenceScriptSha256 -isnot [string] -or $Raw.cutoverEvidenceScriptSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'evidence binding' }
+        }
+        $profileProperties += 'profileFingerprint'
+        Assert-DysonCutoverBrokerExactProperties $Raw $profileProperties
         if ($Raw.protocol -isnot [string] -or [string]$Raw.protocol -cne $script:DysonCutoverBrokerProfileProtocol -or
             (($Raw.schemaVersion -isnot [int]) -and ($Raw.schemaVersion -isnot [long])) -or
             [int64]$Raw.schemaVersion -ne $script:DysonCutoverBrokerSchemaVersion -or
@@ -553,8 +568,10 @@ function ConvertTo-DysonCutoverBrokerValidatedProfile {
             installerScriptSha256 = [string]$Raw.installerScriptSha256
             workerScriptSha256 = [string]$Raw.workerScriptSha256
             submitScriptSha256 = [string]$Raw.submitScriptSha256
-            profileFingerprint = [string]$Raw.profileFingerprint
         }
+        if ($hasPreviousStop) { $profile | Add-Member NoteProperty previousStopScriptSha256 ([string]$Raw.previousStopScriptSha256) }
+        if ($hasEvidence) { $profile | Add-Member NoteProperty cutoverEvidenceScriptSha256 ([string]$Raw.cutoverEvidenceScriptSha256) }
+        $profile | Add-Member NoteProperty profileFingerprint ([string]$Raw.profileFingerprint)
         $core = [ordered]@{}
         foreach ($property in $profile.PSObject.Properties) {
             if ($property.Name -cne 'profileFingerprint') { $core[$property.Name] = $property.Value }
@@ -577,6 +594,9 @@ function ConvertTo-DysonCutoverBrokerValidatedProfile {
             (Get-DysonCutoverBrokerSha256File (Join-Path $profile.brokerScriptRoot 'Submit-DysonCutoverBrokerRequest.ps1')) -cne $profile.submitScriptSha256) {
             throw 'profile binding'
         }
+        if ($hasPreviousStop -and (Get-DysonCutoverBrokerSha256File (Join-Path $profile.cutoverScriptRoot 'Stop-DysonServer.ps1')) -cne
+            [string]$profile.previousStopScriptSha256) { throw 'previous stop file binding' }
+        if ($hasEvidence -and (Get-DysonCutoverBrokerSha256File (Join-Path $profile.cutoverScriptRoot 'cutover\Get-DysonCutoverEvidence.ps1')) -cne $profile.cutoverEvidenceScriptSha256) { throw 'evidence file binding' }
         return $profile
     }
     catch {
@@ -640,6 +660,7 @@ function Get-DysonCutoverBrokerRequestFingerprint {
         candidateMode = $Request.candidateMode
         candidateRecover = [bool]$Request.candidateRecover
     }
+    if ($null -ne $Request.PSObject.Properties['previousStopReconcileOnly']) { $core.previousStopReconcileOnly = $Request.previousStopReconcileOnly }
     return Get-DysonCutoverBrokerSha256Text (ConvertTo-DysonCutoverBrokerJson $core)
 }
 
@@ -647,13 +668,17 @@ function ConvertTo-DysonCutoverBrokerValidatedRequest {
     param([Parameter(Mandatory)]$Raw)
 
     try {
-        Assert-DysonCutoverBrokerExactProperties $Raw @(
+        $requestProperties = @(
             'protocol', 'schemaVersion', 'brokerRequestId', 'capability', 'requestId',
             'authorityInventoryRevision', 'projectRoot', 'dataRoot', 'authorityProfileFile',
             'cutoverScriptRoot', 'runtimeBootstrapRoot', 'runtimeTaskTransactionRoot', 'serviceUser',
             'gamePort', 'leaseInstanceId', 'leaseToken', 'candidateMode', 'candidateRecover',
             'requestFingerprint', 'createdAt'
         )
+        if ($null -ne $Raw.PSObject.Properties['previousStopReconcileOnly']) { $requestProperties += 'previousStopReconcileOnly' }
+        Assert-DysonCutoverBrokerExactProperties $Raw $requestProperties
+        if ($null -ne $Raw.PSObject.Properties['previousStopReconcileOnly'] -and
+            ($Raw.previousStopReconcileOnly -isnot [bool] -or -not $Raw.previousStopReconcileOnly -or $Raw.capability -cne 'StopPreviousRuntime')) { throw 'invalid reconcile option' }
         if ($Raw.protocol -isnot [string] -or [string]$Raw.protocol -cne $script:DysonCutoverBrokerRequestProtocol -or
             (($Raw.schemaVersion -isnot [int]) -and ($Raw.schemaVersion -isnot [long])) -or
             [int64]$Raw.schemaVersion -ne $script:DysonCutoverBrokerSchemaVersion -or
@@ -662,12 +687,13 @@ function ConvertTo-DysonCutoverBrokerValidatedRequest {
             $Raw.serviceUser -isnot [string] -or [string]$Raw.serviceUser -notmatch '^[^"\r\n]{3,128}$' -or
             (($Raw.gamePort -isnot [int]) -and ($Raw.gamePort -isnot [long])) -or
             [int64]$Raw.gamePort -lt 1 -or [int64]$Raw.gamePort -gt 65535 -or
-            $Raw.leaseInstanceId -isnot [string] -or [string]$Raw.leaseInstanceId -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
-            $Raw.leaseToken -isnot [string] -or [string]$Raw.leaseToken -cnotmatch '^[A-Za-z0-9_-]{43}$' -or
+            $Raw.leaseInstanceId -isnot [string] -or ($Raw.capability -cne 'CutoverEvidence' -and [string]$Raw.leaseInstanceId -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') -or
+            $Raw.leaseToken -isnot [string] -or ($Raw.capability -cne 'CutoverEvidence' -and [string]$Raw.leaseToken -cnotmatch '^[A-Za-z0-9_-]{43}$') -or
             $Raw.candidateRecover -isnot [bool] -or
             $Raw.requestFingerprint -isnot [string] -or [string]$Raw.requestFingerprint -cnotmatch '^[0-9a-f]{64}$') {
             throw 'request value'
         }
+        if ($Raw.capability -ceq 'CutoverEvidence' -and ($Raw.leaseInstanceId -cne '' -or $Raw.leaseToken -cne '')) { throw 'unexpected read lease' }
         Assert-DysonCutoverBrokerTimestamp $Raw.createdAt
         $capability = [string]$Raw.capability
         if ($capability -ceq 'CandidateTaskTransaction') {
@@ -701,6 +727,7 @@ function ConvertTo-DysonCutoverBrokerValidatedRequest {
             requestFingerprint = [string]$Raw.requestFingerprint
             createdAt = [string]$Raw.createdAt
         }
+        if ($null -ne $Raw.PSObject.Properties['previousStopReconcileOnly']) { $request | Add-Member -NotePropertyName previousStopReconcileOnly -NotePropertyValue $true }
         if ((Get-DysonCutoverBrokerRequestFingerprint $request) -cne $request.requestFingerprint) {
             throw 'request fingerprint'
         }
@@ -733,10 +760,11 @@ function New-DysonCutoverBrokerRequest {
         [Parameter(Mandatory)][string]$RuntimeTaskTransactionRoot,
         [Parameter(Mandatory)][string]$ServiceUser,
         [Parameter(Mandatory)][int]$GamePort,
-        [Parameter(Mandatory)][string]$LeaseInstanceId,
-        [Parameter(Mandatory)][string]$LeaseToken,
+        [string]$LeaseInstanceId = '',
+        [string]$LeaseToken = '',
         [AllowNull()]$CandidateMode,
-        [bool]$CandidateRecover
+        [bool]$CandidateRecover,
+        [bool]$PreviousStopReconcileOnly
     )
 
     $request = [pscustomobject][ordered]@{
@@ -761,6 +789,7 @@ function New-DysonCutoverBrokerRequest {
         requestFingerprint = ('0' * 64)
         createdAt = (Get-Date).ToUniversalTime().ToString('o')
     }
+    if ($PreviousStopReconcileOnly) { $request | Add-Member -NotePropertyName previousStopReconcileOnly -NotePropertyValue $true }
     $request.requestFingerprint = Get-DysonCutoverBrokerRequestFingerprint $request
     return ConvertTo-DysonCutoverBrokerValidatedRequest $request
 }
@@ -771,6 +800,7 @@ function Assert-DysonCutoverBrokerRequestBinding {
         [Parameter(Mandatory)]$Profile
     )
 
+    if ($Request.capability -ceq 'CutoverEvidence' -and $null -eq $Profile.PSObject.Properties['cutoverEvidenceScriptSha256']) { Throw-DysonCutoverBrokerError 'DYSON_CONTROL_CUTOVER_BROKER_PROFILE_BINDING_MISMATCH' }
     $matches =
         (Test-DysonCutoverBrokerSamePath $Request.projectRoot $Profile.projectRoot) -and
         (Test-DysonCutoverBrokerSamePath $Request.dataRoot $Profile.dataRoot) -and
@@ -795,6 +825,10 @@ function Assert-DysonCutoverBrokerRequestBinding {
 
 function Assert-DysonCutoverBrokerLease {
     param([Parameter(Mandatory)]$Request)
+    if ($Request.capability -ceq 'CutoverEvidence') {
+        if ($Request.leaseInstanceId -cne '' -or $Request.leaseToken -cne '') { Throw-DysonCutoverBrokerError 'DYSON_CONTROL_CUTOVER_BROKER_LEASE_INVALID' }
+        return
+    }
 
     try {
         $leaseCommon = Join-Path $Request.cutoverScriptRoot 'DysonHostMutationLease.Common.ps1'

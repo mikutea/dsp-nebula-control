@@ -482,7 +482,8 @@ function Assert-DysonUninstallBrokerPreflightStateUnchanged {
     if ($null -eq $Before) { return }
     $same = if ($Kind -ceq 'lifecycle') {
         [string]$Before.activeVersion -ceq [string]$After.activeVersion -and
-        [string]$Before.profileHash -ceq [string]$After.profileHash
+        [string]$Before.profileHash -ceq [string]$After.profileHash -and
+        [string]$Before.profileFileSddl -ceq [string]$After.profileFileSddl
     }
     else {
         [string]$Before.activeVersion -ceq [string]$After.activeVersion -and
@@ -598,9 +599,7 @@ function Restore-DysonUninstallBrokerPreimageAclsAndTask {
 
     foreach ($directoryAcl in @($State.directoryAcls)) {
         $path = Assert-DysonPlainDirectory -Path ([string]$directoryAcl.path)
-        $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $path -ErrorAction Stop
-        $acl.SetSecurityDescriptorSddlForm([string]$directoryAcl.sddl)
-        Microsoft.PowerShell.Security\Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+        Restore-DysonDeploymentDirectorySecurityPreimage -Path $path -Sddl ([string]$directoryAcl.sddl)
     }
     foreach ($binding in @(
         @([string]$State.profilePath, [byte[]]$State.profileBytes, [string]$State.profileSddl),
@@ -610,9 +609,7 @@ function Restore-DysonUninstallBrokerPreimageAclsAndTask {
             -Path ([string]$binding[0]) -Bytes ([byte[]]$binding[1])
         $path = Assert-DysonUninstallPlainFile ([string]$binding[0]) 32768 `
             'A restored cutover broker state file is unavailable or redirected.'
-        $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $path -ErrorAction Stop
-        $acl.SetSecurityDescriptorSddlForm([string]$binding[2])
-        Microsoft.PowerShell.Security\Set-Acl -LiteralPath $path -AclObject $acl -ErrorAction Stop
+        Restore-DysonDeploymentFileSecurityPreimage -Path $path -Sddl ([string]$binding[2])
     }
     if ([string]::IsNullOrWhiteSpace($ShadowRoot)) {
         Register-ScheduledTask -TaskName 'Dyson-Control-Cutover-Broker' -TaskPath '\' `
@@ -788,7 +785,8 @@ function Get-DysonUninstallLifecycleBrokerState {
             )
         }
         [void](Assert-DysonLifecycleBrokerTaskPair -Profile $profile `
-            -Backend $(if ($ShadowRoot) { 'Shadow' } else { 'Windows' }) -ShadowRoot $ShadowRoot)
+            -Backend $(if ($ShadowRoot) { 'Shadow' } else { 'Windows' }) -ShadowRoot $ShadowRoot `
+            -AllowPreparedDisabled)
     }
     finally {
         if ($ShadowRoot) {
@@ -870,6 +868,7 @@ function Get-DysonUninstallLifecycleBrokerState {
         profileHash = Get-DysonLifecycleBrokerProfileHash -ProfileFile $profileFile
         profileBytes = [IO.File]::ReadAllBytes($profileFile)
         profileSddl = $profileSddl
+        profileFileSddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $profileFile -ErrorAction Stop).Sddl
         profileAclPath = $shadowProfileAclPath
         profileAclBytes = $profileAclBytes
         taskPath = $shadowTaskPath
@@ -938,13 +937,13 @@ function Set-DysonUninstallLifecycleFileBytesAtomic {
 function Restore-DysonUninstallLifecyclePreimageAclsAndTask {
     param([Parameter(Mandatory)]$State, [string]$ShadowRoot)
     foreach ($directoryAcl in @($State.directoryAcls)) {
-        $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath ([string]$directoryAcl.path) -ErrorAction Stop
-        $acl.SetSecurityDescriptorSddlForm([string]$directoryAcl.sddl)
-        Microsoft.PowerShell.Security\Set-Acl -LiteralPath ([string]$directoryAcl.path) `
-            -AclObject $acl -ErrorAction Stop
+        Restore-DysonDeploymentDirectorySecurityPreimage -Path ([string]$directoryAcl.path) `
+            -Sddl ([string]$directoryAcl.sddl)
     }
     Set-DysonUninstallLifecycleFileBytesAtomic -Path ([string]$State.profilePath) `
         -Bytes ([byte[]]$State.profileBytes)
+    Restore-DysonDeploymentFileSecurityPreimage -Path ([string]$State.profilePath) `
+        -Sddl ([string]$State.profileFileSddl)
     if ($ShadowRoot) {
         Set-DysonUninstallLifecycleFileBytesAtomic -Path ([string]$State.profileAclPath) `
             -Bytes ([byte[]]$State.profileAclBytes) -MaximumBytes 8192
@@ -952,10 +951,6 @@ function Restore-DysonUninstallLifecyclePreimageAclsAndTask {
             -Bytes ([byte[]]$State.taskBytes)
     }
     else {
-        $profileAcl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath ([string]$State.profilePath) -ErrorAction Stop
-        $profileAcl.SetSecurityDescriptorSddlForm([string]$State.profileSddl)
-        Microsoft.PowerShell.Security\Set-Acl -LiteralPath ([string]$State.profilePath) `
-            -AclObject $profileAcl -ErrorAction Stop
         Register-ScheduledTask -TaskName 'Dyson-Control-Lifecycle-Broker' -TaskPath '\DysonControl\' `
             -Xml ([string]$State.taskXml) -Force -ErrorAction Stop | Out-Null
         $null = . ([string]$State.taskAclHelper)
@@ -969,6 +964,10 @@ function Assert-DysonUninstallLifecycleRestored {
     if (-not (Test-DysonUninstallBytesEqual `
             ([IO.File]::ReadAllBytes([string]$State.profilePath)) ([byte[]]$State.profileBytes))) {
         throw 'The lifecycle broker profile bytes were not restored.'
+    }
+    if ((Microsoft.PowerShell.Security\Get-Acl -LiteralPath ([string]$State.profilePath) -ErrorAction Stop).Sddl -cne
+        [string]$State.profileFileSddl) {
+        throw 'The lifecycle broker profile file ACL was not restored.'
     }
     Assert-DysonUninstallLifecycleDurableStatePreserved -State $State
     foreach ($directoryAcl in @($State.directoryAcls)) {

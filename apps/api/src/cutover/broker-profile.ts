@@ -36,6 +36,8 @@ const brokerProfileSchema = z.strictObject({
   installerScriptSha256: sha256Schema,
   workerScriptSha256: sha256Schema,
   submitScriptSha256: sha256Schema,
+  previousStopScriptSha256: sha256Schema.optional(),
+  cutoverEvidenceScriptSha256: sha256Schema.optional(),
   profileFingerprint: sha256Schema
 })
 
@@ -136,6 +138,14 @@ export function readCutoverBrokerProfile(
     [profile.workerScriptSha256, path.join(brokerScriptRoot, 'Invoke-DysonCutoverBrokerWorker.ps1')],
     [profile.submitScriptSha256, path.join(brokerScriptRoot, 'Submit-DysonCutoverBrokerRequest.ps1')]
   ] as const
+  if (profile.cutoverEvidenceScriptSha256 !== undefined &&
+      sha256File(plainFile(path.join(scriptRoot, 'cutover', 'Get-DysonCutoverEvidence.ps1'), maximumScriptBytes)) !== profile.cutoverEvidenceScriptSha256) {
+    throw new CutoverBrokerProfileError('CUTOVER_BROKER_PROFILE_BINDING_MISMATCH')
+  }
+  if (profile.previousStopScriptSha256 !== undefined &&
+      sha256File(plainFile(path.join(scriptRoot, 'Stop-DysonServer.ps1'), maximumScriptBytes)) !== profile.previousStopScriptSha256) {
+    throw new CutoverBrokerProfileError('CUTOVER_BROKER_PROFILE_BINDING_MISMATCH')
+  }
   for (const [expected, candidate] of fileBindings) {
     const file = plainFile(candidate, maximumScriptBytes)
     if (sha256File(file) !== expected) {

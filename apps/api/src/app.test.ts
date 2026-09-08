@@ -17,6 +17,7 @@ import type {
   StatusProvider
 } from './domain.js'
 import { DemoProvider } from './providers/demo.js'
+import { buildPlayerSnapshot } from './players/protocol.js'
 import type {
   LifecycleBrokerStatusEvidence,
   WindowsLifecycleBrokerClient
@@ -37,6 +38,50 @@ afterEach(async () => {
 })
 
 describe('control API', () => {
+  it.each(['complete', 'empty', 'truncated', 'expired', 'unavailable'] as const)(
+    'projects only a current complete authoritative roster into overview: %s', async (kind) => {
+      const config = loadConfig({ NODE_ENV: 'test', DYSON_PROVIDER: 'demo',
+        DYSON_DEV_ADMIN_PASSWORD: 'test-password-long-enough', DYSON_PUBLIC_ORIGIN: 'http://127.0.0.1:13010' })
+      const demo = new DemoProvider()
+      const provider: StatusProvider = {
+        name: 'windows', collectStatus: async () => {
+          const value = await demo.collectStatus()
+          return { ...value, runtime: { ...value.runtime, onlinePlayers: null, maxPlayers: null } }
+        }, previewLifecycle: (action) => demo.previewLifecycle(action)
+      }
+      const now = Date.now()
+      const snapshot = buildPlayerSnapshot({
+        sessionId: '10000000-0000-4000-8000-000000000001', writtenAtUnixMs: kind === 'expired' ? now - 60_000 : now,
+        sequence: 1, state: 'active', truncated: kind === 'truncated',
+        players: kind === 'empty' ? [] : [{ sessionPlayerId: 'player-000001', displayName: 'FictionalPlayer',
+          online: true, joinedAtUnixMs: now - 120_000, location: 'deep-space' }]
+      }, 'fictional-roster-secret-at-least-32-characters').snapshot
+      const read = vi.fn(async () => {
+        if (kind === 'unavailable') throw new Error('fixture unavailable')
+        return snapshot
+      })
+      application = await buildApplication(config, { statusProvider: provider, playerSnapshotSource: { read } })
+      const cookie = await loginAdministrator(application)
+      const responses = await Promise.all([1, 2].map(() => application!.app.inject({
+        method: 'GET', url: '/api/v1/status', cookies: { dyson_session: cookie }
+      })))
+      for (const response of responses) {
+        expect(response.statusCode).toBe(200)
+        expect(response.json().data.runtime.onlinePlayers).toBe(kind === 'complete' ? 1 : kind === 'empty' ? 0 : null)
+        expect(response.json().data.runtime.maxPlayers).toBeNull()
+      }
+      if (kind === 'complete' || kind === 'empty' || kind === 'truncated') expect(read).toHaveBeenCalledTimes(1)
+      if (kind === 'complete') {
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(now + config.playerSnapshotMaximumAgeMs + 1)
+        try {
+          const expired = await application.app.inject({ method: 'GET', url: '/api/v1/status',
+            cookies: { dyson_session: cookie } })
+          expect(expired.statusCode).toBe(200)
+          expect(expired.json().data.runtime.onlinePlayers).toBeNull()
+        } finally { clock.mockRestore() }
+      }
+    }
+  )
   it('echoes the immutable deployment release through the health contract', async () => {
     const config = loadConfig({
       NODE_ENV: 'test', DYSON_PROVIDER: 'demo', DYSON_DEV_ADMIN_PASSWORD: 'test-password-long-enough',
@@ -48,7 +93,7 @@ describe('control API', () => {
     expect(health.statusCode).toBe(200)
     expect(health.headers['x-dyson-control-release']).toBe('v0.1.0-fixture.1')
     expect(health.json()).toMatchObject({
-      status: 'ok', version: '0.1.0-rc.1', deploymentVersion: 'v0.1.0-fixture.1'
+      status: 'ok', version: '0.1.0-rc.14', deploymentVersion: 'v0.1.0-fixture.1'
     })
 
     const readiness = await application.app.inject({ method: 'GET', url: '/readyz' })
@@ -58,7 +103,7 @@ describe('control API', () => {
     expect(readiness.json()).toMatchObject({
       status: 'ready',
       provider: 'demo',
-      version: '0.1.0-rc.1',
+      version: '0.1.0-rc.14',
       deploymentVersion: 'v0.1.0-fixture.1',
       checks: {
         deploymentVersion: 'not-applicable',

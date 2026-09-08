@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using BepInEx;
 using BepInEx.Configuration;
+using HarmonyLib;
 
 namespace DysonControl.Bridge
 {
@@ -13,7 +14,7 @@ namespace DysonControl.Bridge
         public const string PluginGuid = "io.github.mikutea.dyson-control-bridge";
         public const string PluginName = "Dyson Control Bridge";
         public const string PluginVersion = "0.1.0";
-        public const string ReleaseVersion = "0.1.0-rc.1";
+        public const string ReleaseVersion = "0.1.0-rc.14";
 
         private ConfigEntry<bool> bridgeEnabled;
         private ConfigEntry<string> controlRoot;
@@ -27,7 +28,10 @@ namespace DysonControl.Bridge
         private GameSaveAdapter adapter;
         private PlayerRosterPublisher playerRoster;
         private SimulationTelemetrySampler simulationTelemetry;
+        private long nextTelemetryDiagnosticTicks;
         private LoadedSaveEvidencePublisher loadedSaveEvidence;
+        private Harmony loadedSaveHarmony;
+        private static DysonControlBridgePlugin loadedSaveHookOwner;
         private PendingSave pending;
         private bool operational;
         private long nextPollMonotonicTicks;
@@ -97,6 +101,7 @@ namespace DysonControl.Bridge
                     processId,
                     processStartedAtUnixMs,
                     startedAtUnixMs);
+                RegisterLoadedSaveHooks();
                 simulationTelemetry = new SimulationTelemetrySampler(
                     bridgeSessionId,
                     processId,
@@ -127,6 +132,11 @@ namespace DysonControl.Bridge
             }
             catch (Exception exception)
             {
+                operational = false;
+                UnregisterLoadedSaveHooks();
+                try { loadedSaveEvidence?.FailClosed(); }
+                catch { }
+                loadedSaveEvidence = null;
                 Logger.LogError("Dyson Control Bridge initialization failed: " + exception.GetType().Name);
             }
         }
@@ -229,11 +239,95 @@ namespace DysonControl.Bridge
 
         private void OnDestroy()
         {
+            operational = false;
+            UnregisterLoadedSaveHooks();
+            adapter?.InvalidateLoadObservation();
             playerRoster?.Dispose();
             playerRoster = null;
             loadedSaveEvidence?.Dispose();
             loadedSaveEvidence = null;
             simulationTelemetry = null;
+        }
+
+        private void RegisterLoadedSaveHooks()
+        {
+            if (loadedSaveHookOwner != null && !ReferenceEquals(loadedSaveHookOwner, this))
+                throw new InvalidOperationException("A loaded-save hook owner already exists.");
+            loadedSaveHookOwner = this;
+            loadedSaveHarmony = new Harmony(PluginGuid + ".loaded-save-origin");
+            loadedSaveHarmony.Patch(adapter.LoadCurrentGameMethod,
+                prefix: new HarmonyMethod(typeof(DysonControlBridgePlugin), nameof(BeforeGameLoad)),
+                postfix: new HarmonyMethod(typeof(DysonControlBridgePlugin), nameof(AfterGameLoad)),
+                finalizer: new HarmonyMethod(typeof(DysonControlBridgePlugin), nameof(FinalizeGameLoad)));
+            loadedSaveHarmony.Patch(adapter.NewGameMethod,
+                prefix: new HarmonyMethod(typeof(DysonControlBridgePlugin), nameof(BeforeNewGame)));
+        }
+
+        private void UnregisterLoadedSaveHooks()
+        {
+            if (ReferenceEquals(loadedSaveHookOwner, this)) loadedSaveHookOwner = null;
+            if (loadedSaveHarmony == null) return;
+            try { loadedSaveHarmony.UnpatchSelf(); }
+            catch (Exception exception) { Logger.LogWarning("Loaded-save hook cleanup failed: " + exception.GetType().Name); }
+            finally { loadedSaveHarmony = null; }
+        }
+
+        private static void BeforeGameLoad(out LoadedSaveOriginTracker.LoadAttempt __state)
+        {
+            __state = null;
+            var owner = loadedSaveHookOwner;
+            if (owner == null) return;
+            try
+            {
+                __state = owner.adapter.BeginLoadObservation();
+                owner.loadedSaveEvidence?.InvalidateLoadedOrigin();
+            }
+            catch (Exception exception) { owner.FailLoadedSaveHooks(exception); }
+        }
+
+        private static void AfterGameLoad(string __0, bool __result, LoadedSaveOriginTracker.LoadAttempt __state)
+        {
+            var owner = loadedSaveHookOwner;
+            if (owner == null) return;
+            try { owner.adapter.CompleteLoadObservation(__state, __result, __0); }
+            catch (Exception exception) { owner.FailLoadedSaveHooks(exception); }
+        }
+
+        private static Exception FinalizeGameLoad(Exception __exception, LoadedSaveOriginTracker.LoadAttempt __state)
+        {
+            var owner = loadedSaveHookOwner;
+            if (__exception != null && owner != null)
+            {
+                try
+                {
+                    owner.adapter.CompleteLoadObservation(__state, false, null);
+                    owner.adapter.InvalidateLoadObservation();
+                    owner.loadedSaveEvidence?.InvalidateLoadedOrigin();
+                }
+                catch (Exception exception) { owner.FailLoadedSaveHooks(exception); }
+            }
+            return __exception;
+        }
+
+        private static void BeforeNewGame()
+        {
+            var owner = loadedSaveHookOwner;
+            if (owner == null) return;
+            try
+            {
+                owner.adapter.InvalidateLoadObservation();
+                owner.loadedSaveEvidence?.InvalidateLoadedOrigin();
+            }
+            catch (Exception exception) { owner.FailLoadedSaveHooks(exception); }
+        }
+
+        private void FailLoadedSaveHooks(Exception exception)
+        {
+            adapter?.InvalidateLoadObservation();
+            try { loadedSaveEvidence?.FailClosed(); }
+            catch { }
+            loadedSaveEvidence = null;
+            Logger.LogWarning("Loaded-save observation hooks failed closed: " + exception.GetType().Name);
         }
 
         private void WriteHeartbeat(long nowUnixMs, long nowMonotonicTicks)
@@ -250,16 +344,25 @@ namespace DysonControl.Bridge
 
         private void PublishSimulationTelemetry(long nowUnixMs, long nowMonotonicTicks)
         {
-            var ready = GameMain.data != null && GameMain.isRunning && !GameMain.isPaused;
+            var ready = GameMain.data != null && GameMain.isRunning;
             var telemetry = simulationTelemetry.Observe(
                 ready,
                 GameMain.gameTick,
                 FPSController.currentUPS,
                 Math.Max(startedAtUnixMs, nowUnixMs),
-                nowMonotonicTicks);
+                nowMonotonicTicks, GameMain.isPaused);
             if (telemetry != null)
             {
                 store.WriteSimulationTelemetry(telemetry);
+            }
+            else if (nowMonotonicTicks >= nextTelemetryDiagnosticTicks)
+            {
+                nextTelemetryDiagnosticTicks = BridgeMonotonicTime.DeadlineAfter(
+                    nowMonotonicTicks, BridgeMonotonicTime.DurationTicks(30000));
+                Logger.LogInfo(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "Simulation sample pending: data={0}; running={1}; paused={2}; tick={3}; ups={4:R}.",
+                    GameMain.data != null, GameMain.isRunning, GameMain.isPaused,
+                    GameMain.gameTick, FPSController.currentUPS));
             }
         }
 

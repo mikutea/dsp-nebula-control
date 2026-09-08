@@ -156,6 +156,7 @@ export { allowedScriptPaths };
         'Install-DysonControl.ps1', 'Install-DysonControlTask.ps1', 'Install-DysonNodeRuntime.ps1',
         'Invoke-DysonControlDeployment.ps1', 'New-DysonRebootAcceptanceCheckpoint.ps1',
         'Repair-DysonNodeRuntime.ps1',
+        'Set-DysonGameBootstrapAccess.ps1',
         'Start-DysonControl.ps1', 'Test-DysonControlDeployment.ps1',
         'Test-DysonRebootAcceptanceResume.ps1', 'Uninstall-DysonControl.ps1'
     )

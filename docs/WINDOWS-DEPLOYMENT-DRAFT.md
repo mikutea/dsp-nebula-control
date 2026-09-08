@@ -24,6 +24,15 @@ The public repository contains no production environment file. Examples in
 this guide use fictional paths and endpoints; operators must not publish their
 real paths, hostnames, accounts, task exports, logs, or secrets.
 
+Choose install/data roots that are also valid for rollback and uninstall.
+Inside Program Files or ProgramData, only the canonical `DysonControl`
+directory is supported; suffixing it with a candidate name is not a supported
+side-by-side layout. For an isolated candidate, use separate dedicated trees
+outside those managed locations, for example `C:\ExampleCandidate\install` and
+`C:\ExampleCandidate\data`, with its own task name and loopback port. Do not
+reuse an existing deployment's data root. Preview must reject an unsupported
+layout before creating directories, just as an actual install must.
+
 The release does not bundle Node. Install or provision the supported runtime in
 its own `RuntimeRoot` and pass `-RuntimeRoot`, the exact `-NodeExecutable`, and
 `-ExpectedNodeSha256` to every install, task, launcher, status, reboot-acceptance,
@@ -180,6 +189,7 @@ scripts\windows\deployment\Install-DysonNodeRuntime.ps1
 scripts\windows\deployment\Invoke-DysonControlDeployment.ps1
 scripts\windows\deployment\New-DysonRebootAcceptanceCheckpoint.ps1
 scripts\windows\deployment\Start-DysonControl.ps1
+scripts\windows\deployment\Set-DysonGameBootstrapAccess.ps1
 scripts\windows\deployment\Test-DysonControlDeployment.ps1
 scripts\windows\deployment\Test-DysonRebootAcceptanceResume.ps1
 scripts\windows\deployment\Uninstall-DysonControl.ps1
@@ -771,6 +781,18 @@ the executable path nor child-process output.
 
 ### Explicit lifecycle- and cutover-broker installation
 
+For a controller installation that registers the startup task and installs or
+upgrades either broker, `Install-DysonControl.ps1` acquires the shared application
+host-mutation lease before stopping the previous panel task. An active game
+mutation blocks that step; the installer does not interrupt it. After the panel
+stops producing requests, existing status workers finish naturally within a
+bounded wait. The installer does not kill broker workers or discard pending
+records; the normal pending-work checks still apply. A failure during this
+quiescence stage restores the previous panel task state. After broker and
+configuration publication, the lease is released before starting the new panel
+so startup recovery can acquire it. Verify this sequence and rollback on the
+target host; the implementation alone is not upgrade acceptance evidence.
+
 Neither privileged broker is installed by default. Lifecycle installation is
 requested only with `-InstallLifecycleBrokerTask`. It requires an explicit
 `ConfigurationSource`, `-RegisterStartupTask`, `-StartAfterInstall`, a loopback
@@ -795,7 +817,7 @@ DYSON_STOP_TASK=Dyson-Nebula-Stop
 DYSON_CUTOVER_ENABLED=true
 DYSON_CUTOVER_RECOVERY_ENABLED=true
 DYSON_CUTOVER_PROFILE_FILE=C:\GameServer\Example\DysonControlData\data\authority-inventory\authority-profile.json
-DYSON_CUTOVER_TASK_TRANSACTION_ROOT=C:\GameServer\Example\DysonControlData\data\runtime-task-transactions
+DYSON_CUTOVER_TASK_TRANSACTION_ROOT=C:\GameServer\Example\DysonControlData\runtime-task-transactions
 DYSON_CUTOVER_SERVICE_USER=.\ExampleGameService
 ```
 
@@ -827,7 +849,7 @@ $dataRoot = 'C:\GameServer\Example\DysonControlData'
 $projectRoot = 'C:\GameServer\Example\DSP'
 $bootstrapRoot = 'C:\GameServer\Example\DysonControl\bootstrap'
 $authorityProfile = 'C:\GameServer\Example\DysonControlData\data\authority-inventory\authority-profile.json'
-$taskTransactions = 'C:\GameServer\Example\DysonControlData\data\runtime-task-transactions'
+$taskTransactions = Join-Path $dataRoot 'runtime-task-transactions' # deployment data root
 $serviceUser = '.\ExampleGameService'
 $gamePort = 27015
 
@@ -936,7 +958,7 @@ $upgrade = @{
   CutoverProjectRoot = 'C:\GameServer\Example\DSP'
   CutoverAuthorityProfileFile = 'C:\GameServer\Example\DysonControlData\data\authority-inventory\authority-profile.json'
   CutoverAuthorityInventoryRevision = ('b' * 64)
-  CutoverRuntimeTaskTransactionRoot = 'C:\GameServer\Example\DysonControlData\data\runtime-task-transactions'
+  CutoverRuntimeTaskTransactionRoot = 'C:\GameServer\Example\DysonControlData\runtime-task-transactions'
   CutoverServiceUser = '.\ExampleGameService'
   CutoverGamePort = 27015
   CutoverRuntimeBootstrapRoot = 'C:\GameServer\Example\DysonControl\bootstrap'
@@ -962,8 +984,17 @@ The lower-level release transaction's JSON result contains `snapshotId`. Use
 that exact ID rather than guessing `latest` during an incident:
 
 ```powershell
+$installRoot = 'C:\GameServer\Example\DysonControl'
+$deploymentDataRoot = 'C:\GameServer\Example\DysonControlData'
+$runtimeRoot = 'C:\GameServer\Example\DysonControlRuntime\node-current'
+$node = Join-Path $runtimeRoot 'node-v24.0.0-win-x64\node.exe'
+$expectedNodeSha256 = ('d' * 64) # same independently verified node.exe hash as installation
+
 & .\scripts\windows\deployment\Invoke-DysonControlDeployment.ps1 `
   -Operation Rollback `
+  -InstallRoot $installRoot -DataRoot $deploymentDataRoot `
+  -RuntimeRoot $runtimeRoot -NodeExecutable $node `
+  -ExpectedNodeSha256 $expectedNodeSha256 `
   -SnapshotId '20300101-000000000-1a2b3c4d' `
   -RestartControlTask `
   -ReadinessUri 'http://127.0.0.1:13010/readyz' `
@@ -1107,7 +1138,9 @@ it never opens or copies the `.dsv`/`.server` pair.
 $artifact = 'C:\GameServer\Example\Packages\DysonControl-v0.2.0'
 $project = 'C:\GameServer\Example\DSP'
 $gsm = 'C:\GameServer\Example\DSP\tools\ExampleGameManager'
-$data = 'C:\GameServer\Example\DysonControlData'
+$deploymentDataRoot = 'C:\GameServer\Example\DysonControlData'
+$appDataRoot = Join-Path $deploymentDataRoot 'data'
+$recoverySnapshotRoot = Join-Path $appDataRoot 'migration\snapshots'
 $protectionId = 'save:00000000-0000-4000-8000-000000000001'
 $protectionDigest = '0000000000000000000000000000000000000000000000000000000000000000'
 $migration = "$artifact\scripts\windows\migration"
@@ -1116,7 +1149,7 @@ $migration = "$artifact\scripts\windows\migration"
   -ProjectRoot $project -GsManagerRoot $gsm
 
 & "$migration\New-DysonGsManagerSnapshot.ps1" `
-  -ProjectRoot $project -GsManagerRoot $gsm -DataRoot $data `
+  -ProjectRoot $project -GsManagerRoot $gsm -DataRoot $appDataRoot `
   -PairedSaveProtectionPointId $protectionId `
   -PairedSaveProtectionManifestSha256 $protectionDigest `
   -WhatIf
@@ -1129,13 +1162,16 @@ schema and exact file set:
 
 ```powershell
 & "$migration\Test-DysonGsManagerSnapshot.ps1" `
-  -DataRoot $data `
+  -DataRoot $appDataRoot `
   -SnapshotId '<opaque snapshot UUID>' `
   -ExpectedSnapshotManifestSha256 '<64-character snapshot manifest SHA-256>'
 ```
 
-The fixed snapshot layout is
-`DataRoot\migration\snapshots\<snapshotId>`. A same-parent private staging tree
+The fixed snapshot layout is `$recoverySnapshotRoot\<snapshotId>`, or
+`<application DataRoot>\migration\snapshots\<snapshotId>`. Snapshot creation,
+verification, restoration, and the later GSManager removal procedure must all
+use the same `$appDataRoot`; the deployment root is not the snapshot lookup root.
+A same-parent private staging tree
 is completely copied, re-inventoried, manifested, and self-verified before one
 directory rename publishes it. Failure removes the bounded partial directory and
 never publishes a half snapshot. Its protected ACL admits only the creating
@@ -1157,7 +1193,7 @@ write the target:
 
 ```powershell
 & "$migration\Restore-DysonGsManagerSnapshot.ps1" `
-  -ProjectRoot $project -GsManagerRoot $gsm -DataRoot $data `
+  -ProjectRoot $project -GsManagerRoot $gsm -DataRoot $appDataRoot `
   -SnapshotId '<opaque snapshot UUID>' `
   -ExpectedSnapshotManifestSha256 '<64-character snapshot manifest SHA-256>' `
   -PairedSaveProtectionPointId $protectionId `
@@ -1222,6 +1258,17 @@ host or production removal is evidenced, so `CUT-003` remains `not-started`.
 
 ## Bridge source-to-private-candidate deployment
 
+Controller and running Bridge versions can be managed separately. Set
+`DYSON_BRIDGE_PLUGIN_VERSION` explicitly in the protected configuration source
+to the installed plugin version whose protocol compatibility has been verified
+with the selected controller. The lifecycle heartbeat check requires that exact
+version; this setting does not disable signature or runtime checks. A
+controller-only reader fix therefore need not replace the Bridge or restart the
+game solely to align release labels. Omitting the setting uses the controller's
+default expected plugin version. Do not infer compatibility from a version pin:
+verify the signed heartbeat and the affected save/runtime evidence before
+accepting the combination.
+
 The main control-plane release never redistributes the licensed game/mod
 reference assemblies. It carries only the exact Bridge sources, `net472`
 project, disabled template, and scripts under `scripts\windows\bridge`. Build a
@@ -1267,7 +1314,20 @@ its state cannot be established.
   -WhatIf
 ```
 
-After confirmation, installation writes only the fixed
+For a game directory on a share, explicitly select a dedicated private runtime
+directory on the **game VM's** local NTFS volume with
+`-PrivateRuntimeRoot 'C:\ProgramData\ExampleBridge\current'`. Its direct parent
+must be a dedicated container, not a shared directory such as ProgramData.
+This does not relocate the
+game, plugin DLL, or saves. The private layout stores the secret at
+`C:\ProgramData\ExampleBridge\current\dyson-control-bridge.secret` and protocol files
+under `C:\ProgramData\ExampleBridge\current\control`; configure the control plane's
+`DYSON_BRIDGE_SECRET_FILE` and `DYSON_BRIDGE_CONTROL_ROOT` with those respective
+paths. Use the same explicit option for the approved install after preview.
+The installation state binds this layout so verification and recoverable
+uninstall/restore can distinguish it from the legacy server-tree layout.
+
+With the default legacy layout, installation writes only the fixed
 `BepInEx\plugins\dyson-control-bridge` plugin location and fixed BepInEx config,
 state, audit, secret, control-tree, and snapshot names. The old DLL/config/state are
 snapshotted before same-directory atomic publication. The generated secret has
@@ -1279,6 +1339,16 @@ account can process and publish the complete fixed protocol. Any failure restore
 the previous DLL/config/state and DACLs and removes only a newly generated
 secret/empty control directories. The installed config always starts with
 `Enabled = false`; the scripts never start or restart DSP.
+
+A successful `-WhatIf` does not prove that the target filesystem can preserve
+these ACLs: it deliberately does not write a secret or exercise `Set-Acl`.
+An SMB/NAS mapping may accept a write but normalize the resulting permissions
+differently from local NTFS. If installation reports an exact-ACL mismatch,
+do not enable the plugin or weaken the verifier. Inspect the failed transaction
+and independently confirm the previous DLL/config/state and secret preimage
+were restored. Keep game/save storage in its configured location; qualify the
+private communication storage separately under the actual control and game
+identities before retrying installation.
 
 `Test-DysonControlBridgeInstallation.ps1` is read-only. The uninstall script is
 dry-run capable, snapshots the current DLL/config/state, preserves the secret,
@@ -1396,6 +1466,52 @@ artifacts for investigation.
 For a parallel installation while GSManager still owns production, preview and
 apply only `PrepareDisabled` from an administrator PowerShell session:
 
+Initialize the separate GSManager authority before replacing its legacy task
+definitions. Use the application data directory for authority initialization:
+
+| Command or setting | Data directory in the example layout |
+| --- | --- |
+| `Install-DysonControl.ps1 -DataRoot` | `C:\GameServer\Example\DysonControlData` |
+| `DYSON_DATA_DIR` | `C:\GameServer\Example\DysonControlData\data` |
+| `Initialize-DysonGsManagerAuthority.ps1 -DataRoot` | `C:\GameServer\Example\DysonControlData\data` |
+| Authority profile consumed by the API | `C:\GameServer\Example\DysonControlData\data\authority-inventory\authority-profile.json` |
+| Runtime-task transaction root (default) | `C:\GameServer\Example\DysonControlData\runtime-task-transactions` |
+| GSManager recovery snapshot directory | `C:\GameServer\Example\DysonControlData\data\migration\snapshots` |
+
+The top-level installer derives this application directory by appending `data`
+to its deployment data root. Keep the runtime-task transaction root identical
+across authority initialization, the API configuration, and broker installation.
+
+If the candidate pair has already been prepared, the initializer
+also accepts `-PreparedLegacyTemplateRoot` and
+`-ExpectedLegacyTemplateSha256`. That directory must contain only
+`legacy-server.xml` and `legacy-stop.xml`, defining the fixed legacy scripts
+under the configured project. The digest is SHA-256 of the UTF-8 text
+`<lowercase server byte hash>:<lowercase stop byte hash>`. The initializer
+checks that both current candidate tasks are disabled and match the installed
+bootstrap, retains their real preimages, and creates separate GSManager task
+entries from the templates. It records `authoritySource=reconstructed-template`
+and the template digest; these templates are new desired definitions, not
+historical task backups. Preview the same request with `-WhatIf` before applying.
+
+The lifecycle broker can be installed while both candidate tasks are Disabled.
+Installation validates their complete definitions and records the expected
+active definitions without enabling the tasks. Mixed enabled/disabled pairs
+are rejected. The broker worker still requires both tasks to be active before
+dispatching a game operation; deployment readiness alone does not activate them.
+
+Before preparing game tasks, provision the separate game account's bootstrap
+state access with `scripts/windows/deployment/Set-DysonGameBootstrapAccess.ps1`
+from Windows PowerShell 5.1. Pass the installed `-BootstrapRoot` and the same
+`-GameServiceSid` used for Bridge installation; run `-WhatIf` first. The game
+must be stopped. The command grants state reads and creation of game-owned
+state files without granting write access to the active release pointer. It
+records the previous descriptors below `DataRoot/game-access-snapshots` and
+supports `-RestoreSnapshotId` with the returned `-ExpectedSnapshotSha256` while
+the stopped state tree is unchanged. Repeating an already-applied grant is a
+no-op. Verify the actual game account can read the bootstrap context and write
+its own state before activating its tasks.
+
 ```powershell
 $runtimeRequest = [guid]::NewGuid().ToString('D')
 $project = 'C:\GameServer\Example\DSP'
@@ -1429,15 +1545,25 @@ is configured. Otherwise it derives `runtime-task-transactions` beside the
 selected `DataRoot` (for the production layout,
 `C:\GameServer\Example\DysonControlData\runtime-task-transactions`) and never falls back to
 the process `%ProgramData%`. Receipts never print XML or local paths. The
-isolated regression gates are:
+installer retains completed transaction preimages in its private `completed`
+directory. To undo a successful installation, pass the original deployment
+arguments and mode, `-RestoreCompletedRequestId` with its original request ID,
+and a new `-RequestId`. Preview with `-WhatIf` first. This creates a separate
+rollback receipt and preserves the original evidence. It restores the archived
+Enabled state, so an old enabled task becomes enabled again. For an interrupted
+rollback, repeat its new request ID and exact arguments with `-Recover`.
+Older installations without a completed archive cannot be restored from a
+receipt alone. The isolated regression gates are:
 
 ```powershell
 npm run runtime-tasks:selftest
 npm run game-bootstrap:selftest
+npm run game-bootstrap:access-selftest
 npm run cutover:selftest
 ```
 
-They use file-backed fake scheduler/runtime fixtures and temporary fictional
+The access suite uses real ACLs on temporary local directories. The other suites
+use file-backed fake scheduler/runtime fixtures and temporary fictional
 roots only; they do not touch the native Task Scheduler, Steam, DSP, saves,
 GSManager, or production processes. `cutover:selftest` includes the authority,
 host, and 38-case cutover-broker suites. The broker suite covers cross-release
@@ -1688,6 +1814,19 @@ maintenance window:
     gates should a separate approved cutover remove GSManager.
 
 ## Operator inputs still required after release packaging
+
+Qualified-client storage rollback restores an adopted empty directory's captured
+owner, group, DACL, and inheritance control bits exactly. The rollback uses
+`SetFileSecurityW` for the captured directory descriptor; the ordinary ACL
+installer retains its existing inheritance behavior. Lifecycle and cutover
+broker rollback use the same primitive for their captured directory preimages,
+without propagating changes to descendants. This avoids the automatic
+`SE_DACL_AUTO_INHERITED` conversion described in Microsoft's Win32 documentation,
+"Automatic Propagation of Inheritable ACEs".
+A populated or redirected rollback target is rejected, audit rules are not
+rewritten, and the resulting SDDL must equal the captured preimage. Run
+`SelfTest-DysonDeploymentConfigurationIntegration.ps1` with an elevated Windows
+token to exercise real directory ACLs, including legacy and protected descriptors.
 
 The release workflow now closes build, artifact assembly, public scanning,
 deterministic ZIP, checksum, provenance, and GitHub asset publication. A Windows

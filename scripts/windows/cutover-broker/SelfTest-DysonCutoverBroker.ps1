@@ -1,9 +1,9 @@
-[CmdletBinding()]
-param()
+﻿[CmdletBinding()]
+param([switch]$FileAclOnly)
 
 if ($PSVersionTable.PSEdition -ne 'Desktop') {
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    & $windowsPowerShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $PSCommandPath
+    & $windowsPowerShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $PSCommandPath -FileAclOnly:$FileAclOnly
     exit $LASTEXITCODE
 }
 
@@ -196,12 +196,99 @@ function Get-SelfTestInstallArguments {
     return $arguments
 }
 
+function Test-SelfTestNativeAtomicFileAcl {
+    $parseErrors = $null; $parseTokens = $null
+    $installerAst = [Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $PSScriptRoot 'Install-DysonCutoverBrokerTask.ps1'), [ref]$parseTokens, [ref]$parseErrors)
+    Assert-SelfTest ($parseErrors.Count -eq 0) 'Installer parse failed.'
+    $atomicFunction = $installerAst.Find({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Set-InstallerFileAtomic'
+    }, $false)
+    . ([scriptblock]::Create($atomicFunction.Extent.Text))
+    $root = Join-Path $fixtureRoot 'native-file-acl'
+    [void][IO.Directory]::CreateDirectory($root)
+    $rawDriftCases = 0
+    foreach ($protected in @($false, $true)) {
+        foreach ($autoInherited in @($false, $true)) {
+            $path = Join-Path $root ('file-' + $protected + '-' + $autoInherited + '.json')
+            [IO.File]::WriteAllText($path, 'original')
+            $acl = Get-Acl -LiteralPath $path
+            if ($protected) { $acl.SetAccessRuleProtection($true, $true); Set-Acl -LiteralPath $path -AclObject $acl }
+            $initial = (Get-Acl -LiteralPath $path).Sddl
+            # Load the native helper, then independently establish the descriptor
+            # variants that File.Replace must preserve (including a legacy D:).
+            Restore-DysonCutoverBrokerFileSecurityPreimage -Path $path -Sddl $initial
+            $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($initial)
+            $flags = $descriptor.ControlFlags -band (-bnot [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited)
+            if ($autoInherited) { $flags = $flags -bor [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInheritRequired }
+            $descriptor.SetFlags($flags)
+            $binary = [byte[]]::new($descriptor.BinaryLength); $descriptor.GetBinaryForm($binary, 0)
+            Assert-SelfTest ([DysonControl.CutoverBrokerFileAclRestore]::SetFileSecurityW($path, 7, $binary)) 'Native file fixture ACL initialization failed.'
+            $before = (Get-Acl -LiteralPath $path).Sddl
+            $temporary = $path + '.raw'; $backup = $path + '.backup'
+            [IO.File]::WriteAllText($temporary, 'raw-replacement')
+            [IO.File]::Replace($temporary, $path, $backup)
+            if ((Get-Acl -LiteralPath $path).Sddl -cne $before) { $rawDriftCases++ }
+            Restore-DysonCutoverBrokerFileSecurityPreimage -Path $path -Sddl $before
+            [IO.File]::Delete($backup)
+            foreach ($content in @('candidate', 'original')) {
+                Set-InstallerFileAtomic -Path $path -Bytes ([Text.Encoding]::UTF8.GetBytes($content)) -MaximumBytes 4096
+                Assert-SelfTest ((Get-Acl -LiteralPath $path).Sddl -ceq $before -and
+                    [IO.File]::ReadAllText($path) -ceq $content) 'Atomic replacement/rollback changed exact file bytes or ACL.'
+            }
+            Assert-SelfTestErrorCode { Set-InstallerFileAtomic -Path $path -Bytes ([byte[]]@(1,2)) -MaximumBytes 1 } 'DYSON_CONTROL_CUTOVER_BROKER_STORAGE_UNAVAILABLE'
+            Assert-SelfTest ((Get-Acl -LiteralPath $path).Sddl -ceq $before -and
+                [IO.File]::ReadAllText($path) -ceq 'original') 'Rejected atomic write changed the file preimage.'
+        }
+    }
+    Assert-SelfTest ($rawDriftCases -gt 0) 'Native File.Replace ACL drift was not reproduced.'
+    $tests.Add('native-file-replace-exact-acl-forward-rollback-and-rejection')
+}
+
+function Test-SelfTestNativeChildExitCode {
+    $worker = Join-Path $PSScriptRoot 'Invoke-DysonCutoverBrokerWorker.ps1'
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($worker, [ref]$tokens, [ref]$parseErrors)
+    Assert-SelfTest ($parseErrors.Count -eq 0) 'The worker must parse before native child validation.'
+    foreach ($name in @('ConvertTo-WorkerCommandLineArgument', 'Invoke-WorkerBoundedChild')) {
+        $definitions = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+        }, $true))
+        Assert-SelfTest ($definitions.Count -eq 1) 'The native child helper binding is ambiguous.'
+        . ([scriptblock]::Create($definitions[0].Extent.Text))
+    }
+    $root = Join-Path $fixtureRoot 'native-child'
+    [void][IO.Directory]::CreateDirectory($root)
+    $child = Join-Path $root 'child.ps1'
+    $source = @'
+param([int]$ExitStatus)
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+Write-Output '{"ok":true}'
+exit $ExitStatus
+'@
+    [IO.File]::WriteAllText($child, $source, [Text.UTF8Encoding]::new($false))
+    $result = Invoke-WorkerBoundedChild -ScriptPath $child -ChildArguments @('-ExitStatus', '0') -WorkRoot $root -TimeoutSeconds 10
+    Assert-SelfTest ($result.ok -eq $true) 'A successful native child was not accepted.'
+    Assert-SelfTestErrorCode {
+        Invoke-WorkerBoundedChild -ScriptPath $child -ChildArguments @('-ExitStatus', '7') -WorkRoot $root -TimeoutSeconds 10
+    } 'DYSON_CONTROL_CUTOVER_BROKER_CHILD_FAILED'
+    Assert-SelfTest (@(Get-ChildItem $root -File | Where-Object Extension -in @('.stdout', '.stderr')).Count -eq 0) 'Native child output was not cleaned.'
+    $tests.Add('native-child-success-exit-and-nonzero-exit')
+}
+
 try {
     [void][IO.Directory]::CreateDirectory($fixtureRoot)
     $commonPath = Join-Path $PSScriptRoot 'DysonCutoverBroker.Common.ps1'
     $aclPath = Join-Path $PSScriptRoot 'DysonCutoverBroker.TaskAcl.ps1'
     . $commonPath
     . $aclPath
+    Test-SelfTestNativeAtomicFileAcl
+    if ($FileAclOnly) {
+        [pscustomobject]@{ protocol = 'DYSON_CONTROL_CUTOVER_BROKER_FILE_ACL_SELFTEST_V1'; status = 'passed'; tests = @($tests) } | ConvertTo-Json -Compress
+        exit 0
+    }
+    Test-SelfTestNativeChildExitCode
     $script:cutoverScriptRoot = Assert-DysonCutoverBrokerPlainDirectory (Split-Path $PSScriptRoot -Parent)
     $leaseCommon = Join-Path $script:cutoverScriptRoot 'DysonHostMutationLease.Common.ps1'
     $hostCommon = Join-Path $script:cutoverScriptRoot 'cutover\DysonCutoverHost.Common.ps1'
@@ -365,6 +452,13 @@ try {
         @($directoryIntent | Where-Object { $_.kind -eq 'private' -and $_.localService -eq 'none' }).Count -eq 1
     ) 'The broker storage ACL intent is not separated by channel.'
     $tests.Add('acl-intent')
+    $nativeAcl = Assert-DysonFixedTaskReadExecuteAclIntent 'D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;LS)'
+    Assert-SelfTest (-not $nativeAcl.localServiceWrite) 'native mapped task rights changed access intent'
+    $extraRightsRejected = $false
+    try { [void](Assert-DysonFixedTaskReadExecuteAclIntent 'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LS)') }
+    catch { $extraRightsRejected = $true }
+    Assert-SelfTest $extraRightsRejected 'mapped Local Service write access was accepted'
+    $tests.Add('native-mapped-task-rights')
 
     $profile = Read-DysonCutoverBrokerProfile $script:brokerRoot $script:brokerProfileFile
     Assert-SelfTest (
@@ -372,6 +466,137 @@ try {
         (Test-DysonCutoverBrokerSamePath $profile.cutoverScriptRoot $script:cutoverScriptRoot)
     ) 'The installed broker profile did not pin the script roots.'
     $tests.Add('fixed-profile')
+    Assert-SelfTest ($profile.previousStopScriptSha256 -ceq (Get-DysonCutoverBrokerSha256File (Join-Path $script:cutoverScriptRoot 'Stop-DysonServer.ps1'))) `
+        'The new profile did not pin the compatible previous-stop leaf.'
+    $legacyCore = [ordered]@{}
+    foreach ($property in $profile.PSObject.Properties) {
+        if ($property.Name -cnotin @('profileFingerprint','previousStopScriptSha256','cutoverEvidenceScriptSha256')) { $legacyCore[$property.Name] = $property.Value }
+    }
+    $legacyFingerprint = Get-DysonCutoverBrokerSha256Text (ConvertTo-DysonCutoverBrokerJson $legacyCore)
+    $legacyCore['profileFingerprint'] = $legacyFingerprint
+    $legacyProfile = ConvertTo-DysonCutoverBrokerValidatedProfile ([pscustomobject]$legacyCore)
+    Assert-SelfTest ($legacyProfile.profileFingerprint -ceq $legacyFingerprint -and
+        $null -eq $legacyProfile.PSObject.Properties['previousStopScriptSha256']) 'Old profile fingerprint changed during compatible parsing.'
+    $tests.Add('legacy-profile-readable-and-stop-leaf-bound')
+    $readId = [guid]::NewGuid().ToString('D')
+    $readRequest = New-DysonCutoverBrokerRequest -BrokerRequestId $readId -Capability 'CutoverEvidence' -RequestId ([guid]::NewGuid().ToString('D')) `
+        -AuthorityInventoryRevision $script:inventoryRevision -ProjectRoot $script:projectRoot -DataRoot $script:dataRoot `
+        -AuthorityProfileFile $script:authorityProfileFile -CutoverScriptRoot $script:cutoverScriptRoot `
+        -RuntimeBootstrapRoot $script:bootstrapRoot -RuntimeTaskTransactionRoot $script:transactionRoot `
+        -ServiceUser $script:serviceUser -GamePort $script:gamePort -CandidateMode $null -CandidateRecover $false
+    Assert-SelfTestErrorCode { Assert-DysonCutoverBrokerRequestBinding $readRequest $legacyProfile } 'DYSON_CONTROL_CUTOVER_BROKER_PROFILE_BINDING_MISMATCH'
+    $badRead = ConvertTo-DysonCutoverBrokerJson $readRequest | ConvertFrom-Json
+    $badRead.leaseInstanceId = [guid]::NewGuid().ToString('D')
+    $badRead.requestFingerprint = Get-DysonCutoverBrokerRequestFingerprint $badRead
+    Assert-SelfTestErrorCode { [void](ConvertTo-DysonCutoverBrokerValidatedRequest $badRead) } 'DYSON_CONTROL_CUTOVER_BROKER_REQUEST_INVALID'
+    $withoutLease = @('-BrokerRoot',$script:brokerRoot,'-BrokerProfileFile',$script:brokerProfileFile,
+        '-BrokerRequestId',$readId,'-Capability','CutoverEvidence','-RequestId',$readRequest.requestId,
+        '-AuthorityInventoryRevision',$script:inventoryRevision,'-ProjectRoot',$script:projectRoot,
+        '-DataRoot',$script:dataRoot,'-AuthorityProfileFile',$script:authorityProfileFile,
+        '-CutoverScriptRoot',$script:cutoverScriptRoot,'-RuntimeBootstrapRoot',$script:bootstrapRoot,
+        '-RuntimeTaskTransactionRoot',$script:transactionRoot,'-ServiceUser',$script:serviceUser,
+        '-GamePort',[string]$script:gamePort,'-SchedulerBackend','Shadow','-ShadowRoot',$script:shadowRoot)
+    $taskBeforeRead = Get-DysonCutoverBrokerSha256File (Join-Path $script:shadowRoot 'task-intent.json')
+    $readResult = Invoke-SelfTestPowerShell -Script (Join-Path $PSScriptRoot 'Submit-DysonCutoverBrokerRequest.ps1') -Arguments @($withoutLease)
+    $readEnvelope = ConvertFrom-SelfTestEnvelope $readResult
+    Assert-SelfTest ($readResult.exitCode -eq 0 -and $readEnvelope.capability -ceq 'CutoverEvidence' -and
+        $readEnvelope.childReceipt.protocol -ceq 'DYSON_CONTROL_CUTOVER_EVIDENCE_V1' -and
+        $readEnvelope.childReceipt.evidence.previousDefined -and
+        (Get-DysonCutoverBrokerSha256File (Join-Path $script:shadowRoot 'task-intent.json')) -ceq $taskBeforeRead) ('Bound read-only evidence failed: ' + $readResult.text)
+    $tests.Add('fixed-readonly-evidence-no-lease-legacy-binding-and-no-task-mutation')
+    & {
+        $tokens=$null; $errors=$null
+        $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'Submit-DysonCutoverBrokerRequest.ps1'),[ref]$tokens,[ref]$errors)
+        Assert-SelfTest ($errors.Count -eq 0) 'Submit script parse failed.'
+        $fn=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Start-SubmitBoundBrokerTask'},$false)
+        . ([scriptblock]::Create($fn.Extent.Text))
+        $script:readWakeCount=0; $script:readWakeState='Running'; $script:readWakeDrift=$false
+        function Get-ScheduledTask {
+            param($TaskName,$TaskPath)
+            [pscustomobject]@{TaskName=$profile.taskName;TaskPath=$profile.taskPath;State=$script:readWakeState
+                Principal=[pscustomobject]@{UserId='SYSTEM';LogonType='ServiceAccount';RunLevel='Highest'}
+                Actions=@([pscustomobject]@{Execute=(Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe');Arguments=$(if($script:readWakeDrift){'wrong-fixed-action'}else{Get-DysonCutoverBrokerTaskArguments $profile})})}
+        }
+        function Start-ScheduledTask {param($TaskName,$TaskPath);$script:readWakeCount++}
+        Start-SubmitBoundBrokerTask $profile -OnlyIfIdle
+        Assert-SelfTest ($script:readWakeCount -eq 0) 'A busy broker was re-triggered by read wake recovery.'
+        $script:readWakeState='Ready'; Start-SubmitBoundBrokerTask $profile -OnlyIfIdle
+        Assert-SelfTest ($script:readWakeCount -eq 1) 'An idle broker did not receive the lost read wake.'
+        $script:readWakeDrift=$true
+        Assert-SelfTestErrorCode {Start-SubmitBoundBrokerTask $profile -OnlyIfIdle} 'DYSON_CONTROL_CUTOVER_BROKER_TASK_INVALID'
+        Assert-SelfTest ($script:readWakeCount -eq 1) 'Read wake recovery triggered a drifted task.'
+    }
+    $tests.Add('read-wake-rechecks-fixed-task-and-waits-for-idle')
+    $wakeWrapper = Join-Path $fixtureRoot 'read-wake-scheduler-fixture.ps1'
+    $wakeSource = @'
+param([string]$CaseFile)
+$ErrorActionPreference='Stop'
+$global:cutoverWakeConfig=Get-Content -LiteralPath $CaseFile -Raw | ConvertFrom-Json
+. (Join-Path $global:cutoverWakeConfig.scripts 'DysonCutoverBroker.Common.ps1')
+$global:cutoverWakeProfile=Read-DysonCutoverBrokerProfile $global:cutoverWakeConfig.brokerRoot $global:cutoverWakeConfig.profileFile
+$global:cutoverWakeBusy=$true
+function global:Get-ScheduledTask {
+    [CmdletBinding()]param($TaskName,$TaskPath)
+    [IO.File]::AppendAllText(($global:cutoverWakeConfig.log+'.trace'),"get-task`n")
+    [pscustomobject]@{TaskName=$global:cutoverWakeProfile.taskName;TaskPath=$global:cutoverWakeProfile.taskPath;State=$(if($global:cutoverWakeBusy){'Running'}else{'Ready'})
+        Principal=[pscustomobject]@{UserId='SYSTEM';LogonType='ServiceAccount';RunLevel='Highest'}
+        Actions=@([pscustomobject]@{Execute=(Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe');Arguments=(Get-DysonCutoverBrokerTaskArguments $global:cutoverWakeProfile)})}
+}
+function global:Start-ScheduledTask {
+    [CmdletBinding()]param($TaskName,$TaskPath)
+    if($global:cutoverWakeBusy){
+        # The old worker's captured request set is empty. The new queued request
+        # is invisible to that pass and IgnoreNew consumes its initial wake.
+        [IO.File]::AppendAllText($global:cutoverWakeConfig.log,"ignored-after-enumeration`n")
+        if(-not $global:cutoverWakeConfig.stayBusy){$global:cutoverWakeBusy=$false}
+        return
+    }
+    [IO.File]::AppendAllText($global:cutoverWakeConfig.log,"dispatch-same-request`n")
+    & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $global:cutoverWakeConfig.scripts 'Invoke-DysonCutoverBrokerWorker.ps1') -BrokerRoot $global:cutoverWakeConfig.brokerRoot -BrokerProfileFile $global:cutoverWakeConfig.profileFile -SchedulerBackend Shadow -ShadowRoot $global:cutoverWakeConfig.shadow -OnceBrokerRequestId $global:cutoverWakeConfig.requestId | Out-Null
+}
+$tokens=[string[]]$global:cutoverWakeConfig.arguments
+$argsForSubmit=@{}
+for($i=0;$i -lt $tokens.Length;$i+=2){$argsForSubmit[$tokens[$i].TrimStart('-')]=$tokens[$i+1]}
+try { & (Join-Path $global:cutoverWakeConfig.scripts 'Submit-DysonCutoverBrokerRequest.ps1') @argsForSubmit; exit $LASTEXITCODE } catch { [pscustomobject]@{fixtureError=$_.Exception.Message}|ConvertTo-Json -Compress; exit 1 }
+'@
+    [IO.File]::WriteAllText($wakeWrapper,$wakeSource,[Text.UTF8Encoding]::new($false))
+    foreach($wakeMode in @('read-success','read-timeout','mutation-no-retry')) {
+        $wakeId=[guid]::NewGuid().ToString('D')
+        $wakeArgs=[Collections.Generic.List[string]]::new()
+        for($i=0;$i -lt $withoutLease.Count;$i++) {
+            if($withoutLease[$i] -ceq '-ShadowRoot'){$i++;continue}
+            $wakeArgs.Add($withoutLease[$i])
+        }
+        $wakeArgs[$wakeArgs.IndexOf('-BrokerRequestId')+1]=$wakeId
+        $wakeArgs[$wakeArgs.IndexOf('-SchedulerBackend')+1]='Windows'
+        $wakeArgs.Add('-TimeoutSeconds');$wakeArgs.Add('10')
+        if($wakeMode -ceq 'mutation-no-retry') {
+            $wakeArgs[$wakeArgs.IndexOf('-Capability')+1]='StopCandidateRuntime'
+            $wakeArgs.Add('-LeaseInstanceId');$wakeArgs.Add([guid]::NewGuid().ToString('D'))
+            $wakeArgs.Add('-LeaseToken');$wakeArgs.Add(('x'*43))
+        }
+        $wakeLog=Join-Path $fixtureRoot ($wakeId+'.wake.log')
+        $wakeCase=Join-Path $fixtureRoot ($wakeId+'.case.json')
+        [IO.File]::WriteAllText($wakeCase,([ordered]@{scripts=$PSScriptRoot;brokerRoot=$script:brokerRoot;profileFile=$script:brokerProfileFile;shadow=$script:shadowRoot;requestId=$wakeId;log=$wakeLog;stayBusy=($wakeMode -ceq 'read-timeout');arguments=@($wakeArgs)}|ConvertTo-Json -Depth 5 -Compress),[Text.UTF8Encoding]::new($false))
+        $timer=[Diagnostics.Stopwatch]::StartNew()
+        $wakeResult=Invoke-SelfTestPowerShell -Script $wakeWrapper -Arguments @('-CaseFile',$wakeCase)
+        $timer.Stop();Assert-SelfTest (Test-Path -LiteralPath $wakeLog) ('Scheduler fixture did not start: '+$wakeResult.text+'; queried='+[string](Test-Path ($wakeLog+'.trace')));$wakeEvents=@([IO.File]::ReadAllLines($wakeLog))
+        if($wakeMode -ceq 'read-success') {
+            $envelope=ConvertFrom-SelfTestEnvelope $wakeResult
+            Assert-SelfTest ($wakeResult.exitCode -eq 0 -and $envelope.brokerRequestId -ceq $wakeId -and
+                $envelope.childReceipt.protocol -ceq 'DYSON_CONTROL_CUTOVER_EVIDENCE_V1' -and
+                ($wakeEvents -join ',') -ceq 'ignored-after-enumeration,dispatch-same-request') ('Lost read wake did not converge: '+$wakeResult.text)
+            $replayed=Invoke-SelfTestPowerShell -Script $wakeWrapper -Arguments @('-CaseFile',$wakeCase)
+            Assert-SelfTest ($replayed.exitCode -eq 0 -and @([IO.File]::ReadAllLines($wakeLog)).Count -eq 2) 'An existing evidence receipt triggered another worker.'
+        }
+        else {
+            $envelope=ConvertFrom-SelfTestEnvelope $wakeResult
+            Assert-SelfTest ($wakeResult.exitCode -eq 1 -and $envelope.error.code -ceq 'DYSON_CONTROL_CUTOVER_BROKER_TIMEOUT' -and
+                ($wakeEvents -join ',') -ceq 'ignored-after-enumeration' -and $timer.Elapsed.TotalSeconds -lt 20) ('Read timeout/mutation no-retry bound failed: '+$wakeResult.text+'; exit='+$wakeResult.exitCode+'; seconds='+$timer.Elapsed.TotalSeconds+'; events='+($wakeEvents -join ','))
+            Remove-DysonCutoverBrokerPlainFile (Join-Path $script:brokerRoot ('requests\'+$wakeId+'.json'))
+        }
+    }
+    $tests.Add('lost-read-wake-full-submit-converges-receipt-stops-and-mutation-never-retries')
 
     Assert-SelfTestErrorCode {
         [void](Get-DysonCutoverBrokerFullPath (Join-Path $fixtureRoot 'project\..\project'))
@@ -583,6 +808,41 @@ try {
         'An interrupted intent was redispatched instead of failing closed.'
     $tests.Add('interrupted-intent')
 
+    foreach ($reconcile in @($false, $true)) {
+        $resumeRequest = New-DysonCutoverBrokerRequest -BrokerRequestId ([guid]::NewGuid().ToString('D')) `
+            -Capability 'StopPreviousRuntime' -RequestId ([guid]::NewGuid().ToString('D')) `
+            -AuthorityInventoryRevision $script:inventoryRevision -ProjectRoot $script:projectRoot `
+            -DataRoot $script:dataRoot -AuthorityProfileFile $script:authorityProfileFile `
+            -CutoverScriptRoot $script:cutoverScriptRoot -RuntimeBootstrapRoot $script:bootstrapRoot `
+            -RuntimeTaskTransactionRoot $script:transactionRoot -ServiceUser $script:serviceUser `
+            -GamePort $script:gamePort -LeaseInstanceId $script:lease.InstanceId -LeaseToken $script:lease.Token `
+            -CandidateMode $null -CandidateRecover $false -PreviousStopReconcileOnly $reconcile
+        if ($reconcile) {
+            $tampered = ConvertTo-DysonCutoverBrokerJson $resumeRequest | ConvertFrom-Json
+            $tampered.PSObject.Properties.Remove('previousStopReconcileOnly')
+            Assert-SelfTestErrorCode { [void](ConvertTo-DysonCutoverBrokerValidatedRequest $tampered) } 'DYSON_CONTROL_CUTOVER_BROKER_REQUEST_INVALID'
+        }
+        $resumePaths = Get-DysonCutoverBrokerRecordPaths $storage $resumeRequest.brokerRequestId
+        Write-DysonCutoverBrokerJsonNew $resumePaths.request $resumeRequest $script:DysonCutoverBrokerMaximumRequestBytes
+        $resumeIntent = [pscustomobject][ordered]@{
+            protocol = 'DYSON_CONTROL_CUTOVER_BROKER_INTENT_V1'; schemaVersion = 1
+            brokerRequestId = $resumeRequest.brokerRequestId; requestFingerprint = $resumeRequest.requestFingerprint
+            capability = $resumeRequest.capability; requestId = $resumeRequest.requestId
+            authorityInventoryRevision = $resumeRequest.authorityInventoryRevision
+            state = 'dispatching'; createdAt = (Get-Date).ToUniversalTime().ToString('o')
+        }
+        Write-DysonCutoverBrokerJsonNew $resumePaths.intent $resumeIntent $script:DysonCutoverBrokerMaximumRequestBytes
+        $resumed = Invoke-SelfTestPowerShell -Script (Join-Path $PSScriptRoot 'Invoke-DysonCutoverBrokerWorker.ps1') -Arguments @(
+            '-BrokerRoot', $script:brokerRoot, '-BrokerProfileFile', $script:brokerProfileFile,
+            '-SchedulerBackend', 'Shadow', '-ShadowRoot', $script:shadowRoot, '-OnceBrokerRequestId', $resumeRequest.brokerRequestId
+        )
+        $resumedReceipt = Read-DysonCutoverBrokerJson $resumePaths.receipt $script:DysonCutoverBrokerMaximumReceiptBytes
+        $expectedAction = if ($reconcile) { 'ReconcilePreviousStop' } else { 'StopPreviousRuntime' }
+        Assert-SelfTest ($resumed.exitCode -eq 0 -and $resumedReceipt.state -ceq 'succeeded' -and
+            $resumedReceipt.childReceipt.action -ceq $expectedAction) 'Bound previous-stop intent did not resume with its exact cleanup mode.'
+    }
+    $tests.Add('previous-stop-intent-resume-and-reconcile-fingerprint')
+
     $env:DYSON_CUTOVER_BROKER_SELFTEST_CHILD_MODE = 'oversize'
     $oversizeInvocation = Invoke-SelfTestPowerShell -Script $submitScript -Arguments `
         (Get-SelfTestSubmitArguments -BrokerRequestId ([guid]::NewGuid().ToString('D')) `
@@ -641,6 +901,10 @@ try {
     $installReceiptsBeforeUpgrade = @(Get-ChildItem -LiteralPath $installationReceiptRoot -File |
         ForEach-Object { $_.Name } | Sort-Object -CaseSensitive)
     $oldProfileFingerprint = [string]$profile.profileFingerprint
+    $upgradeFileAcls = @{}
+    foreach ($path in @($script:brokerProfileFile, $bundleBindingPath, $taskIntentPath, $directoryAclIntentPath)) {
+        $upgradeFileAcls[$path] = (Get-Acl -LiteralPath $path).Sddl
+    }
 
     foreach ($failureStage in @(
         'after-snapshot', 'after-old-task-disabled', 'after-profile',
@@ -666,6 +930,7 @@ try {
             $failedUpgrade.exitCode -eq 1 -and
             [string]$failedUpgradeEnvelope.error.code -ceq 'DYSON_CONTROL_CUTOVER_BROKER_INSTALL_FAILED' -and
             [string]$failedTransaction.state -ceq 'rolled-back' -and
+            @($upgradeFileAcls.Keys | Where-Object { (Get-Acl -LiteralPath $_).Sddl -cne $upgradeFileAcls[$_] }).Count -eq 0 -and
             [string]$failedTransaction.previousProfileFingerprint -ceq $oldProfileFingerprint -and
             [string]$failedTransaction.candidateProfileFingerprint -cmatch '^[0-9a-f]{64}$' -and
             [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:brokerProfileFile)) -ceq

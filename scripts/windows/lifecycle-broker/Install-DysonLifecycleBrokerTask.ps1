@@ -144,6 +144,14 @@ function Set-InstallerDirectoryAcl {
                 $localService, $rights, [Security.AccessControl.InheritanceFlags]::None,
                 [Security.AccessControl.PropagationFlags]::None, $allow
             ))
+            # The publisher must rename and read back the file it just created.
+            # Existing SYSTEM/administrator-owned requests remain protected.
+            $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new('S-1-3-0'),
+                ([Security.AccessControl.FileSystemRights]::Read -bor [Security.AccessControl.FileSystemRights]::Delete),
+                [Security.AccessControl.InheritanceFlags]::ObjectInherit,
+                [Security.AccessControl.PropagationFlags]::InheritOnly, $allow
+            ))
         }
         Set-Acl -LiteralPath $resolved -AclObject $security -ErrorAction Stop
     }
@@ -257,7 +265,7 @@ function Ensure-InstallerTaskFolder {
     try {
         $service = New-Object -ComObject 'Schedule.Service'; $service.Connect()
         $root = $service.GetFolder('\')
-        try { $folder = $service.GetFolder($script:InstallerTaskPath) }
+        try { $folder = $service.GetFolder($script:InstallerTaskPath.TrimEnd('\')) }
         catch { $folder = $root.CreateFolder('DysonControl') }
     }
     finally {
@@ -468,12 +476,8 @@ function Restore-InstallerTaskSnapshot {
 
 function Assert-InstallerRuntimeTaskBindings {
     param([Parameter(Mandatory)]$Profile)
-    $server = Get-DysonLifecycleBrokerTaskDescriptor -Profile $Profile -Kind server -Backend $Backend -ShadowRoot $ShadowRoot
-    $stop = Get-DysonLifecycleBrokerTaskDescriptor -Profile $Profile -Kind stop -Backend $Backend -ShadowRoot $ShadowRoot
-    if ((Get-DysonLifecycleBrokerTaskDescriptorHash $server.descriptor) -cne [string]$Profile.serverTask.descriptorHash -or
-        (Get-DysonLifecycleBrokerTaskDescriptorHash $stop.descriptor) -cne [string]$Profile.stopTask.descriptorHash) {
-        Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID'
-    }
+    [void](Assert-DysonLifecycleBrokerTaskPair -Profile $Profile -Backend $Backend `
+        -ShadowRoot $ShadowRoot -AllowPreparedDisabled)
 }
 
 function New-InstallerCandidateProfile {
@@ -491,10 +495,10 @@ function New-InstallerCandidateProfile {
         stopTask = [pscustomobject][ordered]@{ name = 'Dyson-Nebula-Stop'; path = '\'; descriptorHash = ('0' * 64) }
         dependencyHashes = @(); dispatchReadyTimeoutSeconds = $DispatchReadyTimeoutSeconds; createdAt = $CreatedAt
     }
-    $server = Get-DysonLifecycleBrokerTaskDescriptor -Profile $provisional -Kind server -Backend $Backend -ShadowRoot $ShadowRoot
-    $stop = Get-DysonLifecycleBrokerTaskDescriptor -Profile $provisional -Kind stop -Backend $Backend -ShadowRoot $ShadowRoot
-    $provisional.serverTask.descriptorHash = Get-DysonLifecycleBrokerTaskDescriptorHash $server.descriptor
-    $provisional.stopTask.descriptorHash = Get-DysonLifecycleBrokerTaskDescriptorHash $stop.descriptor
+    $pair = Get-DysonLifecycleBrokerValidatedTaskPair -Profile $provisional -Backend $Backend `
+        -ShadowRoot $ShadowRoot -AllowPreparedDisabled
+    $provisional.serverTask.descriptorHash = Get-DysonLifecycleBrokerExpectedActiveDescriptorHash $pair.server.descriptor
+    $provisional.stopTask.descriptorHash = Get-DysonLifecycleBrokerExpectedActiveDescriptorHash $pair.stop.descriptor
     $provisional.dependencyHashes = New-InstallerDependencyHashes $provisional
     $profile = ConvertTo-DysonLifecycleBrokerValidatedProfile $provisional
     Assert-DysonLifecycleBrokerDependencies $profile

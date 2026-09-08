@@ -13,7 +13,7 @@ function Assert-DeploymentStatusFixture {
 
 function Test-DeploymentStatusRejected {
     param([Parameter(Mandatory)][scriptblock]$Operation)
-    try { & $Operation; return $false }
+    try { [void](& $Operation); return $false }
     catch { return $true }
 }
 
@@ -55,6 +55,115 @@ function Write-DeploymentStatusEnvironment {
         ($lines -join "`n") + "`n",
         [System.Text.UTF8Encoding]::new($false)
     )
+}
+
+function Assert-DeploymentReadinessHttpBudget {
+    Assert-DeploymentStatusFixture (-not (Test-DeploymentStatusRejected { $true })) `
+        'the rejection helper mistook successful output for a rejected operation'
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+public sealed class DysonDeploymentReadinessFixture : IDisposable {
+    readonly TcpListener listener = new TcpListener(IPAddress.Loopback, 0);
+    readonly ManualResetEvent stopped = new ManualResetEvent(false);
+    readonly Thread worker;
+    readonly int delay;
+    readonly string response;
+    TcpClient current;
+    public int Port { get; private set; }
+    public int Requests;
+    public DysonDeploymentReadinessFixture(int delayMilliseconds, string version, string body) {
+        delay = delayMilliseconds;
+        response = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n" +
+            "X-Dyson-Control-Release: " + version + "\r\nContent-Length: " +
+            Encoding.UTF8.GetByteCount(body) + "\r\n\r\n" + body;
+        listener.Start(); Port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        worker = new Thread(Run); worker.IsBackground = true; worker.Start();
+    }
+    void Run() {
+        while (!stopped.WaitOne(0)) {
+            try {
+                using (var client = listener.AcceptTcpClient()) {
+                    current = client;
+                    using (var stream = client.GetStream()) {
+                        stream.ReadTimeout = 5000;
+                        var reader = new StreamReader(stream, Encoding.ASCII, false, 1024, true);
+                        string line;
+                        while ((line = reader.ReadLine()) != null && line.Length != 0) {}
+                        Interlocked.Increment(ref Requests);
+                        if (stopped.WaitOne(delay)) return;
+                        var bytes = Encoding.UTF8.GetBytes(response);
+                        stream.Write(bytes, 0, bytes.Length); stream.Flush();
+                    }
+                }
+            } catch { if (stopped.WaitOne(0)) return; }
+            finally { current = null; }
+        }
+    }
+    public void Dispose() {
+        stopped.Set(); listener.Stop();
+        var client = current; if (client != null) client.Close();
+        worker.Join(2000);
+    }
+}
+'@
+    $validBody = '{"status":"ready","deploymentVersion":"1.0.0","checks":{"api":"pass","storage":"pass","lifecycleBroker":"pass"}}'
+    $server = [DysonDeploymentReadinessFixture]::new(2500, '1.0.0', $validBody)
+    try {
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $healthy = Test-DysonLoopbackReadiness -ReadinessUri ('http://127.0.0.1:' + $server.Port + '/readyz') `
+            -ExpectedVersion '1.0.0' -RequiredChecks lifecycleBroker -TimeoutSeconds 8
+        Assert-DeploymentStatusFixture ($healthy -and $timer.ElapsedMilliseconds -ge 2400 -and
+            $timer.ElapsedMilliseconds -lt 8000 -and $server.Requests -eq 1) `
+            'a valid readiness response slower than two seconds was not accepted within its total budget'
+    }
+    finally { $server.Dispose() }
+    $server = [DysonDeploymentReadinessFixture]::new(3500, '1.0.0', $validBody)
+    try {
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $rejected = Test-DeploymentStatusRejected {
+            Test-DysonLoopbackReadiness -ReadinessUri ('http://127.0.0.1:' + $server.Port + '/readyz') `
+                -ExpectedVersion '1.0.0' -RequiredChecks lifecycleBroker -TimeoutSeconds 1
+        }
+        # TimeoutSec has whole-second precision; allow bounded cancellation and
+        # scheduler overhead, but never wait for the valid 3.5-second response.
+        Assert-DeploymentStatusFixture ($rejected -and $server.Requests -ge 1 -and
+            $timer.ElapsedMilliseconds -ge 900 -and $timer.ElapsedMilliseconds -lt 3000) `
+            'readiness exceeded its overall failure budget or accepted a late response'
+    }
+    finally { $server.Dispose() }
+    foreach ($invalid in @(
+        @{ header = '1.0.1'; body = $validBody },
+        @{ header = '1.0.0'; body = $validBody.Replace('"deploymentVersion":"1.0.0"', '"deploymentVersion":"1.0.1"') },
+        @{ header = '1.0.0'; body = $validBody.Replace('"status":"ready"', '"status":"starting"') },
+        @{ header = '1.0.0'; body = $validBody.Replace('"lifecycleBroker":"pass"', '"lifecycleBroker":"fail"') },
+        @{ header = '1.0.0'; body = $validBody.Replace('"lifecycleBroker":"pass"', '"other":"pass"') }
+    )) {
+        $server = [DysonDeploymentReadinessFixture]::new(0, $invalid.header, $invalid.body)
+        try {
+            Assert-DeploymentStatusFixture (Test-DeploymentStatusRejected {
+                Test-DysonLoopbackReadiness -ReadinessUri ('http://127.0.0.1:' + $server.Port + '/readyz') `
+                    -ExpectedVersion '1.0.0' -RequiredChecks lifecycleBroker -TimeoutSeconds 1
+            }) 'readiness accepted a wrong version, header, status or required check'
+        }
+        finally { $server.Dispose() }
+    }
+    & {
+        # Model a client returning after a timeout boundary despite cancellation.
+        function Invoke-WebRequest {
+            param($Uri, [switch]$UseBasicParsing, [int]$TimeoutSec, $ErrorAction)
+            Start-Sleep -Milliseconds 1200
+            [pscustomobject]@{ StatusCode = 200; Content = $validBody; Headers = @{ 'X-Dyson-Control-Release' = '1.0.0' } }
+        }
+        Assert-DeploymentStatusFixture (Test-DeploymentStatusRejected {
+            Test-DysonLoopbackReadiness -ReadinessUri 'http://127.0.0.1:1/readyz' `
+                -ExpectedVersion '1.0.0' -TimeoutSeconds 1
+        }) 'readiness accepted a response returned after its overall deadline'
+    }
 }
 
 $temporaryBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
@@ -313,6 +422,8 @@ try {
         -not [bool]$disabledClean.ready -and [string]$disabledClean.state -ceq 'disabled-clean') `
         -Message 'a disabled broker with only empty durable storage was not treated as clean'
 
+    Assert-DeploymentReadinessHttpBudget
+
     [ordered]@{
         protocol = 'DYSON_CONTROL_DEPLOYMENT_STATUS_SELFTEST_V1'
         state = 'passed'
@@ -324,6 +435,8 @@ try {
         disabledResidualTaskRejected = $true
         disabledCleanStateValidated = $true
         controlTaskContractNegativeMatrixValidated = $true
+        slowReadinessWithinBudgetValidated = $true
+        readinessDeadlineAndResponseContractValidated = $true
         brokerStatusSubmitted = $false
         productionChanged = $false
     } | ConvertTo-Json -Depth 5 -Compress

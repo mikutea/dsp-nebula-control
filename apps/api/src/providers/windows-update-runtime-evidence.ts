@@ -14,7 +14,6 @@ export const WINDOWS_UPDATE_RUNTIME_EVIDENCE_FILE = 'loaded-save-evidence' as co
 export const WINDOWS_UPDATE_RUNTIME_SESSION_FILE = 'runtime-session' as const
 
 const fixedSaveName = '_lastexit_'
-const fixedSaveNameBase64Url = 'X2xhc3RleGl0Xw'
 const maximumEvidenceBytes = 4_096
 const maximumSecretBytes = 1_024
 const futureToleranceMs = 5_000
@@ -34,7 +33,7 @@ const runtimeKeys = [
   'observationGeneration',
   'observedAtUnixMs',
   'writtenAtUnixMs',
-  'saveNameB64',
+  'saveName',
   'dsvBytes',
   'dsvWriteTimeUtcTicks',
   'dsvSha256',
@@ -227,8 +226,8 @@ export function buildWindowsUpdateRuntimeEvidence(
     observationGeneration: formatPositiveInteger(input.observationGeneration),
     observedAtUnixMs: formatPositiveInteger(input.observedAtUnixMs),
     writtenAtUnixMs: formatPositiveInteger(input.writtenAtUnixMs),
-    saveNameB64: input.saveName === undefined || input.saveName === fixedSaveName
-      ? fixedSaveNameBase64Url
+    saveName: input.saveName === undefined || input.saveName === fixedSaveName
+      ? fixedSaveName
       : invalid(),
     dsvBytes: formatPositiveInteger(input.dsvBytes),
     dsvWriteTimeUtcTicks: formatPositiveInt64(input.dsvWriteTimeUtcTicks),
@@ -251,7 +250,7 @@ export function parseWindowsUpdateRuntimeEvidence(
   const { values, hmac } = parseCanonical(payload, runtimeKeys)
   assertHmac(runtimeKeys.map((key) => values[key]), hmac, validateSecret(secretInput))
   if (values.protocol !== WINDOWS_UPDATE_RUNTIME_EVIDENCE_PROTOCOL ||
-      values.saveNameB64 !== fixedSaveNameBase64Url) invalid()
+      values.saveName !== fixedSaveName) invalid()
   const record: WindowsUpdateRuntimeEvidenceRecord = {
     protocol: WINDOWS_UPDATE_RUNTIME_EVIDENCE_PROTOCOL,
     sessionId: requireCanonicalGuid(values.sessionId),

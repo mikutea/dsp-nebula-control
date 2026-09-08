@@ -287,7 +287,9 @@ function Write-DysonLifecycleBrokerJsonNew {
     }
     finally {
         if (Test-Path -LiteralPath $temporary -PathType Leaf) {
-            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+            # Remove-Item -Force may request WriteAttributes. The publisher has
+            # delete access to its own temporary file, not content-write access.
+            try { [IO.File]::Delete($temporary) } catch { }
         }
     }
     return $full
@@ -630,7 +632,7 @@ function Get-DysonLifecycleBrokerAclIntent {
     param([Parameter(Mandatory)][string]$LocalServiceSid)
     return [pscustomobject][ordered]@{
         root = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl', "${LocalServiceSid}:ReadAndExecute")
-        requests = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl', "${LocalServiceSid}:CreateFiles+AppendData+ListDirectory+ReadAttributes+Synchronize")
+        requests = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl', "${LocalServiceSid}:CreateFiles+AppendData+ListDirectory+ReadAttributes+Synchronize", 'CREATOR OWNER:Read+Delete (files only)')
         intents = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl')
         receipts = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl', "${LocalServiceSid}:ReadAndExecute")
         profile = @('SYSTEM:FullControl', 'BUILTIN\\Administrators:FullControl', "${LocalServiceSid}:Read")
@@ -642,11 +644,12 @@ function ConvertTo-DysonLifecycleBrokerTaskDescriptor {
     param(
         [Parameter(Mandatory)]$Task,
         [Parameter(Mandatory)][ValidateSet('server', 'stop')][string]$Kind,
-        [Parameter(Mandatory)]$Profile
+        [Parameter(Mandatory)]$Profile,
+        [switch]$AllowPreparedDisabled
     )
     try {
         $expectedName = if ($Kind -ceq 'server') { 'Dyson-Nebula-Server' } else { 'Dyson-Nebula-Stop' }
-        $actions = @($Task.Actions)
+        $actions = @($Task.Actions | Where-Object { $null -ne $_ })
         if ([string]$Task.TaskName -cne $expectedName -or [string]$Task.TaskPath -cne '\' -or $actions.Count -ne 1) {
             Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID'
         }
@@ -690,9 +693,10 @@ function ConvertTo-DysonLifecycleBrokerTaskDescriptor {
         }
         else { [string]$Task.Settings.RestartInterval }
         $startWhenAvailable = [bool]$Task.Settings.StartWhenAvailable
-        if (-not [string]::Equals($principalLeaf, $expectedLeaf, [StringComparison]::OrdinalIgnoreCase) -or
+        if (-not (Test-DysonLifecycleBrokerTaskUserEqual ([string]$Task.Principal.UserId) ([string]$Profile.serviceUser)) -or
             [string]$Task.Principal.LogonType -cne 'Interactive' -or [string]$Task.Principal.RunLevel -cne 'Limited' -or
-            [string]$Task.Settings.MultipleInstances -cne 'IgnoreNew' -or -not [bool]$Task.Settings.Enabled) {
+            [string]$Task.Settings.MultipleInstances -cne 'IgnoreNew' -or
+            (-not $AllowPreparedDisabled -and -not [bool]$Task.Settings.Enabled)) {
             Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID'
         }
         if (($Kind -ceq 'server' -and ($executionTimeLimit -cne 'PT0S' -or $restartCount -ne 3 -or
@@ -701,12 +705,12 @@ function ConvertTo-DysonLifecycleBrokerTaskDescriptor {
             $null -ne $restartInterval -or $startWhenAvailable))) {
             Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID'
         }
-        $triggers = @($Task.Triggers)
+        $triggers = @($Task.Triggers | Where-Object { $null -ne $_ })
         $trigger = if ($Kind -ceq 'server') {
             if ($triggers.Count -ne 1) { Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID' }
             [ordered]@{
                 count = 1
-                userId = ([string]$triggers[0].UserId -split '\\')[-1].ToLowerInvariant()
+                userId = $expectedLeaf.ToLowerInvariant()
                 delay = [string]$triggers[0].Delay
             }
         }
@@ -715,7 +719,7 @@ function ConvertTo-DysonLifecycleBrokerTaskDescriptor {
             [ordered]@{ count = 0; userId = $null; delay = $null }
         }
         if ($Kind -ceq 'server' -and
-            (-not [string]::Equals([string]$trigger.userId, $expectedLeaf, [StringComparison]::OrdinalIgnoreCase) -or
+            (-not (Test-DysonLifecycleBrokerTaskUserEqual ([string]$triggers[0].UserId) ([string]$Profile.serviceUser)) -or
             [string]$trigger.delay -cne 'PT20S')) {
             Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID'
         }
@@ -725,10 +729,10 @@ function ConvertTo-DysonLifecycleBrokerTaskDescriptor {
             execute = $actualPowerShell.ToLowerInvariant()
             arguments = $arguments
             workingDirectory = ''
-            userId = $principalLeaf.ToLowerInvariant()
+            userId = $expectedLeaf.ToLowerInvariant()
             logonType = 'Interactive'
             runLevel = 'Limited'
-            enabled = $true
+            enabled = [bool]$Task.Settings.Enabled
             multipleInstances = 'IgnoreNew'
             executionTimeLimit = $executionTimeLimit
             restartCount = $restartCount
@@ -743,12 +747,27 @@ function ConvertTo-DysonLifecycleBrokerTaskDescriptor {
     }
 }
 
+function Test-DysonLifecycleBrokerTaskUserEqual {
+    param([string]$Actual, [string]$Expected)
+    if (-not [string]::IsNullOrWhiteSpace($Actual) -and
+        [string]::Equals($Actual, $Expected, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    try {
+        $sids = @(foreach ($value in @($Actual, $Expected)) {
+            if ($value -match '^S-1-') { ([Security.Principal.SecurityIdentifier]::new($value)).Value }
+            else { ([Security.Principal.NTAccount]::new($value)).Translate([Security.Principal.SecurityIdentifier]).Value }
+        })
+        return $sids[0] -ceq $sids[1]
+    }
+    catch { return $false }
+}
+
 function Get-DysonLifecycleBrokerTaskDescriptor {
     param(
         [Parameter(Mandatory)]$Profile,
         [Parameter(Mandatory)][ValidateSet('server', 'stop')][string]$Kind,
         [ValidateSet('Windows', 'Shadow')][string]$Backend = 'Windows',
-        [string]$ShadowRoot
+        [string]$ShadowRoot,
+        [switch]$AllowPreparedDisabled
     )
     if ($Backend -ceq 'Shadow') {
         if ($env:DYSON_LIFECYCLE_BROKER_SELFTEST -cne '1' -or [string]::IsNullOrWhiteSpace($ShadowRoot)) {
@@ -767,6 +786,10 @@ function Get-DysonLifecycleBrokerTaskDescriptor {
             'runLevel', 'enabled', 'multipleInstances', 'executionTimeLimit', 'restartCount',
             'restartInterval', 'startWhenAvailable', 'trigger'
         ) 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID'
+        if ($descriptor.enabled -isnot [bool] -or
+            (-not $AllowPreparedDisabled -and -not [bool]$descriptor.enabled)) {
+            Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID'
+        }
         if (($Kind -ceq 'server' -and ([string]$descriptor.executionTimeLimit -cne 'PT0S' -or
             [int]$descriptor.restartCount -ne 3 -or [string]$descriptor.restartInterval -cne 'PT1M' -or
             -not [bool]$descriptor.startWhenAvailable)) -or
@@ -781,8 +804,37 @@ function Get-DysonLifecycleBrokerTaskDescriptor {
     try { $matches = @(Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction Stop) }
     catch { Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID' }
     if ($matches.Count -ne 1) { Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID' }
-    $descriptor = ConvertTo-DysonLifecycleBrokerTaskDescriptor -Task $matches[0] -Kind $Kind -Profile $Profile
+    $descriptor = ConvertTo-DysonLifecycleBrokerTaskDescriptor -Task $matches[0] -Kind $Kind -Profile $Profile `
+        -AllowPreparedDisabled:$AllowPreparedDisabled
     return [pscustomobject][ordered]@{ descriptor = $descriptor; state = [string]$matches[0].State }
+}
+
+function Get-DysonLifecycleBrokerExpectedActiveDescriptorHash {
+    param([Parameter(Mandatory)]$Descriptor)
+    # Installation pins the definition expected after cutover activation without
+    # changing the observed descriptor or enabling either scheduled task.
+    $expected = [ordered]@{}
+    foreach ($property in $Descriptor.PSObject.Properties) { $expected[$property.Name] = $property.Value }
+    $expected.enabled = $true
+    return Get-DysonLifecycleBrokerTaskDescriptorHash ([pscustomobject]$expected)
+}
+
+function Get-DysonLifecycleBrokerValidatedTaskPair {
+    param([Parameter(Mandatory)]$Profile,
+        [ValidateSet('Windows', 'Shadow')][string]$Backend = 'Windows',
+        [string]$ShadowRoot, [switch]$AllowPreparedDisabled)
+    $server = Get-DysonLifecycleBrokerTaskDescriptor -Profile $Profile -Kind server -Backend $Backend `
+        -ShadowRoot $ShadowRoot -AllowPreparedDisabled:$AllowPreparedDisabled
+    $stop = Get-DysonLifecycleBrokerTaskDescriptor -Profile $Profile -Kind stop -Backend $Backend `
+        -ShadowRoot $ShadowRoot -AllowPreparedDisabled:$AllowPreparedDisabled
+    $prepared = -not [bool]$server.descriptor.enabled
+    if ([bool]$server.descriptor.enabled -ne [bool]$stop.descriptor.enabled -or
+        ($prepared -and (-not $AllowPreparedDisabled -or
+            [string]$server.state -cne 'Disabled' -or
+            [string]$stop.state -cne 'Disabled'))) {
+        Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID'
+    }
+    return [pscustomobject][ordered]@{ server = $server; stop = $stop; preparedDisabled = $prepared }
 }
 
 function Get-DysonLifecycleBrokerTaskDescriptorHash {
@@ -794,13 +846,14 @@ function Assert-DysonLifecycleBrokerTaskPair {
     param(
         [Parameter(Mandatory)]$Profile,
         [ValidateSet('Windows', 'Shadow')][string]$Backend = 'Windows',
-        [string]$ShadowRoot
+        [string]$ShadowRoot,
+        [switch]$AllowPreparedDisabled
     )
-    $server = Get-DysonLifecycleBrokerTaskDescriptor -Profile $Profile -Kind server -Backend $Backend -ShadowRoot $ShadowRoot
-    $stop = Get-DysonLifecycleBrokerTaskDescriptor -Profile $Profile -Kind stop -Backend $Backend -ShadowRoot $ShadowRoot
-    if ((Get-DysonLifecycleBrokerTaskDescriptorHash $server.descriptor) -cne [string]$Profile.serverTask.descriptorHash -or
-        (Get-DysonLifecycleBrokerTaskDescriptorHash $stop.descriptor) -cne [string]$Profile.stopTask.descriptorHash) {
+    $pair = Get-DysonLifecycleBrokerValidatedTaskPair -Profile $Profile -Backend $Backend `
+        -ShadowRoot $ShadowRoot -AllowPreparedDisabled:$AllowPreparedDisabled
+    if ((Get-DysonLifecycleBrokerExpectedActiveDescriptorHash $pair.server.descriptor) -cne [string]$Profile.serverTask.descriptorHash -or
+        (Get-DysonLifecycleBrokerExpectedActiveDescriptorHash $pair.stop.descriptor) -cne [string]$Profile.stopTask.descriptorHash) {
         Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_TASK_INVALID'
     }
-    return [pscustomobject][ordered]@{ server = $server; stop = $stop }
+    return $pair
 }

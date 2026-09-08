@@ -243,7 +243,7 @@ export interface WindowsCutoverHostClient {
   inspect(request: Readonly<WindowsCutoverInspectionRequest>): Promise<unknown>
   runCandidateTaskTransaction(request: Readonly<WindowsCutoverCandidateTaskRequest>): Promise<unknown>
   disablePreviousAuthority(request: Readonly<WindowsCutoverFixedMutationRequest>): Promise<unknown>
-  stopPreviousRuntime(request: Readonly<WindowsCutoverFixedMutationRequest>): Promise<unknown>
+  stopPreviousRuntime(request: Readonly<WindowsCutoverFixedMutationRequest>, options?: Readonly<{ reconcileOnly: true }>): Promise<unknown>
   enablePreviousAuthority(request: Readonly<WindowsCutoverFixedMutationRequest>): Promise<unknown>
   startPreviousRuntime(request: Readonly<WindowsCutoverFixedMutationRequest>): Promise<unknown>
   startCandidateRuntime(request: Readonly<WindowsCutoverFixedMutationRequest>): Promise<unknown>
@@ -413,8 +413,8 @@ export class WindowsCutoverAdapter implements CutoverHostAdapter {
     return this.#runFixedMutation('disablePreviousAuthority', input)
   }
 
-  stopPreviousRuntime(input: CutoverAdapterMutationRequest): Promise<void> {
-    return this.#runFixedMutation('stopPreviousRuntime', input)
+  stopPreviousRuntime(input: CutoverAdapterMutationRequest, options?: Readonly<{ reconcileOnly: true }>): Promise<void> {
+    return this.#runFixedMutation('stopPreviousRuntime', input, options)
   }
 
   enablePreviousAuthority(input: CutoverAdapterMutationRequest): Promise<void> {
@@ -481,13 +481,15 @@ export class WindowsCutoverAdapter implements CutoverHostAdapter {
     }
   }
 
-  async #runFixedMutation(method: FixedMutationMethod, input: CutoverAdapterMutationRequest): Promise<void> {
+  async #runFixedMutation(method: FixedMutationMethod, input: CutoverAdapterMutationRequest, options?: Readonly<{ reconcileOnly: true }>): Promise<void> {
     const request = parseRequest(mutationRequestSchema, input)
     const scope = request.hostMutation
     scope.assertActive()
     try {
       const result = fixedMutationReceiptSchema.parse(
-        await this.#hostClient[method]({ requestId: request.requestId, hostMutation: scope })
+        await (method === 'stopPreviousRuntime'
+          ? this.#hostClient.stopPreviousRuntime({ requestId: request.requestId, hostMutation: scope }, options)
+          : this.#hostClient[method]({ requestId: request.requestId, hostMutation: scope }))
       )
       scope.assertActive()
       if (result.requestId !== request.requestId) {

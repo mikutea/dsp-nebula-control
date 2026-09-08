@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const POLICY_ID = 'dyson-public-release-hygiene'
-export const POLICY_VERSION = '1.4.15'
+export const POLICY_VERSION = '1.4.17'
 
 export const DEFAULT_LIMITS = Object.freeze({
   maximumWorktreeFiles: 50_000,
@@ -103,9 +103,23 @@ export const EXACT_ALLOWLIST = Object.freeze([
   { scope: 'worktree', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'apps/api/src/update-pipeline/http.test.ts' },
   { scope: 'worktree', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'scripts/public-release/scanner.mjs' },
   { scope: 'worktree', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'scripts/public-release/scanner.test.mjs' },
+  { scope: 'history', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'scripts/public-release/scanner.test.mjs', blobId: '2547f0745c68edb8bda47b1f1a37f35a90a9badc' },
   { scope: 'worktree', ruleId: 'STEAM_IDENTIFIER', path: 'apps/api/src/console/parser.test.ts' },
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'apps/api/src/client-profile/generator.test.ts' },
+  // The public CSharp vector reader contains an escaped-string regex, not a network share.
+  { scope: 'worktree', ruleId: 'UNC_PATH', path: 'apps/api/src/providers/windows-update-runtime-evidence.test.ts' },
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'apps/api/src/providers/windows-update-runtime-evidence.test.ts', blobId: '0c43c5bb19a97a6d207c16e589c0c56911b694c6' },
   // These sources contain protocol/extended-path syntax, not a deployment endpoint.
+  // Reviewed runtime-approval/ACL rollback changes retain only generic extended-path syntax.
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1', blobId: 'b61ea568d290d89a3e6e1b322b38d31f12453564' },
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1', blobId: '5ec20be499907bdf4afa526bfc8836ae9617e82d' },
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: 'fbc9442ed303e6bde58f534513a4a9c98c25a3f0' },
+  // The added Bridge configuration test uses fictional paths; authentication fixtures remain fictional.
+  { scope: 'history', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'apps/api/src/config.test.ts', blobId: 'd4aad480b97f2369497db3aec19773be0d962015' },
+  // The builder uses generic Windows extended paths to clean its checked temporary directory.
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/bridge/Build-DysonControlBridgeCandidate.ps1', blobId: 'ecfcc230bd9279d2f15546d3988720c76a22cc1f' },
+  { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/windows/bridge/Build-DysonControlBridgeCandidate.ps1' },
+  { scope: 'artifact', ruleId: 'UNC_PATH', path: 'scripts/windows/bridge/Build-DysonControlBridgeCandidate.ps1' },
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'integrations/dyson-control-bridge/BridgeProtocol.cs' },
   { scope: 'artifact', ruleId: 'UNC_PATH', path: 'integrations/dyson-control-bridge/BridgeProtocol.cs' },
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/public-release/scanner.mjs' },
@@ -138,6 +152,10 @@ export const EXACT_ALLOWLIST = Object.freeze([
     path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1',
     blobId: 'f2ca6521af2412de66015decb40b48238df8174d'
   },
+  // Pending-status preflight changes retain the reviewed path parser and
+  // fictional deployment fixtures; bind their new contents explicitly.
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1', blobId: 'e41dad64ed934c92c51f90cf060fc4c9a86d9853' },
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: 'a103af151998d1a9f7d3411e3bd31baa783a1148' },
   {
     scope: 'history',
     ruleId: 'PRIVATE_IP_ADDRESS',
@@ -334,6 +352,7 @@ export const PUBLIC_REFERENCE_HOSTS = Object.freeze([
   'react.dev',
   'release-assets.githubusercontent.com',
   'registry.npmjs.org',
+  'schemas.microsoft.com',
   'ca.trufo.ai',
   'ocsp.trufo.ai',
   'thunderstore.io',

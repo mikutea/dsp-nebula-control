@@ -1,3 +1,24 @@
+<#
+.SYNOPSIS
+Installs the fixed runtime task pair or restores a completed installation.
+.DESCRIPTION
+To undo a succeeded installation, supply its original deployment arguments and
+Mode, add -RestoreCompletedRequestId with that installation's request id, and
+choose a NEW -RequestId. Preview with -WhatIf. The source completed/<id>.json
+and receipts/<id>.json must exist, and the current task pair must match that
+receipt. Both original evidence files remain unchanged; the restore operation
+has its own intent, receipt and archive. Failure restores the pre-restore pair.
+
+Recovery of an interrupted restore uses the same arguments and new request id
+with -Recover. Ordinary -Recover only finishes an active transaction; it does
+not undo a completed succeeded installation. Archives created before completed
+preimages were retained cannot be reconstructed from a receipt alone.
+
+The archived XML, enabled state and owner/group/DACL are restored. Mode binds
+the original installation; it does not override the archived enabled state.
+An enabled prior logon task becomes enabled again. Running process state is
+not restored and this command does not explicitly start a game process.
+#>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory)][string]$ProjectRoot,
@@ -8,6 +29,8 @@ param(
     [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$')]
     [string]$RequestId = ([guid]::NewGuid().ToString('D')),
     [switch]$Recover,
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$')]
+    [string]$RestoreCompletedRequestId,
     [ValidatePattern('^[\p{L}\p{N}_. -]{1,128}$')][string]$ServerTaskName = 'Dyson-Nebula-Server',
     [ValidatePattern('^[\p{L}\p{N}_. -]{1,128}$')][string]$StopTaskName = 'Dyson-Nebula-Stop',
     [ValidateRange(5, 240)][int]$Ups = 60,
@@ -80,7 +103,10 @@ function Write-RuntimeTaskJsonNew {
     $directory = Assert-RuntimeTaskPlainDirectory -Path ([IO.Path]::GetDirectoryName($Path)) -Create
     $temporary = Join-Path $directory ('.runtime-task-' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
-        [IO.File]::WriteAllText($temporary, (ConvertTo-RuntimeTaskCanonicalJson $Value) + "`n", [Text.UTF8Encoding]::new($false))
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-RuntimeTaskCanonicalJson $Value) + "`n")
+        $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
+        finally { $stream.Dispose() }
         [IO.File]::Move($temporary, $Path)
     }
     finally {
@@ -119,9 +145,11 @@ function ConvertTo-RuntimeTaskCanonicalSddl {
     }
     try {
         $raw = [Security.AccessControl.RawSecurityDescriptor]::new($SecurityDescriptor)
-        if ($null -eq $raw.Owner -or $null -eq $raw.Group -or $null -eq $raw.DiscretionaryAcl -or
-            -not ($raw.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected)) {
-            throw 'A runtime-task security descriptor is incomplete or unprotected.'
+        # A pre-existing Windows task may inherit its DACL. Preserve that state
+        # for backup/rollback; target verification separately compares the exact
+        # fixed protected descriptor required for newly installed tasks.
+        if ($null -eq $raw.Owner -or $null -eq $raw.Group -or $null -eq $raw.DiscretionaryAcl) {
+            throw 'A runtime-task security descriptor is incomplete.'
         }
         $sections = [Security.AccessControl.AccessControlSections]::Owner -bor
             [Security.AccessControl.AccessControlSections]::Group -bor
@@ -135,7 +163,39 @@ function ConvertTo-RuntimeTaskCanonicalSddl {
 
 function Test-RuntimeTaskSecurityDescriptorEqual {
     param([Parameter(Mandatory)][string]$Expected, [Parameter(Mandatory)][string]$Actual)
-    return (ConvertTo-RuntimeTaskCanonicalSddl $Expected) -ceq (ConvertTo-RuntimeTaskCanonicalSddl $Actual)
+    $normalized = @(foreach ($value in @($Expected, $Actual)) {
+        $raw = [Security.AccessControl.RawSecurityDescriptor]::new((ConvertTo-RuntimeTaskCanonicalSddl $value))
+        # Task Scheduler marks restored inherited ACLs as auto-inherited. That
+        # bookkeeping bit does not change the owner, protection or access rules.
+        $raw.SetFlags($raw.ControlFlags -band (-bnot [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited))
+        $allAllow = $true
+        $aceKeys = @(foreach ($ace in $raw.DiscretionaryAcl) {
+            if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed) { $allAllow = $false }
+            if ($ace -is [Security.AccessControl.KnownAce]) {
+                # The scheduler persists file-object generic access mappings.
+                $mask = [int64]$ace.AccessMask -band 0xffffffffL
+                $mapped = $mask -band 0x0fffffffL
+                if ($mask -band 0x80000000L) { $mapped = $mapped -bor 0x120089L } # FILE_GENERIC_READ
+                if ($mask -band 0x40000000L) { $mapped = $mapped -bor 0x120116L } # FILE_GENERIC_WRITE
+                if ($mask -band 0x20000000L) { $mapped = $mapped -bor 0x1200a0L } # FILE_GENERIC_EXECUTE
+                if ($mask -band 0x10000000L) { $mapped = $mapped -bor 0x1f01ffL } # FILE_ALL_ACCESS
+                $ace.AccessMask = [int]$mapped
+            }
+            $bytes = [byte[]]::new($ace.BinaryLength)
+            $ace.GetBinaryForm($bytes, 0)
+            [Convert]::ToBase64String($bytes)
+        })
+        if ($allAllow) {
+            # Windows canonicalizes explicit/inherited allow-entry order on
+            # restore. The same all-allow grants are additive; deny ordering is
+            # never normalized, and every ACE byte and protection bit remains bound.
+            'allow|{0}|{1}|{2}|{3}|{4}' -f $raw.Owner.Value, $raw.Group.Value,
+                [int]$raw.ControlFlags, $raw.DiscretionaryAcl.Revision,
+                ([string]::Join(';', @($aceKeys | Sort-Object -CaseSensitive)))
+        }
+        else { 'ordered|' + $raw.GetSddlForm([Security.AccessControl.AccessControlSections]'Owner, Group, Access') }
+    })
+    return $normalized[0] -ceq $normalized[1]
 }
 
 function Invoke-WithRuntimeTaskComObject {
@@ -405,6 +465,18 @@ function Get-RuntimeTaskPairDigest {
     return Get-RuntimeTaskSha256 (ConvertTo-RuntimeTaskCanonicalJson $pair)
 }
 
+function Test-RuntimeTaskUserEqual {
+    param([string]$Expected, [string]$Actual)
+    try {
+        $sids = @(foreach ($value in @($Expected, $Actual)) {
+            if ($value -match '^S-1-') { ([Security.Principal.SecurityIdentifier]::new($value)).Value }
+            else { ([Security.Principal.NTAccount]::new($value)).Translate([Security.Principal.SecurityIdentifier]).Value }
+        })
+        return $sids[0] -ceq $sids[1]
+    }
+    catch { return $false }
+}
+
 function Assert-RuntimeTaskTarget {
     param([Parameter(Mandatory)]$Descriptor)
     $image = Get-RuntimeTaskImage ([string]$Descriptor.taskName)
@@ -421,22 +493,25 @@ function Assert-RuntimeTaskTarget {
         return
     }
     $task = @(Get-ScheduledTask -TaskName ([string]$Descriptor.taskName) -TaskPath '\' -ErrorAction Stop)
-    if ($task.Count -ne 1 -or $task[0].Actions.Count -ne 1 -or
-        [string]$task[0].Actions[0].Execute -cne [string]$Descriptor.execute -or
-        [string]$task[0].Actions[0].Arguments -cne [string]$Descriptor.arguments -or
-        -not [string]::IsNullOrWhiteSpace([string]$task[0].Actions[0].WorkingDirectory) -or
-        -not [string]::Equals([string]$task[0].Principal.UserId, [string]$Descriptor.userId, [StringComparison]::OrdinalIgnoreCase) -or
+    if ($task.Count -ne 1) { throw 'A runtime task is missing or ambiguous after registration.' }
+    $actions = @($task[0].Actions | Where-Object { $null -ne $_ })
+    $triggers = @($task[0].Triggers | Where-Object { $null -ne $_ })
+    if ($actions.Count -ne 1 -or
+        [string]$actions[0].Execute -cne [string]$Descriptor.execute -or
+        [string]$actions[0].Arguments -cne [string]$Descriptor.arguments -or
+        -not [string]::IsNullOrWhiteSpace([string]$actions[0].WorkingDirectory) -or
+        -not (Test-RuntimeTaskUserEqual ([string]$Descriptor.userId) ([string]$task[0].Principal.UserId)) -or
         [string]$task[0].Principal.LogonType -cne 'Interactive' -or [string]$task[0].Principal.RunLevel -cne 'Limited' -or
         [bool]$task[0].Settings.Enabled -ne [bool]$Descriptor.enabled -or
         [string]$task[0].Settings.MultipleInstances -cne 'IgnoreNew') {
         throw 'An installed runtime task did not pass fixed action, principal, path, or state verification.'
     }
     if ([string]$Descriptor.trigger -ceq 'AtLogOn') {
-        if ($task[0].Triggers.Count -ne 1 -or
-            -not [string]::Equals([string]$task[0].Triggers[0].UserId, $ServiceUser, [StringComparison]::OrdinalIgnoreCase) -or
-            [string]$task[0].Triggers[0].Delay -cne 'PT20S') { throw 'The fixed start-task trigger did not pass verification.' }
+        if ($triggers.Count -ne 1 -or
+            -not (Test-RuntimeTaskUserEqual $ServiceUser ([string]$triggers[0].UserId)) -or
+            [string]$triggers[0].Delay -cne 'PT20S') { throw 'The fixed start-task trigger did not pass verification.' }
     }
-    elseif ($task[0].Triggers.Count -ne 0) { throw 'The fixed stop task unexpectedly has a trigger.' }
+    elseif ($triggers.Count -ne 0) { throw 'The fixed stop task unexpectedly has a trigger.' }
 }
 
 function Restore-RuntimeTaskPair {
@@ -450,10 +525,12 @@ function Restore-RuntimeTaskPair {
 }
 
 function Assert-RuntimeTaskIntent {
-    param([Parameter(Mandatory)]$Intent)
+    param([Parameter(Mandatory)]$Intent,
+        [string]$ExpectedRequestId = $requestId,
+        [string]$ExpectedFingerprint = $requestFingerprint)
     if ([string]$Intent.protocol -cne $protocol -or [int]$Intent.schemaVersion -ne 2 -or
-        [string]$Intent.requestId -cne $requestId -or
-        [string]$Intent.requestFingerprint -cne $requestFingerprint -or
+        [string]$Intent.requestId -cne $ExpectedRequestId -or
+        [string]$Intent.requestFingerprint -cne $ExpectedFingerprint -or
         [string]$Intent.mode -cne $Mode -or
         [string]$Intent.projectRoot -cne $resolvedProjectRoot -or
         [string]$Intent.dataRoot -cne $script:resolvedDataRoot -or
@@ -486,8 +563,7 @@ function Assert-RuntimeTaskIntent {
 function Assert-RuntimeTaskTerminalLayout {
     param([Parameter(Mandatory)]$Intent, [Parameter(Mandatory)]$Receipt)
     if ([string]$Receipt.status -ceq 'succeeded') {
-        Assert-RuntimeTaskTarget $Intent.target.server
-        Assert-RuntimeTaskTarget $Intent.target.stop
+        Assert-RuntimeTaskDesiredPair $Intent.target
     }
     elseif ([string]$Receipt.status -ceq 'rolled-back') {
         if (-not (Test-RuntimeTaskImageEqual $Intent.previous.server (Get-RuntimeTaskImage $fixedServerTaskName)) -or
@@ -501,15 +577,33 @@ function Assert-RuntimeTaskTerminalLayout {
     }
 }
 
+function Assert-RuntimeTaskDesiredPair {
+    param([Parameter(Mandatory)]$Target)
+    if ($RestoreCompletedRequestId) {
+        if (-not (Test-RuntimeTaskImageEqual $Target.server (Get-RuntimeTaskImage $fixedServerTaskName)) -or
+            -not (Test-RuntimeTaskImageEqual $Target.stop (Get-RuntimeTaskImage $fixedStopTaskName))) {
+            throw 'The completed-task restoration did not restore the archived prior pair.'
+        }
+    }
+    else {
+        Assert-RuntimeTaskTarget $Target.server
+        Assert-RuntimeTaskTarget $Target.stop
+    }
+}
+
 function New-RuntimeTaskReceipt {
     param([Parameter(Mandatory)]$Intent, [ValidateSet('succeeded', 'rolled-back')][string]$Status)
-    return [pscustomobject][ordered]@{
+    $result = [pscustomobject][ordered]@{
         protocol = $receiptProtocol; schemaVersion = 2; requestId = [string]$Intent.requestId
         requestFingerprint = [string]$Intent.requestFingerprint; status = $Status; mode = [string]$Intent.mode
         serverTask = $fixedServerTaskName; stopTask = $fixedStopTaskName
         terminalPairDigest = Get-RuntimeTaskPairDigest
         completedAt = (Get-Date).ToUniversalTime().ToString('o'); reused = $false
     }
+    if ($RestoreCompletedRequestId) {
+        $result | Add-Member NoteProperty restoreCompletedRequestId $RestoreCompletedRequestId
+    }
+    return $result
 }
 
 function Read-ValidatedRuntimeTaskReceipt {
@@ -563,7 +657,18 @@ function Test-RuntimeTaskIntentPresent {
 function Complete-RuntimeTaskIntentCleanup {
     param([string]$IntentPath)
     Assert-RuntimeTaskMutationScope
-    if (Test-Path -LiteralPath $IntentPath -PathType Leaf) { Remove-Item -LiteralPath $IntentPath -Force }
+    if (Test-Path -LiteralPath $IntentPath -PathType Leaf) {
+        $completedIntent = Read-RuntimeTaskJson $IntentPath
+        Assert-RuntimeTaskIntent $completedIntent
+        $archiveRoot = Assert-RuntimeTaskPlainDirectory -Path (Join-Path ([IO.Path]::GetDirectoryName($IntentPath)) 'completed') -Create
+        $archivePath = Join-Path $archiveRoot ([string]$completedIntent.requestId + '.json')
+        if (Test-Path -LiteralPath $archivePath) {
+            if ((ConvertTo-RuntimeTaskCanonicalJson (Read-RuntimeTaskJson $archivePath)) -cne
+                (ConvertTo-RuntimeTaskCanonicalJson $completedIntent)) { throw 'The completed runtime-task archive conflicts with its transaction.' }
+        }
+        else { Write-RuntimeTaskJsonNew $archivePath $completedIntent }
+        Remove-Item -LiteralPath $IntentPath -Force
+    }
     Assert-RuntimeTaskMutationScope
 }
 
@@ -637,9 +742,43 @@ $requestBinding = [ordered]@{
 }
 $requestFingerprint = Get-RuntimeTaskSha256 (ConvertTo-RuntimeTaskCanonicalJson $requestBinding)
 
+# A completed restore is a new transaction, never a rewrite of the original
+# succeeded receipt. Its own preimage permits compensation and crash recovery.
+$restoreSource = $null
+$restoreReceipt = $null
+if ($RestoreCompletedRequestId) {
+    $RestoreCompletedRequestId = $RestoreCompletedRequestId.ToLowerInvariant()
+    if ($RestoreCompletedRequestId -ceq $requestId) {
+        throw 'A completed-task restoration requires a new request id.'
+    }
+    $restoreArchivePath = Join-Path (Join-Path $transactionRoot 'completed') ($RestoreCompletedRequestId + '.json')
+    $restoreSource = Read-RuntimeTaskJson $restoreArchivePath
+    if ($null -ne $restoreSource.PSObject.Properties['restoreCompletedRequestId']) {
+        throw 'Only a completed installation can be selected for restoration.'
+    }
+    $sourceBinding = [ordered]@{}
+    foreach ($key in $requestBinding.Keys) { $sourceBinding[$key] = $requestBinding[$key] }
+    $sourceBinding.requestId = $RestoreCompletedRequestId
+    Assert-RuntimeTaskIntent -Intent $restoreSource -ExpectedRequestId $RestoreCompletedRequestId `
+        -ExpectedFingerprint (Get-RuntimeTaskSha256 (ConvertTo-RuntimeTaskCanonicalJson $sourceBinding))
+    $restoreReceiptPath = Join-Path $receiptsRoot ($RestoreCompletedRequestId + '.json')
+    $restoreReceipt = Read-ValidatedRuntimeTaskReceipt -Path $restoreReceiptPath -Intent $restoreSource
+    if ([string]$restoreReceipt.status -cne 'succeeded') {
+        throw 'Only a succeeded runtime-task installation can be restored.'
+    }
+    $targetServer = $restoreSource.previous.server
+    $targetStop = $restoreSource.previous.stop
+    $requestBinding.target = [ordered]@{ server = $targetServer; stop = $targetStop }
+    $requestBinding.restoreCompletedRequestId = $RestoreCompletedRequestId
+    $requestBinding.restoreArchiveSha256 = Get-RuntimeTaskSha256 (ConvertTo-RuntimeTaskCanonicalJson $restoreSource)
+    $requestBinding.restoreReceiptSha256 = Get-RuntimeTaskSha256 (ConvertTo-RuntimeTaskCanonicalJson $restoreReceipt)
+    $requestFingerprint = Get-RuntimeTaskSha256 (ConvertTo-RuntimeTaskCanonicalJson $requestBinding)
+}
+
 if (-not $PSCmdlet.ShouldProcess("$fixedServerTaskName and $fixedStopTaskName", 'Apply the transactional runtime-task pair operation')) {
     [ordered]@{ protocol = $protocol; state = 'preview'; dryRun = $true; recovery = [bool]$Recover
-        requestId = $requestId; mode = $Mode; serverTask = $fixedServerTaskName; stopTask = $fixedStopTaskName } | ConvertTo-Json -Compress
+        requestId = $requestId; mode = $Mode; restoreCompletedRequestId = $RestoreCompletedRequestId
+        serverTask = $fixedServerTaskName; stopTask = $fixedStopTaskName } | ConvertTo-Json -Compress
     exit 0
 }
 
@@ -734,9 +873,21 @@ try {
         $lease = Enter-DysonHostMutationLease -DataRoot $script:resolvedDataRoot -Owner $leaseOwner `
             -Operation $leaseOperation -RequestId $requestId -OwnerPid $PID -TimeoutMilliseconds 0
     }
+    if (Test-RuntimeTaskIntentPresent -Path $intentPath) {
+        throw 'A runtime-task transaction appeared while acquiring the host mutation lease.'
+    }
     $transactionRoot = Assert-RuntimeTaskPlainDirectory -Path $transactionRoot -Create
     $receiptsRoot = Assert-RuntimeTaskPlainDirectory -Path $receiptsRoot -Create
     Assert-RuntimeTaskMutationScope
+    if ($RestoreCompletedRequestId) {
+        if ((Get-RuntimeTaskSha256 (ConvertTo-RuntimeTaskCanonicalJson (Read-RuntimeTaskJson $restoreArchivePath))) -cne
+                [string]$requestBinding.restoreArchiveSha256 -or
+            (Get-RuntimeTaskSha256 (ConvertTo-RuntimeTaskCanonicalJson (Read-RuntimeTaskJson $restoreReceiptPath))) -cne
+                [string]$requestBinding.restoreReceiptSha256 -or
+            [string]$restoreReceipt.terminalPairDigest -cne (Get-RuntimeTaskPairDigest)) {
+            throw 'The completed-task restoration source or current task pair has drifted.'
+        }
+    }
     $intent = [pscustomobject][ordered]@{
         protocol = $protocol; schemaVersion = 2; requestId = $requestId; requestFingerprint = $requestFingerprint
         mode = $Mode; projectRoot = $resolvedProjectRoot; dataRoot = $script:resolvedDataRoot
@@ -746,15 +897,19 @@ try {
         target = [ordered]@{ server = $targetServer; stop = $targetStop }
         createdAt = (Get-Date).ToUniversalTime().ToString('o')
     }
+    if ($RestoreCompletedRequestId) {
+        $intent | Add-Member NoteProperty restoreCompletedRequestId $RestoreCompletedRequestId
+    }
     Assert-RuntimeTaskMutationScope
     Write-RuntimeTaskJsonNew $intentPath $intent
     Assert-RuntimeTaskMutationScope
-    Register-RuntimeTaskTarget $targetServer Start
+    if ($RestoreCompletedRequestId) { Restore-RuntimeTaskImage $targetServer }
+    else { Register-RuntimeTaskTarget $targetServer Start }
     if ($SchedulerBackend -ceq 'Shadow' -and $env:DYSON_RUNTIME_TASK_SELFTEST_FAIL_POINT -ceq 'HardExitAfterStartRegister') { [Environment]::Exit(86) }
     if ($SchedulerBackend -ceq 'Shadow' -and $env:DYSON_RUNTIME_TASK_SELFTEST_FAIL_POINT -ceq 'SecondRegister') { throw 'Fictional shadow scheduler second-task failure.' }
-    Register-RuntimeTaskTarget $targetStop Stop
-    Assert-RuntimeTaskTarget $targetServer
-    Assert-RuntimeTaskTarget $targetStop
+    if ($RestoreCompletedRequestId) { Restore-RuntimeTaskImage $targetStop }
+    else { Register-RuntimeTaskTarget $targetStop Stop }
+    Assert-RuntimeTaskDesiredPair $intent.target
     $receipt = New-RuntimeTaskReceipt $intent succeeded
     Assert-RuntimeTaskMutationScope
     Write-RuntimeTaskJsonNew $receiptPath $receipt
@@ -799,7 +954,9 @@ catch {
         throw [InvalidOperationException]::new('Runtime-task installation failed and the complete prior pair was restored.', $failure.Exception)
     }
     if (-not $script:borrowedLease -and $null -ne $lease -and $lease.Active) {
-        try { [void](Exit-DysonHostMutationLease $lease abandoned) } catch {}
+        # No intent was constructed, so no scheduler mutation was reachable.
+        # A failed preimage read must not strand an otherwise untouched host.
+        try { [void](Exit-DysonHostMutationLease $lease released) } catch {}
     }
     throw
 }

@@ -45,6 +45,43 @@ function Assert-BootstrapSelfTest {
     if (-not $Condition) { throw "Game lifecycle bootstrap self-test failed: $Message" }
 }
 
+function Assert-BootstrapPidCleanupContract {
+    $probePath = Join-Path $testRoot 'pid-cleanup-probe.pid'
+    foreach ($name in @('Start-DysonServer.ps1', 'Stop-DysonServer.ps1')) {
+        $source = [IO.File]::ReadAllText((Join-Path (Split-Path $PSScriptRoot -Parent) $name))
+        $tokens = $null; $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+        $definitions = @($ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Remove-DysonExitedPidRecord'
+        }, $false))
+        Assert-BootstrapSelfTest ($errors.Count -eq 0 -and $definitions.Count -eq 1) 'PID cleanup helper could not be extracted'
+        & {
+            . ([scriptblock]::Create($definitions[0].Extent.Text))
+            [IO.File]::WriteAllText($probePath, '4242')
+            Remove-DysonExitedPidRecord -Path $probePath -ExpectedProcessId 4242
+            Assert-BootstrapSelfTest (-not [IO.File]::Exists($probePath)) 'matching exited PID record was not removed'
+            Remove-DysonExitedPidRecord -Path $probePath -ExpectedProcessId 4242
+            [IO.File]::WriteAllText($probePath, '4343')
+            Remove-DysonExitedPidRecord -Path $probePath -ExpectedProcessId 4242
+            Assert-BootstrapSelfTest ([IO.File]::ReadAllText($probePath) -ceq '4343') 'a different PID record was removed'
+            $locked = [IO.File]::Open($probePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            try {
+                $rejected = $false
+                try { Remove-DysonExitedPidRecord -Path $probePath -ExpectedProcessId 4343 }
+                catch { $rejected = $true }
+                Assert-BootstrapSelfTest $rejected 'a non-absence IO error was hidden during PID cleanup'
+            }
+            finally { $locked.Dispose() }
+            $rejected = $false
+            try { Remove-DysonExitedPidRecord -Path $testRoot -ExpectedProcessId 4242 }
+            catch { $rejected = $true }
+            Assert-BootstrapSelfTest $rejected 'a directory/permission error was treated as an absent PID file'
+            [IO.File]::Delete($probePath)
+        }
+    }
+}
+
 function Write-BootstrapSelfTestText {
     param([string]$Path, [string]$Value)
     [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($Path)) | Out-Null
@@ -280,6 +317,17 @@ function Test-BootstrapSelfTestBindingHasTerminalReceipt {
     return $false
 }
 
+function Open-BootstrapSelfTestBindingObserver {
+    param([Parameter(Mandatory)][string]$Path)
+
+    # Publication polling must not prevent the wrapper from retiring its old
+    # binding. ReadAllText uses FileShare.Read and races that deletion.
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    try { return [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false, $true)) }
+    catch { $stream.Dispose(); throw }
+}
+
 function Test-BootstrapSelfTestPublishedLifecycle {
     param(
         [Parameter(Mandatory)][string]$Version,
@@ -289,10 +337,12 @@ function Test-BootstrapSelfTestPublishedLifecycle {
     $publishedBinding = $null
     try {
         if ([System.IO.File]::Exists($bindingPath)) {
-            $publishedBinding = [System.IO.File]::ReadAllText(
-                $bindingPath,
-                [System.Text.UTF8Encoding]::new($false, $true)
-            ) | Microsoft.PowerShell.Utility\ConvertFrom-Json -ErrorAction Stop
+            $bindingObserver = Open-BootstrapSelfTestBindingObserver -Path $bindingPath
+            try {
+                $publishedBinding = $bindingObserver.ReadToEnd() |
+                    Microsoft.PowerShell.Utility\ConvertFrom-Json -ErrorAction Stop
+            }
+            finally { $bindingObserver.Dispose() }
         }
     }
     catch { return $false }
@@ -824,6 +874,27 @@ try {
         if ($eventProbeStream) { $eventProbeStream.Dispose() }
         if ([System.IO.File]::Exists($eventsPath)) { [System.IO.File]::Delete($eventsPath) }
     }
+    Assert-BootstrapPidCleanupContract
+    # Hold the actual publication observer open across retirement and a new
+    # publication at the same path. The old handle must not block either write.
+    [IO.File]::WriteAllText($bindingPath, '{"generation":"old"}')
+    $bindingObserver = Open-BootstrapSelfTestBindingObserver -Path $bindingPath
+    try {
+        [IO.File]::Delete($bindingPath)
+        [IO.File]::WriteAllText($bindingPath, '{"generation":"new"}')
+        Assert-BootstrapSelfTest -Condition (
+            ($bindingObserver.ReadToEnd() | ConvertFrom-Json).generation -ceq 'old' -and
+            ([IO.File]::ReadAllText($bindingPath) | ConvertFrom-Json).generation -ceq 'new'
+        ) -Message 'binding observation blocked retirement or observed a different publication'
+    }
+    finally { $bindingObserver.Dispose(); [IO.File]::Delete($bindingPath) }
+    [IO.File]::WriteAllText($bindingPath, '{"version":')
+    try {
+        Assert-BootstrapSelfTest -Condition (-not (Test-BootstrapSelfTestPublishedLifecycle `
+            -Version '2.0.0' -MinimumStartEvents 0)) `
+            -Message 'a partial binding JSON was accepted as a published lifecycle'
+    }
+    finally { [IO.File]::Delete($bindingPath) }
     foreach ($name in @(
         'DysonGameLifecycleBootstrap.Common.ps1',
         'Resolve-DysonGameLifecycleRelease.ps1',
@@ -859,13 +930,31 @@ try {
 
     $gameSource = @'
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 public static class DysonGameBootstrapProcessFixture {
     public static int Main(string[] args) {
         if (args.Length != 1 || String.IsNullOrWhiteSpace(args[0])) return 64;
-        while (!File.Exists(args[0])) Thread.Sleep(25);
-        return String.Equals(File.ReadAllText(args[0]).Trim(), "crash", StringComparison.Ordinal) ? 17 : 0;
+        var lifetime = Stopwatch.StartNew();
+        Stopwatch publication = null;
+        while (lifetime.ElapsedMilliseconds < 300000) {
+            if (File.Exists(args[0])) {
+                if (publication == null) publication = Stopwatch.StartNew();
+                try {
+                    // WriteAllText makes the path visible before its writer closes.
+                    // A sharing error or empty/partial value is not a game crash
+                    // or a completed stop signal.
+                    var command = File.ReadAllText(args[0]).Trim();
+                    if (String.Equals(command, "crash", StringComparison.Ordinal)) return 17;
+                    if (String.Equals(command, "stop", StringComparison.Ordinal) ||
+                        String.Equals(command, "cleanup", StringComparison.Ordinal)) return 0;
+                } catch (IOException) { }
+                if (publication.ElapsedMilliseconds >= 5000) return 65;
+            }
+            Thread.Sleep(25);
+        }
+        return 66;
     }
 }
 '@
@@ -1491,7 +1580,14 @@ public static class DysonGameBootstrapProcessFixture {
         [bool]$postUnexpectedRestartB.receiptPersisted -and
         -not [System.IO.File]::Exists($bindingPath) -and
         -not [System.IO.File]::Exists($expectedExitPath)
-    ) -Message 'the recovered expected-exit intent was not consumed exactly once'
+    ) -Message ('the recovered expected-exit intent was not consumed exactly once [' +
+        'exit=' + [string]$postUnexpectedRestartBResult.exitCode +
+        ';state=' + [string]$postUnexpectedRestartB.state +
+        ';outcome=' + [string]$postUnexpectedRestartB.runtimeOutcome +
+        ';errorCode=' + [string](Get-BootstrapSelfTestPropertyValue -Value $postUnexpectedRestartB -Name 'errorCode') +
+        ';receipt=' + [string]$postUnexpectedRestartB.receiptPersisted +
+        ';bindingPresent=' + [string][IO.File]::Exists($bindingPath) +
+        ';intentPresent=' + [string][IO.File]::Exists($expectedExitPath) + ']')
     Assert-BootstrapSelfTestNoPathLeak -Result $postUnexpectedRestartBResult `
         -Message 'the post-unexpected clean result disclosed a host path'
 

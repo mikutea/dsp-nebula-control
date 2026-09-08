@@ -253,7 +253,7 @@ export interface CutoverHostAdapter {
   createSaveProtectionPoint(request: CutoverSaveProtectionRequest): Promise<CutoverSaveProtectionReceipt>
   restoreActivationBaseline(request: CutoverBaselineRestoreRequest): Promise<CutoverBaselineRestoreReceipt>
   disablePreviousAuthority(request: CutoverAdapterMutationRequest): Promise<void>
-  stopPreviousRuntime(request: CutoverAdapterMutationRequest): Promise<void>
+  stopPreviousRuntime(request: CutoverAdapterMutationRequest, options?: Readonly<{ reconcileOnly: true }>): Promise<void>
   enableCandidateAuthority(request: CutoverAuthorityMutationRequest): Promise<CutoverAuthorityMutationResult>
   startCandidateRuntime(request: CutoverAdapterMutationRequest): Promise<void>
   disableCandidateAuthority(request: CutoverAuthorityMutationRequest): Promise<CutoverAuthorityMutationResult>

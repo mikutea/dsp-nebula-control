@@ -7,6 +7,10 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^[^"\r\n]{1,128}$')][string]$ServiceUser,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$')][string]$RequestId,
     [switch]$Recover,
+    # Explicit reconstruction input, never a claim of historical task backup.
+    # Exactly legacy-server.xml and legacy-stop.xml; SHA256 of UTF8(serverHash:stopHash).
+    [string]$PreparedLegacyTemplateRoot,
+    [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedLegacyTemplateSha256,
     [string]$LeaseInstanceId,
     [string]$LeaseToken,
     [ValidateSet('Windows', 'Shadow')][string]$Backend = 'Windows',
@@ -39,7 +43,7 @@ function New-GsAuthorityReceipt {
         [ValidateSet('succeeded', 'rolled-back')][string]$Status,
         [Parameter(Mandatory)][string]$TerminalDigest
     )
-    return [pscustomobject][ordered]@{
+    $receipt = [ordered]@{
         protocol = $script:GsAuthorityReceiptProtocol
         schemaVersion = 1
         requestId = [string]$Intent.requestId
@@ -54,6 +58,11 @@ function New-GsAuthorityReceipt {
         completedAt = [DateTime]::UtcNow.ToString('o')
         reused = $false
     }
+    if ($script:GsAuthorityPreparedTemplates) {
+        $receipt['authoritySource'] = 'reconstructed-template'
+        $receipt['legacyTemplateSha256'] = $ExpectedLegacyTemplateSha256
+    }
+    return [pscustomobject]$receipt
 }
 
 function New-GsAuthorityProfile {
@@ -100,7 +109,7 @@ function New-GsAuthorityProfile {
             legacyPreimage = [pscustomobject][ordered]@{
                 startDefinitionSha256 = (& $taskProfile $candidateStart).definitionSha256
                 stopDefinitionSha256 = (& $taskProfile $candidateStop).definitionSha256
-                expectedEnabledBeforeIsolation = $true
+                expectedEnabledBeforeIsolation = -not $script:GsAuthorityPreparedTemplates
                 expectedEnabledAfterIsolation = $false
             }
             expectedPreparedDisabled = [pscustomobject][ordered]@{
@@ -114,6 +123,10 @@ function New-GsAuthorityProfile {
             allowedTransitions = @('legacy-preimage-disabled', 'prepared-disabled', 'active')
         }
         previousScriptBundleRevision = Get-GsAuthoritySha256Text ((Get-GsAuthorityFileImage $script:GsAuthorityStartCopy).sha256 + ':' + (Get-GsAuthorityFileImage $script:GsAuthorityStopCopy).sha256)
+    }
+    if ($script:GsAuthorityPreparedTemplates) {
+        $profileCore | Add-Member -NotePropertyName authoritySource -NotePropertyValue 'reconstructed-template'
+        $profileCore | Add-Member -NotePropertyName legacyTemplateSha256 -NotePropertyValue $ExpectedLegacyTemplateSha256
     }
     $revisionCore = [ordered]@{}
     foreach ($property in $profileCore.PSObject.Properties) { $revisionCore[$property.Name] = $property.Value }
@@ -211,8 +224,16 @@ function Get-GsAuthorityCurrentPreflight {
     if (-not [bool]$panel.enabled) { Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_PANEL_INVALID' }
     $oldStart = Get-GsAuthorityTaskImage $script:GsAuthorityOldStartTask
     $oldStop = Get-GsAuthorityTaskImage $script:GsAuthorityOldStopTask
-    $startDefinition = Assert-GsAuthorityLegacyTask $oldStart $script:GsAuthoritySourceStart $ServiceUser
-    $stopDefinition = Assert-GsAuthorityLegacyTask $oldStop $script:GsAuthoritySourceStop $ServiceUser
+    $sourceStart = $oldStart; $sourceStop = $oldStop
+    if ($script:GsAuthorityPreparedTemplates) {
+        $expected = Get-GsAuthorityExpectedRuntimeDescriptors $false
+        Assert-GsAuthorityPreparedTask $oldStart $expected.start
+        Assert-GsAuthorityPreparedTask $oldStop $expected.stop
+        $sourceStart = ConvertTo-GsAuthorityTemplateImage $script:GsAuthorityTemplateBundle.server
+        $sourceStop = ConvertTo-GsAuthorityTemplateImage $script:GsAuthorityTemplateBundle.stop
+    }
+    $startDefinition = Assert-GsAuthorityLegacyTask $sourceStart $script:GsAuthoritySourceStart $ServiceUser
+    $stopDefinition = Assert-GsAuthorityLegacyTask $sourceStop $script:GsAuthoritySourceStop $ServiceUser
     $newStart = Get-GsAuthorityTaskImage $script:GsAuthorityNewStartTask -AllowMissing
     $newStop = Get-GsAuthorityTaskImage $script:GsAuthorityNewStopTask -AllowMissing
     if ([bool]$newStart.present -or [bool]$newStop.present) {
@@ -230,6 +251,7 @@ function Get-GsAuthorityCurrentPreflight {
     return [pscustomobject][ordered]@{
         panel = $panel; oldStart = $oldStart; oldStop = $oldStop; newStart = $newStart; newStop = $newStop
         startDefinition = $startDefinition; stopDefinition = $stopDefinition; env = $envImage; envUpdate = $envUpdate
+        sourceStart = $sourceStart; sourceStop = $sourceStop
     }
 }
 
@@ -334,8 +356,12 @@ function Complete-GsAuthorityOwnedLease {
 $script:GsAuthorityOwnedLease = $null
 $script:GsAuthorityBorrowedLease = $false
 $script:GsAuthorityRestoring = $false
+$script:GsAuthorityPreparedTemplates = -not [string]::IsNullOrWhiteSpace($PreparedLegacyTemplateRoot)
 
 try {
+    if ($script:GsAuthorityPreparedTemplates -ne (-not [string]::IsNullOrWhiteSpace($ExpectedLegacyTemplateSha256))) {
+        Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_TEMPLATE_ARGUMENT_INVALID'
+    }
     $script:GsAuthorityBackend = $Backend
     $script:GsAuthorityProjectRoot = Assert-GsAuthorityPlainDirectory $ProjectRoot
     $dataInput = Assert-GsAuthorityPlainDirectory $DataRoot
@@ -392,6 +418,11 @@ try {
     $script:GsAuthorityIntentPath = Join-Path $transactionRootCandidate 'active-intent.json'
     $receiptsCandidate = Join-Path $transactionRootCandidate 'receipts'
     $script:GsAuthorityReceiptPath = Join-Path $receiptsCandidate ($script:GsAuthorityRequestId + '.json')
+    $script:GsAuthorityTemplateArchivePath = Join-Path $receiptsCandidate ($script:GsAuthorityRequestId + '.legacy-templates.json')
+    if ($script:GsAuthorityPreparedTemplates) {
+        $script:GsAuthorityTemplateBundle = Read-GsAuthorityTemplateBundle $PreparedLegacyTemplateRoot $ExpectedLegacyTemplateSha256 `
+            -ArchivePath $script:GsAuthorityTemplateArchivePath -UseArchive:($Recover -or (Test-Path -LiteralPath $script:GsAuthorityReceiptPath))
+    }
     $binding = [ordered]@{
         requestId = $script:GsAuthorityRequestId
         projectRootIdentity = $script:GsAuthorityProjectRoot.ToUpperInvariant()
@@ -406,6 +437,10 @@ try {
         panelTask = $script:GsAuthorityPanelTask
         oldTasks = @($script:GsAuthorityOldStartTask, $script:GsAuthorityOldStopTask)
         previousTasks = @($script:GsAuthorityNewStartTask, $script:GsAuthorityNewStopTask)
+    }
+    if ($script:GsAuthorityPreparedTemplates) {
+        $binding['authoritySource'] = 'reconstructed-template'
+        $binding['legacyTemplateSha256'] = $ExpectedLegacyTemplateSha256
     }
     $script:GsAuthorityRequestFingerprint = Get-GsAuthoritySha256Text (ConvertTo-GsAuthorityJson $binding)
 
@@ -511,11 +546,15 @@ try {
             stopCopy = Get-GsAuthorityFileImage $script:GsAuthorityStopCopy
             profile = Get-GsAuthorityFileImage $script:GsAuthorityProfilePath
         }
-        $targetStart = New-GsAuthorityTargetImage $preflight.oldStart $script:GsAuthorityNewStartTask $script:GsAuthorityStartCopy $preflight.startDefinition
-        $targetStop = New-GsAuthorityTargetImage $preflight.oldStop $script:GsAuthorityNewStopTask $script:GsAuthorityStopCopy $preflight.stopDefinition
+        $targetStart = New-GsAuthorityTargetImage $preflight.sourceStart $script:GsAuthorityNewStartTask $script:GsAuthorityStartCopy $preflight.startDefinition
+        $targetStop = New-GsAuthorityTargetImage $preflight.sourceStop $script:GsAuthorityNewStopTask $script:GsAuthorityStopCopy $preflight.stopDefinition
         $intentTarget = [pscustomobject][ordered]@{
             startSha256 = $startSha256; stopSha256 = $stopSha256; envSha256 = [string]$preflight.envUpdate.sha256
             startDefinition = $preflight.startDefinition; stopDefinition = $preflight.stopDefinition
+        }
+        if ($script:GsAuthorityPreparedTemplates) {
+            $intentTarget | Add-Member -NotePropertyName authoritySource -NotePropertyValue 'reconstructed-template'
+            $intentTarget | Add-Member -NotePropertyName legacyTemplates -NotePropertyValue $script:GsAuthorityTemplateBundle
         }
         $intent = [pscustomobject][ordered]@{
             protocol = $script:GsAuthorityProtocol; schemaVersion = 1
@@ -532,6 +571,10 @@ try {
         }
         Write-GsAuthorityJsonNew $script:GsAuthorityIntentPath $intent
         $intentPersisted = $true
+        if ($Backend -ceq 'Shadow' -and $env:DYSON_GSMANAGER_AUTHORITY_SELFTEST_FAIL_POINT -ceq 'HardExitBeforeTemplateArchive') { [Environment]::Exit(94) }
+        if ($script:GsAuthorityPreparedTemplates) {
+            Write-GsAuthorityJsonNew $script:GsAuthorityTemplateArchivePath $script:GsAuthorityTemplateBundle
+        }
         if ($Backend -ceq 'Shadow' -and $env:DYSON_GSMANAGER_AUTHORITY_SELFTEST_FAIL_POINT -ceq 'HardExitAfterIntent') { [Environment]::Exit(91) }
 
         if ([bool]$preflight.panel.running) { Set-GsAuthorityTaskRunning $script:GsAuthorityPanelTask $false }
@@ -564,8 +607,18 @@ try {
         }
         if ($Backend -ceq 'Shadow' -and $env:DYSON_GSMANAGER_AUTHORITY_SELFTEST_FAIL_POINT -ceq 'HardExitAfterEnv') { [Environment]::Exit(92) }
 
-        Disable-GsAuthorityLegacyTask $script:GsAuthorityOldStartTask
-        Disable-GsAuthorityLegacyTask $script:GsAuthorityOldStopTask
+        if (-not $script:GsAuthorityPreparedTemplates) {
+            Disable-GsAuthorityLegacyTask $script:GsAuthorityOldStartTask
+            Disable-GsAuthorityLegacyTask $script:GsAuthorityOldStopTask
+        }
+        else {
+            foreach ($name in @('oldStart', 'oldStop')) {
+                $before = $intent.preimage.tasks.$name
+                if (-not (Test-GsAuthorityTaskImageEqual $before (Get-GsAuthorityTaskImage $before.taskName))) {
+                    Throw-GsAuthorityError 'DYSON_GSMANAGER_AUTHORITY_PREPARED_TASK_CHANGED'
+                }
+            }
+        }
         if ([bool]$preflight.panel.running) { Set-GsAuthorityTaskRunning $script:GsAuthorityPanelTask $true }
         $panelAfter = Get-GsAuthorityTaskImage $script:GsAuthorityPanelTask
         if ([bool]$panelAfter.running -ne [bool]$preflight.panel.running) {

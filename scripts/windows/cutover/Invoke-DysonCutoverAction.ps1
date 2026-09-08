@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ProjectRoot,
     [Parameter(Mandatory)][string]$ProfileFile,
@@ -13,6 +13,8 @@ param(
     [Parameter(Mandatory)][string]$LeaseInstanceId,
     [Parameter(Mandatory)][string]$LeaseToken,
     [string]$Confirm,
+    [ValidatePattern('^[0-9a-f]{64}$')][string]$PreviousStopScriptSha256,
+    [switch]$PreviousStopReconcileOnly,
     [switch]$WhatIf,
     [ValidateSet('Windows', 'Shadow')][string]$Backend = 'Windows',
     [string]$ShadowRoot
@@ -31,6 +33,9 @@ try {
     }
     . $leaseCommon
     . $hostCommon
+    $script:CutoverHostPreviousStopScriptSha256 = $PreviousStopScriptSha256
+    $script:CutoverHostPreviousStopReconcileOnly = [bool]$PreviousStopReconcileOnly
+    if ($PreviousStopReconcileOnly -and $Action -cne 'StopPreviousRuntime') { throw 'invalid reconcile action' }
     Initialize-CutoverHostContext -ProjectRoot $ProjectRoot -ProfileFile $ProfileFile `
         -RuntimeBootstrapRoot $RuntimeBootstrapRoot -RuntimeTaskTransactionRoot $RuntimeTaskTransactionRoot `
         -ServiceUser $ServiceUser -GamePort $GamePort -AuthorityInventoryRevision $AuthorityInventoryRevision `
@@ -58,7 +63,7 @@ try {
         schemaVersion = 1
         requestId = $script:CutoverHostRequestId
         authorityInventoryRevision = $script:CutoverHostExpectedInventoryRevision
-        action = $Action
+        action = $(if ($PreviousStopReconcileOnly) { 'ReconcilePreviousStop' } else { $Action })
         status = 'succeeded'
     } | ConvertTo-Json -Depth 4 -Compress
     exit 0

@@ -73,6 +73,7 @@ function Invoke-RuntimeTaskFixture {
         [string]$DataRootOverride,
         [string]$LeaseInstanceId,
         [string]$LeaseToken,
+        [string]$RestoreCompletedRequestId,
         [switch]$UseDerivedTransactionRoot,
         [switch]$Recover,
         [switch]$WhatIf
@@ -96,6 +97,7 @@ function Invoke-RuntimeTaskFixture {
         $arguments += @('-LeaseToken', $LeaseToken)
     }
     if ($Recover) { $arguments += '-Recover' }
+    if ($RestoreCompletedRequestId) { $arguments += @('-RestoreCompletedRequestId', $RestoreCompletedRequestId) }
     if ($WhatIf) { $arguments += '-WhatIf' }
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -140,6 +142,33 @@ function Assert-OuterLeaseUnchanged {
 }
 
 try {
+    $parseTokens = $null; $parseErrors = $null
+    $installerAst = [Management.Automation.Language.Parser]::ParseFile($installer, [ref]$parseTokens, [ref]$parseErrors)
+    foreach ($name in @('ConvertTo-RuntimeTaskCanonicalSddl', 'Test-RuntimeTaskSecurityDescriptorEqual', 'Test-RuntimeTaskUserEqual')) {
+        $functionAst = $installerAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name }, $true)
+        . ([scriptblock]::Create($functionAst.Extent.Text))
+    }
+    Assert-RuntimeTaskSelfTest (Test-RuntimeTaskSecurityDescriptorEqual `
+        'O:SYG:SYD:(A;ID;GA;;;SY)' 'O:SYG:SYD:AI(A;ID;GA;;;SY)') 'native inheritance bookkeeping changed equality'
+    Assert-RuntimeTaskSelfTest (-not (Test-RuntimeTaskSecurityDescriptorEqual `
+        'O:SYG:SYD:P(A;;GA;;;SY)' 'O:SYG:SYD:(A;;GA;;;SY)')) 'task DACL protection drift was ignored'
+    Assert-RuntimeTaskSelfTest (-not (Test-RuntimeTaskSecurityDescriptorEqual `
+        'O:SYG:SYD:P(A;;GRGX;;;LS)' 'O:SYG:SYD:P(A;;GA;;;LS)')) 'task permission drift was ignored'
+    Assert-RuntimeTaskSelfTest (Test-RuntimeTaskSecurityDescriptorEqual `
+        'O:SYG:SYD:(A;ID;GA;;;SY)(A;;GR;;;BA)' 'O:SYG:SYD:AI(A;;GR;;;BA)(A;ID;GA;;;SY)') `
+        'native allow-entry canonicalization changed effective grants'
+    Assert-RuntimeTaskSelfTest (-not (Test-RuntimeTaskSecurityDescriptorEqual `
+        'O:SYG:SYD:P(D;;GW;;;LS)(A;;GA;;;LS)' 'O:SYG:SYD:P(A;;GA;;;LS)(D;;GW;;;LS)')) `
+        'deny/allow ordering was ignored'
+    Assert-RuntimeTaskSelfTest (Test-RuntimeTaskSecurityDescriptorEqual $expectedTaskSddl `
+        'O:SYG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;LS)') `
+        'native generic-to-file access mapping changed task permissions'
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    Assert-RuntimeTaskSelfTest (Test-RuntimeTaskUserEqual $currentIdentity.Name $currentIdentity.User.Value) `
+        'qualified account and SID did not identify the same task user'
+    Assert-RuntimeTaskSelfTest (-not (Test-RuntimeTaskUserEqual 'S-1-5-19' 'S-1-5-20')) `
+        'different task users were treated as the same identity'
+
     $preview = New-RuntimeTaskFixture 'preview'
     Remove-Item -LiteralPath $preview.Transactions -Recurse -Force
     $previewResult = Invoke-RuntimeTaskFixture -Fixture $preview -StableRoot $preview.StableA `
@@ -167,6 +196,11 @@ try {
     Assert-RuntimeTaskSelfTest ($a.ExitCode -eq 0) ('initial A installation failed: ' + $a.StdErr)
     $b = Invoke-RuntimeTaskFixture $upgrade $upgrade.StableB Activate $requestB
     Assert-RuntimeTaskSelfTest ($b.ExitCode -eq 0) ('A to B upgrade failed: ' + $b.StdErr)
+    $completedArchive = Get-Content -LiteralPath (Join-Path $upgrade.Transactions ('completed\' + $requestB + '.json')) -Raw | ConvertFrom-Json
+    Assert-RuntimeTaskSelfTest ($completedArchive.previous.server.present -and $completedArchive.previous.stop.present -and
+        [string]$completedArchive.previous.server.securityDescriptor -ceq $expectedCanonicalTaskSddl -and
+        -not [string]::IsNullOrWhiteSpace([string]$completedArchive.previous.server.xmlBase64)) `
+        'successful task replacement discarded its previous definitions or permissions'
     $startB = Get-ShadowTask $upgrade start
     $stopB = Get-ShadowTask $upgrade stop
     Assert-RuntimeTaskSelfTest ([string]$startB.descriptor.arguments -like ('*' + $upgrade.StableB + '*') -and
@@ -476,9 +510,120 @@ try {
         }
     }
 
+    $legacy = New-RuntimeTaskFixture 'inherited-legacy-acl'
+    $legacySeed = Invoke-RuntimeTaskFixture $legacy $legacy.StableA Activate ([guid]::NewGuid().ToString('D'))
+    Assert-RuntimeTaskSelfTest ($legacySeed.ExitCode -eq 0) 'legacy fixture seed failed'
+    $legacySddl = 'O:SYG:SYD:(A;ID;GA;;;SY)(A;ID;GA;;;BA)'
+    foreach ($kind in @('start', 'stop')) {
+        $record = Get-ShadowTask $legacy $kind
+        $record.securityDescriptor = $legacySddl
+        [IO.File]::WriteAllText((Join-Path $legacy.Shadow ($kind + '-task.json')),
+            ($record | ConvertTo-Json -Depth 16 -Compress), [Text.UTF8Encoding]::new($false))
+    }
+    $legacyBefore = Get-ShadowPair $legacy
+    $legacyFailure = Invoke-RuntimeTaskFixture -Fixture $legacy -StableRoot $legacy.StableB `
+        -Mode PrepareDisabled -RequestId ([guid]::NewGuid().ToString('D')) -FailPoint SecondRegister
+    $legacyRestored = Get-ShadowPair $legacy
+    Assert-RuntimeTaskSelfTest ($legacyFailure.ExitCode -ne 0 -and
+        $legacyBefore.Start -ceq $legacyRestored.Start -and $legacyBefore.Stop -ceq $legacyRestored.Stop) `
+        'failed migration did not restore inherited legacy task permissions exactly'
+    $legacyUpgrade = Invoke-RuntimeTaskFixture $legacy $legacy.StableB PrepareDisabled ([guid]::NewGuid().ToString('D'))
+    Assert-RuntimeTaskSelfTest ($legacyUpgrade.ExitCode -eq 0 -and
+        (Get-ShadowTask $legacy start).securityDescriptor -ceq $expectedCanonicalTaskSddl -and
+        (Get-ShadowTask $legacy stop).securityDescriptor -ceq $expectedCanonicalTaskSddl) `
+        'legacy task migration did not install the fixed protected permissions'
+
+    $badPreimage = New-RuntimeTaskFixture 'preimage-read-failure'
+    $seed = Invoke-RuntimeTaskFixture $badPreimage $badPreimage.StableA Activate ([guid]::NewGuid().ToString('D'))
+    Assert-RuntimeTaskSelfTest ($seed.ExitCode -eq 0) 'preimage failure fixture seed failed'
+    $badPath = Join-Path $badPreimage.Shadow 'start-task.json'
+    $validPreimage = [IO.File]::ReadAllText($badPath)
+    $badRecord = $validPreimage | ConvertFrom-Json
+    $badRecord.securityDescriptor = 'invalid'
+    [IO.File]::WriteAllText($badPath, ($badRecord | ConvertTo-Json -Depth 16 -Compress), [Text.UTF8Encoding]::new($false))
+    $readFailure = Invoke-RuntimeTaskFixture $badPreimage $badPreimage.StableB PrepareDisabled ([guid]::NewGuid().ToString('D'))
+    Assert-RuntimeTaskSelfTest ($readFailure.ExitCode -ne 0 -and
+        (Get-DysonHostMutationLeaseStatus -DataRoot $badPreimage.Data).state -ceq 'released' -and
+        -not (Test-Path -LiteralPath (Join-Path $badPreimage.Transactions 'active-intent.json'))) `
+        'a preimage read failure stranded the lease before any scheduler mutation'
+
+    $completed = New-RuntimeTaskFixture 'completed-restore'
+    $initial = Invoke-RuntimeTaskFixture $completed $completed.StableA Activate ([guid]::NewGuid().ToString('D'))
+    Assert-RuntimeTaskSelfTest ($initial.ExitCode -eq 0) 'completed restore seed failed'
+    $originalPair = Get-ShadowPair $completed
+    $completedRequest = [guid]::NewGuid().ToString('D')
+    $replacement = Invoke-RuntimeTaskFixture $completed $completed.StableB PrepareDisabled $completedRequest
+    Assert-RuntimeTaskSelfTest ($replacement.ExitCode -eq 0) 'completed restore replacement failed'
+    $replacementPair = Get-ShadowPair $completed
+    $sourceArchivePath = Join-Path $completed.Transactions ('completed\' + $completedRequest + '.json')
+    $sourceReceiptPath = Join-Path $completed.Transactions ('receipts\' + $completedRequest + '.json')
+    $sourceArchiveBytes = [IO.File]::ReadAllText($sourceArchivePath)
+    $sourceReceiptBytes = [IO.File]::ReadAllText($sourceReceiptPath)
+    $restoreRequest = [guid]::NewGuid().ToString('D')
+    $preview = Invoke-RuntimeTaskFixture $completed $completed.StableB PrepareDisabled $restoreRequest `
+        -RestoreCompletedRequestId $completedRequest -WhatIf
+    Assert-RuntimeTaskSelfTest ($preview.ExitCode -eq 0 -and
+        (Get-ShadowPair $completed).Start -ceq $replacementPair.Start -and
+        -not (Test-Path (Join-Path $completed.Transactions ('receipts\' + $restoreRequest + '.json')))) `
+        'completed restoration preview mutated tasks or evidence'
+    $sameId = Invoke-RuntimeTaskFixture $completed $completed.StableB PrepareDisabled $completedRequest `
+        -RestoreCompletedRequestId $completedRequest
+    Assert-RuntimeTaskSelfTest ($sameId.ExitCode -ne 0) 'completed restoration accepted its source request id'
+
+    $driftPath = Join-Path $completed.Shadow 'stop-task.json'
+    $driftRecord = Get-ShadowTask $completed stop
+    $driftRecord.enabled = $true
+    [IO.File]::WriteAllText($driftPath, ($driftRecord | ConvertTo-Json -Depth 16 -Compress))
+    $writesBefore = @(Get-Content (Join-Path $completed.Shadow 'writes.log')).Count
+    $drift = Invoke-RuntimeTaskFixture $completed $completed.StableB PrepareDisabled $restoreRequest `
+        -RestoreCompletedRequestId $completedRequest
+    Assert-RuntimeTaskSelfTest ($drift.ExitCode -ne 0 -and $drift.StdErr -match 'drifted' -and
+        @(Get-Content (Join-Path $completed.Shadow 'writes.log')).Count -eq $writesBefore -and
+        (Get-DysonHostMutationLeaseStatus -DataRoot $completed.Data).state -ceq 'released') `
+        'completed restoration accepted drift, wrote tasks, or stranded its lease'
+    [IO.File]::WriteAllText($driftPath, $replacementPair.Stop)
+
+    $crashedRestoreRequest = [guid]::NewGuid().ToString('D')
+    $crashedRestore = Invoke-RuntimeTaskFixture $completed $completed.StableB PrepareDisabled $crashedRestoreRequest `
+        -RestoreCompletedRequestId $completedRequest -FailPoint HardExitAfterStartRegister
+    Assert-RuntimeTaskSelfTest ($crashedRestore.ExitCode -eq 86 -and
+        (Test-RuntimeTaskSelfTestFilePresent (Join-Path $completed.Transactions 'active-intent.json'))) `
+        'interrupted completed restoration lost its durable intent'
+    $recoveredRestore = Invoke-RuntimeTaskFixture $completed $completed.StableB PrepareDisabled $crashedRestoreRequest `
+        -RestoreCompletedRequestId $completedRequest -Recover
+    $recoveredPair = Get-ShadowPair $completed
+    Assert-RuntimeTaskSelfTest ($recoveredRestore.ExitCode -eq 0 -and
+        $recoveredRestore.StdOut -match '"status":"rolled-back"' -and
+        $recoveredPair.Start -ceq $replacementPair.Start -and $recoveredPair.Stop -ceq $replacementPair.Stop -and
+        -not (Test-RuntimeTaskSelfTestFilePresent (Join-Path $completed.Transactions 'active-intent.json'))) `
+        ('interrupted completed restoration recovery failed: ' + $recoveredRestore.StdErr)
+
+    $failedRestore = Invoke-RuntimeTaskFixture $completed $completed.StableB PrepareDisabled ([guid]::NewGuid().ToString('D')) `
+        -RestoreCompletedRequestId $completedRequest -FailPoint SecondRegister
+    $compensatedPair = Get-ShadowPair $completed
+    Assert-RuntimeTaskSelfTest ($failedRestore.ExitCode -ne 0 -and
+        $compensatedPair.Start -ceq $replacementPair.Start -and $compensatedPair.Stop -ceq $replacementPair.Stop -and
+        (Get-DysonHostMutationLeaseStatus -DataRoot $completed.Data).state -ceq 'released') `
+        'failed completed restoration did not compensate the full pre-restore pair'
+
+    $restored = Invoke-RuntimeTaskFixture $completed $completed.StableB PrepareDisabled $restoreRequest `
+        -RestoreCompletedRequestId $completedRequest
+    $restoredPair = Get-ShadowPair $completed
+    Assert-RuntimeTaskSelfTest ($restored.ExitCode -eq 0 -and $restored.StdOut -match '"status":"succeeded"' -and
+        $restoredPair.Start -ceq $originalPair.Start -and $restoredPair.Stop -ceq $originalPair.Stop) `
+        ('completed restoration did not restore XML, enabled state and ACL: ' + $restored.StdErr)
+    Assert-RuntimeTaskSelfTest ([IO.File]::ReadAllText($sourceArchivePath) -ceq $sourceArchiveBytes -and
+        [IO.File]::ReadAllText($sourceReceiptPath) -ceq $sourceReceiptBytes -and
+        (Test-Path (Join-Path $completed.Transactions ('completed\' + $restoreRequest + '.json')))) `
+        'completed restoration rewrote original evidence or omitted its own archive'
+    $replayedRestore = Invoke-RuntimeTaskFixture $completed $completed.StableB PrepareDisabled $restoreRequest `
+        -RestoreCompletedRequestId $completedRequest
+    Assert-RuntimeTaskSelfTest ($replayedRestore.ExitCode -eq 0 -and $replayedRestore.StdOut -match '"reused":true') `
+        'completed restoration replay was not idempotent'
+
     [ordered]@{
         protocol = 'DYSON_CONTROL_RUNTIME_TASK_SELFTEST_V2'; state = 'passed'; scheduler = 'shadow'
-        productionSchedulerTouched = $false; cases = 20
+        productionSchedulerTouched = $false; cases = 41
     } | ConvertTo-Json -Compress
 }
 finally {

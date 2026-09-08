@@ -219,6 +219,22 @@ and oversized input are rejected without reflecting the submitted value.
 
 ## Integration checklist
 
+The service launcher uses `Test-DysonControlConfiguration.ps1 -RuntimeOnly`.
+This verifies the protected current configuration against the administrator-
+published `config\dyson-control.runtime.json` approval; it does not open the
+private transaction lock, receipts, or historical snapshots. The approval
+contains hashes and counters, never environment values. It is revoked under
+the mutation lock before a configuration transaction and is published only
+after a successful clean terminal state and snapshot validation. Missing,
+changed, or mismatched approval prevents startup. Do not hand-write an approval
+to bypass an interrupted transaction; recover the transaction with the normal
+configuration tools. Older installations acquire an approval through a
+verified configuration install/reuse operation.
+
+The default test remains the administrator's full journal/snapshot audit.
+Runtime success does not claim that the service account can perform that audit
+or restore configuration. Keep those private ACLs unchanged.
+
 The deployment orchestration must:
 
 1. run the elevated self-test and the API CLI tests;

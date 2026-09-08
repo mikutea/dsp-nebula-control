@@ -11,7 +11,7 @@ $restoreScript = Join-Path $PSScriptRoot 'Restore-DysonGsManagerSnapshot.ps1'
 . $commonScript
 
 $temporaryBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
-$testRoot = Join-Path $temporaryBase ('dyson-gsm-migration-selftest-' + [guid]::NewGuid().ToString('N'))
+$testRoot = Join-Path $temporaryBase ('dgm-' + [guid]::NewGuid().ToString('N'))
 $projectRoot = Join-Path $testRoot 'fictional-project'
 $gsManagerRoot = Join-Path $projectRoot 'tools\GSManager'
 $dataRoot = Join-Path $testRoot 'fictional-program-data\DysonControl'
@@ -203,6 +203,13 @@ try {
     Write-FixtureText -Path (Join-Path $gsManagerRoot 'config\settings.json') `
         -Value ('{"endpoint":"https://example.com","token":"' + $sensitiveMarker + '"}')
     Write-FixtureText -Path (Join-Path $gsManagerRoot 'bin\gsmanager-helper.exe') -Value 'fictional GSManager helper'
+    $umlautFixtureName = ([char]0x00e4) + 'ther-localization.yml'
+    $galaxyFixtureName = ([char]0x661f) + ([char]0x7cfb) + '.yml'
+    $resourceFixtureName = ([char]0x8d44) + ([char]0x6e90) + '.yml'
+    Write-FixtureText -Path (Join-Path $gsManagerRoot 'config\zeta-localization.yml') -Value 'fictional zeta locale'
+    Write-FixtureText -Path (Join-Path $gsManagerRoot ('config\' + $umlautFixtureName)) -Value 'fictional umlaut locale'
+    Write-FixtureText -Path (Join-Path $gsManagerRoot ('config\' + $galaxyFixtureName)) -Value 'fictional galaxy locale'
+    Write-FixtureText -Path (Join-Path $gsManagerRoot ('config\' + $resourceFixtureName)) -Value 'fictional resource locale'
     [System.IO.Directory]::CreateDirectory((Join-Path $gsManagerRoot 'empty-explicit-directory')) | Out-Null
     $fixtureRootSddl = ConvertTo-DysonGsCanonicalSecurityDescriptorSddl `
         'O:SYG:BAD:P(A;OICI;FA;;;SY)(A;OICI;GRGX;;;BU)'
@@ -313,7 +320,7 @@ try {
     $inspectRaw = & $inspectScript -ProjectRoot $projectRoot -GsManagerRoot $gsManagerRoot -TaskName $taskName
     $inspect = Convert-LastMigrationJson -Output $inspectRaw
     Assert-MigrationSelfTest -Condition ($inspect.state -eq 'inspected' -and [bool]$inspect.dryRun -and
-        $inspect.fileCount -eq 2 -and -not [bool]$inspect.productionChanged) -Message 'Inspect was not a bounded no-write inventory'
+        $inspect.fileCount -eq 6 -and -not [bool]$inspect.productionChanged) -Message 'Inspect was not a bounded no-write inventory'
 
     $whatIfRaw = & $snapshotScript -ProjectRoot $projectRoot -GsManagerRoot $gsManagerRoot -DataRoot $dataRoot `
         -TaskName $taskName -PairedSaveProtectionPointId $protectionPointId `
@@ -364,8 +371,22 @@ try {
     [System.IO.Directory]::Delete($sourceJunction, $false)
     [void]$junctions.Remove($sourceJunction)
 
-    $tamperSnapshot = New-FixtureSnapshot
-    $tamperPath = Join-Path (Get-DysonGsSnapshotRoot -DataRoot $dataRoot -SnapshotId $tamperSnapshot.snapshotId) 'gsmanager\config\settings.json'
+    $previousCulture = [System.Globalization.CultureInfo]::CurrentCulture
+    try {
+        # de-DE sorts the umlaut beside a, while the protocol requires UTF-16 ordinal order.
+        # CJK names keep the production non-ASCII filename case covered as well.
+        [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('de-DE')
+        $tamperSnapshot = New-FixtureSnapshot
+    }
+    finally { [System.Globalization.CultureInfo]::CurrentCulture = $previousCulture }
+    $ordinalSnapshotRoot = Get-DysonGsSnapshotRoot -DataRoot $dataRoot -SnapshotId $tamperSnapshot.snapshotId
+    $ordinalManifest = Read-DysonGsJsonBounded -Path (Join-Path $ordinalSnapshotRoot 'manifest.json')
+    $ordinalPaths = @($ordinalManifest.files | ForEach-Object { [string]$_.path })
+    Assert-MigrationSelfTest -Condition (
+        $ordinalPaths -ccontains ('gsmanager/config/' + $umlautFixtureName) -and
+        $ordinalPaths -ccontains ('gsmanager/config/' + $galaxyFixtureName)
+    ) -Message 'the culture-independent snapshot omitted a non-ASCII fixture'
+    $tamperPath = Join-Path $ordinalSnapshotRoot 'gsmanager\config\settings.json'
     [System.IO.File]::AppendAllText($tamperPath, 'tampered', [System.Text.UTF8Encoding]::new($false))
     $tamperFailure = $null
     Assert-MigrationSelfTest -Condition (Test-MigrationRejected -FailureMessage ([ref]$tamperFailure) -Command {
@@ -690,6 +711,7 @@ try {
         strictSchemaAndFullRehash = $true
         tamperExtraAndReparseRejected = $true
         fileCountTotalAndSingleFileLimitsEnforced = $true
+        ordinalAndNonAsciiInventoryOrder = $true
         sensitiveOutputRedacted = $true
         schedulerQueryFailureRejected = $true
         nonRootTaskRejected = $true
@@ -738,7 +760,7 @@ finally {
         }
     }
     $testFull = [System.IO.Path]::GetFullPath($testRoot).TrimEnd('\', '/')
-    $expectedPrefix = $temporaryBase + [System.IO.Path]::DirectorySeparatorChar + 'dyson-gsm-migration-selftest-'
+    $expectedPrefix = $temporaryBase + [System.IO.Path]::DirectorySeparatorChar + 'dgm-'
     $env:DYSON_GSMANAGER_MIGRATION_SELFTEST = if ([string]::IsNullOrEmpty($previousMigrationSelfTest)) { $null } else { $previousMigrationSelfTest }
     $env:DYSON_GSMANAGER_MIGRATION_SHADOW_ROOT = if ([string]::IsNullOrEmpty($previousMigrationShadowRoot)) { $null } else { $previousMigrationShadowRoot }
     if ($testFull.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $testFull)) {

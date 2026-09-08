@@ -998,6 +998,7 @@ export class CutoverService {
     }, scope)
 
     if (desired === 'candidate') {
+      let previousStopFinalized = false
       if (!journal.baselineSaveProtected || !journal.baseState.prepared || !evidence.candidateDefined) {
         throw new CutoverError('CUTOVER_RECOVERY_TARGET_NOT_ALLOWED')
       }
@@ -1018,6 +1019,7 @@ export class CutoverService {
           journal = await this.#advanceJournal(journal, 'stop-source-intent', {}, scope)
           await this.#mutate(scope, journal.requestId, (requestContext) =>
             this.#adapter.stopPreviousRuntime(requestContext))
+          previousStopFinalized = true
           evidence = await this.#inspect(scope, journal.requestId)
           assertKnownEvidence(evidence)
         }
@@ -1035,6 +1037,14 @@ export class CutoverService {
         } else {
           if (evidence.processState !== 'none' || evidence.portState !== 'closed') {
             throw new CutoverError('CUTOVER_STOP_GATE_FAILED')
+          }
+          if (!previousStopFinalized && !evidence.previousEnabled && !evidence.candidateEnabled) {
+            // A completed process exit can precede the stop task's durable
+            // acknowledgement/cleanup. Reconcile it before enabling authority.
+            await this.#mutate(scope, journal.requestId, (requestContext) =>
+              this.#adapter.stopPreviousRuntime(requestContext))
+            evidence = await this.#inspect(scope, journal.requestId)
+            assertStoppedWithAuthoritiesDisabled(evidence)
           }
           if (!evidence.candidateEnabled) {
             if (evidence.previousEnabled) throw new CutoverError('CUTOVER_AUTHORITY_DRIFT')
@@ -1107,6 +1117,19 @@ export class CutoverService {
       }
       const restoreBaseline = journal.operation === 'rollback-immediate' ||
         (journal.operation === 'activate' && journal.baselineSaveProtected)
+      if (!evidence.previousEnabled && !evidence.candidateEnabled) {
+        // Recovery only reconciles the existing stop transaction. A healthy old
+        // process must never receive a new signal while restoring its authority.
+        await this.#mutate(scope, journal.requestId, (requestContext) =>
+          this.#adapter.stopPreviousRuntime(requestContext, { reconcileOnly: true }))
+        evidence = await this.#inspect(scope, journal.requestId)
+        assertKnownEvidence(evidence)
+        if (evidence.previousEnabled || evidence.candidateEnabled ||
+            (evidence.processState !== 'previous-only' &&
+              (evidence.processState !== 'none' || evidence.portState !== 'closed'))) {
+          throw new CutoverError('CUTOVER_STOP_GATE_FAILED')
+        }
+      }
       if (restoreBaseline && evidence.processState === 'none' && !journal.baselineRestored) {
         journal = await this.#restoreActivationBaseline(journal, evidence, scope)
       }

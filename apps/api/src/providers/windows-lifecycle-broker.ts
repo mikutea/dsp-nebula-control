@@ -89,13 +89,29 @@ const verifyEvidenceSchema = z.strictObject({
   blockers: z.array(blockerSchema).max(16),
   runtime: runtimeSchema
 })
+const processTelemetrySchema = z.strictObject({
+  processId: z.number().int().positive(),
+  startedAtUnixMs: z.number().int().positive(),
+  sampledAtUnixMs: z.number().int().positive(),
+  processCoresUsed: z.number().finite().nonnegative(),
+  workingSetGiB: z.number().finite().nonnegative(),
+  privateMemoryGiB: z.number().finite().nonnegative(),
+  threadCount: z.number().int().nonnegative()
+})
 const statusEvidenceSchema = z.strictObject({
   lifecycleState: lifecycleStateSchema,
   task: taskSchema,
-  runtime: runtimeSchema
+  runtime: runtimeSchema,
+  processTelemetry: processTelemetrySchema.nullable().optional()
 }).superRefine((evidence, context) => {
   if (evidence.lifecycleState !== evidence.runtime.lifecycleState) {
     context.addIssue({ code: 'custom', message: 'state-binding' })
+  }
+  const telemetry = evidence.processTelemetry
+  if (telemetry && (evidence.lifecycleState !== 'running_verified' ||
+      evidence.runtime.process.status !== 'verified' || telemetry.processId !== evidence.runtime.process.pid ||
+      telemetry.startedAtUnixMs > telemetry.sampledAtUnixMs)) {
+    context.addIssue({ code: 'custom', message: 'telemetry-binding' })
   }
 })
 const dispatchedEvidenceSchema = z.strictObject({

@@ -846,6 +846,39 @@ describe('provider-agnostic GSManager cutover', () => {
     })
   })
 
+  it.each(['candidate', 'previous'] as const)('finishes stopped-source task cleanup before recovering %s authority', async (desired) => {
+    const harness = createHarness()
+    await prepareCutover(harness, randomUUID())
+    harness.adapter.hardExitAfter = 'stopPreviousRuntime'
+    await expect(activateCutover(harness, id(131))).rejects.toBeInstanceOf(CutoverError)
+    expect(harness.adapter.previousStopSignals).toBe(1)
+    expect(harness.adapter.previousStopCleanupPending).toBe(true)
+    harness.adapter.hardExitAfter = null
+    harness.resetObservations()
+    const recovered = await harness.service.recoverInterrupted({ requestId: id(131), desired })
+    expect(recovered.phase).toBe(`recovered-${desired}`)
+    expect(harness.adapter.previousStopSignals).toBe(1)
+    expect(harness.adapter.previousStopCleanupPending).toBe(false)
+    const enabled = desired === 'candidate' ? 'enableCandidateAuthority' : 'enablePreviousAuthority'
+    expect(harness.adapter.mutations.indexOf('stopPreviousRuntime')).toBeLessThan(harness.adapter.mutations.indexOf(enabled))
+  })
+
+  it.each([true, false])('recovers a failed previous stop without re-signaling (game still running=%s)', async (running) => {
+    const harness = createHarness()
+    await prepareCutover(harness, randomUUID())
+    const oldRuntime = { ...harness.adapter.evidence }
+    harness.adapter.hardExitAfter = 'stopPreviousRuntime'
+    await expect(activateCutover(harness, id(132))).rejects.toBeInstanceOf(CutoverError)
+    harness.adapter.hardExitAfter = null
+    harness.adapter.previousStopFailed = true
+    if (running) Object.assign(harness.adapter.evidence, oldRuntime, { previousEnabled: false })
+    const recovered = await harness.service.recoverInterrupted({ requestId: id(132), desired: 'previous' })
+    expect(recovered.phase).toBe('recovered-previous')
+    expect(harness.adapter.previousStopSignals).toBe(1)
+    expect(harness.adapter.previousStopFailed).toBe(true)
+    expect(harness.adapter.previousStopCleanupPending).toBe(false)
+  })
+
   it('recovers an interrupted activation idempotently to the candidate terminal', async () => {
     const harness = createHarness()
     await prepareCutover(harness, randomUUID() )
@@ -879,7 +912,8 @@ describe('provider-agnostic GSManager cutover', () => {
     const recovered = await harness.service.recoverInterrupted({ requestId: id(14), desired: 'previous' })
 
     expect(recovered.phase).toBe('recovered-previous')
-    expect(harness.adapter.mutations).toEqual(['enablePreviousAuthority'])
+    expect(harness.adapter.mutations).toEqual(['stopPreviousRuntime', 'enablePreviousAuthority'])
+    expect(harness.adapter.previousStopSignals).toBe(0)
     expect(harness.adapter.evidence.processState).toBe('previous-only')
     expect(harness.store.state.authority).toBe('previous')
   })
@@ -897,6 +931,7 @@ describe('provider-agnostic GSManager cutover', () => {
     expect(harness.adapter.mutations).toEqual([
       'disableCandidateAuthority',
       'stopCandidateRuntime',
+      'stopPreviousRuntime',
       'restoreActivationBaseline',
       'enablePreviousAuthority',
       'startPreviousRuntime'
@@ -1127,6 +1162,9 @@ class FakeCutoverAdapter implements CutoverHostAdapter {
   readonly seenScopes: HostMutationOperationScope[] = []
   hardExitAfter: string | null = null
   hardExitBefore: string | null = null
+  previousStopSignals = 0
+  previousStopCleanupPending = false
+  previousStopFailed = false
   beforeInspect: (() => void) | null = null
   afterMutation: ((name: string) => void) | null = null
 
@@ -1163,15 +1201,21 @@ class FakeCutoverAdapter implements CutoverHostAdapter {
     this.apply('disablePreviousAuthority', request, () => { this.evidence.previousEnabled = false })
   }
 
-  async stopPreviousRuntime(request: CutoverAdapterMutationRequest): Promise<void> {
+  async stopPreviousRuntime(request: CutoverAdapterMutationRequest, options?: Readonly<{ reconcileOnly: true }>): Promise<void> {
     this.apply('stopPreviousRuntime', request, () => {
-      Object.assign(this.evidence, stoppedRuntime())
+      if (!options?.reconcileOnly) {
+        if (this.previousStopFailed) throw new Error('stop failed')
+        if (this.evidence.processState === 'previous-only') this.previousStopSignals += 1
+        Object.assign(this.evidence, stoppedRuntime())
+      }
+      this.previousStopCleanupPending = this.hardExitAfter === 'stopPreviousRuntime'
     })
   }
 
   async enableCandidateAuthority(
     request: CutoverAuthorityMutationRequest
   ): Promise<CutoverAuthorityMutationResult> {
+    if (this.previousStopCleanupPending) throw new Error('previous stop cleanup required')
     return this.applyAuthorityMutation(
       'enableCandidateAuthority',
       request,
@@ -1205,6 +1249,7 @@ class FakeCutoverAdapter implements CutoverHostAdapter {
   }
 
   async enablePreviousAuthority(request: CutoverAdapterMutationRequest): Promise<void> {
+    if (this.previousStopCleanupPending) throw new Error('previous stop cleanup required')
     this.apply('enablePreviousAuthority', request, () => { this.evidence.previousEnabled = true })
   }
 

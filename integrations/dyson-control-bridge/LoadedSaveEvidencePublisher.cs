@@ -9,6 +9,130 @@ namespace DysonControl.Bridge
 {
     internal delegate bool TryObserveLoadedSave(out LoadedSaveObservation observation);
 
+    /// <summary>Tracks successful load calls, never the name imported inside save data.</summary>
+    internal sealed class LoadedSaveOriginTracker
+    {
+        private readonly object sync = new object();
+        private long generation;
+        private int activeLoads;
+        private bool reentrantOrInvalidated;
+        private object data;
+        private object session;
+        private string saveName;
+        private LoadedSaveObservation loadedFiles;
+        private bool observedReady;
+
+        internal LoadAttempt BeginLoad()
+        {
+            lock (sync)
+            {
+                ClearOrigin();
+                if (generation == long.MaxValue || activeLoads == int.MaxValue)
+                    throw new InvalidOperationException("Loaded-save load generation exhausted.");
+                if (activeLoads == 0) reentrantOrInvalidated = false;
+                else reentrantOrInvalidated = true;
+                activeLoads++;
+                return new LoadAttempt(this, ++generation);
+            }
+        }
+
+        internal void CompleteLoad(LoadAttempt attempt, bool succeeded, string actualLoadArgument,
+            object loadedData, object multiplayerSession, LoadedSaveObservation files)
+        {
+            lock (sync)
+            {
+                if (attempt == null || !ReferenceEquals(attempt.Owner, this) || attempt.Completed) return;
+                attempt.Completed = true;
+                activeLoads--;
+                if (attempt.Generation != generation || activeLoads != 0 || reentrantOrInvalidated || !succeeded ||
+                    loadedData == null || multiplayerSession == null || files == null || !files.IsValid() ||
+                    !string.Equals(files.SaveName, actualLoadArgument, StringComparison.Ordinal) ||
+                    !string.Equals(actualLoadArgument, BridgeProtocol.LastExitSaveName, StringComparison.Ordinal))
+                {
+                    ClearOrigin();
+                    return;
+                }
+                data = loadedData;
+                session = multiplayerSession;
+                saveName = actualLoadArgument;
+                loadedFiles = files.Copy();
+                observedReady = false;
+            }
+        }
+
+        internal bool TryObserve(object currentData, object currentSession, bool hostGameLoaded, out string name)
+        {
+            lock (sync)
+            {
+                name = null;
+                if (saveName == null) return false;
+                if (!ReferenceEquals(data, currentData) || !ReferenceEquals(session, currentSession))
+                {
+                    ClearOrigin();
+                    return false;
+                }
+                if (!hostGameLoaded)
+                {
+                    // The load postfix precedes Nebula's game-begin callback.
+                    // Once readiness was observed, losing it revokes the origin.
+                    if (observedReady) ClearOrigin();
+                    return false;
+                }
+                observedReady = true;
+                name = saveName;
+                return true;
+            }
+        }
+
+        internal void Invalidate()
+        {
+            lock (sync)
+            {
+                ClearOrigin();
+                if (activeLoads != 0) reentrantOrInvalidated = true;
+            }
+        }
+
+        internal bool TryMatchFiles(object currentData, object currentSession, LoadedSaveObservation current,
+            out LoadedSaveObservation observation)
+        {
+            lock (sync)
+            {
+                observation = null;
+                if (loadedFiles == null || !observedReady) return false;
+                if (!ReferenceEquals(data, currentData) || !ReferenceEquals(session, currentSession) ||
+                    current == null || !loadedFiles.MetadataEquals(current))
+                {
+                    ClearOrigin();
+                    return false;
+                }
+                observation = loadedFiles.Copy();
+                return true;
+            }
+        }
+
+        private void ClearOrigin()
+        {
+            data = null;
+            session = null;
+            saveName = null;
+            loadedFiles = null;
+            observedReady = false;
+        }
+
+        internal sealed class LoadAttempt
+        {
+            internal LoadAttempt(LoadedSaveOriginTracker owner, long generation)
+            {
+                Owner = owner;
+                Generation = generation;
+            }
+            internal LoadedSaveOriginTracker Owner { get; }
+            internal long Generation { get; }
+            internal bool Completed { get; set; }
+        }
+    }
+
     /// <summary>
     /// Maintains a signed proof for the exact save name retained by the running
     /// game. Hashing is performed away from Unity's main thread. The fixed output
@@ -195,6 +319,13 @@ namespace DysonControl.Bridge
             evidencePresent = false;
             publishedObservation = null;
             disposed = true;
+        }
+
+        internal void InvalidateLoadedOrigin()
+        {
+            if (pending != null) pending.Invalidated = true;
+            InvalidateEvidence();
+            nextAttemptUnixMs = 0;
         }
 
         private void InvalidateEvidence()

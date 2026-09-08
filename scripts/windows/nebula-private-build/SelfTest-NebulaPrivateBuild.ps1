@@ -34,6 +34,19 @@ function Assert-True {
     if (-not $Condition) { throw $Code }
 }
 
+function Get-NestedTransactionFailureCode {
+    param([Parameter(Mandatory)]$Failure)
+    # Preserve the failing case even when its diagnostic contains a local path
+    # or a long child-process error. Only fixed-format identifiers leave here.
+    $name = [string]$Failure.name
+    if ($name -cnotmatch '^[a-z0-9][a-z0-9-]{0,95}$') { $name = 'unknown-case' }
+    $code = 'NEBULA_PRIVATE_NESTED_CASE_' + $name.ToUpperInvariant().Replace('-', '_')
+    $childCode = [regex]::Match([string]$Failure.detail,
+        '(?<![A-Z0-9_])(?:NEBULA_PRIVATE|NEBULA_PLUGIN)_[A-Z0-9_]{1,96}(?![A-Z0-9_])')
+    if ($childCode.Success) { $code += '__' + $childCode.Value }
+    return $code
+}
+
 function Assert-ThrowsCode {
     param([Parameter(Mandatory)][scriptblock]$Body, [Parameter(Mandatory)][string]$Code)
     try { & $Body; throw ('SELFTEST_EXPECTED_ERROR_NOT_THROWN_' + $Code) }
@@ -653,14 +666,46 @@ try {
             -CandidateRoot (Join-Path $jobRoot 'candidate') } 'NEBULA_PRIVATE_CANDIDATE_MANIFEST_INVALID'
     }
 
+    Test-Case 'nested-transaction-diagnostics-retain-case-without-private-paths' {
+        $failure = [pscustomobject]@{
+            name = 'maintenance-window-expiry-after-intent-fails-closed'
+            detail = 'wrong-failure: C:\fictional-fixture\script.ps1 NEBULA_PLUGIN_WINDOW_EXPIRED ' + ('x' * 200)
+        }
+        $code = Get-NestedTransactionFailureCode $failure
+        $nestedException = [InvalidOperationException]::new($code)
+        $nestedException.Data['Code'] = $code
+        Assert-True ((Get-NebulaPrivateErrorCode $nestedException) -ceq
+            'NEBULA_PRIVATE_NESTED_CASE_MAINTENANCE_WINDOW_EXPIRY_AFTER_INTENT_FAILS_CLOSED__NEBULA_PLUGIN_WINDOW_EXPIRED')
+        Assert-True ($code -cnotmatch '[\\/:]' -and $code -notmatch 'fictional')
+    }
+
     Test-Case 'whole-tree-cutover-transaction-adversarial-selftest' {
         $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $transactionOutput = @(& $windowsPowerShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
             -File (Join-Path $PSScriptRoot 'SelfTest-NebulaPluginTransaction.ps1'))
-        $transaction = ($transactionOutput -join "`n") | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0) {
-            $firstFailure = @($transaction.results | Where-Object { -not [bool]$_.passed } | Select-Object -First 1)[0]
-            throw ('NESTED_' + [string]$firstFailure.name + '_' + [string]$firstFailure.detail)
+        $transactionExitCode = [int]$LASTEXITCODE
+        $transactionText = $transactionOutput -join "`n"
+        if ([string]::IsNullOrWhiteSpace($transactionText)) {
+            throw ('NESTED_TRANSACTION_SUMMARY_MISSING_EXIT_' + $transactionExitCode)
+        }
+        try { $transaction = $transactionText | ConvertFrom-Json -ErrorAction Stop }
+        catch { throw ('NESTED_TRANSACTION_SUMMARY_INVALID_EXIT_' + $transactionExitCode) }
+        $transactionProperties = @($transaction.PSObject.Properties | ForEach-Object { [string]$_.Name })
+        if ($null -eq $transaction -or $transactionProperties.Count -ne 4 -or
+            $transactionProperties -cnotcontains 'protocol' -or $transactionProperties -cnotcontains 'passed' -or
+            $transactionProperties -cnotcontains 'failed' -or $transactionProperties -cnotcontains 'results' -or
+            [string]$transaction.protocol -cne 'DYSON_NEBULA_PLUGIN_TRANSACTION_SELFTEST_V1') {
+            throw ('NESTED_TRANSACTION_SUMMARY_INVALID_EXIT_' + $transactionExitCode)
+        }
+        if ($transactionExitCode -ne 0) {
+            $failures = @($transaction.results | Where-Object { -not [bool]$_.passed } | Select-Object -First 1)
+            if ($failures.Count -eq 0) {
+                throw ('NESTED_TRANSACTION_FAILED_WITHOUT_RESULT_EXIT_' + $transactionExitCode)
+            }
+            $code = Get-NestedTransactionFailureCode $failures[0]
+            $nestedException = [InvalidOperationException]::new($code)
+            $nestedException.Data['Code'] = $code
+            throw $nestedException
         }
         Assert-True ([int]$transaction.failed -eq 0 -and [int]$transaction.passed -ge 12)
         Assert-True (@($transaction.results | Where-Object { -not [bool]$_.passed }).Count -eq 0)

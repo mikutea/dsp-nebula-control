@@ -11,6 +11,25 @@ import type { ObservabilityHintCode } from './types.js'
 const baseTime = Date.parse('2026-08-31T00:00:00.000Z')
 
 describe('observability alert episode state machine', () => {
+  it('persists incomplete running identity together with unavailable storage evidence', () => {
+    const alerts = stateMachine()
+    alerts.ingest(snapshot(0))
+    alerts.ingest(snapshot(1, { missingStartedAt: true, missingProjectRoot: true }))
+    expect(getEpisode(alerts, 'OBSERVABILITY_INCOMPLETE').status).toBe('open')
+    const restored = ObservabilityAlertEpisodeStateMachine.hydrate(alerts.serializeJson())
+    restored.ingest(snapshot(2, { missingStartedAt: true, missingProjectRoot: true }))
+    expect(getEpisode(restored, 'OBSERVABILITY_INCOMPLETE').observationCount).toBe(2)
+    const legacy = alerts.serialize()
+    const incomplete = legacy.episodes.find((episode) => episode.code === 'OBSERVABILITY_INCOMPLETE')!
+    expect(incomplete.relatedMetrics).toEqual(['automation.projectRootAvailable', 'runtime.startedAt'])
+    incomplete.relatedMetrics.reverse()
+    expect(ObservabilityAlertEpisodeStateMachine.hydrate(legacy).project()).toEqual(alerts.project())
+    incomplete.relatedMetrics.push('host.cpu.totalPercent')
+    expectAlertCode(() => ObservabilityAlertEpisodeStateMachine.hydrate(legacy), 'OBSERVABILITY_ALERT_STATE_INVALID')
+    incomplete.relatedMetrics = ['runtime.startedAt', 'runtime.startedAt']
+    expectAlertCode(() => ObservabilityAlertEpisodeStateMachine.hydrate(legacy), 'OBSERVABILITY_ALERT_STATE_INVALID')
+  })
+
   it('opens once, updates repeat observations, and retains severity-change history', () => {
     const alerts = stateMachine()
 
@@ -347,6 +366,8 @@ describe('observability alert episode state machine', () => {
 })
 
 interface SnapshotOptions {
+  missingStartedAt?: boolean
+  missingProjectRoot?: boolean
   source?: string
   hostCpuPercent?: number | null
   memoryAvailableBytes?: number
@@ -364,7 +385,8 @@ function snapshot(index: number, options: SnapshotOptions = {}) {
     observedAt: observedAt(index),
     source: options.source ?? 'fixture.alerts',
     runtime: {
-      state: 'running', processId: 4242, startedAt: '2026-08-30T11:00:00.000Z'
+      state: 'running', processId: 4242,
+      startedAt: options.missingStartedAt ? null : '2026-08-30T11:00:00.000Z'
     },
     host: {
       cpu: {
@@ -400,7 +422,7 @@ function snapshot(index: number, options: SnapshotOptions = {}) {
     },
     network: { gamePort: { port: 8469, listening: true } },
     simulation: { ups, tps: ups, targetUps: 60 },
-    automation: { storageDependencyKind: 'none', projectRootAvailable: true }
+    automation: { storageDependencyKind: 'none', projectRootAvailable: options.missingProjectRoot ? null : true }
   })
 }
 

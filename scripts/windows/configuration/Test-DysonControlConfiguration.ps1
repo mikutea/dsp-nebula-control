@@ -7,7 +7,8 @@ param(
     [ValidateSet('NT AUTHORITY\LOCAL SERVICE')]
     [string]$ServiceAccount = 'NT AUTHORITY\LOCAL SERVICE',
     [string]$ProtectedSnapshotPath,
-    [switch]$PlanSnapshotRestore
+    [switch]$PlanSnapshotRestore,
+    [switch]$RuntimeOnly
 )
 
 Set-StrictMode -Version 2.0
@@ -32,6 +33,12 @@ $bindings = @{
 Assert-DysonConfigurationExpectedBindings -Contract $contract -ExpectedLauncherBindings $bindings
 
 $storage = Get-DysonConfigurationStoragePaths -DataRoot $resolvedDataRoot
+if ($RuntimeOnly) {
+    if ($ProtectedSnapshotPath -or $PlanSnapshotRestore) { throw 'DYSON_CONFIGURATION_RUNTIME_RESTORE_FORBIDDEN' }
+    Test-DysonConfigurationRuntimeApproval -Storage $storage -Contract $contract `
+        -ExpectedLauncherBindings $bindings -ServiceSid $serviceSid -ParentAcl $dataRootAcl
+    return
+}
 foreach ($directory in @(
         $storage.configRoot, $storage.transactionRoot, $storage.intentsRoot,
         $storage.receiptsRoot, $storage.snapshotRoot
