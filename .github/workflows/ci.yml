@@ -18,6 +18,9 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.20.0
@@ -44,4 +47,4 @@ jobs:
       - run: npm ci
       - run: npm ci --prefix apps/api
       - run: npm ci --prefix apps/web
-      - run: npm run check
+      - run: node scripts/validate-incremental.mjs

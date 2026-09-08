@@ -9,7 +9,18 @@ const workflowPath = path.join(repositoryRoot, '.github', 'workflows', 'release.
 const ciWorkflow = await readFile(ciWorkflowPath, 'utf8')
 const workflow = await readFile(workflowPath, 'utf8')
 
-test('CI is bounded, read-only, and runs the complete gate on Node 24 and Windows PowerShell 5.1', () => {
+test('CI and release install the SDK selected by the repository and use the same Node runtime', async () => {
+  const selection = JSON.parse(await readFile(path.join(repositoryRoot, 'global.json'), 'utf8'))
+  assert.equal(selection.sdk.rollForward, 'disable')
+  assert.equal(selection.sdk.allowPrerelease, false)
+  for (const configuration of [ciWorkflow, workflow]) {
+    assert.ok(configuration.includes(`dotnet-version: ${selection.sdk.version}`))
+    assert.match(configuration, /actions\/setup-dotnet@[0-9a-f]{40}/)
+    assert.match(configuration, /node-version: 24\.20\.0/)
+  }
+})
+
+test('CI is bounded, read-only, and runs affected regressions on Node 24 and Windows PowerShell 5.1', () => {
   assert.match(ciWorkflow, /^permissions:\r?\n  contents: read\r?$/m)
   assert.doesNotMatch(ciWorkflow, /^\s{2}[a-z-]+: write\s*$/m)
   assert.match(ciWorkflow, /runs-on: windows-latest/)
@@ -24,7 +35,7 @@ test('CI is bounded, read-only, and runs the complete gate on Node 24 and Window
     'npm ci',
     'npm ci --prefix apps/api',
     'npm ci --prefix apps/web',
-    'npm run check'
+    'node scripts/validate-incremental.mjs'
   ]) assert.ok(ciWorkflow.includes(command), `missing CI gate: ${command}`)
 })
 
@@ -47,13 +58,13 @@ test('release workflow pins official actions and grants only release contents ac
   assert.match(workflow, /runs-on: windows-latest/)
 })
 
-test('release workflow builds, runs the full gate, and verifies every boundary', () => {
+test('release workflow builds, runs affected regressions, and verifies every boundary', () => {
   for (const command of [
     'npm ci',
     'npm ci --prefix apps/api',
     'npm ci --prefix apps/web',
     'npm run build',
-    'npm run check',
+    'node scripts/validate-incremental.mjs',
     'npm run version:check -- --expected-version $env:RELEASE_VERSION --tag $env:RELEASE_TAG',
     'npm run acceptance:gate -- --release-commit $env:RELEASE_COMMIT',
     '--artifact-manifest',
@@ -71,7 +82,7 @@ test('release workflow builds, runs the full gate, and verifies every boundary',
   )
   const lockedInstall = workflow.indexOf('npm ci')
   const build = workflow.indexOf('npm run build')
-  const completeGate = workflow.indexOf('npm run check')
+  const completeGate = workflow.indexOf('node scripts/validate-incremental.mjs')
   const acceptanceGate = workflow.indexOf('npm run acceptance:gate -- --release-commit $env:RELEASE_COMMIT')
   const artifactAssembly = workflow.indexOf('npm run release:artifact --')
   const releaseCreation = workflow.indexOf("'release', 'create', $env:RELEASE_TAG")
@@ -92,4 +103,12 @@ test('GitHub release creation is conflict-safe and cannot clobber assets', () =>
   assert.match(workflow, /'--prerelease', '--latest=false'/)
   assert.doesNotMatch(workflow, /gh\s+release\s+upload|--clobber/)
   assert.match(workflow, /GitHub Release creation or asset upload failed closed\./)
+})
+
+test('CI and release never automatically repeat the complete suite', () => {
+  for (const configuration of [ciWorkflow, workflow]) {
+    assert.doesNotMatch(configuration, /npm run check(?:\s|$)/)
+    assert.match(configuration, /fetch-depth: 0/)
+    assert.match(configuration, /node scripts\/validate-incremental\.mjs/)
+  }
 })

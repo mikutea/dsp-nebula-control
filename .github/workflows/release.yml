@@ -30,8 +30,13 @@ jobs:
       - name: Set up Node.js 24
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 24
+          node-version: 24.20.0
           cache: npm
+
+      - name: Set up the pinned .NET SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.424
 
       - name: Validate immutable release source
         shell: pwsh
@@ -87,11 +92,11 @@ jobs:
           npm run build
           if ($LASTEXITCODE -ne 0) { throw 'The release build failed.' }
 
-      - name: Run complete repository gate
+      - name: Run affected regressions against the verified baseline
         shell: pwsh
         run: |
-          npm run check
-          if ($LASTEXITCODE -ne 0) { throw 'The complete repository gate failed.' }
+          node scripts/validate-incremental.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'The incremental validation gate failed.' }
 
       - name: Assemble and exactly verify runtime artifact
         shell: pwsh

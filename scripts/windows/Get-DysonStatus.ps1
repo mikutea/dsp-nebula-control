@@ -20,6 +20,31 @@ function Convert-ToIsoUtc {
     return $Value.ToUniversalTime().ToString('o')
 }
 
+function Get-DysonProjectGlobalMappingAvailability {
+    param([Parameter(Mandatory)][string]$Root)
+
+    try {
+        $normalizedRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+        $drive = [IO.Path]::GetPathRoot($normalizedRoot).TrimEnd('\')
+        if ($drive -match '^[A-Za-z]:$') {
+            $mappings = @(Get-SmbGlobalMapping -LocalPath $drive -ErrorAction Stop)
+        }
+        elseif ($normalizedRoot.StartsWith('\\', [StringComparison]::Ordinal)) {
+            $mappings = @(Get-SmbGlobalMapping -ErrorAction Stop | Where-Object {
+                $remote = ([string]$_.RemotePath).TrimEnd('\')
+                $remote.Length -gt 2 -and (
+                    $normalizedRoot.Equals($remote, [StringComparison]::OrdinalIgnoreCase) -or
+                    $normalizedRoot.StartsWith($remote + '\', [StringComparison]::OrdinalIgnoreCase)
+                )
+            })
+        }
+        else { return $null }
+        if ($mappings.Count -ne 1) { return $null }
+        return [bool]([string]$mappings[0].Status -eq 'OK')
+    }
+    catch { return $null }
+}
+
 function Get-SafeProcess {
     param([Parameter(Mandatory)][string]$ExpectedPath)
 
@@ -499,17 +524,7 @@ catch {
     $gamePortListening = $false
 }
 
-$globalMappingAvailable = $null
-try {
-    $projectDrive = [System.IO.Path]::GetPathRoot($resolvedProjectRoot).TrimEnd('\')
-    if ($projectDrive -match '^[A-Za-z]:$') {
-        $mapping = Get-SmbGlobalMapping -LocalPath $projectDrive -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($mapping) { $globalMappingAvailable = [bool]($mapping.Status -eq 'OK') }
-    }
-}
-catch {
-    $globalMappingAvailable = $null
-}
+$globalMappingAvailable = Get-DysonProjectGlobalMappingAvailability -Root $resolvedProjectRoot
 
 $startedAt = if ($process) {
     try { Convert-ToIsoUtc -Value $process.StartTime } catch { $null }
