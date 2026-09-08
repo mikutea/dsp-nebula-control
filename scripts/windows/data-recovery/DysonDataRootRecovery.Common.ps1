@@ -505,10 +505,22 @@ function Set-DysonDataRootRecoveryAclIntent {
                 -AclObject $security -ErrorAction Stop
         }
     }
-    catch { Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_ACCESS_CONTROL_FAILED' }
+    catch {
+        if ($env:DYSON_DATA_ROOT_RECOVERY_SELFTEST -ceq '1') {
+            $cause = $_.Exception
+            while ($null -ne $cause.InnerException) { $cause = $cause.InnerException }
+            [Console]::WriteLine((@{ phase = 'acl-write'; type = $Type; exceptionType = $cause.GetType().Name; hresult = $cause.HResult } | ConvertTo-Json -Compress))
+        }
+        Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_ACCESS_CONTROL_FAILED'
+    }
     $observed = Get-DysonDataRootRecoveryAclIntent $Path
     if ($observed.descriptorSha256 -cne $intent.descriptorSha256 -or
         $observed.binaryBase64 -cne $intent.binaryBase64) {
+        if ($env:DYSON_DATA_ROOT_RECOVERY_SELFTEST -ceq '1') {
+            $expectedDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($binary, 0)
+            $actualDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new([Convert]::FromBase64String($observed.binaryBase64), 0)
+            [Console]::WriteLine((@{ phase = 'acl-readback'; type = $Type; expectedFlags = [int]$expectedDescriptor.ControlFlags; actualFlags = [int]$actualDescriptor.ControlFlags; ownerEqual = ($expectedDescriptor.Owner -eq $actualDescriptor.Owner); groupEqual = ($expectedDescriptor.Group -eq $actualDescriptor.Group); expectedAceCount = $expectedDescriptor.DiscretionaryAcl.Count; actualAceCount = $actualDescriptor.DiscretionaryAcl.Count } | ConvertTo-Json -Compress))
+        }
         Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_ACCESS_CONTROL_FAILED'
     }
 }
