@@ -11,12 +11,18 @@ $script:DysonDataRootRecoveryMaximumEntryCount = 100000
 $script:DysonDataRootRecoveryMaximumTotalBytes = 1099511627776
 $script:DysonDataRootRecoveryDirectoryDigest = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
 $script:DysonDataRootRecoveryAllowedTopLevel = @(
+    '.dyson-control-deployment-locks',
     'acceptance',
     'audit',
+    'authority-inventory',
     'config',
+    'configuration-snapshots',
+    'configuration-transactions',
     'data',
+    'game-access-snapshots',
     'logs',
     'migration',
+    'private',
     'runtime-task-transactions',
     'snapshots',
     'state'
@@ -761,7 +767,25 @@ function Assert-DysonDataRootRecoveryBrokerHistoryClosed {
         }
         $receiptMap[$Matches.id] = $item.FullName
     }
-    if ($requestMap.Count -ne $receiptMap.Count) {
+    if ($Kind -ceq 'cutover') {
+        # The worker removes requests after persisting terminal receipts. Validate
+        # the retained history using its authoritative protocol, not file counts.
+        $brokerCommon = Join-Path $script:DysonDataRootRecoveryCommonRoot 'cutover-broker\DysonCutoverBroker.Common.ps1'
+        try {
+            . $brokerCommon
+            foreach ($id in $receiptMap.Keys) {
+                $terminal = ConvertTo-DysonCutoverBrokerValidatedReceipt (Read-DysonDataRootRecoveryJson $receiptMap[$id])
+                if ([string]$terminal.brokerRequestId -cne $id) { throw 'receipt identity mismatch' }
+                # A failed read-only observation cannot leave a host mutation to
+                # recover. Failed mutating operations still require reconciliation.
+                if ($terminal.state -ceq 'failed' -and $terminal.capability -cne 'CutoverEvidence') {
+                    throw 'failed mutation requires reconciliation'
+                }
+            }
+        }
+        catch { Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION' }
+    }
+    if ($Kind -ceq 'lifecycle' -and $requestMap.Count -ne $receiptMap.Count) {
         Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
     }
     foreach ($id in $requestMap.Keys) {
@@ -785,7 +809,7 @@ function Assert-DysonDataRootRecoveryBrokerHistoryClosed {
             Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
         }
     }
-    return $requestMap.Count
+    return $receiptMap.Count
 }
 
 function Assert-DysonDataRootRecoveryNoPendingMutations {
@@ -938,7 +962,14 @@ function Get-DysonDataRootRecoveryTreeInventory {
             Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_SAVE_PAIR_INVALID'
         }
     }
-    $sorted = @($entries | Sort-Object -Property relativePath)
+    $sorted = [object[]]@($entries)
+    $ordinalEntryComparer = [System.Collections.Generic.Comparer[object]]::Create(
+        [System.Comparison[object]]{
+            param($left, $right)
+            return [System.StringComparer]::Ordinal.Compare([string]$left.relativePath, [string]$right.relativePath)
+        }
+    )
+    [System.Array]::Sort($sorted, $ordinalEntryComparer)
     $inventoryJson = ConvertTo-DysonDataRootRecoveryJson ([pscustomobject][ordered]@{ entries = $sorted })
     return [pscustomobject][ordered]@{
         entries = $sorted

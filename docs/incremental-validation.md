@@ -22,6 +22,15 @@ its impact and extend the explicit test plan before continuing; there is no auto
 full-suite fallback. This plan is intentionally scoped to the reviewed rc.15 changes.
 Future functionality requires a new mapping and the corresponding affected regressions.
 
+The DataRoot recovery layout correction additionally runs its focused Windows recovery
+self-test when either recovery implementation or fixture changes. Its installer-state
+fixtures must survive bundle creation, restoration, and failure rollback with their
+bytes and ACLs intact; unknown top-level paths remain rejected.
+The same focused test covers consumed cutover requests with retained terminal receipts,
+strict receipt validation, and rejection of residual intents, unpaired requests, and
+failed mutating operations. A terminal failed read-only observation remains history,
+not an outstanding host mutation.
+
 `--plan` prints the intended checks without executing them and never reports a pass.
 Release builds, artifact/package verification, public-data scanning, and artifact-bound
 production acceptance remain separate gates. Existing evidence may be reused only where

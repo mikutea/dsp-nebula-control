@@ -18,6 +18,8 @@ const reviewedPaths = new Set([
   '.github/workflows/ci.yml', '.github/workflows/release.yml', 'global.json',
   'scripts/windows/release/release-workflow.test.mjs',
   'scripts/windows/Get-DysonStatus.ps1',
+  'scripts/windows/data-recovery/DysonDataRootRecovery.Common.ps1',
+  'scripts/windows/data-recovery/SelfTest-DysonDataRootRecovery.ps1',
   'apps/api/src/providers/windows-status-script.test.ts',
   'scripts/validate-incremental.mjs', 'scripts/validate-incremental.test.mjs',
   'docs/incremental-validation.md', 'AGENTS.md'
@@ -55,6 +57,10 @@ export function runValidation(root, planOnly = false) {
       'src/providers/windows-status-script.test.ts', 'src/providers/windows.test.ts',
       'src/observability/server-status.test.ts', 'src/observability/snapshot.test.ts']]
   ]
+  if (files.some(file => file.startsWith('scripts/windows/data-recovery/'))) {
+    commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', 'scripts/windows/data-recovery/SelfTest-DysonDataRootRecovery.ps1']])
+  }
   const report = { baseline, subject: git(['rev-parse', 'HEAD']).trim(), changes,
     fullSuiteRerun: false, releaseQualified: false, commands, state: 'planned' }
   if (planOnly) return report

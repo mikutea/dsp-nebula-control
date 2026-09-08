@@ -145,6 +145,22 @@ try {
     Write-SelfTestUtf8 (Join-Path $dataRoot 'data\world.server') 'paired-server-data'
     Write-SelfTestUtf8 (Join-Path $dataRoot 'logs\control.log') ('private-log-' + $privateMarker)
     Write-SelfTestUtf8 (Join-Path $dataRoot 'state\active-release.json') '{"version":"selftest"}'
+    foreach ($relative in @('data\Z-state.json', 'data\a-state.json', 'data\_state.json')) {
+        Write-SelfTestUtf8 (Join-Path $dataRoot $relative) 'ordinal-order-fixture'
+    }
+    # These directories are emitted by the current installer/configuration tools.
+    # They must survive the same byte/ACL restore and rollback checks as the database.
+    $installerStatePaths = @(
+        '.dyson-control-deployment-locks\fixture.lock',
+        'authority-inventory\fixture.json',
+        'configuration-snapshots\fixture.json',
+        'configuration-transactions\fixture.json',
+        'game-access-snapshots\fixture.json',
+        'private\fixture.json'
+    )
+    foreach ($relative in $installerStatePaths) {
+        Write-SelfTestUtf8 (Join-Path $dataRoot $relative) ('installer-state-' + $privateMarker)
+    }
     $longComponent = 'extended-length-' + ('x' * 144)
     $longRelativePath = Join-Path (Join-Path 'data' $longComponent) 'deep-state.json'
     $longPath = Join-Path $dataRoot $longRelativePath
@@ -176,6 +192,10 @@ try {
     }
 
     $stage = 'preflight-negative-cases'
+    $unknownRootFile = Join-Path $dataRoot 'unrecognized-installer-state.json'
+    Write-SelfTestUtf8 $unknownRootFile 'must-not-be-silently-included'
+    Assert-SelfTestFailure { & $newScript @commonArgs -BundleId ([guid]::NewGuid().ToString('D')) -WhatIf } 'DYSON_CONTROL_DATA_RECOVERY_TREE_INVALID'
+    [System.IO.File]::Delete($unknownRootFile)
     # Fail closed before any bundle mutation when SQLite sidecars, incomplete save pairs,
     # reparse points, broker work, or a running control task are observed.
     $walPath = Join-Path $dataRoot 'data\control.sqlite-wal'
@@ -206,6 +226,40 @@ try {
     Write-SelfTestUtf8 (Join-Path $brokerRoot ('requests\' + [guid]::NewGuid().ToString('D') + '.json')) '{}'
     Assert-SelfTestFailure { & $newScript @commonArgs -BundleId ([guid]::NewGuid().ToString('D')) -WhatIf } 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
     [System.IO.Directory]::Delete($brokerRoot, $true)
+
+    $cutoverRoot = Join-Path $dataRoot 'data\cutover-broker'
+    foreach ($relative in @('requests', 'receipts', 'intents', 'work')) {
+        [void][System.IO.Directory]::CreateDirectory((Join-Path $cutoverRoot $relative))
+    }
+    $terminalId = [guid]::NewGuid().ToString('D')
+    $terminalPath = Join-Path $cutoverRoot ('receipts\' + $terminalId + '.json')
+    $closedRead = [ordered]@{
+        protocol = 'DYSON_CONTROL_CUTOVER_BROKER_RECEIPT_V1'; schemaVersion = 1
+        brokerRequestId = $terminalId; requestFingerprint = ('a' * 64)
+        capability = 'CutoverEvidence'; requestId = [guid]::NewGuid().ToString('D')
+        authorityInventoryRevision = ('b' * 64); state = 'failed'
+        errorCode = 'DYSON_CONTROL_CUTOVER_BROKER_RECOVERY_REQUIRED'; childReceipt = $null
+        createdAt = '2026-01-01T00:00:00.0000000Z'; completedAt = '2026-01-01T00:00:01.0000000Z'
+    }
+    Write-SelfTestUtf8 $terminalPath ($closedRead | ConvertTo-Json -Depth 8 -Compress)
+    Assert-SelfTest ((Assert-DysonDataRootRecoveryBrokerHistoryClosed $cutoverRoot cutover) -eq 1) `
+        'a terminal read-only receipt with a consumed request was rejected'
+    $closedRead.capability = 'StartCandidateRuntime'
+    Write-SelfTestUtf8 $terminalPath ($closedRead | ConvertTo-Json -Depth 8 -Compress)
+    Assert-SelfTestFailure { Assert-DysonDataRootRecoveryBrokerHistoryClosed $cutoverRoot cutover } 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
+    $closedRead.capability = 'CutoverEvidence'; $closedRead.requestFingerprint = 'invalid'
+    Write-SelfTestUtf8 $terminalPath ($closedRead | ConvertTo-Json -Depth 8 -Compress)
+    Assert-SelfTestFailure { Assert-DysonDataRootRecoveryBrokerHistoryClosed $cutoverRoot cutover } 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
+    $closedRead.requestFingerprint = ('a' * 64)
+    Write-SelfTestUtf8 $terminalPath ($closedRead | ConvertTo-Json -Depth 8 -Compress)
+    $pendingPath = Join-Path $cutoverRoot ('intents\' + $terminalId + '.json')
+    Write-SelfTestUtf8 $pendingPath '{}'
+    Assert-SelfTestFailure { Assert-DysonDataRootRecoveryBrokerHistoryClosed $cutoverRoot cutover } 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
+    [System.IO.File]::Delete($pendingPath)
+    $pendingPath = Join-Path $cutoverRoot ('requests\' + [guid]::NewGuid().ToString('D') + '.json')
+    Write-SelfTestUtf8 $pendingPath '{}'
+    Assert-SelfTestFailure { Assert-DysonDataRootRecoveryBrokerHistoryClosed $cutoverRoot cutover } 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
+    [System.IO.File]::Delete($pendingPath)
 
     Write-SelfTestTask Running
     Assert-SelfTestFailure { & $newScript @commonArgs -BundleId ([guid]::NewGuid().ToString('D')) -WhatIf } 'DYSON_CONTROL_DATA_RECOVERY_TASK_NOT_QUIESCED'
@@ -285,6 +339,9 @@ try {
     # not create a protection point or alter the current tree.
     $configPath = Join-Path $dataRoot 'config\dyson-control.env'
     Write-SelfTestUtf8 $configPath 'mutated-current-state'
+    foreach ($relative in $installerStatePaths) {
+        Write-SelfTestUtf8 (Join-Path $dataRoot $relative) 'mutated-installer-state'
+    }
     Set-SelfTestPrivateFileAcl $configPath
     Write-SelfTestUtf8 (Join-Path $dataRoot 'data\post-bundle.txt') 'post-bundle'
     $beforeRestorePreview = Get-DysonDataRootRecoveryTreeInventory $dataRoot
@@ -316,6 +373,10 @@ try {
         [string]$restored.protectionManifestSha256 -match '^[0-9a-f]{64}$') 'successful restore result is invalid'
     $sourceBundle = Test-DysonDataRootRecoveryBundleCore $bundleRoot $created.manifestSha256 $created.dataRootIdentity recovery
     [void](Test-DysonDataRootRecoveryPayloadAgainstManifest $dataRoot $sourceBundle.manifest -VerifyAcl)
+    foreach ($relative in $installerStatePaths) {
+        Assert-SelfTest ([System.IO.File]::ReadAllText((Join-Path $dataRoot $relative)) -ceq ('installer-state-' + $privateMarker)) `
+            'installer state was not restored from the verified bundle'
+    }
     $protectionPath = Join-Path (Join-Path $recoveryRoot 'protection-points') $restoreId
     $protection = Test-DysonDataRootRecoveryBundleCore $protectionPath $restored.protectionManifestSha256 $created.dataRootIdentity protection-point
     Assert-SelfTest ($protection.manifest.inventorySha256 -ceq $beforeRestorePreview.inventorySha256) 'automatic protection point did not capture the overwritten tree'
