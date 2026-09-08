@@ -484,6 +484,23 @@ function ConvertTo-DysonDataRootRecoveryValidatedAclIntent {
     }
 }
 
+function Initialize-DysonDataRootRecoveryNativeAcl {
+    if ($null -ne ('Dyson.DataRootRecoveryNativeAcl' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace Dyson {
+    public static class DataRootRecoveryNativeAcl {
+        // Unlike SetNamedSecurityInfo, this legacy API does not upgrade the
+        // descriptor's inheritance model or propagate changes into children.
+        [DllImport("advapi32.dll", EntryPoint = "SetFileSecurityW", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetFileSecurity(string path, uint information, byte[] descriptor);
+    }
+}
+'@
+}
+
 function Set-DysonDataRootRecoveryAclIntent {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$AclIntent, [Parameter(Mandatory)][ValidateSet('file', 'directory')][string]$Type)
 
@@ -514,6 +531,26 @@ function Set-DysonDataRootRecoveryAclIntent {
         Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_ACCESS_CONTROL_FAILED'
     }
     $observed = Get-DysonDataRootRecoveryAclIntent $Path
+    if ($observed.binaryBase64 -cne $intent.binaryBase64) {
+        $expectedDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($binary, 0)
+        $actualDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new([Convert]::FromBase64String($observed.binaryBase64), 0)
+        $autoInherited = [System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited
+        if (($expectedDescriptor.ControlFlags -band $autoInherited) -eq 0 -and
+            ($actualDescriptor.ControlFlags -band $autoInherited) -ne 0) {
+            # Set-Acl can upgrade a legacy DACL even when every ACE is retained.
+            # Restore the captured model, then retain the full binary equality gate.
+            try {
+                Initialize-DysonDataRootRecoveryNativeAcl
+                $full = Assert-DysonDataRootRecoveryNoReparseAncestors $Path
+                if (-not [Dyson.DataRootRecoveryNativeAcl]::SetFileSecurity(
+                    (ConvertTo-DysonDataRootRecoveryExtendedPath $full), [uint32]7, $binary)) {
+                    throw 'native security descriptor restore failed'
+                }
+                $observed = Get-DysonDataRootRecoveryAclIntent $Path
+            }
+            catch { Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_ACCESS_CONTROL_FAILED' }
+        }
+    }
     if ($observed.descriptorSha256 -cne $intent.descriptorSha256 -or
         $observed.binaryBase64 -cne $intent.binaryBase64) {
         if ($env:DYSON_DATA_ROOT_RECOVERY_SELFTEST -ceq '1') {

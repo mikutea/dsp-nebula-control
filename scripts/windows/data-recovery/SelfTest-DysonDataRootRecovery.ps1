@@ -148,6 +148,22 @@ try {
     foreach ($relative in @('data\Z-state.json', 'data\a-state.json', 'data\_state.json')) {
         Write-SelfTestUtf8 (Join-Path $dataRoot $relative) 'ordinal-order-fixture'
     }
+    # Reproduce the legacy inheritance model seen on hosted Windows runners,
+    # independently of the default ACLs on the machine running this test.
+    $legacyAclDirectory = Join-Path $dataRoot 'data\legacy-acl'
+    [void][System.IO.Directory]::CreateDirectory($legacyAclDirectory)
+    $legacyAcl = Get-DysonDataRootRecoveryAclIntent $legacyAclDirectory
+    $legacyDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new([Convert]::FromBase64String($legacyAcl.binaryBase64), 0)
+    $legacyDescriptor.SetFlags([System.Security.AccessControl.ControlFlags]([int]$legacyDescriptor.ControlFlags -band (-bnot 1024)))
+    $legacyBytes = New-Object byte[] $legacyDescriptor.BinaryLength
+    $legacyDescriptor.GetBinaryForm($legacyBytes, 0)
+    Initialize-DysonDataRootRecoveryNativeAcl
+    Assert-SelfTest ([Dyson.DataRootRecoveryNativeAcl]::SetFileSecurity($legacyAclDirectory, [uint32]7, $legacyBytes)) `
+        'legacy ACL fixture could not be created'
+    $legacyObserved = Get-DysonDataRootRecoveryAclIntent $legacyAclDirectory
+    Assert-SelfTest ($legacyObserved.binaryBase64 -ceq [Convert]::ToBase64String($legacyBytes)) `
+        'legacy ACL fixture did not retain its exact descriptor'
+    Write-SelfTestUtf8 (Join-Path $legacyAclDirectory 'child.json') 'legacy-inheritance-child'
     # These directories are emitted by the current installer/configuration tools.
     # They must survive the same byte/ACL restore and rollback checks as the database.
     $installerStatePaths = @(
@@ -523,6 +539,7 @@ try {
         explicitConfirmationEnforced = $true
         protectionPointVerified = $true
         byteAclRollbackExact = $true
+        legacyInheritancePreserved = $true
         idempotentReceipts = $true
         terminalReceiptNeverRolledBack = $true
         terminalRestartReplayReconciled = $true
