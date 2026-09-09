@@ -61,6 +61,7 @@ export function selectCommands(changes) {
       '-File', 'scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1']])
   }
   if (affected.has('scripts/windows/deployment/Install-DysonControl.ps1')) {
+    commands.push(['node', ['apps/api/node_modules/typescript/bin/tsc', '-p', 'apps/api/tsconfig.json']])
     commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-File', 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1']])
   }

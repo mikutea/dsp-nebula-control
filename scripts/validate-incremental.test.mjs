@@ -44,6 +44,9 @@ test('bootstrap coordination selects broker and deployment regressions', () => {
     'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1']) {
     assert.ok(commands.some(([exe, args]) => exe === 'powershell.exe' && args.includes(script)))
   }
+  const buildIndex = commands.findIndex(([, args]) => args.includes('apps/api/tsconfig.json'))
+  const deploymentIndex = commands.findIndex(([, args]) => args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1'))
+  assert.ok(buildIndex >= 0 && buildIndex < deploymentIndex)
   assert.ok(commands.every(([, args]) => !args.includes('check')))
 })
 

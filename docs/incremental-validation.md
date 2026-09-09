@@ -30,7 +30,8 @@ full-suite fallback. This plan is intentionally scoped to the reviewed rc.17 cha
 Future functionality requires a new mapping and the corresponding affected regressions.
 
 The bootstrap/broker upgrade correction runs the lifecycle broker self-test and,
-when the deployment coordinator changes, the deployment self-test. The broker
+when the deployment coordinator changes, the deployment self-test. Deployment
+fixtures use compiled API helpers, so that group builds the API first. The broker
 regressions replace bootstrap line endings across releases and verify byte-exact
 restoration at each upgrade failure point. The prior bootstrap backup is accepted
 only for an explicit existing-broker upgrade and must match the old pinned hashes;
