@@ -1269,7 +1269,7 @@ function Resolve-DysonGameBootstrapReleaseVersion {
             throw 'BOOTSTRAP_RELEASE_INVENTORY_INVALID'
         }
         $canonicalLines.Add(('{0}|{1}|{2}' -f $relative, $length, $hash))
-        if ($relative -ceq [string]$manifest.entryPoint) { $entryPointPresent = $true }
+        if ($relative -ceq ([string]$manifest.entryPoint).Replace('\', '/')) { $entryPointPresent = $true }
         if ($relative -ceq $script:DysonGameStartRelativePath) { $startHash = $hash }
         if ($relative -ceq $script:DysonGameStopRelativePath) { $stopHash = $hash }
     }
@@ -1306,9 +1306,20 @@ function Resolve-DysonGameBootstrapActiveRelease {
     $pointerRecord = Read-DysonGameBootstrapJsonFile `
         -Path $Context.activePointerPath -MaximumBytes $script:DysonMaximumPointerBytes
     $pointer = $pointerRecord.value
-    Assert-DysonGameBootstrapExactProperties -Value $pointer -Names @(
-        'protocol', 'version', 'entryPoint', 'payloadSha256', 'activatedAt'
-    )
+    $pointerNames = @('protocol', 'version', 'entryPoint', 'payloadSha256', 'activatedAt')
+    $hasIdentity = $pointer.PSObject.Properties.Name -contains 'deploymentId'
+    if ($hasIdentity) { $pointerNames += @('deploymentId', 'deploymentIdentitySha256') }
+    Assert-DysonGameBootstrapExactProperties -Value $pointer -Names $pointerNames
+    if ($hasIdentity) {
+        $deploymentCommon = Assert-DysonGameBootstrapPlainFile -Path `
+            ([IO.Path]::Combine($Context.bootstrapRoot, 'DysonDeployment.Common.ps1')) -MaximumBytes 4MB
+        . $deploymentCommon.FullName
+        $identity = Get-DysonDeploymentIdentity -InstallRoot $Context.installRoot -DataRoot $Context.dataRoot
+        if ([string]$pointer.deploymentId -cne [string]$identity.marker.deploymentId -or
+            [string]$pointer.deploymentIdentitySha256 -cne [string]$identity.markerSha256) {
+            throw 'BOOTSTRAP_DEPLOYMENT_IDENTITY_MISMATCH'
+        }
+    }
     if ([string]$pointer.protocol -cne $script:DysonDeploymentProtocol) {
         throw 'BOOTSTRAP_POINTER_PROTOCOL_INVALID'
     }

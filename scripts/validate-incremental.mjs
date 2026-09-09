@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const baseline = '9accff7d525ebc5c846ee0f3aff7234ba6e5decc'
+export const baseline = '47b125e57cea4a0ba2457b842b926edc6c4a2faf'
 const versionFiles = new Set([
   '.env.example', 'README.md', 'package.json', 'package-lock.json',
   'apps/api/package.json', 'apps/api/package-lock.json',
@@ -20,6 +20,11 @@ const reviewedPaths = new Set([
   'scripts/windows/Get-DysonStatus.ps1',
   'scripts/windows/data-recovery/DysonDataRootRecovery.Common.ps1',
   'scripts/windows/data-recovery/SelfTest-DysonDataRootRecovery.ps1',
+  'scripts/windows/lifecycle-broker/Install-DysonLifecycleBrokerTask.ps1',
+  'scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1',
+  'scripts/windows/deployment/Install-DysonControl.ps1',
+  'scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1',
+  'scripts/windows/bootstrap/SelfTest-DysonGameBootstrapPointer.ps1',
   'apps/api/src/providers/windows-status-script.test.ts',
   'scripts/validate-incremental.mjs', 'scripts/validate-incremental.test.mjs',
   'docs/incremental-validation.md', 'AGENTS.md'
@@ -29,7 +34,7 @@ const normalize = text => text.replaceAll('\r\n', '\n')
 export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
   if (versionFiles.has(file) && before !== null &&
-      normalize(before).replaceAll('0.1.0-rc.15', '0.1.0-rc.16') === normalize(after)) return 'version-only'
+      normalize(before).replaceAll('0.1.0-rc.16', '0.1.0-rc.17') === normalize(after)) return 'version-only'
   if (reviewedPaths.has(file)) return 'affected'
   throw new Error(`No reviewed affected-test mapping for ${file}; update the plan, never auto-run the full suite.`)
 }
@@ -49,6 +54,21 @@ export function selectCommands(changes) {
   if ([...affected].some(file => file.startsWith('scripts/windows/data-recovery/'))) {
     commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-File', 'scripts/windows/data-recovery/SelfTest-DysonDataRootRecovery.ps1']])
+  }
+  if ([...affected].some(file => file.startsWith('scripts/windows/lifecycle-broker/')) ||
+      affected.has('scripts/windows/deployment/Install-DysonControl.ps1')) {
+    commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', 'scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1']])
+  }
+  if (affected.has('scripts/windows/deployment/Install-DysonControl.ps1')) {
+    commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1']])
+  }
+  if ([...affected].some(file => file.startsWith('scripts/windows/bootstrap/'))) {
+    for (const script of ['SelfTest-DysonGameBootstrapPointer.ps1', 'SelfTest-DysonGameLifecycleBootstrap.ps1']) {
+      commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', `scripts/windows/bootstrap/${script}`]])
+    }
   }
   return commands
 }

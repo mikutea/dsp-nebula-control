@@ -9,6 +9,7 @@ param(
     [ValidateRange(1, 65535)][int]$GamePort = 8469,
     [ValidateRange(5, 60)][int]$DispatchReadyTimeoutSeconds = 30,
     [switch]$UpgradeExisting,
+    [string]$PreviousBootstrapRoot,
     [switch]$CompensateFirstInstall,
     [switch]$RemoveCurrent,
     [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedProfileHash,
@@ -555,7 +556,19 @@ function Get-InstallerExistingSnapshot {
     if (-not (Test-DysonLifecycleBrokerSamePath ([string]$profile.brokerRoot) ([string]$Storage.root))) {
         Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_PROFILE_BINDING_MISMATCH'
     }
-    Assert-DysonLifecycleBrokerDependencies $profile
+    if ($PreviousBootstrapRoot) {
+        $previousRoot = Assert-DysonLifecycleBrokerPlainDirectory $PreviousBootstrapRoot
+        foreach ($entry in @($profile.dependencyHashes)) {
+            $dependencyPath = Get-DysonLifecycleBrokerExpectedDependencyPath $profile ([string]$entry.name)
+            if ([string]$entry.name -cin @('Start-DysonServer.ps1', 'Stop-DysonServer.ps1')) {
+                $dependencyPath = Join-Path $previousRoot ([string]$entry.name)
+            }
+            if ((Get-DysonLifecycleBrokerSha256File $dependencyPath) -cne [string]$entry.sha256) {
+                Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_HASH_DRIFT'
+            }
+        }
+    }
+    else { Assert-DysonLifecycleBrokerDependencies $profile }
     Assert-InstallerRuntimeTaskBindings $profile
     $profileAcl = Get-InstallerProfileAclSddl $resolvedProfile
     $task = Get-InstallerTaskSnapshot $profile
@@ -587,6 +600,19 @@ function Assert-InstallerPublishedState {
 function Restore-InstallerUpgradeSnapshot {
     param([Parameter(Mandatory)][string]$ProfileFile, [Parameter(Mandatory)]$Snapshot)
     try {
+        if ($PreviousBootstrapRoot) {
+            foreach ($name in @('Start-DysonServer.ps1', 'Stop-DysonServer.ps1')) {
+                $source = Join-Path (Assert-DysonLifecycleBrokerPlainDirectory $PreviousBootstrapRoot) $name
+                $entry = @($Snapshot.profile.dependencyHashes | Where-Object { [string]$_.name -ceq $name })
+                if ($entry.Count -ne 1 -or
+                    (Get-DysonLifecycleBrokerSha256File $source) -cne [string]$entry[0].sha256) {
+                    Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_HASH_DRIFT'
+                }
+                $destination = Get-DysonLifecycleBrokerExpectedDependencyPath $Snapshot.profile $name
+                [void](Set-InstallerBytesAtomic -Path $destination -Bytes ([IO.File]::ReadAllBytes($source)) `
+                    -MaximumBytes 1048576)
+            }
+        }
         [void](Set-InstallerBytesAtomic -Path $ProfileFile -Bytes ([byte[]]$Snapshot.profileBytes) `
             -MaximumBytes $script:DysonLifecycleBrokerMaximumProfileBytes)
         Restore-InstallerProfileAcl -Path $ProfileFile -Sddl ([string]$Snapshot.profileAcl)
@@ -693,6 +719,8 @@ try {
     if ($Backend -ceq 'Shadow') { $ConfirmPreference = 'None' }
     $exclusiveModeCount = [int][bool]$UpgradeExisting + [int][bool]$CompensateFirstInstall + [int][bool]$RemoveCurrent
     if ($exclusiveModeCount -gt 1 -or
+        ($PSBoundParameters.ContainsKey('PreviousBootstrapRoot') -and
+            (-not $UpgradeExisting -or [string]::IsNullOrWhiteSpace($PreviousBootstrapRoot))) -or
         ($RemoveCurrent -and -not $PSBoundParameters.ContainsKey('ExpectedProfileHash')) -or
         (-not $RemoveCurrent -and $PSBoundParameters.ContainsKey('ExpectedProfileHash'))) {
         Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_INPUT_INVALID'
@@ -739,6 +767,9 @@ try {
     }
     $script:InstallerProfileFile = Join-Path $storage.root 'broker-profile.json'
     $hasProfile = Test-Path -LiteralPath $script:InstallerProfileFile -PathType Leaf
+    if ($PreviousBootstrapRoot -and -not $hasProfile) {
+        Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_REQUEST_CONFLICT'
+    }
 
     if (($CompensateFirstInstall -or $RemoveCurrent) -and -not $hasProfile) {
         Throw-DysonLifecycleBrokerError 'DYSON_CONTROL_LIFECYCLE_BROKER_REQUEST_CONFLICT'

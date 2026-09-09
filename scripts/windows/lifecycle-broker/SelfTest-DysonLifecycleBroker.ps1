@@ -196,6 +196,7 @@ function Invoke-SelfTestInstall {
         [string]$BootstrapRoot = $script:installed,
         [string]$Project = $script:project,
         [switch]$UpgradeExisting,
+        [string]$PreviousBootstrapRoot,
         [switch]$CompensateFirstInstall,
         [switch]$RemoveCurrent,
         [string]$ExpectedProfileHash,
@@ -209,6 +210,7 @@ function Invoke-SelfTestInstall {
         '-Backend', 'Shadow', '-ShadowRoot', $Shadow
     )) { $arguments.Add([string]$entry) }
     if ($UpgradeExisting) { $arguments.Add('-UpgradeExisting') }
+    if ($PreviousBootstrapRoot) { $arguments.Add('-PreviousBootstrapRoot'); $arguments.Add($PreviousBootstrapRoot) }
     if ($CompensateFirstInstall) { $arguments.Add('-CompensateFirstInstall') }
     if ($RemoveCurrent) { $arguments.Add('-RemoveCurrent') }
     if ($PSBoundParameters.ContainsKey('ExpectedProfileHash')) {
@@ -874,14 +876,30 @@ try {
         (Test-SelfTestBytesEqual $profileBytes ([IO.File]::ReadAllBytes($script:profileFile))))) `
         'upgrade rejects reparse-point candidate root'
 
+    $previousBootstrap = Join-Path $script:root 'previous-bootstrap'
+    [void][IO.Directory]::CreateDirectory($previousBootstrap)
+    $replacementBootstrap = @{}
+    foreach ($name in @('Start-DysonServer.ps1', 'Stop-DysonServer.ps1')) {
+        $path = Join-Path $script:installed $name
+        Copy-Item -LiteralPath $path -Destination (Join-Path $previousBootstrap $name)
+        $original = [IO.File]::ReadAllText($path)
+        $replacement = $original.Replace("`r`n", "`n")
+        if ($replacement -ceq $original) { $replacement = $replacement.Replace("`n", "`r`n") }
+        Assert-SelfTest ($replacement -cne $original) ('bootstrap newline fixture differs: ' + $name)
+        $replacementBootstrap[$name] = [Text.UTF8Encoding]::new($false).GetBytes($replacement)
+    }
     $rollbackStages = @(
         'after-old-snapshot', 'after-task-disabled', 'after-profile-published',
         'after-task-registered', 'after-task-acl', 'after-final-verified'
     )
     foreach ($failureStage in $rollbackStages) {
+        foreach ($name in $replacementBootstrap.Keys) {
+            [IO.File]::WriteAllBytes((Join-Path $script:installed $name), $replacementBootstrap[$name])
+        }
         Set-SelfTestInstallerFailureStage -Shadow $script:shadow -Stage $failureStage
         $failedUpgrade = Invoke-SelfTestInstall -Script $candidateInstall -InstalledRoot $candidateInstalled `
-            -Broker $script:broker -Data $script:data -Shadow $script:shadow -UpgradeExisting
+            -Broker $script:broker -Data $script:data -Shadow $script:shadow -UpgradeExisting `
+            -PreviousBootstrapRoot $previousBootstrap
         $failedEnvelope = ConvertFrom-SelfTestOutput $failedUpgrade.stdout
         Assert-SelfTest ($failedUpgrade.exitCode -ne 0 -and
             $failedEnvelope.error.code -ceq 'DYSON_CONTROL_LIFECYCLE_BROKER_INSTALL_FAILED' -and
@@ -889,10 +907,19 @@ try {
             (Test-SelfTestBytesEqual $taskBytes ([IO.File]::ReadAllBytes($shadowTaskFile)) ) -and
             (Test-SelfTestBytesEqual $aclBytes ([IO.File]::ReadAllBytes($shadowAclFile)) ) ) `
             ('upgrade rollback restores exact snapshot at ' + $failureStage)
+        foreach ($name in $replacementBootstrap.Keys) {
+            Assert-SelfTest (Test-SelfTestFileBytesEqual (Join-Path $script:installed $name) `
+                ([IO.File]::ReadAllBytes((Join-Path $previousBootstrap $name)))) `
+                ('bootstrap rollback is byte exact: ' + $failureStage + ': ' + $name)
+        }
     }
     Set-SelfTestInstallerFailureStage -Shadow $script:shadow -Stage 'none'
+    foreach ($name in $replacementBootstrap.Keys) {
+        [IO.File]::WriteAllBytes((Join-Path $script:installed $name), $replacementBootstrap[$name])
+    }
     $upgrade = Invoke-SelfTestInstall -Script $candidateInstall -InstalledRoot $candidateInstalled `
-        -Broker $script:broker -Data $script:data -Shadow $script:shadow -UpgradeExisting
+        -Broker $script:broker -Data $script:data -Shadow $script:shadow -UpgradeExisting `
+        -PreviousBootstrapRoot $previousBootstrap
     $upgradeEnvelope = ConvertFrom-SelfTestOutput $upgrade.stdout
     $upgradedProfile = Read-DysonLifecycleBrokerProfile $script:profileFile
     $upgradedTask = Get-Content -Raw -LiteralPath $shadowTaskFile | ConvertFrom-Json

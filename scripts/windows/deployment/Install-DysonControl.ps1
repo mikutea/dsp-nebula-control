@@ -2368,6 +2368,9 @@ try {
         }
         if ($UpgradeLifecycleBrokerExisting) {
             $lifecycleBrokerInstallArguments['UpgradeExisting'] = $true
+            if ($null -ne $lifecycleBrokerPreviousState -and $bootstrapBackup) {
+                $lifecycleBrokerInstallArguments['PreviousBootstrapRoot'] = $bootstrapBackup
+            }
         }
         if ($lifecycleBrokerShadowFull) {
             $lifecycleBrokerInstallArguments['Backend'] = 'Shadow'
