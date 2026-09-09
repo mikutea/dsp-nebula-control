@@ -923,12 +923,13 @@ try {
     $upgradeEnvelope = ConvertFrom-SelfTestOutput $upgrade.stdout
     $upgradedProfile = Read-DysonLifecycleBrokerProfile $script:profileFile
     $upgradedTask = Get-Content -Raw -LiteralPath $shadowTaskFile | ConvertFrom-Json
-    Assert-SelfTest ($upgrade.exitCode -eq 0 -and $upgradeEnvelope.operation -ceq 'upgraded' -and $upgradeEnvelope.upgraded -and
-        (Test-DysonLifecycleBrokerSamePath $upgradedProfile.brokerScriptRoot $candidateBrokerScripts) -and
-        [string]$upgradedProfile.createdAt -cne [string]$initialProfile.createdAt -and [bool]$upgradedTask.enabled -and
-        [string]$upgradedTask.sddl -ceq (Get-DysonLifecycleBrokerTaskSddl) -and
-        [string]$upgradedTask.descriptor.arguments -match [regex]::Escape($candidateBrokerScripts)) `
-        'explicit cross-release upgrade publishes candidate profile task and DACL'
+    Assert-SelfTest ($upgrade.exitCode -eq 0) 'cross-release upgrade exits successfully'
+    Assert-SelfTest ($upgradeEnvelope.operation -ceq 'upgraded' -and $upgradeEnvelope.upgraded) 'cross-release upgrade returns its operation receipt'
+    Assert-SelfTest (Test-DysonLifecycleBrokerSamePath $upgradedProfile.brokerScriptRoot $candidateBrokerScripts) 'cross-release upgrade binds the candidate script root'
+    Assert-SelfTest ([string]$upgradedProfile.createdAt -cne [string]$initialProfile.createdAt) 'cross-release upgrade records a new creation time'
+    Assert-SelfTest ([bool]$upgradedTask.enabled) 'cross-release upgrade enables the worker'
+    Assert-SelfTest ([string]$upgradedTask.sddl -ceq (Get-DysonLifecycleBrokerTaskSddl)) 'cross-release upgrade preserves the worker DACL'
+    Assert-SelfTest ([string]$upgradedTask.descriptor.arguments -match [regex]::Escape($candidateBrokerScripts)) 'cross-release upgrade binds worker arguments to the candidate scripts'
 
     $upgradedBytes = [IO.File]::ReadAllBytes($script:profileFile)
     $candidateReplay = Invoke-SelfTestInstall -Script $candidateInstall -InstalledRoot $candidateInstalled `
