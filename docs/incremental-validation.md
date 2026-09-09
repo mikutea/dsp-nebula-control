@@ -41,6 +41,9 @@ Bootstrap resolver changes run the focused pointer test and the existing game
 lifecycle bootstrap self-test. Identity-bearing pointers must match the root-bound
 deployment marker, partial or unknown fields remain rejected, and Windows entry-point
 separators must resolve against the canonical slash-delimited file inventory.
+The exact addition of that pointer test to the artifact allowlist is separately
+recognized; any other packaging-module change fails closed. Real artifact and
+package construction and verification remain mandatory before deployment.
 
 The DataRoot recovery layout correction additionally runs its focused Windows recovery
 self-test when either recovery implementation or fixture changes. Its installer-state

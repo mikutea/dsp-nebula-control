@@ -240,6 +240,7 @@ $script:DysonArtifactRequiredGameBootstrapScripts = @(
     'scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1',
     'scripts/windows/bootstrap/Resolve-DysonGameLifecycleRelease.ps1',
     'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1',
+    'scripts/windows/bootstrap/SelfTest-DysonGameBootstrapPointer.ps1',
     'scripts/windows/bootstrap/Start-DysonServer.ps1',
     'scripts/windows/bootstrap/Stop-DysonServer.ps1'
 )

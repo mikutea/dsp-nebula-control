@@ -33,6 +33,9 @@ const normalize = text => text.replaceAll('\r\n', '\n')
 
 export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
+  if (file === 'scripts/windows/release/DysonReleasePackaging.Common.ps1' && before !== null &&
+      normalize(before).replace("    'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1',",
+        "    'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1',\n    'scripts/windows/bootstrap/SelfTest-DysonGameBootstrapPointer.ps1',") === normalize(after)) return 'release-test-allowlist'
   if (versionFiles.has(file) && before !== null &&
       normalize(before).replaceAll('0.1.0-rc.16', '0.1.0-rc.17') === normalize(after)) return 'version-only'
   if (reviewedPaths.has(file)) return 'affected'
