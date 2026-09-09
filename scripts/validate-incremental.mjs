@@ -26,6 +26,7 @@ const reviewedPaths = new Set([
   'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1',
   'scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1',
   'scripts/windows/bootstrap/SelfTest-DysonGameBootstrapPointer.ps1',
+  'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1',
   'apps/api/src/providers/windows-status-script.test.ts',
   'scripts/validate-incremental.mjs', 'scripts/validate-incremental.test.mjs',
   'docs/incremental-validation.md', 'AGENTS.md'
@@ -59,6 +60,12 @@ export function selectCommands(changes) {
     commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-File', 'scripts/windows/data-recovery/SelfTest-DysonDataRootRecovery.ps1']])
   }
+  if ([...affected].some(file => file.startsWith('scripts/windows/bootstrap/'))) {
+    for (const script of ['SelfTest-DysonGameBootstrapPointer.ps1', 'SelfTest-DysonGameLifecycleBootstrap.ps1']) {
+      commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', `scripts/windows/bootstrap/${script}`]])
+    }
+  }
   if ([...affected].some(file => file.startsWith('scripts/windows/lifecycle-broker/')) ||
       affected.has('scripts/windows/deployment/Install-DysonControl.ps1')) {
     commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
@@ -69,12 +76,6 @@ export function selectCommands(changes) {
     commands.push(['node', ['apps/api/node_modules/typescript/bin/tsc', '-p', 'apps/api/tsconfig.json']])
     commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-File', 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1']])
-  }
-  if ([...affected].some(file => file.startsWith('scripts/windows/bootstrap/'))) {
-    for (const script of ['SelfTest-DysonGameBootstrapPointer.ps1', 'SelfTest-DysonGameLifecycleBootstrap.ps1']) {
-      commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', `scripts/windows/bootstrap/${script}`]])
-    }
   }
   return commands
 }

@@ -2039,6 +2039,24 @@ public static class DysonGameBootstrapProcessFixture {
         publicReceiptsWerePathFree = $true
     } | Microsoft.PowerShell.Utility\ConvertTo-Json -Depth 6 -Compress
 }
+catch {
+    $failure = $_
+    $diagnostics = @($Error | Select-Object -First 8 | ForEach-Object {
+        $message = [string]$_.Exception.Message
+        [ordered]@{
+            file = [IO.Path]::GetFileName([string]$_.InvocationInfo.ScriptName)
+            line = $_.InvocationInfo.ScriptLineNumber
+            type = $_.Exception.GetType().Name
+            innerType = if ($_.Exception.InnerException) { $_.Exception.InnerException.GetType().Name } else { $null }
+            code = if ($message -cmatch '^[A-Z][A-Z0-9_]+$' -or $message -cin @(
+                'pending replacement verification failed', 'replacement verification failed',
+                'restore verification failed', 'recovery removal verification failed'
+            )) { $message } else { 'unclassified' }
+        }
+    })
+    [ordered]@{protocol='DYSON_BOOTSTRAP_SELFTEST_DIAGNOSTIC_V1';errors=$diagnostics}|ConvertTo-Json -Depth 5 -Compress|Write-Output
+    throw $failure
+}
 finally {
     $cleanupManagedProcess = $null
     $cleanupReleaseProcess = $null
