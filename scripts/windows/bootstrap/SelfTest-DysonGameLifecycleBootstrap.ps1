@@ -1321,6 +1321,27 @@ public static class DysonGameBootstrapProcessFixture {
 
         $finalRequested = Write-DysonGameBootstrapExpectedExitRequested `
             -Context $expectedExitContext -Binding $expectedExitBinding
+        if (-not ('DysonBootstrapFixtureNativeAcl' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+public static class DysonBootstrapFixtureNativeAcl {
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetFileSecurity(string path, uint information, byte[] descriptor);
+}
+'@
+        }
+        $legacy = [Security.AccessControl.RawSecurityDescriptor]::new($finalRequested.aclSddl)
+        $legacy.SetFlags($legacy.ControlFlags -band (-bnot [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited))
+        $legacyBytes = [byte[]]::new($legacy.BinaryLength)
+        $legacy.GetBinaryForm($legacyBytes, 0)
+        if (-not [DysonBootstrapFixtureNativeAcl]::SetFileSecurity($expectedExitPath, [uint32]4, $legacyBytes)) {
+            throw 'legacy inherited ACL fixture could not be created'
+        }
+        $finalRequested = Read-DysonGameBootstrapExpectedExit -Context $expectedExitContext
+        $legacyObserved = [Security.AccessControl.RawSecurityDescriptor]::new($finalRequested.aclSddl)
+        Assert-BootstrapSelfTest (($legacyObserved.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited) -eq 0) `
+            'the expected-exit fixture did not retain legacy inheritance flags'
         $script:DysonGameBootstrapExpectedExitFaultHook = {
             param($Phase, $FaultContext)
             if ($Phase -cne 'after-replace') { return }

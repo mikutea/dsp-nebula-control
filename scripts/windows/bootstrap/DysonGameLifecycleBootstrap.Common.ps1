@@ -1112,6 +1112,16 @@ function Complete-DysonGameBootstrapExpectedExit {
             throw 'pending replacement verification failed'
         }
         Invoke-DysonGameBootstrapExpectedExitFault -Phase 'after-pending-write' -Context $Context
+        $targetBeforeReplace = Read-DysonGameBootstrapExpectedExitFile -Context $Context -Path $paths.canonical
+        if ([string]$targetBeforeReplace.sha256 -cne [string]$current.sha256 -or
+            -not (Test-DysonGameBootstrapExpectedExitSecurityEqual -Left $targetBeforeReplace -Right $current)) {
+            throw 'replacement target changed'
+        }
+        # File.Replace can promote legacy inherited ACEs to explicit entries and
+        # then append the parent's inherited ACEs. Normalize the verified target
+        # descriptor first, as the rollback path already does. The existing
+        # owner/group/protection/ACE comparison remains unchanged.
+        Set-DysonGameBootstrapExpectedExitSecurity -Path $paths.canonical -AclSddl ([string]$current.aclSddl)
         [System.IO.File]::Replace($paths.pending, $paths.canonical, $paths.recovery)
         Invoke-DysonGameBootstrapExpectedExitFault -Phase 'after-replace' -Context $Context
         $persisted = Read-DysonGameBootstrapExpectedExitFile -Context $Context -Path $paths.canonical

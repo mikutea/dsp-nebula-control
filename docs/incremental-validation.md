@@ -41,6 +41,9 @@ Bootstrap resolver changes run the focused pointer test and the existing game
 lifecycle bootstrap self-test. Identity-bearing pointers must match the root-bound
 deployment marker, partial or unknown fields remain rejected, and Windows entry-point
 separators must resolve against the canonical slash-delimited file inventory.
+The lifecycle self-test also creates a legacy inherited security descriptor for
+expected-exit replacement. Owner, group, protection and every ACE must survive;
+the existing comparison permits only the filesystem's auto-inheritance flag normalization.
 The exact addition of that pointer test to the artifact allowlist is separately
 recognized; any other packaging-module change fails closed. Real artifact and
 package construction and verification remain mandatory before deployment.
