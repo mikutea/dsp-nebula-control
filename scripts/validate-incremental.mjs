@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const baseline = 'f0f022eef7b799da21e9adfd37246b62dcf971ee'
+export const baseline = '9accff7d525ebc5c846ee0f3aff7234ba6e5decc'
 const versionFiles = new Set([
   '.env.example', 'README.md', 'package.json', 'package-lock.json',
   'apps/api/package.json', 'apps/api/package-lock.json',
@@ -29,9 +29,28 @@ const normalize = text => text.replaceAll('\r\n', '\n')
 export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
   if (versionFiles.has(file) && before !== null &&
-      normalize(before).replaceAll('0.1.0-rc.14', '0.1.0-rc.15') === normalize(after)) return 'version-only'
+      normalize(before).replaceAll('0.1.0-rc.15', '0.1.0-rc.16') === normalize(after)) return 'version-only'
   if (reviewedPaths.has(file)) return 'affected'
   throw new Error(`No reviewed affected-test mapping for ${file}; update the plan, never auto-run the full suite.`)
+}
+
+export function selectCommands(changes) {
+  const affected = new Set(changes.filter(change => change.kind === 'affected').map(change => change.file))
+  const commands = [
+    ['node', ['scripts/validate-version-consistency.mjs']],
+    ['node', ['--test', 'scripts/validate-incremental.test.mjs', 'scripts/windows/release/release-workflow.test.mjs']]
+  ]
+  if (affected.has('scripts/windows/Get-DysonStatus.ps1') ||
+      affected.has('apps/api/src/providers/windows-status-script.test.ts')) {
+    commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
+      'src/providers/windows-status-script.test.ts', 'src/providers/windows.test.ts',
+      'src/observability/server-status.test.ts', 'src/observability/snapshot.test.ts']])
+  }
+  if ([...affected].some(file => file.startsWith('scripts/windows/data-recovery/'))) {
+    commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', 'scripts/windows/data-recovery/SelfTest-DysonDataRootRecovery.ps1']])
+  }
+  return commands
 }
 
 export function runValidation(root, planOnly = false) {
@@ -50,17 +69,7 @@ export function runValidation(root, planOnly = false) {
     }
     return { file, kind: classifyChange(file, before, after) }
   })
-  const commands = [
-    ['node', ['scripts/validate-version-consistency.mjs']],
-    ['node', ['--test', 'scripts/validate-incremental.test.mjs', 'scripts/windows/release/release-workflow.test.mjs']],
-    ['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
-      'src/providers/windows-status-script.test.ts', 'src/providers/windows.test.ts',
-      'src/observability/server-status.test.ts', 'src/observability/snapshot.test.ts']]
-  ]
-  if (files.some(file => file.startsWith('scripts/windows/data-recovery/'))) {
-    commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-      '-File', 'scripts/windows/data-recovery/SelfTest-DysonDataRootRecovery.ps1']])
-  }
+  const commands = selectCommands(changes)
   const report = { baseline, subject: git(['rev-parse', 'HEAD']).trim(), changes,
     fullSuiteRerun: false, releaseQualified: false, commands, state: 'planned' }
   if (planOnly) return report

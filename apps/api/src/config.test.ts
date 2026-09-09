@@ -68,15 +68,15 @@ describe('production configuration', () => {
 
   it('accepts only a bounded deployment release identifier', () => {
     expect(loadConfig({
-      NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: 'v0.1.0-rc.15+fixture'
-    }).deploymentVersion).toBe('v0.1.0-rc.15+fixture')
+      NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: 'v0.1.0-rc.16+fixture'
+    }).deploymentVersion).toBe('v0.1.0-rc.16+fixture')
     expect(() => loadConfig({
       NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: '../untrusted release'
     })).toThrow()
   })
 
   it('defaults the expected Bridge heartbeat to the full repository release version', () => {
-    expect(loadConfig({ NODE_ENV: 'test' }).bridgePluginVersion).toBe('0.1.0-rc.15')
+    expect(loadConfig({ NODE_ENV: 'test' }).bridgePluginVersion).toBe('0.1.0-rc.16')
   })
 
   it('keeps player notices disabled and validates the closed mutation gate', () => {

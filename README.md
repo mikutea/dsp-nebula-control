@@ -8,7 +8,7 @@ parts that generic panels do not: the licensed DSP client, Nebula/BepInEx
 compatibility, paired `.dsv` + `.server` saves, locked mod sets, staged updates,
 client/server parity, and rollback-oriented operations.
 
-> Project status: `0.1.0-rc.15` implementation foundation. The repository now
+> Project status: `0.1.0-rc.16` implementation foundation. The repository now
 > contains an authenticated dashboard; bounded Windows inventory; durable,
 > opt-in lifecycle transactions; paired-save catalogue and default-off,
 > authenticated backup/restore workflows;
