@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { classifyChange, selectCommands } from './validate-incremental.mjs'
+import { classifyChange, selectCommands, planExecution } from './validate-incremental.mjs'
 
 test('version reuse permits only the exact reviewed version substitution', () => {
   assert.equal(classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.16\r\n', 'v=0.1.0-rc.17\n'), 'version-only')
@@ -36,18 +36,59 @@ test('unknown paths and deletions stop instead of silently skipping tests', () =
   assert.throws(() => classifyChange('apps/api/src/config.ts', null, 'new'))
 })
 
-test('bootstrap coordination selects broker and deployment regressions', () => {
+test('deployment coordination selects integration checks without retesting an unchanged broker', () => {
   const file = 'scripts/windows/deployment/Install-DysonControl.ps1'
   assert.equal(classifyChange(file, 'old', 'new'), 'affected')
   const commands = selectCommands([{ file, kind: 'affected' }])
-  for (const script of ['scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1',
-    'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1']) {
+  for (const script of ['scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1']) {
     assert.ok(commands.some(([exe, args]) => exe === 'powershell.exe' && args.includes(script)))
   }
+  assert.ok(commands.every(([, args]) => !args.includes('scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1')))
   const buildIndex = commands.findIndex(([, args]) => args.includes('apps/api/tsconfig.json'))
   const deploymentIndex = commands.findIndex(([, args]) => args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1'))
   assert.ok(buildIndex >= 0 && buildIndex < deploymentIndex)
   assert.ok(commands.every(([, args]) => !args.includes('check')))
+})
+
+test('default validation declares missing host evidence instead of running the long deployment suite', () => {
+  const plan = planExecution([{ file: 'scripts/windows/deployment/Install-DysonControl.ps1', kind: 'affected' }])
+  assert.equal(plan.mode, 'fast')
+  assert.equal(plan.commands.length, 2)
+  assert.ok(plan.pendingHostCommands.some(([, args]) => args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')))
+  assert.equal(plan.components.find(item => item.group === 'deployment').decision, 'host-validation-required')
+})
+
+test('target-host mode runs only changed components and full deployment remains explicit', () => {
+  const changes = [
+    { file: 'scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1', kind: 'affected' },
+    { file: 'scripts/windows/deployment/Install-DysonControl.ps1', kind: 'affected' }
+  ]
+  const focused = planExecution(changes, { hostChecks: true })
+  assert.ok(focused.commands.some(([, args]) => args.includes('scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1')))
+  assert.ok(focused.commands.every(([, args]) => !args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')))
+  const explicit = planExecution(changes, { hostChecks: true, fullDeployment: true })
+  assert.equal(explicit.pendingHostCommands.length, 0)
+  assert.ok(explicit.commands.some(([, args]) => args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')))
+})
+
+test('component evidence reuses an already verified change independently', () => {
+  const changes = [{ file: 'scripts/windows/deployment/Install-DysonControl.ps1', kind: 'affected' }]
+  const plan = planExecution(changes, { componentChanges: { deployment: [] } })
+  assert.equal(plan.pendingHostCommands.length, 0)
+  assert.equal(plan.components.find(item => item.group === 'deployment').decision, 'reuse')
+})
+
+test('documentation and test-only edits do not imply production transaction changes', () => {
+  assert.equal(classifyChange('README.md', 'old', 'new'), 'documentation')
+  const file = 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1'
+  const kind = classifyChange(file, 'old', 'new')
+  assert.equal(kind, 'test-only')
+  const plan = planExecution([{ file, kind }])
+  assert.equal(plan.pendingHostCommands.length, 0)
+  assert.deepEqual(plan.syntaxFiles, [file])
+  assert.ok(plan.commands.some(([, args]) => args.includes('-EncodedCommand')))
+  const explicit = planExecution([{ file: 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', kind: 'test-only' }], { hostChecks: true })
+  assert.ok(explicit.commands.some(([, args]) => args.includes('scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1')))
 })
 
 test('bootstrap resolution selects pointer and runtime regressions', () => {
