@@ -2509,8 +2509,8 @@ try {
     $installedBootstrapLayoutPath = Join-Path $installerRoot 'bootstrap\bootstrap-layout.json'
     foreach ($launcherDependency in @('Start-DysonControl.ps1', 'DysonDeployment.Configuration.ps1')) {
         Assert-SelfTest -Condition (
-            (Get-FileHash -LiteralPath (Join-Path $installerRoot ('bootstrap\' + $launcherDependency))).Hash -ceq
-            (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $launcherDependency)).Hash
+            (Get-DysonFileSha256 -Path (Join-Path $installerRoot ('bootstrap\' + $launcherDependency))) -ceq
+            (Get-DysonFileSha256 -Path (Join-Path $PSScriptRoot $launcherDependency))
         ) -Message 'the launcher and configuration adapter did not retain the current source contract'
     }
     Assert-SelfTest -Condition (Test-Path -LiteralPath $installedBootstrapLayoutPath -PathType Leaf) `

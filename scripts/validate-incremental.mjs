@@ -23,6 +23,7 @@ const reviewedPaths = new Set([
   'scripts/windows/lifecycle-broker/Install-DysonLifecycleBrokerTask.ps1',
   'scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1',
   'scripts/windows/deployment/Install-DysonControl.ps1',
+  'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1',
   'scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1',
   'scripts/windows/bootstrap/SelfTest-DysonGameBootstrapPointer.ps1',
   'apps/api/src/providers/windows-status-script.test.ts',
@@ -63,7 +64,8 @@ export function selectCommands(changes) {
     commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-File', 'scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1']])
   }
-  if (affected.has('scripts/windows/deployment/Install-DysonControl.ps1')) {
+  if (affected.has('scripts/windows/deployment/Install-DysonControl.ps1') ||
+      affected.has('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')) {
     commands.push(['node', ['apps/api/node_modules/typescript/bin/tsc', '-p', 'apps/api/tsconfig.json']])
     commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-File', 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1']])
