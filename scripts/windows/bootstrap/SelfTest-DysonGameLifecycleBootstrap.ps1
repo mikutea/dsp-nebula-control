@@ -39,6 +39,7 @@ $outsideLayoutTarget = Join-Path $testRoot 'outside-layout-target'
 $layoutRedirectCreated = $false
 $children = [System.Collections.Generic.List[object]]::new()
 $foreignProcess = $null
+$bootstrapFailureSecurity = @{}
 
 function Assert-BootstrapSelfTest {
     param([bool]$Condition, [string]$Message)
@@ -1320,8 +1321,30 @@ public static class DysonGameBootstrapProcessFixture {
 
         $finalRequested = Write-DysonGameBootstrapExpectedExitRequested `
             -Context $expectedExitContext -Binding $expectedExitBinding
-        $finalCompleted = Complete-DysonGameBootstrapExpectedExit `
-            -Context $expectedExitContext -BindingId ([string]$expectedExitBinding.bindingId)
+        $script:DysonGameBootstrapExpectedExitFaultHook = {
+            param($Phase, $FaultContext)
+            if ($Phase -cne 'after-replace') { return }
+            $original = [Security.AccessControl.RawSecurityDescriptor]::new($finalRequested.aclSddl)
+            foreach ($kind in @('canonical', 'recovery')) {
+                $paths = Get-DysonGameBootstrapExpectedExitPaths $FaultContext
+                $record = Read-DysonGameBootstrapExpectedExitFile -Context $FaultContext -Path $paths.$kind
+                $actual = [Security.AccessControl.RawSecurityDescriptor]::new($record.aclSddl)
+                $bootstrapFailureSecurity[$kind] = [ordered]@{
+                    ownerMatches = ($actual.Owner.Value -ceq $original.Owner.Value)
+                    groupMatches = ($actual.Group.Value -ceq $original.Group.Value)
+                    flags = @([int]$original.ControlFlags, [int]$actual.ControlFlags)
+                    aclRevisions = @($original.DiscretionaryAcl.Revision, $actual.DiscretionaryAcl.Revision)
+                    originalAces = @($original.DiscretionaryAcl | ForEach-Object { '{0}:{1}:{2}' -f $_.AceType,[int]$_.AceFlags,$_.AccessMask })
+                    actualAces = @($actual.DiscretionaryAcl | ForEach-Object { '{0}:{1}:{2}' -f $_.AceType,[int]$_.AceFlags,$_.AccessMask })
+                    securityMatches = (Test-DysonGameBootstrapExpectedExitSecurityEqual $record $finalRequested)
+                }
+            }
+        }.GetNewClosure()
+        try {
+            $finalCompleted = Complete-DysonGameBootstrapExpectedExit `
+                -Context $expectedExitContext -BindingId ([string]$expectedExitBinding.bindingId)
+        }
+        finally { $script:DysonGameBootstrapExpectedExitFaultHook = $null }
         $finalCompletedAgain = Complete-DysonGameBootstrapExpectedExit `
             -Context $expectedExitContext -BindingId ([string]$expectedExitBinding.bindingId)
         $completedWriteAgain = Write-DysonGameBootstrapExpectedExitRequested `
@@ -2054,7 +2077,7 @@ catch {
             )) { $message } else { 'unclassified' }
         }
     })
-    [ordered]@{protocol='DYSON_BOOTSTRAP_SELFTEST_DIAGNOSTIC_V1';errors=$diagnostics}|ConvertTo-Json -Depth 5 -Compress|Write-Output
+    [ordered]@{protocol='DYSON_BOOTSTRAP_SELFTEST_DIAGNOSTIC_V1';errors=$diagnostics;security=$bootstrapFailureSecurity}|ConvertTo-Json -Depth 6 -Compress|Write-Output
     throw $failure
 }
 finally {
