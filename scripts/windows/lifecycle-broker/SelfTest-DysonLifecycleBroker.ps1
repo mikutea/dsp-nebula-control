@@ -783,7 +783,9 @@ try {
         'normal removal emits bounded receipt and preserves history audit sentinels runtime tasks and other installs'
 
     # Stage a second fictional release without modifying the first release's pinned dependencies.
-    $candidateInstalled = Join-Path $script:root 'candidate-release\scripts\windows'
+    # CI environment paths can use forward slashes; installed descriptors use
+    # canonical Windows paths. Exercise that boundary explicitly.
+    $candidateInstalled = (Join-Path $script:root 'candidate-release\scripts\windows').Replace('\', '/')
     $candidateBrokerScripts = Join-Path $candidateInstalled 'lifecycle-broker'
     [void][IO.Directory]::CreateDirectory($candidateBrokerScripts)
     foreach ($name in @(
@@ -929,7 +931,8 @@ try {
     Assert-SelfTest ([string]$upgradedProfile.createdAt -cne [string]$initialProfile.createdAt) 'cross-release upgrade records a new creation time'
     Assert-SelfTest ([bool]$upgradedTask.enabled) 'cross-release upgrade enables the worker'
     Assert-SelfTest ([string]$upgradedTask.sddl -ceq (Get-DysonLifecycleBrokerTaskSddl)) 'cross-release upgrade preserves the worker DACL'
-    Assert-SelfTest ([string]$upgradedTask.descriptor.arguments -match [regex]::Escape($candidateBrokerScripts)) 'cross-release upgrade binds worker arguments to the candidate scripts'
+    $expectedWorker = Join-Path ([IO.Path]::GetFullPath($candidateBrokerScripts)) 'Invoke-DysonLifecycleBrokerWorker.ps1'
+    Assert-SelfTest ([string]$upgradedTask.descriptor.arguments -match [regex]::Escape('-File "' + $expectedWorker + '"')) 'cross-release upgrade binds worker arguments to the candidate scripts'
 
     $upgradedBytes = [IO.File]::ReadAllBytes($script:profileFile)
     $candidateReplay = Invoke-SelfTestInstall -Script $candidateInstall -InstalledRoot $candidateInstalled `
