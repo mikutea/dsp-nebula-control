@@ -62,7 +62,6 @@ const environmentSchema = z.object({
   DYSON_SAVE_RETENTION_MUTATIONS_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_SAVE_RETENTION_PURGE_MINIMUM_HOURS: z.coerce.number().int().min(1).max(8_760).default(168),
   DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED: z.enum(['true', 'false']).default('false'),
-  DYSON_CONFIG_MUTATIONS_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_SAVE_TRANSFER_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_SAVE_TRANSFER_ROOT: z.string().optional(),
   DYSON_LIFECYCLE_ENABLED: z.enum(['true', 'false']).default('false'),
@@ -475,10 +474,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   if (value.DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED === 'true' && value.DYSON_LIFECYCLE_ENABLED !== 'true') {
     throw new Error('DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED requires lifecycle execution')
   }
-  if (value.DYSON_CONFIG_MUTATIONS_ENABLED === 'true' &&
-      (value.DYSON_PROVIDER !== 'windows' || value.DYSON_LIFECYCLE_ENABLED !== 'true')) {
-    throw new Error('DYSON_CONFIG_MUTATIONS_ENABLED requires the Windows lifecycle provider')
-  }
   if (value.DYSON_SAVE_TRANSFER_ROOT && !path.isAbsolute(value.DYSON_SAVE_TRANSFER_ROOT)) {
     throw new Error('DYSON_SAVE_TRANSFER_ROOT must be an absolute path')
   }
@@ -575,7 +570,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     saveRetentionMutationsEnabled: value.DYSON_SAVE_RETENTION_MUTATIONS_ENABLED === 'true',
     saveRetentionPurgeMinimumHours: value.DYSON_SAVE_RETENTION_PURGE_MINIMUM_HOURS,
     configHistoryMutationsEnabled: value.DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED === 'true',
-    configMutationsEnabled: value.DYSON_CONFIG_MUTATIONS_ENABLED === 'true',
+    configMutationsEnabled: value.DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED === 'true',
     saveTransferEnabled: value.DYSON_SAVE_TRANSFER_ENABLED === 'true',
     saveTransferRoot: value.DYSON_SAVE_TRANSFER_ROOT ? path.resolve(value.DYSON_SAVE_TRANSFER_ROOT) : null,
     lifecycleEnabled: value.DYSON_LIFECYCLE_ENABLED === 'true',

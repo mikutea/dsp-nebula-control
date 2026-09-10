@@ -18,14 +18,14 @@ const invalidConsoleCursorSecret = ['too', 'short'].join('-')
 describe('production configuration', () => {
   it('keeps base configuration apply disabled until the complete Windows lifecycle chain is enabled', () => {
     expect(loadConfig({ NODE_ENV: 'test' }).configMutationsEnabled).toBe(false)
-    expect(() => loadConfig({ NODE_ENV: 'test', DYSON_CONFIG_MUTATIONS_ENABLED: 'true' }))
-      .toThrow(/requires the Windows lifecycle provider/)
+    expect(() => loadConfig({ NODE_ENV: 'test', DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED: 'true' }))
+      .toThrow(/requires the Windows provider/)
     expect(() => loadConfig({ NODE_ENV: 'test', DYSON_PROVIDER: 'windows',
-      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson', DYSON_CONFIG_MUTATIONS_ENABLED: 'true' }))
-      .toThrow(/requires the Windows lifecycle provider/)
+      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson', DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED: 'true' }))
+      .toThrow(/requires lifecycle execution/)
     expect(loadConfig({ NODE_ENV: 'test', DYSON_PROVIDER: 'windows',
       DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson', ...lifecycleExecutionEnvironment,
-      DYSON_CONFIG_MUTATIONS_ENABLED: 'true' }).configMutationsEnabled).toBe(true)
+      DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED: 'true' }).configMutationsEnabled).toBe(true)
   })
 
   it('fails closed on misspelled DYSON variables while ignoring unrelated host variables', () => {

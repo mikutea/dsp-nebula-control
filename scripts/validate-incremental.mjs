@@ -131,9 +131,18 @@ const rc23VerifiedSources = new Map([
   ["scripts/windows/configuration/dyson-control.environment-contract.json", "8ae71deb1f48f4b32b415b8fa6071b2ca3718e02a439d7bd5bd4fcdffb9c31e0"]
 ])
 
+// Reuse the existing configuration gate without migrating the persisted contract.
+const configurationGateSources = new Map([
+  [".env.example", "6ea35413832696eb4fb1dd5d2ee4247df56d7173b37ac65821f8a6088ad2ee76"],
+  ["apps/api/src/config.ts", "a4f154beec0605fa66b67b6fc7e340ec9e26158c494f99d134829190d788b9ca"],
+  ["apps/api/src/config.test.ts", "a80d70a009148924def94a384ae49acb1518c427b9b1e758557bd86723cb8d99"],
+  ["scripts/windows/configuration/dyson-control.environment-contract.json", "5386f42df066b3d5ce4fa26f3346baf4311b0ec8efb1eb4d83bdf488c14786dc"]
+])
+
 export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
   if (rc23VerifiedSources.get(file) === aclSourceHash(after)) return 'verified-rc23-source'
+  if (configurationGateSources.get(file) === aclSourceHash(after)) return 'configuration-gate'
   const startup = startupSources.get(file)
   if (startup && before !== null && startup.before.includes(startupSourceHash(before)) &&
       startup.after === startupSourceHash(after)) return 'startup-policy'
@@ -242,6 +251,9 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
   const isRunnerCheck = ([, args]) => args.includes('src/providers/powershell-runner.test.ts')
   const hostCommands = selected.slice(2).filter(command => !isRunnerCheck(command))
   const commands = [...selected.slice(0, 2), ...selected.slice(2).filter(isRunnerCheck)]
+  if (changes.some(change => change.kind === 'configuration-gate')) commands.push(['node',
+    ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=2',
+      'src/config.test.ts', 'src/configuration-apply-coordination.test.ts', 'src/configuration-reconcile-coordination.test.ts']])
   if (controlExitChanged) commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
     '-File', 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', '-ExitPolicyOnly']])
   if (aclChanged) commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
@@ -280,7 +292,8 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
       verifiedCommit: componentBaselines[group].commit,
       evidence: componentBaselines[group].evidence })),
     reasons: changes.map(({ file, kind }) => ({ file, kind,
-      decision: kind === 'verified-rc23-source' ? 'reuse exact RC23 source evidence; production qualification remains separate' :
+      decision: kind === 'configuration-gate' ? 'run focused shared configuration gate checks' :
+        kind === 'verified-rc23-source' ? 'reuse exact RC23 source evidence; production qualification remains separate' :
         kind === 'control-exit-policy' ? 'reviewed runtime change: execute the focused exit-policy check' :
         kind === 'affected' ? 'run matching checks or reuse the verified component baseline' : 'no production behavior change' })) }
 }

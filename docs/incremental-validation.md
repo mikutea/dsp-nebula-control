@@ -2,6 +2,12 @@
 
 ## Verified RC23 application batch
 
+Ordinary configuration writes and history operations share the existing
+`DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED` switch. The original environment contract
+is preserved so existing configuration intent chains retain their valid binding.
+The follow-up gate change selects only configuration loading and apply/reconcile
+coordination checks, plus the real installer preflight against the existing store.
+
 Commit `b2eb4590710bff5b79dec44273001b55d39dabcf` has a byte-exact reuse
 mapping in the validation runner. Local affected integration passed 708 assertions;
 the history follow-up passed 103 assertions locally and on the target Windows host.
