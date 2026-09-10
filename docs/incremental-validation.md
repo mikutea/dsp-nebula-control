@@ -106,3 +106,10 @@ unverifiable process states. Native PowerShell pipeline unrolling must never
 turn the array into null or a scalar; the API's strict array schema is unchanged.
 Any other worker source edit returns to the regular broker impact plan. A real
 broker request against the installed candidate remains the integration gate.
+
+PowerShell invocation changes run the native Windows PowerShell binding fixtures
+and lifecycle broker client contracts in the default check. Explicit false
+switches must bind as booleans, while quoted paths and metacharacter-containing
+values remain data. Script allowlisting, output bounds and cancellation stay in
+force. Read-only calls without explicit boolean switches retain their existing
+invocation path. Native dispatch on the installed host remains a separate gate.

@@ -150,3 +150,15 @@ test('the exact verify blocker array change runs its three serialization cases',
   }
   assert.equal(classifyChange(file, 'other before', 'other after'), 'affected')
 })
+
+test('PowerShell invocation changes run native binding and broker contracts once in every mode', () => {
+  const file = 'apps/api/src/providers/powershell-runner.ts'
+  assert.equal(classifyChange(file, 'before', 'after'), 'affected')
+  for (const options of [{}, {hostChecks:true}]) {
+    const plan = planExecution([{file,kind:'affected'}], options)
+    assert.equal(plan.pendingHostCommands.length, 0)
+    const checks = plan.commands.filter(([,args]) => args.includes('src/providers/powershell-runner.test.ts'))
+    assert.equal(checks.length, 1)
+    assert.ok(checks[0][1].includes('src/providers/windows-lifecycle-broker.test.ts'))
+  }
+})

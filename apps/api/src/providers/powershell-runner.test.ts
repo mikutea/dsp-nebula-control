@@ -130,3 +130,30 @@ describe('PowerShellLifecycleRunner script allowlist', () => {
     }
   })
 })
+
+describe.skipIf(process.platform !== 'win32')('native Windows PowerShell argument binding', () => {
+  it.each([
+    { forceArgument: '-Force:$false', force: false },
+    { forceArgument: '-Force', force: true }
+  ])('preserves explicit false and literal values with $forceArgument', async ({ forceArgument, force }) => {
+    const temporaryRoot = path.resolve(os.tmpdir())
+    const fixtureRoot = await fs.mkdtemp(path.join(temporaryRoot, "dyson-runner ' quoted-"))
+    try {
+      await fs.writeFile(path.join(fixtureRoot, 'New-DysonSaveProtectionPoint.ps1'), `
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact='High')]
+param([string]$Value, [switch]$Force, [bool]$Enabled=$true)
+$allowed = $PSCmdlet.ShouldProcess('disposable fixture', 'observe only')
+[ordered]@{value=$Value;force=[bool]$Force;enabled=$Enabled;allowed=$allowed}|ConvertTo-Json -Compress
+`)
+      const value = "literal ' and \" ; $(throw 'not executable') | & trailing\\"
+      const runner = new PowerShellLifecycleRunner(fixtureRoot, 10_000)
+      const output = await runner.run('New-DysonSaveProtectionPoint.ps1',
+        ['-Value', value, forceArgument, '-Enabled:$false', '-Confirm:$false'],
+        new AbortController().signal)
+      expect(JSON.parse(output)).toEqual({ value, force, enabled: false, allowed: true })
+    } finally {
+      if (path.dirname(fixtureRoot) !== temporaryRoot) throw new Error('Unsafe fixture cleanup path')
+      await fs.rm(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+})

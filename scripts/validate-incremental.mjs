@@ -38,6 +38,7 @@ const reviewedPaths = new Set([
   'scripts/windows/bootstrap/SelfTest-DysonGameBootstrapPointer.ps1',
   'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1',
   'apps/api/src/providers/windows-status-script.test.ts',
+  'apps/api/src/providers/powershell-runner.ts', 'apps/api/src/providers/powershell-runner.test.ts',
   'scripts/validate-incremental.mjs', 'scripts/validate-incremental.test.mjs',
   'docs/incremental-validation.md', 'AGENTS.md'
 ])
@@ -86,6 +87,11 @@ export function selectCommands(changes, { componentChanges } = {}) {
     ['node', ['scripts/validate-version-consistency.mjs']],
     ['node', ['--test', 'scripts/validate-incremental.test.mjs', 'scripts/windows/release/release-workflow.test.mjs']]
   ]
+  if (['apps/api/src/providers/powershell-runner.ts', 'apps/api/src/providers/powershell-runner.test.ts']
+      .some(file => changed('lifecycle').has(file))) {
+    commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
+      'src/providers/powershell-runner.test.ts', 'src/providers/windows-lifecycle-broker.test.ts']])
+  }
   if (changed('status').has('scripts/windows/Get-DysonStatus.ps1') ||
       changed('status').has('apps/api/src/providers/windows-status-script.test.ts')) {
     commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
@@ -123,7 +129,7 @@ const commandGroup = command => {
   if (isDeploymentCommand(command)) return 'deployment'
   const args = command[1].join(' ')
   if (args.includes('/bootstrap/')) return 'bootstrap'
-  if (args.includes('/lifecycle-broker/')) return 'lifecycle'
+  if (args.includes('/lifecycle-broker/') || args.includes('powershell-runner.test.ts')) return 'lifecycle'
   if (args.includes('/data-recovery/')) return 'recovery'
   if (args.includes('windows-status-script.test.ts')) return 'status'
   return null
@@ -139,8 +145,9 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
     ? { ...change, kind: 'affected' } : change)
   const selected = selectCommands(requested(changes), { componentChanges: componentChanges &&
     Object.fromEntries(Object.entries(componentChanges).map(([group, rows]) => [group, requested(rows)])) })
-  const hostCommands = selected.slice(2)
-  const commands = selected.slice(0, 2)
+  const isRunnerCheck = ([, args]) => args.includes('src/providers/powershell-runner.test.ts')
+  const hostCommands = selected.slice(2).filter(command => !isRunnerCheck(command))
+  const commands = [...selected.slice(0, 2), ...selected.slice(2).filter(isRunnerCheck)]
   if (controlExitChanged) commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
     '-File', 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', '-ExitPolicyOnly']])
   if (aclChanged) commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',

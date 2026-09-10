@@ -86,6 +86,43 @@ export function resolvePowerShellScriptPath(scriptRoot: string, scriptName: stri
   return scriptPath
 }
 
+// Windows PowerShell 5.1 -File cannot bind an explicit false switch value.
+// Decode argument data and bind it by declared parameter type inside PowerShell;
+// no argument or path is evaluated as PowerShell source.
+function encodeNamedInvocation(scriptPath: string, scriptArguments: string[]): string {
+  const payload = Buffer.from(JSON.stringify({ scriptPath, arguments: scriptArguments }), 'utf8').toString('base64')
+  const command = `
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$invocation = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json
+$commands = @(Get-Command -Name ([string]$invocation.scriptPath) -CommandType ExternalScript -ErrorAction Stop)
+if ($commands.Count -ne 1) { throw 'HOST_SCRIPT_INVALID' }
+$parameters = $commands[0].Parameters
+$bound = @{}
+$values = @($invocation.arguments)
+for ($index = 0; $index -lt $values.Count; $index++) {
+    $match = [regex]::Match([string]$values[$index], '^-(?<name>[A-Za-z][A-Za-z0-9]*)(?::\\$(?<boolean>true|false))?$', 'IgnoreCase')
+    if (-not $match.Success) { throw 'HOST_ARGUMENT_INVALID' }
+    $name = $match.Groups['name'].Value
+    if (-not $parameters.ContainsKey($name) -or $bound.ContainsKey($name)) { throw 'HOST_ARGUMENT_INVALID' }
+    $type = $parameters[$name].ParameterType
+    if ($match.Groups['boolean'].Success) {
+        if ($type -ne [bool] -and $type -ne [Management.Automation.SwitchParameter]) { throw 'HOST_ARGUMENT_INVALID' }
+        $bound[$name] = [bool]::Parse($match.Groups['boolean'].Value)
+    } elseif ($type -eq [Management.Automation.SwitchParameter]) {
+        $bound[$name] = $true
+    } else {
+        $index++
+        if ($index -ge $values.Count) { throw 'HOST_ARGUMENT_INVALID' }
+        $bound[$name] = [string]$values[$index]
+    }
+}
+& ([string]$invocation.scriptPath) @bound
+if (-not $?) { exit 1 }
+`
+  return Buffer.from(command, 'utf16le').toString('base64')
+}
 export class PowerShellLifecycleRunner implements
   LifecycleScriptRunner,
   WindowsCutoverPowerShellRunner,
@@ -139,10 +176,13 @@ export class PowerShellLifecycleRunner implements
       throw new PowerShellRunnerError('HOST_ARGUMENT_INVALID')
     }
 
+    const invocation = scriptArguments.some(argument => /^-[A-Za-z][A-Za-z0-9]*:\$(?:true|false)$/iu.test(argument))
+      ? ['-EncodedCommand', encodeNamedInvocation(scriptPath, scriptArguments)]
+      : ['-File', scriptPath, ...scriptArguments]
     return new Promise((resolve, reject) => {
       const child = spawn('powershell.exe', [
         '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', scriptPath, ...scriptArguments
+        ...invocation
       ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
       let stdout = ''
       let outputBytes = 0
