@@ -136,3 +136,17 @@ test('the reviewed expected-exit ACL fix runs only its denied-WRITE_OWNER regres
   }
   assert.equal(classifyChange(changes[0].file, 'unreviewed old source', 'unreviewed new source'), 'affected')
 })
+
+test('the exact verify blocker array change runs its three serialization cases', () => {
+  const file = 'scripts/windows/lifecycle-broker/Invoke-DysonLifecycleBrokerWorker.ps1'
+  const changes = [{ file, kind: 'verify-blocker-array' },
+    { file: 'scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1', kind: 'test-only' }]
+  for (const options of [{}, {hostChecks:true}]) {
+    const plan = planExecution(changes, options)
+    assert.equal(plan.pendingHostCommands.length, 0)
+    const checks = plan.commands.filter(([,args]) => args.includes('scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1'))
+    assert.equal(checks.length, 1)
+    assert.ok(checks[0][1].includes('-VerifyEvidenceOnly'))
+  }
+  assert.equal(classifyChange(file, 'other before', 'other after'), 'affected')
+})

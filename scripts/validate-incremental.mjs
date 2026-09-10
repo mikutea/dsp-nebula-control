@@ -30,6 +30,7 @@ const reviewedPaths = new Set([
   'scripts/windows/data-recovery/DysonDataRootRecovery.Common.ps1',
   'scripts/windows/data-recovery/SelfTest-DysonDataRootRecovery.ps1',
   'scripts/windows/lifecycle-broker/Install-DysonLifecycleBrokerTask.ps1',
+  'scripts/windows/lifecycle-broker/Invoke-DysonLifecycleBrokerWorker.ps1',
   'scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1',
   'scripts/windows/deployment/Install-DysonControl.ps1',
   'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1',
@@ -59,6 +60,9 @@ const aclAfterHash = '693e50ca6767358d9e0409987c994c804bc1e6d19be9c9b0f533cf2399
 
 export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
+  if (file === 'scripts/windows/lifecycle-broker/Invoke-DysonLifecycleBrokerWorker.ps1' && before !== null &&
+      aclSourceHash(before) === 'bf7725ecd25c309c7f7e4c6e2050902e5919a920cc45896931a320634f6ff425' &&
+      aclSourceHash(after) === '4c55d309e150b3f8cc5f52afb6f45affc8edef44974365f6e09ec92deede3a70') return 'verify-blocker-array'
   if (file === 'scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1' && before !== null &&
       aclSourceHash(before) === aclBeforeHash && aclSourceHash(after) === aclAfterHash) return 'expected-exit-acl'
   if (file === 'scripts/windows/Start-DysonServer.ps1' && before !== null && normalize(before).includes(controlExitBefore) &&
@@ -126,10 +130,12 @@ const commandGroup = command => {
 }
 
 export function planExecution(changes, { componentChanges, hostChecks = false, fullDeployment = false } = {}) {
+  const verifyBlockersChanged = changes.some(change => change.kind === 'verify-blocker-array')
   const aclChanged = changes.some(change => change.kind === 'expected-exit-acl')
   const controlExitChanged = changes.some(change => change.kind === 'control-exit-policy')
   const requested = rows => rows.map(change => hostChecks && change.kind === 'test-only' &&
-    !((controlExitChanged || aclChanged) && change.file === 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1')
+    !((controlExitChanged || aclChanged) && change.file === 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1') &&
+    !(verifyBlockersChanged && change.file === 'scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1')
     ? { ...change, kind: 'affected' } : change)
   const selected = selectCommands(requested(changes), { componentChanges: componentChanges &&
     Object.fromEntries(Object.entries(componentChanges).map(([group, rows]) => [group, requested(rows)])) })
@@ -139,6 +145,8 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
     '-File', 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', '-ExitPolicyOnly']])
   if (aclChanged) commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
     '-File', 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', '-ExpectedExitAclOnly']])
+  if (verifyBlockersChanged) commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', 'scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1', '-VerifyEvidenceOnly']])
   const syntaxFiles = changes.filter(change => change.kind === 'test-only').map(change => change.file)
   if (syntaxFiles.length) {
     const literals = syntaxFiles.map(file => `'${file.replaceAll("'", "''")}'`).join(',')

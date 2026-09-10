@@ -520,8 +520,8 @@ function Invoke-WorkerRequest {
                 $runtime = Get-WorkerLifecycleEvidence $Profile
                 $target = if ([string]$request.input.expected -ceq 'running') { 'running_verified' } else { 'stopped_verified' }
                 $matched = [string]$runtime.lifecycleState -ceq $target
-                $blockers = if ([string]$runtime.lifecycleState -ceq 'unknown_unverifiable') { @('process_unverifiable') } `
-                    elseif (-not $matched) { @('state_mismatch') } else { @() }
+                $blockers = @(if ([string]$runtime.lifecycleState -ceq 'unknown_unverifiable') { @('process_unverifiable') } `
+                    elseif (-not $matched) { @('state_mismatch') } else { @() })
                 $outcome = [pscustomobject]@{
                     status = if ($matched) { 'succeeded' } else { 'blocked' }; errorCode = $null
                     evidence = [pscustomobject][ordered]@{

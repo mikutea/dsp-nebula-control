@@ -1,9 +1,38 @@
 [CmdletBinding()]
-param()
+param([switch]$VerifyEvidenceOnly)
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+# Execute only the actual worker's blocker assignment, without invoking a task.
+$workerSource = Join-Path $PSScriptRoot 'Invoke-DysonLifecycleBrokerWorker.ps1'
+$parseTokens = $null; $parseErrors = $null
+$workerAst = [Management.Automation.Language.Parser]::ParseFile($workerSource, [ref]$parseTokens, [ref]$parseErrors)
+if ($parseErrors.Count) { throw 'Worker syntax invalid' }
+$assignments = @($workerAst.FindAll({ param($node)
+    $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+    $node.Left.Extent.Text -ceq '$blockers' -and
+    $node.Extent.Text.Contains('unknown_unverifiable')
+}, $true))
+if ($assignments.Count -ne 1) { throw 'Verify blocker assignment not unique' }
+$assignment = [scriptblock]::Create($assignments[0].Extent.Text)
+foreach ($case in @(
+    @{state='running_verified';matched=$true;expected=''},
+    @{state='stopped_verified';matched=$false;expected='state_mismatch'},
+    @{state='unknown_unverifiable';matched=$false;expected='process_unverifiable'}
+)) {
+    $runtime = [pscustomobject]@{lifecycleState=$case.state}; $matched=$case.matched
+    . $assignment
+    if ($blockers -isnot [array]) { throw 'Verify blockers must remain an array' }
+    $roundtrip = ([ordered]@{blockers=$blockers}|ConvertTo-Json -Compress)|ConvertFrom-Json
+    if ($roundtrip.blockers -isnot [array] -or ($roundtrip.blockers -join ',') -cne $case.expected) {
+        throw 'Verify blocker JSON contract mismatch'
+    }
+}
+if ($VerifyEvidenceOnly) {
+    [ordered]@{protocol='DYSON_VERIFY_BLOCKERS_SELFTEST_V1';state='passed';cases=3;productionChanged=$false}|ConvertTo-Json -Compress
+    return
+}
 $env:DYSON_LIFECYCLE_BROKER_SELFTEST = '1'
 . (Join-Path $PSScriptRoot 'DysonLifecycleBroker.Common.ps1')
 . (Join-Path $PSScriptRoot 'DysonLifecycleBroker.TaskAcl.ps1')

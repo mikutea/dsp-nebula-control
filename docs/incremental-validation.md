@@ -98,3 +98,11 @@ return to the normal bootstrap impact plan. The target-host game-account
 requested-to-completed receipt scenario also passed in an isolated directory
 with the real state directory ACL. Actual production stop acceptance remains
 separate and must use the installed release, its binding and durable receipt.
+
+The exact reviewed lifecycle verification serialization correction selects
+`SelfTest-DysonLifecycleBroker.ps1 -VerifyEvidenceOnly`. It executes the worker's
+actual blocker assignment and JSON roundtrip for matched, mismatched and
+unverifiable process states. Native PowerShell pipeline unrolling must never
+turn the array into null or a scalar; the API's strict array schema is unchanged.
+Any other worker source edit returns to the regular broker impact plan. A real
+broker request against the installed candidate remains the integration gate.
