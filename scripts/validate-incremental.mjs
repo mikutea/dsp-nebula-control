@@ -74,7 +74,7 @@ export function classifyChange(file, before, after) {
       normalize(before).replace("    'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1',",
         "    'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1',\n    'scripts/windows/bootstrap/SelfTest-DysonGameBootstrapPointer.ps1',") === normalize(after)) return 'release-test-allowlist'
   if (versionFiles.has(file) && before !== null &&
-      normalize(before).replaceAll('0.1.0-rc.17', '0.1.0-rc.19') === normalize(after)) return 'version-only'
+      normalize(before).replaceAll('0.1.0-rc.17', '0.1.0-rc.20') === normalize(after)) return 'version-only'
   if (reviewedPaths.has(file)) return 'affected'
   throw new Error(`No reviewed affected-test mapping for ${file}; update the plan, never auto-run the full suite.`)
 }
