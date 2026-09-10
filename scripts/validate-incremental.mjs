@@ -136,7 +136,9 @@ const configurationGateSources = new Map([
   [".env.example", "6ea35413832696eb4fb1dd5d2ee4247df56d7173b37ac65821f8a6088ad2ee76"],
   ["apps/api/src/config.ts", "a4f154beec0605fa66b67b6fc7e340ec9e26158c494f99d134829190d788b9ca"],
   ["apps/api/src/config.test.ts", "a80d70a009148924def94a384ae49acb1518c427b9b1e758557bd86723cb8d99"],
-  ["scripts/windows/configuration/dyson-control.environment-contract.json", "5386f42df066b3d5ce4fa26f3346baf4311b0ec8efb1eb4d83bdf488c14786dc"]
+  ["scripts/windows/configuration/dyson-control.environment-contract.json", "5386f42df066b3d5ce4fa26f3346baf4311b0ec8efb1eb4d83bdf488c14786dc"],
+  ["apps/api/src/configuration-apply-coordination.test.ts", "050b0628880f50a8708468840c2f27ea21f1210a6a44645ad9b600e40c6329f8"],
+  ["apps/api/src/configuration-reconcile-coordination.test.ts", "d805c6526e1b91b7596979f74115af7518c65da85d4542079c424d6547cfd81c"]
 ])
 
 export function classifyChange(file, before, after) {

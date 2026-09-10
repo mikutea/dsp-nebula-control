@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -11,7 +11,8 @@ import { HostMutationOperationCoordinatorError, type HostMutationOperationReques
 describe('configuration apply coordination', () => {
   it.each(['disabled', 'lease-busy', 'running', 'stopped'] as const)(
     'allows real fixture configuration writes only behind every gate: %s', async mode => {
-      const root = await mkdtemp(path.join(path.resolve(os.tmpdir()), 'dyson-config-route-'))
+      const temporaryRoot = await realpath(os.tmpdir())
+      const root = await mkdtemp(path.join(temporaryRoot, 'dyson-config-route-'))
       const configRoot = path.join(root, 'server', 'BepInEx', 'config')
       await mkdir(configRoot, { recursive: true })
       const file = path.join(configRoot, 'nebula.cfg')
@@ -51,6 +52,7 @@ describe('configuration apply coordination', () => {
         expect(login.statusCode).toBe(200)
         const cookies = { dyson_session: login.cookies[0]!.value }
         const current = await application.app.inject({ method: 'GET', url: '/api/v1/configuration', cookies })
+        expect(current.statusCode, current.body).toBe(200)
         expect(current.json().data.execution).toMatchObject({ enabled: mode !== 'disabled', requiresStopped: true })
         const requestId = randomUUID()
         const payload = { requestId, confirmation: 'APPLY_CONFIG',
@@ -83,7 +85,7 @@ describe('configuration apply coordination', () => {
         if (mode === 'disabled' || mode === 'lease-busy') expect(proofs).toBe(0)
       } finally {
         await application.close()
-        if (path.dirname(root) !== path.resolve(os.tmpdir())) throw new Error('Unsafe fixture cleanup')
+        if (path.dirname(root) !== temporaryRoot) throw new Error('Unsafe fixture cleanup')
         await rm(root, { recursive: true, force: true })
       }
     }

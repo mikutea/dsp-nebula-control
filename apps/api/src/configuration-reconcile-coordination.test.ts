@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
@@ -15,7 +15,8 @@ import { HostMutationOperationCoordinatorError, type HostMutationRecoveryOperati
 describe('configuration recovery HTTP coordination', () => {
   it.each(['disabled', 'busy', 'running', 'stopped', 'not-required', 'mismatch'] as const)(
     'recovers a real interrupted transaction only with matching authority: %s', async mode => {
-      const root = await mkdtemp(path.join(path.resolve(os.tmpdir()), 'dyson-config-reconcile-route-'))
+      const temporaryRoot = await realpath(os.tmpdir())
+      const root = await mkdtemp(path.join(temporaryRoot, 'dyson-config-reconcile-route-'))
       const configRoot = path.join(root, 'server', 'BepInEx', 'config')
       await mkdir(configRoot, { recursive: true })
       const files = { nebula: '[Nebula - Settings]\nAutoPauseEnabled = true\n',
@@ -33,7 +34,8 @@ describe('configuration recovery HTTP coordination', () => {
         const service = new GameConfigTransactionService({ configRoot: input.configRoot,
           testHooks: { onPhase(phase) { if (phase === 'after-replace') process.exit(75) } }
         });
-        await service.apply(input.plan, { transactionId: input.requestId });
+        const result = await service.apply(input.plan, { transactionId: input.requestId });
+        console.error(JSON.stringify({ status: result.status, errorCode: result.errorCode }));
         process.exit(76);
       `
       const child = spawnSync(process.execPath,
@@ -101,7 +103,7 @@ describe('configuration recovery HTTP coordination', () => {
           () => ({ expectedOperation: 'game-config-apply', expectedRequestId: requestId })))
       } finally {
         await application.close()
-        if (path.dirname(root) !== path.resolve(os.tmpdir())) throw new Error('Unsafe fixture cleanup')
+        if (path.dirname(root) !== temporaryRoot) throw new Error('Unsafe fixture cleanup')
         await rm(root, { recursive: true, force: true })
       }
     }
