@@ -121,3 +121,18 @@ test('the status adapter and validation infrastructure have explicit mappings', 
     assert.equal(classifyChange(file, 'old', 'new'), 'affected')
   }
 })
+
+test('the reviewed expected-exit ACL fix runs only its denied-WRITE_OWNER regression', () => {
+  const changes = [
+    { file: 'scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1', kind: 'expected-exit-acl' },
+    { file: 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', kind: 'test-only' }
+  ]
+  for (const options of [{}, { hostChecks: true }]) {
+    const plan = planExecution(changes, options)
+    assert.equal(plan.pendingHostCommands.length, 0)
+    const checks = plan.commands.filter(([, args]) => args.includes('scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1'))
+    assert.equal(checks.length, 1)
+    assert.ok(checks[0][1].includes('-ExpectedExitAclOnly'))
+  }
+  assert.equal(classifyChange(changes[0].file, 'unreviewed old source', 'unreviewed new source'), 'affected')
+})

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$ExitPolicyOnly)
+param([switch]$ExitPolicyOnly, [switch]$ExpectedExitAclOnly)
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -29,6 +29,54 @@ if ($ExitPolicyOnly) {
     return
 }
 
+if ($ExpectedExitAclOnly) {
+    # Exercise the real file-security setter with WRITE_OWNER explicitly denied.
+    # This models the owning game account, including on an elevated test runner.
+    $fixture = Join-Path ([IO.Path]::GetTempPath()) ('dyson-exit-acl-' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($fixture)
+    $probe = Join-Path $fixture 'receipt.json'
+    try {
+        [IO.File]::WriteAllText($probe, '{"fixture":true}')
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl = [IO.File]::GetAccessControl($probe)
+        $acl.SetAccessRuleProtection($true, $true)
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, [Security.AccessControl.FileSystemRights]::TakeOwnership,
+            [Security.AccessControl.AccessControlType]::Deny))
+        [IO.File]::SetAccessControl($probe, $acl)
+        $before = Get-DysonGameBootstrapExpectedExitSecurity -Path $probe
+        foreach ($attempt in 1..2) {
+            Set-DysonGameBootstrapExpectedExitSecurity -Path $probe -AclSddl $before.aclSddl
+            $after = Get-DysonGameBootstrapExpectedExitSecurity -Path $probe
+            if (-not (Test-DysonGameBootstrapExpectedExitSecurityEqual -Left $before -Right $after)) {
+                throw 'Expected-exit ACL changed on repeat application'
+            }
+        }
+        # A genuine group change still requires WRITE_OWNER and must fail closed.
+        $different = [Security.AccessControl.RawSecurityDescriptor]::new($before.aclSddl)
+        $different.Group = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-546')
+        $rejected = $false
+        try {
+            Set-DysonGameBootstrapExpectedExitSecurity -Path $probe -AclSddl $different.GetSddlForm(
+                [Security.AccessControl.AccessControlSections]'Owner, Group, Access')
+        } catch {
+            if ($_.Exception.Message -ne 'BOOTSTRAP_EXPECTED_EXIT_WRITE_FAILED') { throw }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw 'Unauthorized group change accepted' }
+        $after = Get-DysonGameBootstrapExpectedExitSecurity -Path $probe
+        if (-not (Test-DysonGameBootstrapExpectedExitSecurityEqual -Left $before -Right $after)) {
+            throw 'Rejected group change modified security'
+        }
+        if ([IO.File]::ReadAllText($probe) -cne '{"fixture":true}') { throw 'Receipt bytes changed' }
+        [ordered]@{protocol='DYSON_EXPECTED_EXIT_ACL_SELFTEST_V1';state='passed';cases=4;productionChanged=$false}|ConvertTo-Json -Compress
+    } finally {
+        # Delete only the uniquely created fixture and its known file.
+        if ([IO.File]::Exists($probe)) { [IO.File]::Delete($probe) }
+        [IO.Directory]::Delete($fixture, $false)
+    }
+    return
+}
 $temporaryBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $testRoot = Join-Path $temporaryBase ('dyson-game-bootstrap-selftest-' + [guid]::NewGuid().ToString('N'))
 $installRoot = Join-Path $testRoot 'install'

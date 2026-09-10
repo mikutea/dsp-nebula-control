@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -50,8 +51,16 @@ const controlExitAfter = [
   '    }'
 ].join('\n')
 
+// Exact normalized source identities: any additional runtime edit falls back to
+// the regular bootstrap impact plan instead of inheriting this narrow check.
+const aclSourceHash = source => createHash('sha256').update(normalize(source).trimEnd() + '\n').digest('hex')
+const aclBeforeHash = 'b8ff1c53b36ceb1cb8c4f104621c967108c6c2b0c6f667410e3522453e51a1c9'
+const aclAfterHash = '693e50ca6767358d9e0409987c994c804bc1e6d19be9c9b0f533cf2399a2b253'
+
 export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
+  if (file === 'scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1' && before !== null &&
+      aclSourceHash(before) === aclBeforeHash && aclSourceHash(after) === aclAfterHash) return 'expected-exit-acl'
   if (file === 'scripts/windows/Start-DysonServer.ps1' && before !== null && normalize(before).includes(controlExitBefore) &&
       normalize(before).replace(controlExitBefore, controlExitAfter) === normalize(after)) return 'control-exit-policy'
   if (file === 'scripts/windows/deployment/DysonRebootAcceptance.Common.ps1') return 'test-only'
@@ -117,9 +126,10 @@ const commandGroup = command => {
 }
 
 export function planExecution(changes, { componentChanges, hostChecks = false, fullDeployment = false } = {}) {
+  const aclChanged = changes.some(change => change.kind === 'expected-exit-acl')
   const controlExitChanged = changes.some(change => change.kind === 'control-exit-policy')
   const requested = rows => rows.map(change => hostChecks && change.kind === 'test-only' &&
-    !(controlExitChanged && change.file === 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1')
+    !((controlExitChanged || aclChanged) && change.file === 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1')
     ? { ...change, kind: 'affected' } : change)
   const selected = selectCommands(requested(changes), { componentChanges: componentChanges &&
     Object.fromEntries(Object.entries(componentChanges).map(([group, rows]) => [group, requested(rows)])) })
@@ -127,6 +137,8 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
   const commands = selected.slice(0, 2)
   if (controlExitChanged) commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
     '-File', 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', '-ExitPolicyOnly']])
+  if (aclChanged) commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', '-ExpectedExitAclOnly']])
   const syntaxFiles = changes.filter(change => change.kind === 'test-only').map(change => change.file)
   if (syntaxFiles.length) {
     const literals = syntaxFiles.map(file => `'${file.replaceAll("'", "''")}'`).join(',')

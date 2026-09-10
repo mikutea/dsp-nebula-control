@@ -632,9 +632,18 @@ function Set-DysonGameBootstrapExpectedExitSecurity {
         throw 'BOOTSTRAP_EXPECTED_EXIT_INVALID'
     }
     try {
-        $sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
-            [System.Security.AccessControl.AccessControlSections]::Group -bor
-            [System.Security.AccessControl.AccessControlSections]::Access
+        $expectedDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($AclSddl)
+        $currentSecurity = Get-DysonGameBootstrapExpectedExitSecurity -Path $Path
+        $currentDescriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($currentSecurity.aclSddl)
+        # An owning game account can update its DACL without WRITE_OWNER.
+        # Do not request owner/group writes when their values are unchanged.
+        $sections = [System.Security.AccessControl.AccessControlSections]::Access
+        if ([string]$currentDescriptor.Owner.Value -cne [string]$expectedDescriptor.Owner.Value) {
+            $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Owner
+        }
+        if ([string]$currentDescriptor.Group.Value -cne [string]$expectedDescriptor.Group.Value) {
+            $sections = $sections -bor [System.Security.AccessControl.AccessControlSections]::Group
+        }
         $acl = [System.Security.AccessControl.FileSecurity]::new()
         $acl.SetSecurityDescriptorSddlForm($AclSddl, $sections)
         [System.IO.File]::SetAccessControl($Path, $acl)

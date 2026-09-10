@@ -88,3 +88,13 @@ Existing client-join, save, recovery and other real-host results may be reused f
 unchanged behavior. Repeat only checks invalidated by a changed address/protocol,
 game/mod version, configuration, runtime owner or other relevant dependency.
 Do not use a process start, HTTP 200 or preview to claim broader production acceptance.
+
+The exact reviewed expected-exit ACL correction selects
+`SelfTest-DysonGameLifecycleBootstrap.ps1 -ExpectedExitAclOnly`. It denies
+WRITE_OWNER on a disposable receipt, verifies repeated descriptor application,
+rejects an actual group change and checks unchanged security and file bytes.
+Full normalized source hashes constrain this exception; additional runtime edits
+return to the normal bootstrap impact plan. The target-host game-account
+requested-to-completed receipt scenario also passed in an isolated directory
+with the real state directory ACL. Actual production stop acceptance remains
+separate and must use the installed release, its binding and durable receipt.
