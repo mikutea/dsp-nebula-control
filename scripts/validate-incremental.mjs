@@ -4,18 +4,18 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const baseline = '77e72366e998d92e6d4765700a373d6afe18a342'
+export const baseline = 'f7c1d6186460a8586d8532978ec339a9d62686bb'
 // Advance a component only after its relevant checks actually pass. A failed
 // unrelated group must not erase completed evidence for an unchanged component.
 export const componentBaselines = Object.fromEntries(
   ['status', 'recovery', 'bootstrap', 'lifecycle', 'deployment'].map(group => [group, {
     commit: baseline,
-    evidence: 'https://github.com/mikutea/dsp-nebula-control/actions/runs/34358347690'
+    evidence: 'https://github.com/mikutea/dsp-nebula-control/actions/runs/34459007627'
   }])
 )
 componentBaselines.lifecycle = {
-  commit: 'ade74f3c5dbfed210fc4ed5a95a6577a9f1fcd7d',
-  evidence: 'https://github.com/mikutea/dsp-nebula-control/actions/runs/34449324085'
+  commit: baseline,
+  evidence: 'https://github.com/mikutea/dsp-nebula-control/actions/runs/34459007627'
 }
 const versionFiles = new Set([
   '.env.example', 'README.md', 'package.json', 'package-lock.json',
@@ -78,8 +78,62 @@ const startupSources = new Map([
   ['scripts/windows/lifecycle-broker/Invoke-DysonLifecycleBrokerWorker.ps1', {before:['bf7725ecd25c309c7f7e4c6e2050902e5919a920cc45896931a320634f6ff425','4c55d309e150b3f8cc5f52afb6f45affc8edef44974365f6e09ec92deede3a70'],after:'620e27b382b67509aad17facac91854d4442de7699302e8784735d7065a6fa4a'}]
 ])
 
+// Immutable RC23 source bytes verified by local integration and target-host
+// recovery checks. See docs/incremental-validation.md; edits never inherit reuse.
+const rc23VerifiedSources = new Map([
+  [".env.example", "ce7625087de978204de8c36bf777f6c1ee47d4865bf9d8ae20e027cab81dd382"],
+  ["apps/api/package-lock.json", "b0fc9173b227c9cb87b06db4fabbc5ee164a4fcb9e68e151bbbd1170d1f22bd4"],
+  ["apps/api/package.json", "f9cdb3c4b3130c5a2f2a7ff279d72740768f7f693608ad7180e7014db5c056f4"],
+  ["apps/api/src/app.test.ts", "da90f1aef0cf8eea18cc942a26b12f5865bebda17f6d825354b33a491eca5cd8"],
+  ["apps/api/src/app.ts", "6c1b83159f24f8911834fb0aca8d6fffa11e3ac850de13bd27351620510b5847"],
+  ["apps/api/src/config.test.ts", "8ca04559be3eba3876c06508dcc80a041a6ab6d5fe9790546f6ae9fc35271cf2"],
+  ["apps/api/src/config.ts", "f56375e7515c10bf029658043330d89fe369fc935667e8667c40f41c966dd234"],
+  ["apps/api/src/configuration-apply-coordination.test.ts", "0a00855eaed2d0bed43f6805cc52f8f13abb90d4adf7481122720f36903bdcbb"],
+  ["apps/api/src/configuration-reconcile-coordination.test.ts", "2d3d8ca2a48f59a051c1306d9474566858334084adbd82cfdf3d9e74f2c4ee5e"],
+  ["apps/api/src/game-config/history-hard-exit.test.ts", "0e279fee028151e889f9f5a5965ebd8cc7c7f4739e4a7860c9f00f46d54afac4"],
+  ["apps/api/src/game-config/history.test.ts", "873f9143c22a79883c6d6a3b4baa65cb75a97f3ad1ff88e12745d2a83314a026"],
+  ["apps/api/src/game-config/history.ts", "f8fd17dcdcf28410f911d9de9aceebbda825bc0bce7a8183ec4bf1326f1714c8"],
+  ["apps/api/src/game-config/transaction.test.ts", "4561b74316ab9dd5ca61ed40b6451ccf090b467d28558b7508a979f33b38fd46"],
+  ["apps/api/src/game-config/transaction.ts", "f3365914bffc0c73d0cee84771e7d3c8c1f466b5734cb90f767e984f515bca29"],
+  ["apps/api/src/host-mutation/residual-file-lock.test.ts", "0d5e75cb2724be3ab868ca9789de2ad5b201de75fc16dd1baf708c3bcba25282"],
+  ["apps/api/src/host-mutation/residual-file-lock.ts", "421f5c2f52be614fc1fccd3b6b9c5018a3f3a911aebbf7022de606924814dbab"],
+  ["apps/api/src/providers/powershell-output.test.ts", "6b17addafb342a10be5face0fa1cabfd00cb7abfd34b0185817250a353e915c2"],
+  ["apps/api/src/providers/powershell-runner.ts", "0ecda7cd829daf472d311d6c41270ae6c5ccf60a891c16f5eedb4425e36b72b8"],
+  ["apps/api/src/providers/windows-lifecycle.integration.test.ts", "f5a39c275aa6f0aacf9f652181295bcaa9590a93eb5ab2a94721b0dc71e7dcce"],
+  ["apps/api/src/providers/windows-lifecycle.test.ts", "08b9fff9c0e6b8fa6961896bbc1e9557038fea162deac7bf789d0dc1d5d0bac8"],
+  ["apps/api/src/providers/windows-lifecycle.ts", "5e32d9364c444d1a606215b11f01c5a330bfef5550a889a7670ed03b32c99163"],
+  ["apps/api/src/providers/windows.ts", "f7c89a69e84221931113389fafc3922e0bd64395e994cff4fbc98e2aa57432b3"],
+  ["apps/api/src/saves/restore-hard-exit.test.ts", "b297ff909beb47a97d5df3f482fdcec2ce71b173122b429d340c04ed5c4bc788"],
+  ["apps/api/src/saves/transactions.ts", "b58b494950ecf972db60eda47847bfe2fe9196a59b95c00f51b5b68cbb22a5c8"],
+  ["apps/api/src/services/save-job-service.test.ts", "8b64858f59634b4ea1d9fedd856eeae4edd395cdbb2d9558b8018bd0fc101284"],
+  ["apps/api/src/services/save-job-service.ts", "9a20100f61bcb9dc4393e127dd36982a0ace838345c9a1659d6ac5940b413879"],
+  ["apps/api/src/update-pipeline/acquisition.test.ts", "9e4b79656faff0ac040f625aadfb8bc6e855b3f18cca37626ffafb10eb481482"],
+  ["apps/api/src/update-pipeline/acquisition.ts", "51233221385fadadda8eee75f2d44ceb3f22d67910fb443838f09557f457553d"],
+  ["apps/api/src/update-pipeline/cache-mutex.test.ts", "d5af1b16c05a5716f48605965bff07a8e767dd29e4cb3a8bbc9ca67e90a0898a"],
+  ["apps/api/src/update-pipeline/cache-mutex.ts", "677b91ceb8639722a5966a25db3decb5e0f5d286723ffa8fcec516c7efc7063a"],
+  ["apps/api/src/update-pipeline/candidate-preparation.ts", "01738356f8454de8a6429280544632579e449a3940405f87bd823ee8cb8fb8cf"],
+  ["apps/api/src/update-pipeline/staging.test.ts", "3e7a15f380895e48817a4688e0c3349a75cf383b7ac60eb8788cc3e1d2f98452"],
+  ["apps/api/src/update-pipeline/staging.ts", "8279dc02d36e4373ac0bc5188b0dc59271469a1645bcce07ce1c9b8bd1eb1b3c"],
+  ["apps/api/src/update-pipeline/steam-manual-handoff.test.ts", "1c60ce99efd38f0a8d63ffe440bf5aecb5421c96d279f600c5f5c065f6c52c87"],
+  ["apps/api/src/update-pipeline/steam-manual-handoff.ts", "718100e77137a9b8d42638eec7d522fe2b9797c3cc79cdeba89baad4df0250d2"],
+  ["apps/api/src/workspace-routes.test.ts", "c51dea7c13c771d8c55f87f06326aa0c2572b8935f8f70f1b8987dd864e313b4"],
+  ["apps/web/package-lock.json", "27b062ecf2ed2ac88d38a30cd432132e9e38af1f683f73d0dc557fad54b76f2b"],
+  ["apps/web/package.json", "a2e7c3f1d45457185867acdb76636316ea2f542d0b9eaa56b3da416265044c51"],
+  ["apps/web/src/App.tsx", "3c8e1d5d7dad5a68ed6b3ba51e7a8a0fb86b4272e9af3d30a20d330d9c8613d4"],
+  ["apps/web/src/api.ts", "8da161c4213d57c5aa010dbb731badd59d93c52fed2cc95bb9ccb0ab19a4e1e8"],
+  ["apps/web/src/configuration-workspace.test.tsx", "f8d0db0349ecdf2cd648e7c70c34c55e9f0cbe118d7a1957c33b46f7de89c997"],
+  ["apps/web/src/model.ts", "76efc918cb5ada5ed30726d69b692b833c71a757ce82591fb57518ccd516841e"],
+  ["apps/web/src/styles.css", "db054a3c03f8489d240eb3a703dd6a9b67778461048c2f3b61cbe5cc65e06a26"],
+  ["integrations/dyson-control-bridge/DysonControlBridge.csproj", "751afe5332e2d05f2c03d555abfd350b7d1fa8dd9368207f14f8f24d4c108b79"],
+  ["integrations/dyson-control-bridge/DysonControlBridgePlugin.cs", "8419c3114da427e5bfad5231cfe7fd26a001b5b7d6150b234f4d5c4c6a8e58a4"],
+  ["package-lock.json", "b96775591b9aa67e96616dee8db733ec486f74f3bbb612b92b8e53a574ecd094"],
+  ["package.json", "d8edd1c6d3e9fd5a55d1411680c0860a4a1888ee893ae74db344f7daf463fb80"],
+  ["scripts/windows/configuration/dyson-control.environment-contract.json", "8ae71deb1f48f4b32b415b8fa6071b2ca3718e02a439d7bd5bd4fcdffb9c31e0"]
+])
+
 export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
+  if (rc23VerifiedSources.get(file) === aclSourceHash(after)) return 'verified-rc23-source'
   const startup = startupSources.get(file)
   if (startup && before !== null && startup.before.includes(startupSourceHash(before)) &&
       startup.after === startupSourceHash(after)) return 'startup-policy'
@@ -226,7 +280,8 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
       verifiedCommit: componentBaselines[group].commit,
       evidence: componentBaselines[group].evidence })),
     reasons: changes.map(({ file, kind }) => ({ file, kind,
-      decision: kind === 'control-exit-policy' ? 'reviewed runtime change: execute the focused exit-policy check' :
+      decision: kind === 'verified-rc23-source' ? 'reuse exact RC23 source evidence; production qualification remains separate' :
+        kind === 'control-exit-policy' ? 'reviewed runtime change: execute the focused exit-policy check' :
         kind === 'affected' ? 'run matching checks or reuse the verified component baseline' : 'no production behavior change' })) }
 }
 

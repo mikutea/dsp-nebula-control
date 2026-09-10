@@ -1,5 +1,20 @@
 # Risk-based validation
 
+## Verified RC23 application batch
+
+Commit `b2eb4590710bff5b79dec44273001b55d39dabcf` has a byte-exact reuse
+mapping in the validation runner. Local affected integration passed 708 assertions;
+the history follow-up passed 103 assertions locally and on the target Windows host.
+The target Node 24.20.0 run also passed 87 selected recovery/API assertions. The
+built page was checked at four viewport widths, and the Bridge candidate was built
+with SDK 8.0.424 and verified against target game references. Private evidence and
+host details remain outside the repository. These overlapping counts are not summed.
+
+Only the exact normalized source hashes inherit that evidence. Any further edit
+returns to the ordinary affected-check or unmapped-change path. CI still validates
+version bindings and the validation/release workflow rules. This reuse does not mark
+production qualification complete or replace final artifact integrity/hygiene checks.
+
 ## Acquisition and candidate cache mutexes
 
 Changes to `update-pipeline/cache-mutex.ts` require its tests and acquisition,
@@ -69,10 +84,11 @@ Source validation does not imply production acceptance.
 ## Verified baselines
 
 The complete current cumulative baseline is
-`77e72366e998d92e6d4765700a373d6afe18a342`:
-[CI 34358347690](https://github.com/mikutea/dsp-nebula-control/actions/runs/34358347690)
-passed version/workflow checks, bootstrap pointer and lifecycle tests, lifecycle
-broker tests, and deployment integration/rollback tests. It inherits earlier
+`f7c1d6186460a8586d8532978ec339a9d62686bb`:
+[CI 34459007627](https://github.com/mikutea/dsp-nebula-control/actions/runs/34459007627)
+passed its selected version/workflow and runtime checks. It inherits the earlier
+verified bootstrap, lifecycle broker, and deployment integration/rollback baseline
+from [CI 34358347690](https://github.com/mikutea/dsp-nebula-control/actions/runs/34358347690), together with earlier
 unchanged status and recovery results, including
 [CI 34272695419](https://github.com/mikutea/dsp-nebula-control/actions/runs/34272695419).
 The earlier complete Windows baseline remains

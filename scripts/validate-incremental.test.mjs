@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
 import { classifyChange, selectCommands, planExecution } from './validate-incremental.mjs'
+
+test('RC23 evidence reuse requires the exact verified configuration implementation', () => {
+  const source = readFileSync(new URL('../apps/api/src/app.ts', import.meta.url), 'utf8')
+  assert.equal(classifyChange('apps/api/src/app.ts', null, source), 'verified-rc23-source')
+  assert.throws(() => classifyChange('apps/api/src/app.ts', null, source + '\nchangedRuntime();\n'))
+})
 
 test('version reuse permits only the exact reviewed version substitution', () => {
   assert.equal(classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17\r\n', 'v=0.1.0-rc.23\n'), 'version-only')
