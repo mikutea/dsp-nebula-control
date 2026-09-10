@@ -3,8 +3,8 @@ import test from 'node:test'
 import { classifyChange, selectCommands, planExecution } from './validate-incremental.mjs'
 
 test('version reuse permits only the exact reviewed version substitution', () => {
-  assert.equal(classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17\r\n', 'v=0.1.0-rc.18\n'), 'version-only')
-  assert.throws(() => classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17', 'v=0.1.0-rc.18; unsafe=true'))
+  assert.equal(classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17\r\n', 'v=0.1.0-rc.19\n'), 'version-only')
+  assert.throws(() => classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17', 'v=0.1.0-rc.19; unsafe=true'))
   assert.throws(() => classifyChange('apps/api/package-lock.json', 'old dependency', 'new dependency'))
 })
 
