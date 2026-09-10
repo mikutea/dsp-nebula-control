@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+import { setTimeout as wait } from 'node:timers/promises'
 import { z } from 'zod'
 import type { FileBridgeClient } from '../bridge/file-client.js'
 import {
@@ -281,11 +283,29 @@ export class WindowsLifecycleAdapter implements LifecycleMutationAdapter {
     context: LifecycleOperationContext
   ): Promise<LifecyclePhaseResult> {
     try {
-      const evidence = await this.#options.brokerClient.verify({
-        expected,
-        outerRequestId: context.requestId,
-        signal: context.signal
-      })
+      let evidence: Awaited<ReturnType<WindowsLifecycleBrokerClient['verify']>>
+      let attempt = 0
+      while (true) {
+        context.signal.throwIfAborted()
+        context.hostMutation?.assertActive()
+        try {
+          evidence = await this.#options.brokerClient.verify({
+            expected,
+            // A terminal blocked receipt is immutable; a new observation needs
+            // a new identity instead of replaying that cached result forever.
+            outerRequestId: attempt++ === 0 ? context.requestId : randomUUID(),
+            signal: context.signal
+          })
+          break
+        } catch (error) {
+          if (!(error instanceof WindowsLifecycleBrokerClientError) ||
+              error.code !== 'WINDOWS_LIFECYCLE_BROKER_BLOCKED' || error.blockers.length === 0 ||
+              error.blockers.some(blocker => !['state_mismatch', 'process_unverifiable'].includes(blocker))) throw error
+          await wait(1_000, undefined, { signal: context.signal })
+        }
+      }
+      context.signal.throwIfAborted()
+      context.hostMutation?.assertActive()
       const runtimeMatched = expected === 'running'
         ? evidence.runtime.lifecycleState === 'running_verified' &&
           evidence.runtime.process.status === 'verified' && evidence.runtime.port.listenerCount === 1 &&
@@ -307,6 +327,7 @@ export class WindowsLifecycleAdapter implements LifecycleMutationAdapter {
         }
       }
     } catch (error) {
+      if (context.signal.aborted) throw new LifecycleExecutionError('HOST_SCRIPT_ABORTED')
       throw this.#normalizeError(error)
     }
   }

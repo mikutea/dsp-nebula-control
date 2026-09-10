@@ -41,6 +41,7 @@ export class LifecycleService {
   readonly #adapter: LifecycleMutationAdapter
   readonly #events: EventHub
   readonly #phaseTimeoutMs: number
+  readonly #startupTimeoutMs: number
   readonly #coordinator: LifecycleMutationCoordinator | undefined
   #queue: Promise<void> = Promise.resolve()
 
@@ -49,11 +50,16 @@ export class LifecycleService {
     adapter: LifecycleMutationAdapter,
     events: EventHub,
     phaseTimeoutMs = 30_000,
-    coordinator?: LifecycleMutationCoordinator
+    coordinator?: LifecycleMutationCoordinator,
+    startupTimeoutMs = phaseTimeoutMs
   ) {
     if (!Number.isInteger(phaseTimeoutMs) || phaseTimeoutMs < 10 || phaseTimeoutMs > 300_000) {
       throw new Error('Lifecycle phase timeout must be between 10 and 300000 ms')
     }
+    if (!Number.isInteger(startupTimeoutMs) || startupTimeoutMs < 10 || startupTimeoutMs > 900_000) {
+      throw new Error('Lifecycle startup timeout must be between 10 and 900000 ms')
+    }
+    this.#startupTimeoutMs = startupTimeoutMs
     this.#database = database
     this.#adapter = adapter
     this.#events = events
@@ -381,7 +387,7 @@ export class LifecycleService {
         timer = setTimeout(() => {
           reject(new LifecycleExecutionError('LIFECYCLE_PHASE_TIMEOUT'))
           controller.abort()
-        }, this.#phaseTimeoutMs)
+        }, phase === 'verify-running' ? this.#startupTimeoutMs : this.#phaseTimeoutMs)
       })
       const contenders: Array<Promise<LifecyclePhaseResult> | Promise<never>> = [
         Promise.resolve().then(async () => {

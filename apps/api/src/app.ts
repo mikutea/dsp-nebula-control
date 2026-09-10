@@ -747,7 +747,8 @@ export async function buildApplication(
     activeLifecycleAdapter,
     events,
     config.lifecycleTimeoutMs,
-    lifecycleCoordinator
+    lifecycleCoordinator,
+    config.startupTimeoutMs
   )
   const auth = new AuthService(config, database)
   const protectedRoute = (permission: ControlPermission) => ({

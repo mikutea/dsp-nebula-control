@@ -662,3 +662,12 @@ describe('production configuration', () => {
     }
   })
 })
+
+it('configures startup verification separately from individual host calls', () => {
+  const defaults = loadConfig({NODE_ENV:'test'})
+  expect(defaults.startupTimeoutMs).toBe(600_000)
+  expect(defaults.lifecycleTimeoutMs).toBe(240_000)
+  expect(loadConfig({NODE_ENV:'test',DYSON_STARTUP_TIMEOUT_MS:'900000'}).startupTimeoutMs).toBe(900_000)
+  expect(()=>loadConfig({NODE_ENV:'test',DYSON_STARTUP_TIMEOUT_MS:'900001'})).toThrow()
+  expect(()=>loadConfig({NODE_ENV:'test',DYSON_STARTUP_TIMEOUT_MS:'9999'})).toThrow()
+})

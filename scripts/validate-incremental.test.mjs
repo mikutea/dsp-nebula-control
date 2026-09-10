@@ -162,3 +162,23 @@ test('PowerShell invocation changes run native binding and broker contracts once
     assert.ok(checks[0][1].includes('src/providers/windows-lifecycle-broker.test.ts'))
   }
 })
+
+test('the reviewed startup bundle selects bounded checks without repeating deployment suites', () => {
+  const changes = [
+    {file:'scripts/windows/lifecycle-broker/Invoke-DysonLifecycleBrokerWorker.ps1',kind:'startup-policy'},
+    {file:'scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1',kind:'test-only'},
+    {file:'apps/api/src/app.ts',kind:'startup-policy'}
+  ]
+  for (const options of [{},{hostChecks:true}]) {
+    const plan = planExecution(changes,options)
+    expectNoPending(plan)
+    const brokerChecks=plan.commands.filter(([,args])=>args.includes('scripts/windows/lifecycle-broker/SelfTest-DysonLifecycleBroker.ps1'))
+    assert.equal(brokerChecks.length,1)
+    assert.ok(brokerChecks[0][1].includes('-DispatchStateOnly'))
+    assert.equal(plan.commands.filter(([,args])=>args.includes('src/services/lifecycle-service.test.ts')).length,1)
+  }
+  for(const file of ['apps/api/src/app.ts','apps/api/src/config.ts','apps/api/src/services/lifecycle-service.ts']) {
+    assert.throws(()=>classifyChange(file,'unreviewed before','unreviewed after'))
+  }
+  function expectNoPending(plan) { assert.equal(plan.pendingHostCommands.length,0) }
+})

@@ -566,3 +566,39 @@ function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
   const promise = new Promise<T>((resolve) => { resolvePromise = resolve })
   return { promise, resolve: resolvePromise }
 }
+
+it('allows a longer startup verification without extending save timeouts', async () => {
+  const database = new ControlDatabase('unused', true)
+  try {
+    const adapter = new FakeLifecycleAdapter()
+    const original = adapter.verifyRunning.bind(adapter)
+    vi.spyOn(adapter,'verifyRunning').mockImplementation(async context => {
+      await new Promise(resolve=>setTimeout(resolve,80))
+      return original(context)
+    })
+    const service = new LifecycleService(database,adapter,new EventHub(),30,undefined,250)
+    const start = await service.execute('start','startup:separate:0001','Administrator')
+    expect(start.job.state).toBe('succeeded')
+    adapter.hangSaveUntilAbort = true
+    const save = await service.execute('save','startup:separate:0002','Administrator')
+    expect(save.job.state).toBe('failed')
+    expect(save.job.errorCode).toBe('LIFECYCLE_PHASE_TIMEOUT')
+    expect(adapter.saveAbortObserved).toBe(true)
+  } finally { database.close() }
+})
+
+it('aborts startup verification at its own bounded deadline', async () => {
+  const database = new ControlDatabase('unused', true)
+  try {
+    const adapter = new FakeLifecycleAdapter()
+    let aborted = false
+    vi.spyOn(adapter,'verifyRunning').mockImplementation(context => new Promise((_resolve,reject) => {
+      context.signal.addEventListener('abort',()=>{aborted=true;reject(new LifecycleExecutionError('FIXTURE_ABORTED'))},{once:true})
+    }))
+    const service = new LifecycleService(database,adapter,new EventHub(),1000,undefined,25)
+    const result = await service.execute('start','startup:bounded:0001','Administrator')
+    expect(result.job).toMatchObject({state:'failed',errorCode:'LIFECYCLE_PHASE_TIMEOUT'})
+    expect(result.run.recoveryRequired).toBe(true)
+    expect(aborted).toBe(true)
+  } finally { database.close() }
+})

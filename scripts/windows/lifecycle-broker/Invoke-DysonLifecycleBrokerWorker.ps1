@@ -394,13 +394,15 @@ function Invoke-WorkerDispatch {
                     -InvalidCode 'DYSON_CONTROL_LIFECYCLE_BROKER_REQUEST_INVALID'
                 Assert-DysonLifecycleBrokerExactProperties $control @('readyTimeout') 'DYSON_CONTROL_LIFECYCLE_BROKER_REQUEST_INVALID'
                 if (-not [bool]$control.readyTimeout) {
-                    Set-WorkerShadowTaskState -Kind server -State Ready
+                    Set-WorkerShadowTaskState -Kind server -State Running
                     $readyVerified = $true
                 }
             }
             else {
                 $state = [string](Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction Stop).State
-                if ($state -ceq 'Ready') { $readyVerified = $true }
+                # The pinned bootstrap remains active for the lifetime of the game.
+                # Process and port readiness are verified separately after dispatch.
+                if ($state -ceq 'Running') { $readyVerified = $true }
             }
             if (-not $readyVerified) { Start-Sleep -Milliseconds 200 }
         } while (-not $readyVerified -and [datetime]::UtcNow -lt $deadline)

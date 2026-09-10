@@ -113,3 +113,18 @@ switches must bind as booleans, while quoted paths and metacharacter-containing
 values remain data. Script allowlisting, output bounds and cancellation stay in
 force. Read-only calls without explicit boolean switches retain their existing
 invocation path. Native dispatch on the installed host remains a separate gate.
+
+The lifecycle component baseline advances to
+`ade74f3c5dbfed210fc4ed5a95a6577a9f1fcd7d` after its scoped native invocation
+checks and [CI 34449324085](https://github.com/mikutea/dsp-nebula-control/actions/runs/34449324085)
+passed. This avoids repeating unchanged invocation tests for the next startup
+bundle. It is regression evidence, not a declaration that all production
+lifecycle behavior was accepted.
+
+The reviewed persistent-startup bundle has exact normalized source fingerprints
+for its configuration, application wiring, adapter, phase timer and worker.
+Unrelated edits to these inputs require a new plan. Its check runs the affected
+configuration, application, adapter and durable-service tests, plus the actual
+PowerShell dispatch-state guard. The changed worker's complete Shadow broker
+suite also passed on the Windows validation host (107 assertions, no production
+scheduler calls); repeat that only when another worker change invalidates it.

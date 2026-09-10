@@ -439,3 +439,22 @@ Until these host gates pass, the production configuration must keep lifecycle
 execution disabled. Conservative capability flags in the overview remain false;
 the game-management workspace uses the per-action preview result as its only
 execution gate.
+
+## Persistent startup and bounded runtime observation
+
+The owned startup task remains `Running` for the game's lifetime. Dispatch
+acknowledgement waits for that state; scheduler `Ready` means the task is idle,
+not that the game is ready. Exact process identity and the listening port are
+verified independently after dispatch.
+
+A transient `state_mismatch` or `process_unverifiable` during that verification
+causes another read-only observation, never another dispatch. Each observation
+uses a fresh request ID because completed broker receipts are immutable.
+Cancellation, lease loss, malformed evidence and permanent blockers still fail
+closed.
+
+`DYSON_STARTUP_TIMEOUT_MS` controls only running-state verification, including
+rollback startup. It defaults to 600000 ms and is bounded at 900000 ms. The
+separate `DYSON_LIFECYCLE_TIMEOUT_MS` continues to bound individual host calls
+and other transaction phases; increasing the startup allowance does not extend
+save or stop timeouts.

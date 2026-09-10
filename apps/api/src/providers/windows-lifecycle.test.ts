@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { WindowsLifecycleBrokerClientError } from './windows-lifecycle-broker.js'
 import type { BridgeHeartbeat, BridgeReceipt } from '../bridge/protocol.js'
 import {
   LifecycleExecutionError,
@@ -479,3 +480,38 @@ class StartReadyStatusProvider implements StatusProvider {
     }
   }
 }
+
+describe('lifecycle verification transitions', () => {
+  it.each(['running', 'stopped'] as const)('waits for %s using fresh read-only observations', async expected => {
+    const {adapter,broker} = createAdapter()
+    const verify = vi.spyOn(broker, 'verify').mockRejectedValueOnce(
+      new WindowsLifecycleBrokerClientError('WINDOWS_LIFECYCLE_BROKER_BLOCKED', {blockers:['state_mismatch']}))
+    const context = operationContext(expected === 'running' ? 'start' : 'graceful-stop')
+    await (expected === 'running' ? adapter.verifyRunning(context) : adapter.verifyStopped(context))
+    expect(verify).toHaveBeenCalledTimes(2)
+    expect(verify.mock.calls[0]![0].outerRequestId).toBe(requestId)
+    expect(verify.mock.calls[1]![0].outerRequestId).not.toBe(requestId)
+    expect(broker.dispatches).toHaveLength(0)
+  })
+
+  it('cancels a pending observation without retrying or dispatching a task', async () => {
+    const {adapter,broker} = createAdapter()
+    const verify = vi.spyOn(broker,'verify').mockRejectedValue(
+      new WindowsLifecycleBrokerClientError('WINDOWS_LIFECYCLE_BROKER_BLOCKED',{blockers:['process_unverifiable']}))
+    const controller = new AbortController()
+    const pending = adapter.verifyRunning({...operationContext('start'),signal:controller.signal})
+    const timer = setTimeout(()=>controller.abort(),20)
+    try { await expect(pending).rejects.toMatchObject({code:'HOST_SCRIPT_ABORTED'}) }
+    finally { clearTimeout(timer) }
+    expect(verify).toHaveBeenCalledTimes(1)
+    expect(broker.dispatches).toHaveLength(0)
+  })
+
+  it('does not retry a permanent blocker', async () => {
+    const {adapter,broker} = createAdapter()
+    const verify = vi.spyOn(broker,'verify').mockRejectedValue(
+      new WindowsLifecycleBrokerClientError('WINDOWS_LIFECYCLE_BROKER_BLOCKED',{blockers:['task_definition_mismatch']}))
+    await expect(adapter.verifyRunning(operationContext('start'))).rejects.toMatchObject({code:'WINDOWS_LIFECYCLE_BROKER_BLOCKED'})
+    expect(verify).toHaveBeenCalledTimes(1)
+  })
+})

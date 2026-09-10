@@ -66,6 +66,7 @@ const environmentSchema = z.object({
   DYSON_SAVE_TRANSFER_ROOT: z.string().optional(),
   DYSON_LIFECYCLE_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_LIFECYCLE_TIMEOUT_MS: z.coerce.number().int().min(10_000).max(300_000).default(240_000),
+  DYSON_STARTUP_TIMEOUT_MS: z.coerce.number().int().min(10_000).max(900_000).default(600_000),
   DYSON_LIFECYCLE_BROKER_PROFILE_FILE: z.string().optional(),
   DYSON_RUNTIME_SERVICE_USER: z.string().min(3).max(128).regex(/^[^"\r\n]+$/).optional(),
   DYSON_BRIDGE_CONTROL_ROOT: z.string().optional(),
@@ -157,6 +158,7 @@ export interface AppConfig {
   saveTransferRoot: string | null
   lifecycleEnabled: boolean
   lifecycleTimeoutMs: number
+  startupTimeoutMs: number
   lifecycleBrokerProfileFile: string | null
   runtimeServiceUser: string | null
   bridgeControlRoot: string | null
@@ -571,6 +573,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     saveTransferRoot: value.DYSON_SAVE_TRANSFER_ROOT ? path.resolve(value.DYSON_SAVE_TRANSFER_ROOT) : null,
     lifecycleEnabled: value.DYSON_LIFECYCLE_ENABLED === 'true',
     lifecycleTimeoutMs: value.DYSON_LIFECYCLE_TIMEOUT_MS,
+    startupTimeoutMs: value.DYSON_STARTUP_TIMEOUT_MS,
     lifecycleBrokerProfileFile: value.DYSON_LIFECYCLE_BROKER_PROFILE_FILE
       ? path.resolve(value.DYSON_LIFECYCLE_BROKER_PROFILE_FILE)
       : null,

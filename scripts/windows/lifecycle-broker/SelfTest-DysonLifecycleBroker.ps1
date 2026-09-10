@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$VerifyEvidenceOnly)
+param([switch]$VerifyEvidenceOnly, [switch]$DispatchStateOnly)
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -9,6 +9,22 @@ $workerSource = Join-Path $PSScriptRoot 'Invoke-DysonLifecycleBrokerWorker.ps1'
 $parseTokens = $null; $parseErrors = $null
 $workerAst = [Management.Automation.Language.Parser]::ParseFile($workerSource, [ref]$parseTokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw 'Worker syntax invalid' }
+$dispatchGuards = @($workerAst.FindAll({ param($node)
+    $node -is [Management.Automation.Language.IfStatementAst] -and
+    $node.Clauses[0].Item1.Extent.Text.Contains('$state -ceq') -and
+    $node.Extent.Text.Contains('$readyVerified = $true')
+}, $true))
+if ($dispatchGuards.Count -ne 1) { throw 'Dispatch task-state guard not unique' }
+$dispatchGuard = [scriptblock]::Create($dispatchGuards[0].Extent.Text)
+foreach ($state in @('Running','Ready','Queued','Disabled','Unknown')) {
+    $readyVerified = $false
+    . $dispatchGuard
+    if ($readyVerified -ne ($state -ceq 'Running')) { throw "Persistent task acknowledgement invalid for $state" }
+}
+if ($DispatchStateOnly) {
+    [ordered]@{protocol='DYSON_DISPATCH_STATE_SELFTEST_V1';state='passed';cases=5;productionChanged=$false}|ConvertTo-Json -Compress
+    return
+}
 $assignments = @($workerAst.FindAll({ param($node)
     $node -is [Management.Automation.Language.AssignmentStatementAst] -and
     $node.Left.Extent.Text -ceq '$blockers' -and
