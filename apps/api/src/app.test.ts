@@ -93,7 +93,7 @@ describe('control API', () => {
     expect(health.statusCode).toBe(200)
     expect(health.headers['x-dyson-control-release']).toBe('v0.1.0-fixture.1')
     expect(health.json()).toMatchObject({
-      status: 'ok', version: '0.1.0-rc.20', deploymentVersion: 'v0.1.0-fixture.1'
+      status: 'ok', version: '0.1.0-rc.21', deploymentVersion: 'v0.1.0-fixture.1'
     })
 
     const readiness = await application.app.inject({ method: 'GET', url: '/readyz' })
@@ -103,7 +103,7 @@ describe('control API', () => {
     expect(readiness.json()).toMatchObject({
       status: 'ready',
       provider: 'demo',
-      version: '0.1.0-rc.20',
+      version: '0.1.0-rc.21',
       deploymentVersion: 'v0.1.0-fixture.1',
       checks: {
         deploymentVersion: 'not-applicable',

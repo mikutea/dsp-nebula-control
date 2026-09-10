@@ -14,7 +14,7 @@ namespace DysonControl.Bridge
         public const string PluginGuid = "io.github.mikutea.dyson-control-bridge";
         public const string PluginName = "Dyson Control Bridge";
         public const string PluginVersion = "0.1.0";
-        public const string ReleaseVersion = "0.1.0-rc.20";
+        public const string ReleaseVersion = "0.1.0-rc.21";
 
         private ConfigEntry<bool> bridgeEnabled;
         private ConfigEntry<string> controlRoot;
