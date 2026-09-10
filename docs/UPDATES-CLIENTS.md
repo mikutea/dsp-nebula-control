@@ -99,6 +99,62 @@ hosts are rejected. Thunderstore metadata without a provider digest remains
 `artifact-integrity-pending`; it is never treated as verified merely because a
 provider returned a download URL.
 
+### Exact reviewed Thunderstore artifacts
+
+For an existing package whose community review is `unreviewed`, an operator can
+qualify an exact ZIP through the server-owned compatibility policy file named by
+`DYSON_UPDATE_COMPATIBILITY_POLICY_FILE`. Its optional `trustedModArtifacts`
+member has this shape (fictional values; do not deploy this example):
+
+```json
+{
+  "format": "dyson-control-trusted-mod-artifacts",
+  "schemaVersion": 1,
+  "policyId": "example-plugin-review",
+  "reviewedAt": "2026-09-01T00:00:00Z",
+  "expiresAt": "2026-10-01T00:00:00Z",
+  "packages": [{
+    "dependencyId": "Example-ServerHelper-1.0.0",
+    "dependencies": ["Example-Core-2.0.0"],
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sizeBytes": 2048
+  }]
+}
+```
+
+Preserve the containing compatibility policy and its matrix. Protect the file
+and parent directories against writes by the web-service identity and unrelated
+users; use the same host configuration authority as the compatibility matrix.
+Before adding a pin, independently inspect the exact downloaded ZIP, its complete
+dependency list, payload layout and installed-package relationship, and record
+its measured SHA-256 and byte count in private review evidence. A pin establishes
+the reviewed bytes; it does not establish runtime compatibility or safe activation.
+Every dependency needs its own qualification or normal provider approval. Platform
+packages still follow their separate BepInEx/Nebula component paths.
+
+Pins match exact case-sensitive package/version and dependency identities. They
+cannot override rejected community listings, inactive versions or deprecated
+packages, and do not approve an entire author or community. A future review time,
+expired policy, removed pin or changed digest/size fails closed. Policy revisions
+bind both acquisition candidates and compatibility decisions. Editing a policy
+invalidates its earlier reviewed candidates; rediscover against the new policy.
+
+The server reloads the file during discovery and acquisition authorization.
+Browser requests cannot supply this policy. Candidate descriptors and acquisition
+receipts retain `trustedPolicyRevision`; their integrity remains explicitly local
+(`locally-computed-required` before download, `locally-computed` after measurement).
+The operator's pin is never described as a provider-supplied digest. Download
+publication, import and downstream verified receipt reads recheck authority.
+An acquired receipt remains historical evidence after revocation, but cannot grant
+new import authority. The discovery candidate's short TTL does not invalidate
+already acquired bytes by itself; their reviewed policy must still be current.
+
+Revocation blocks future operations; it does not stop the running game or remove
+an already installed plugin. Use the separately gated mod rollback/disable flow
+when live remediation is required. Before production use, verify protected file
+access, the exact archive, dependency routing, native staging and rollback, and
+client compatibility. Repository tests do not replace those target-host checks.
+
 The BepInEx client is deliberately narrower than a general GitHub release
 browser. It accepts only the reviewed layout-policy versions `5.4.22` /
 `5.4.22.0` and `5.4.23.2` through `5.4.23.5`, with their exact official

@@ -9,12 +9,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   ManagedArtifactAcquisitionService,
   thunderstoreDependencyFingerprint,
+  type ManagedArtifactAcquisitionOptions,
   type ArtifactCandidateDescriptor
 } from './acquisition.js'
 import type { DiscoveredModRelease, DiscoveredNebulaRelease } from './discovery.js'
 import type { DiscoveredBepInExRelease } from './bepinex-discovery.js'
 import { bepInExWindowsX64LayoutPolicyIds } from './bepinex-layout.js'
 import { OfflineArtifactStager } from './staging.js'
+import { TrustedModArtifactPolicy, trustedModAcquisitionAuthority } from './trusted-mod-artifacts.js'
 
 const temporaryRoots: string[] = []
 
@@ -24,6 +26,100 @@ afterEach(async () => {
 })
 
 describe('managed artifact acquisition', () => {
+  it('binds reviewed mod downloads to an exact policy and fails closed when the policy is removed', async () => {
+    const value = await fixture()
+    const release = modRelease(value)
+    let policy: TrustedModArtifactPolicy | null = new TrustedModArtifactPolicy({
+      format: 'dyson-control-trusted-mod-artifacts', schemaVersion: 1, policyId: 'fictional-review',
+      reviewedAt: '2026-01-01T00:00:00Z', expiresAt: '2027-01-01T00:00:00Z',
+      packages: [{ dependencyId: release.dependencyId, dependencies: release.dependencies,
+        sha256: value.sha256, sizeBytes: value.bytes.length }]
+    })
+    release.artifact = { ...release.artifact, sha256: value.sha256, sizeBytes: value.bytes.length,
+      trustedPolicyRevision: policy.revision }
+    const fetch = vi.fn(async () => zipResponse(value.bytes))
+    await expect(acquisition(value, fetch).registerModRelease(release)).rejects.toThrow('ACQUISITION_AUTHORITY_REQUIRED')
+    const service = acquisition(value, fetch, { authorizeCandidate: trustedModAcquisitionAuthority(
+      async () => policy, () => Date.parse('2026-09-01T00:00:00Z')) })
+    for (const artifact of [
+      { ...release.artifact, sha256: 'f'.repeat(64) },
+      { ...release.artifact, sizeBytes: value.bytes.length + 1 },
+      { ...release.artifact, trustedPolicyRevision: 'f'.repeat(64) }
+    ]) {
+      await expect(service.registerModRelease({ ...release, artifact })).rejects.toThrow('ACQUISITION_AUTHORITY_REJECTED')
+    }
+    const candidate = await service.registerModRelease(release)
+    const acquired = await service.acquire(requestFor(candidate))
+    expect(acquired.artifact).toMatchObject({ sha256: value.sha256, integrity: 'locally-computed',
+      trustedPolicyRevision: policy.revision })
+    await expect(service.verifyReceiptAuthority(acquired.requestId)).resolves.toBeUndefined()
+    policy = null
+    await expect(service.verifyReceiptAuthority(acquired.requestId)).rejects.toThrow('ACQUISITION_AUTHORITY_REJECTED')
+    await expect(service.acquire(requestFor(candidate))).rejects.toThrow('ACQUISITION_AUTHORITY_REJECTED')
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects revoked authority at registration, preview, acquisition and receipt replay', async () => {
+    const value = await fixture()
+    let allowed = false
+    const fetch = vi.fn(async () => zipResponse(value.bytes))
+    const service = acquisition(value, fetch, { authorizeCandidate: async () => allowed })
+    await expect(service.registerModRelease(modRelease(value))).rejects.toThrow('ACQUISITION_AUTHORITY_REJECTED')
+    allowed = true
+    const candidate = await service.registerModRelease(modRelease(value))
+    allowed = false
+    await expect(service.registerModRelease(modRelease(value))).rejects.toThrow('ACQUISITION_AUTHORITY_REJECTED')
+    await expect(service.preview(candidate.candidateId)).rejects.toThrow('ACQUISITION_AUTHORITY_REJECTED')
+    const request = requestFor(candidate)
+    await expect(service.acquire(request)).rejects.toThrow('ACQUISITION_AUTHORITY_REJECTED')
+    expect(fetch).not.toHaveBeenCalled()
+    allowed = true
+    const receipt = await service.acquire(request)
+    allowed = false
+    await expect(service.acquire(request)).rejects.toThrow('ACQUISITION_AUTHORITY_REJECTED')
+    // Historical evidence remains readable; replay cannot grant fresh authorization.
+    expect(await service.getReceipt(request.requestId)).toEqual(receipt)
+  })
+
+  it('does not publish a download when authority is revoked while fetching', async () => {
+    const value = await fixture()
+    let allowed = true
+    const service = acquisition(value, async () => {
+      allowed = false
+      return zipResponse(value.bytes)
+    }, { authorizeCandidate: async () => allowed })
+    const candidate = await service.registerModRelease(modRelease(value))
+    const request = requestFor(candidate)
+    await expect(service.acquire(request)).rejects.toThrow('ACQUISITION_AUTHORITY_REJECTED')
+    expect(await readdir(value.inboxRoot)).toEqual([])
+    expect(await service.getReceipt(request.requestId)).toBeNull()
+  })
+
+  it('does not attribute a non-provider expected digest to the provider', async () => {
+    const value = await fixture()
+    const service = acquisition(value, async () => zipResponse(value.bytes))
+    const release = modRelease(value)
+    release.artifact.sha256 = value.sha256
+    release.artifact.sizeBytes = value.bytes.length
+    const candidate = await service.registerModRelease(release)
+    const receipt = await service.acquire(requestFor(candidate))
+    expect(receipt.artifact).toMatchObject({ sha256: value.sha256, integrity: 'locally-computed' })
+    expect((await service.getReceipt(receipt.requestId))?.artifact.integrity).toBe('locally-computed')
+  })
+
+  it('still enforces non-provider expected digests before publishing an artifact', async () => {
+    const value = await fixture()
+    const service = acquisition(value, async () => zipResponse(value.bytes))
+    const release = modRelease(value)
+    release.artifact.sha256 = 'f'.repeat(64)
+    release.artifact.sizeBytes = value.bytes.length
+    const candidate = await service.registerModRelease(release)
+    const request = requestFor(candidate)
+    await expect(service.acquire(request)).rejects.toThrow('ACQUISITION_SHA256_MISMATCH')
+    await expect(readFile(path.join(value.inboxRoot, `${value.artifactId}.artifact`))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await service.getReceipt(request.requestId)).toBeNull()
+  })
+
   it('retries both request and artifact locks after the downloader process exits', async () => {
     const value = await fixture()
     const fetch = vi.fn(async () => zipResponse(value.bytes))
@@ -335,6 +431,7 @@ function acquisition(
     maximumBytes: number
     now: () => Date
     candidateTtlMs: number
+    authorizeCandidate: ManagedArtifactAcquisitionOptions['authorizeCandidate']
   }> = {}
 ): ManagedArtifactAcquisitionService {
   return new ManagedArtifactAcquisitionService({
@@ -343,7 +440,8 @@ function acquisition(
     fetch,
     maximumBytes: overrides.maximumBytes,
     now: overrides.now ?? (() => new Date('2026-08-30T08:00:00.000Z')),
-    candidateTtlMs: overrides.candidateTtlMs
+    candidateTtlMs: overrides.candidateTtlMs,
+    authorizeCandidate: overrides.authorizeCandidate
   })
 }
 

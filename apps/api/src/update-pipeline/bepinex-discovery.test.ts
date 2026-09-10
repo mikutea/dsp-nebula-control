@@ -102,6 +102,33 @@ describe('official BepInEx GitHub release discovery', () => {
     )
   })
 
+  it('ignores historical 7z assets while retaining only the reviewed Windows ZIP', async () => {
+    const historical = bepInExGithubReleaseFixture(101, '0.1', {
+      assets: [bepInExGithubAssetFixture(1011, '0.1', 'v0.1', {
+        name: 'BepInEx.v0.1.7z'
+      })]
+    })
+    const reviewed = bepInExGithubReleaseFixture(102, '5.4.23.5', {
+      assets: [
+        bepInExGithubAssetFixture(1021, '5.4.23.5'),
+        bepInExGithubAssetFixture(1022, '5.4.23.5', 'v5.4.23.5', {
+          name: 'BepInEx_win_x64_5.4.23.5.7z'
+        })
+      ]
+    })
+    const client = new BepInExGithubReleaseClient({
+      fetch: async () => response([reviewed, historical])
+    })
+
+    const result = await client.discover()
+
+    expect(result.items).toHaveLength(1)
+    expect(result.items[0]).toMatchObject({
+      version: '5.4.23.5',
+      artifact: { fileName: 'BepInEx_win_x64_5.4.23.5.zip' }
+    })
+  })
+
   it('rejects a matching asset on a wrong host or non-canonical official path', async () => {
     const fileName = officialFixtureAssetName('5.4.23.5')
     const wrongHost = new BepInExGithubReleaseClient({

@@ -43,8 +43,10 @@ const layoutPolicySchema = z.enum([
   bepInExWindowsX64LayoutPolicyIds.v5_4_23_2_through_5
 ])
 const isoDateSchema = z.string().datetime({ offset: true })
-const safeZipFileNameSchema = z.string().min(5).max(128)
-  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\.zip$/)
+// Historical releases also contain non-ZIP assets. Validate their bounded
+// metadata here; only the exact reviewed Windows ZIP can become a candidate.
+const githubAssetNameSchema = z.string().min(1).max(128)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/)
 const positiveSizeSchema = z.number().int().positive().max(2 * 1_024 * 1_024 * 1_024)
 
 export interface DiscoveredBepInExRelease {
@@ -96,7 +98,7 @@ const clientConfigSchema = z.strictObject({
 
 const githubAssetSchema = z.strictObject({
   id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-  name: safeZipFileNameSchema,
+  name: githubAssetNameSchema,
   size: positiveSizeSchema,
   state: z.literal('uploaded'),
   digest: z.string().regex(/^sha256:[0-9a-f]{64}$/i).nullable(),

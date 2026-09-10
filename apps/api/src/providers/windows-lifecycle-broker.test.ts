@@ -20,6 +20,55 @@ const leaseBorrowFixture = 'A'.repeat(43)
 const requestFingerprint = 'c'.repeat(64)
 
 describe('fixed Windows lifecycle broker client', () => {
+  it('coalesces concurrent status reads but never reuses completed evidence or mutable results', async () => {
+    const harness = createHarness()
+    const [first, second] = await Promise.all([
+      harness.client.status({ signal: new AbortController().signal }),
+      harness.client.status({ signal: new AbortController().signal })
+    ])
+    expect(harness.runner.calls).toHaveLength(1)
+    expect(first).toEqual(second)
+    expect(first).not.toBe(second)
+    expect(first.runtime).not.toBe(second.runtime)
+    await harness.client.status({ signal: new AbortController().signal })
+    expect(harness.runner.calls).toHaveLength(2)
+  })
+
+  it('cancels one status waiter without cancelling another caller', async () => {
+    const harness = createHarness()
+    let finish!: () => void
+    harness.runner.respond = call => new Promise(resolve => { finish = () => resolve(JSON.stringify(resultFor(call))) })
+    const cancelled = new AbortController()
+    const rejected = captureError(harness.client.status({ signal: cancelled.signal }))
+    const surviving = harness.client.status({ signal: new AbortController().signal })
+    cancelled.abort()
+    expect(await rejected).toMatchObject({ code: 'WINDOWS_LIFECYCLE_BROKER_REQUEST_INVALID' })
+    expect(harness.runner.calls).toHaveLength(1)
+    expect(harness.runner.calls[0]!.signal.aborted).toBe(false)
+    finish()
+    expect((await surviving).lifecycleState).toBe('running_verified')
+  })
+
+  it('aborts abandoned work and does not let its late completion replace a newer read', async () => {
+    const harness = createHarness()
+    const completions: Array<() => void> = []
+    harness.runner.respond = call => new Promise(resolve => {
+      completions.push(() => resolve(JSON.stringify(resultFor(call))))
+    })
+    const cancelled = new AbortController()
+    const rejected = captureError(harness.client.status({ signal: cancelled.signal }))
+    cancelled.abort()
+    await rejected
+    expect(harness.runner.calls[0]!.signal.aborted).toBe(true)
+    const current = harness.client.status({ signal: new AbortController().signal })
+    completions[0]!()
+    await Promise.resolve()
+    const joined = harness.client.status({ signal: new AbortController().signal })
+    expect(harness.runner.calls).toHaveLength(2)
+    completions[1]!()
+    await Promise.all([current, joined])
+  })
+
   it('validates optional process telemetry and rejects mismatched identity or generation ordering', async () => {
     const sample = { processId: 2202, startedAtUnixMs: 1_000, sampledAtUnixMs: 2_000,
       processCoresUsed: 0.5, workingSetGiB: 1, privateMemoryGiB: 2, threadCount: 3 }
@@ -478,7 +527,7 @@ interface RunnerCall {
 
 class RecordingRunner implements WindowsLifecycleBrokerPowerShellRunner {
   readonly calls: RunnerCall[] = []
-  respond: (call: RunnerCall) => string = (call) => JSON.stringify(resultFor(call))
+  respond: (call: RunnerCall) => string | Promise<string> = (call) => JSON.stringify(resultFor(call))
 
   async run(
     scriptName: LifecycleBrokerScriptName,

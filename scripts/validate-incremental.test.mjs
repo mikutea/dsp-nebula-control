@@ -3,16 +3,39 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { classifyChange, selectCommands, planExecution } from './validate-incremental.mjs'
 
-test('RC23 evidence reuse requires the exact verified configuration implementation', () => {
+test('the reviewed mod trust batch selects checks only for its exact source', () => {
   const source = readFileSync(new URL('../apps/api/src/app.ts', import.meta.url), 'utf8')
-  assert.equal(classifyChange('apps/api/src/app.ts', null, source), 'verified-rc23-source')
+  assert.equal(classifyChange('apps/api/src/app.ts', null, source), 'reviewed-rc24-application')
   assert.throws(() => classifyChange('apps/api/src/app.ts', null, source + '\nchangedRuntime();\n'))
+  const plan = planExecution([{ file: 'apps/api/src/app.ts', kind: 'reviewed-rc24-application' }])
+  assert.ok(plan.commands.some(([, args]) => args.includes('src/update-acquisition-routes.test.ts')))
+  assert.ok(plan.commands.some(([, args]) => args.includes('src/mods/thunderstore-import.test.ts')))
+  assert.ok(plan.commands.some(([, args]) => args.includes('src/mod-supply-workspace.test.tsx')))
+  assert.equal(plan.pendingHostCommands.length, 0)
 })
 
 test('version reuse permits only the exact reviewed version substitution', () => {
   assert.equal(classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17\r\n', 'v=0.1.0-rc.23\n'), 'version-only')
   assert.throws(() => classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17', 'v=0.1.0-rc.23; unsafe=true'))
   assert.throws(() => classifyChange('apps/api/package-lock.json', 'old dependency', 'new dependency'))
+})
+
+test('RC24 reuses only the exact predecessor with uniform version substitution', () => {
+  const file = 'apps/api/src/config.ts'
+  const source = readFileSync(new URL('../apps/api/src/config.ts', import.meta.url), 'utf8')
+  assert.equal(classifyChange(file, null, source), 'configuration-gate')
+  assert.throws(() => classifyChange(file, null, source + '\nnewRuntimeBehavior();\n'))
+  const lockFile = 'apps/api/package-lock.json'
+  const lockSource = readFileSync(new URL('../apps/api/package-lock.json', import.meta.url), 'utf8')
+  assert.equal(classifyChange(lockFile, null, lockSource), 'version-only')
+  assert.throws(() => classifyChange(lockFile, null, lockSource.replace('0.1.0-rc.24', '0.1.0-rc.23')))
+})
+
+test('native status evidence cannot authorize a changed diagnostic script', () => {
+  const file = 'scripts/windows/deployment/Test-DysonControlDeployment.ps1'
+  const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
+  assert.equal(classifyChange(file, null, source), 'verified-native-status')
+  assert.throws(() => classifyChange(file, null, source + '\nUnexpected-Change\n'))
 })
 
 test('a metadata-only candidate reuses functional results', () => {

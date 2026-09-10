@@ -1,5 +1,52 @@
 # Risk-based validation
 
+## RC24 deployment status diagnostic
+
+The status script now constructs the task's expected arguments from the runtime
+paths already validated by `Test-DysonNodeRuntime`. That helper intentionally
+returns redacted evidence without path fields; reading those absent properties
+previously produced a false task failure. The exact normalized source hash is
+bound in the runner after a native read-only execution against the running
+installation passed every static check, including the complete task contract.
+This evidence excludes HTTP readiness timing and does not authorize a changed
+script or claim that the next release is deployed.
+
+RC24 also overlaps independent status collection and broker readiness work.
+Concurrent `LifecycleStatus` callers share only the in-flight request; completed
+results are never cached. Each caller gets separate evidence, individual
+cancellation leaves other callers running, and the last cancelled waiter aborts
+the shared transport. A late abandoned response cannot replace newer work.
+Run `providers/windows-lifecycle-broker.test.ts`, `providers/windows.test.ts`
+and `app.test.ts` plus API typechecking for these changes. Measure native readiness
+latency on the final release before claiming an improvement; fixture concurrency
+checks do not establish the target-host response time.
+
+## Exact reviewed mod acquisition and import (in progress)
+
+The optional embedded artifact policy changes discovery, candidate registration,
+download authorization, receipt provenance and import authorization. It reuses
+the existing compatibility-policy file setting; no environment contract or
+production enablement default changes. Existing policies without the new member
+retain their compatibility revision semantics.
+
+Affected API checks are `update-pipeline/trusted-mod-artifacts.test.ts`,
+`discovery.test.ts`, `acquisition.test.ts`, `acquisition-http.test.ts`,
+`trusted-compatibility.test.ts`, `update-acquisition-routes.test.ts`,
+`trusted-compatibility-routes.test.ts`, `mods/thunderstore-import.test.ts` and
+`thunderstore-mod-import-routes.test.ts`, plus API typechecking. Verify exact
+identity/dependencies/hash/size/revision, expiry and revocation, default rejection
+without authority, rejected/inactive/deprecated provider metadata, browser policy
+injection, revocation during download, and historical versus verified receipts.
+Use the real application assembly with a disposable canonical policy file to
+check reloads and response schemas; isolated service tests are insufficient.
+
+Any accompanying BepInEx discovery repair requires its discovery tests. Frontend
+provenance changes require the affected workspace tests and built-browser review.
+Before packaging, validate target configuration/ACL compatibility with this source
+and update the incremental runner's impact mapping if needed. Before production
+qualification, obtain native exact-archive, policy-protection, import, activation
+and rollback evidence. This in-progress plan is not release or production approval.
+
 ## Verified RC23 application batch
 
 Ordinary configuration writes and history operations share the existing

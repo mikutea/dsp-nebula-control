@@ -33,6 +33,30 @@ afterEach(async () => {
 })
 
 describe('Thunderstore mod importer', () => {
+  it('requires current authority for reviewed archives, including verified receipts and replay', async () => {
+    const fixture = await createFixture()
+    const receipt = await installAcquiredArchive(fixture, packageArchive())
+    receipt.artifact.trustedPolicyRevision = 'a'.repeat(64)
+    const unavailable = createImporter(fixture, acquisitionFixture(receipt))
+    await expect(unavailable.preview({ acquisitionReceiptId })).rejects.toMatchObject({
+      code: 'THUNDERSTORE_MOD_IMPORT_ACQUISITION_UNAVAILABLE'
+    })
+    let authorized = true
+    const importer = createImporter(fixture, { ...acquisitionFixture(receipt),
+      verifyReceiptAuthority: async () => { if (!authorized) throw new Error('revoked') }
+    })
+    const request = executeRequest()
+    const imported = await importer.execute(request)
+    expect(await importer.getVerifiedReceipt(request.requestId)).toEqual(imported)
+    authorized = false
+    for (const attempt of [
+      () => importer.preview({ acquisitionReceiptId }),
+      () => importer.execute(request),
+      () => importer.getVerifiedReceipt(request.requestId)
+    ]) await expect(attempt()).rejects.toMatchObject({ code: 'THUNDERSTORE_MOD_IMPORT_ACQUISITION_UNAVAILABLE' })
+    expect(await importer.getReceipt(request.requestId)).toEqual(imported)
+  })
+
   it('maps a discovery-bound dependency mismatch to a stable 422 HTTP error', async () => {
     const controller = new ThunderstoreModImportHttpController({
       service: {

@@ -129,8 +129,8 @@ if ($IncludeTask) {
         $environmentFull = Get-DysonFullPath -Path $configPath
         $expectedArguments = Get-DysonControlTaskActionArguments -LauncherPath $launcherFull `
             -InstallRoot $installFull -DataRoot $dataFull `
-            -RuntimeRoot ([string]$nodeProtection.runtimeRoot) `
-            -NodeExecutable ([string]$nodeProtection.nodeExecutable) `
+            -RuntimeRoot $RuntimeRoot `
+            -NodeExecutable $NodeExecutable `
             -ExpectedNodeSha256 $ExpectedNodeSha256 -EnvironmentFile $environmentFull
         $powerShellExecutable = Join-Path $env:SystemRoot `
             'System32\WindowsPowerShell\v1.0\powershell.exe'

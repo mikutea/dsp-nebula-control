@@ -254,6 +254,11 @@ export class FixedWindowsLifecycleBrokerClient implements WindowsLifecycleBroker
   readonly #gamePort: number
   readonly #timeoutSeconds: number
   readonly #runner: WindowsLifecycleBrokerPowerShellRunner
+  #statusInFlight: {
+    controller: AbortController
+    waiters: number
+    promise: Promise<LifecycleBrokerStatusEvidence>
+  } | null = null
 
   constructor(options: FixedWindowsLifecycleBrokerClientOptions) {
     if (!options || typeof options !== 'object' || typeof options.profileFile !== 'string' ||
@@ -376,7 +381,39 @@ export class FixedWindowsLifecycleBrokerClient implements WindowsLifecycleBroker
 
   async status(input: { signal: AbortSignal }): Promise<LifecycleBrokerStatusEvidence> {
     assertSignal(input.signal)
-    const receipt = await this.#invoke('LifecycleStatus', randomUUID(), [], input.signal)
+    if (input.signal.aborted) throw new WindowsLifecycleBrokerClientError('WINDOWS_LIFECYCLE_BROKER_REQUEST_INVALID')
+    let work = this.#statusInFlight
+    if (work === null || work.controller.signal.aborted) {
+      const controller = new AbortController()
+      work = { controller, waiters: 0, promise: this.#readStatus(controller.signal) }
+      this.#statusInFlight = work
+      const current = work
+      const clear = () => { if (this.#statusInFlight === current) this.#statusInFlight = null }
+      void current.promise.then(clear, clear)
+    }
+    const current = work
+    current.waiters += 1
+    try {
+      return await new Promise<LifecycleBrokerStatusEvidence>((resolve, reject) => {
+        const abort = () => reject(new WindowsLifecycleBrokerClientError('WINDOWS_LIFECYCLE_BROKER_REQUEST_INVALID'))
+        if (input.signal.aborted) { abort(); return }
+        input.signal.addEventListener('abort', abort, { once: true })
+        void current.promise.then(value => {
+          input.signal.removeEventListener('abort', abort)
+          resolve(structuredClone(value))
+        }, error => {
+          input.signal.removeEventListener('abort', abort)
+          reject(error)
+        })
+      })
+    } finally {
+      current.waiters -= 1
+      if (current.waiters === 0 && this.#statusInFlight === current) current.controller.abort()
+    }
+  }
+
+  async #readStatus(signal: AbortSignal): Promise<LifecycleBrokerStatusEvidence> {
+    const receipt = await this.#invoke('LifecycleStatus', randomUUID(), [], signal)
     this.#assertNotFailed(receipt)
     const evidence = parseEvidence(statusEvidenceSchema, receipt.evidence)
     this.#assertTerminal(receipt, [])

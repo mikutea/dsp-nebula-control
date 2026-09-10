@@ -8,6 +8,8 @@ import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
 import fastifyStatic from '@fastify/static'
 import { z } from 'zod'
+import { TrustedModArtifactPolicy, trustedModAcquisitionAuthority } from './update-pipeline/trusted-mod-artifacts.js'
+import { trustedCompatibilityPolicyInputSchema } from './update-pipeline/trusted-compatibility.js'
 import apiPackage from '../package.json' with { type: 'json' }
 import type { AppConfig } from './config.js'
 import { DemoProvider } from './providers/demo.js'
@@ -319,7 +321,8 @@ const acquisitionCandidateDescriptorSchema: z.ZodType<ArtifactCandidateDescripto
     fileName: z.string().min(5).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\.zip$/i),
     sizeBytes: z.number().int().positive().max(2 * 1_024 * 1_024 * 1_024).nullable(),
     sha256: z.string().length(64).regex(/^[a-f0-9]{64}$/).nullable(),
-    integrity: z.enum(['provider-sha256', 'locally-computed-required'])
+    integrity: z.enum(['provider-sha256', 'locally-computed-required']),
+    trustedPolicyRevision: z.string().regex(/^[0-9a-f]{64}$/).optional()
   }),
   expiresAt: z.string().datetime({ offset: true })
 })
@@ -982,7 +985,15 @@ export async function buildApplication(
   )
   const saveTransfers = dependencies.savePairTransferService ?? defaultSaveTransferService
   const savePromotions = dependencies.savePairPromotionService ?? defaultSaveTransferService
-  const thunderstoreReleases = dependencies.thunderstoreReleaseClient ?? new ThunderstoreReleaseClient({ fetch })
+  const loadTrustedModPolicy = async (): Promise<TrustedModArtifactPolicy | null> => {
+    if (!config.updateStagingEnabled || !config.updateCompatibilityPolicyFile) return null
+    const authority = await readTrustedCompatibilityPolicyAuthority(config.updateCompatibilityPolicyFile)
+    const parsed = trustedCompatibilityPolicyInputSchema.parse(authority.policy)
+    return parsed.trustedModArtifacts === undefined ? null : new TrustedModArtifactPolicy(parsed.trustedModArtifacts)
+  }
+  const thunderstoreReleases = dependencies.thunderstoreReleaseClient ?? new ThunderstoreReleaseClient({
+    fetch, trustedModPolicy: loadTrustedModPolicy
+  })
   const nebulaReleases = dependencies.nebulaReleaseClient ?? new NebulaGithubReleaseClient({ fetch })
   const bepInExReleases = dependencies.bepInExReleaseClient ?? new BepInExGithubReleaseClient({ fetch })
   const updateStager = dependencies.updateStager ?? (
@@ -997,7 +1008,8 @@ export async function buildApplication(
       ? new ManagedArtifactAcquisitionService({
           inboxRoot: config.updateInboxRoot,
           stateRoot: path.join(config.updateStagingRoot, 'acquisitions'),
-          fetch
+          fetch,
+          authorizeCandidate: trustedModAcquisitionAuthority(loadTrustedModPolicy)
         })
       : null
   )
@@ -1433,26 +1445,25 @@ export async function buildApplication(
       cutoverRecovery: cutoverController ? 'fail' : 'not-applicable'
     }
 
-    try {
-      const status = await collectObservabilityStatus()
+    const statusReadiness = collectObservabilityStatus().then(status => {
       checks.statusProvider = 'pass'
       if (provider.name === 'windows') {
         checks.projectRoot = status.automation.projectRootAvailable ? 'pass' : 'fail'
       }
-    } catch {
+    }).catch(() => {
       // Readiness is deliberately code-only and never reflects provider errors.
-    }
+    })
 
-    if (config.lifecycleEnabled && lifecycleBrokerClient) {
-      try {
-        const evidence = await lifecycleBrokerClient.status({
+    const brokerReadiness = config.lifecycleEnabled && lifecycleBrokerClient
+      ? lifecycleBrokerClient.status({
           signal: AbortSignal.timeout(config.statusTimeoutMs)
-        })
+        }).then(evidence => {
         checks.lifecycleBroker = isTrustedLifecycleBrokerStatus(evidence, config) ? 'pass' : 'fail'
-      } catch {
+      }).catch(() => {
         checks.lifecycleBroker = 'fail'
-      }
-    }
+      })
+      : Promise.resolve()
+    await Promise.all([statusReadiness, brokerReadiness])
 
     const currentUpdateProviderAuthorityRevision = defaultUpdateProviderAuthorityRevision !== null &&
         trustedCompatibilityPolicyAuthority !== null
@@ -3931,6 +3942,7 @@ function acquisitionCandidateMatchesRelease(
   return candidate.provider === expectedProvider && candidate.release.kind === expectedKind &&
     candidate.release.sourceId === release.sourceId && candidate.release.version === release.version &&
     candidate.artifact.artifactId === release.artifact.artifactId &&
+    candidate.artifact.trustedPolicyRevision === release.artifact.trustedPolicyRevision &&
     (release.provider !== 'thunderstore' || (
       JSON.stringify(candidate.release.dependencies) === JSON.stringify(release.dependencies) &&
       candidate.release.dependencyFingerprint === thunderstoreDependencyFingerprint(release.dependencies)

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
@@ -43,6 +43,53 @@ afterEach(async () => {
 })
 
 describe('managed artifact acquisition application routes', () => {
+  it('loads exact mod trust from the server file, rejects browser trust and observes revocation', async () => {
+    const roots = await stagingRoots()
+    const policyFile = path.join(await realpath(roots.root), 'trusted-policy.json')
+    const now = Date.now()
+    const policy = {
+      format: 'dyson-control-trusted-compatibility-policy', schemaVersion: 1,
+      policyId: 'fictional-compatibility', reviewedAt: new Date(now - 60000).toISOString(),
+      matrix: { schemaVersion: 1, entries: [{ id: 'fictional', core: {
+        dsp: { equals: '0.10.33.26727' }, nebula: { equals: '0.9.22' }, bepInEx: { equals: '5.4.22' }
+      }, plugins: [] }] },
+      trustedModArtifacts: { format: 'dyson-control-trusted-mod-artifacts', schemaVersion: 1,
+        policyId: 'fictional-reviewed-mod', reviewedAt: new Date(now - 60000).toISOString(),
+        expiresAt: new Date(now + 3600000).toISOString(), packages: [{
+          dependencyId: 'Fictional-ServerHelper-1.2.3', dependencies: [], sha256: 'a'.repeat(64), sizeBytes: 2048
+        }] }
+    }
+    await writeFile(policyFile, JSON.stringify(policy))
+    const fetch = vi.fn(async () => new Response(JSON.stringify({
+      namespace: 'Fictional', name: 'ServerHelper', full_name: 'Fictional-ServerHelper', is_deprecated: false,
+      latest: { namespace: 'Fictional', name: 'ServerHelper', full_name: 'Fictional-ServerHelper-1.2.3',
+        version_number: '1.2.3', dependencies: [], is_active: true, date_created: new Date(now - 60000).toISOString(),
+        download_url: 'https://thunderstore.io/package/download/Fictional/ServerHelper/1.2.3/' },
+      community_listings: [{ community: 'dyson-sphere-program', review_status: 'unreviewed' }]
+    }), { headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetch)
+    application = await buildApplication({ ...enabledConfig(roots), updateCompatibilityPolicyFile: policyFile })
+    const cookie = await login('administrator', administratorPassword)
+    const request = { namespace: 'Fictional', name: 'ServerHelper' }
+    const forged = await post(cookie, '/api/v1/updates/discovery/thunderstore', {
+      ...request, trustedModArtifacts: policy.trustedModArtifacts
+    })
+    expect(forged.statusCode).toBe(400)
+    expect(fetch).not.toHaveBeenCalled()
+    const discovered = await post(cookie, '/api/v1/updates/discovery/thunderstore', request)
+    expect(discovered.statusCode, discovered.body).toBe(200)
+    const candidate = discovered.json().meta.acquisition.candidates[0].candidate
+    expect(candidate?.artifact, discovered.body).toMatchObject({ sha256: 'a'.repeat(64), sizeBytes: 2048,
+      trustedPolicyRevision: expect.stringMatching(/^[0-9a-f]{64}$/) })
+    policy.trustedModArtifacts.packages = []
+    await writeFile(policyFile, JSON.stringify(policy))
+    const preview = await post(cookie, '/api/v1/updates/acquisition/preview', { candidateId: candidate.candidateId })
+    expect(preview.json()).toMatchObject({ ok: false, error: { code: 'ACQUISITION_AUTHORITY_REJECTED' } })
+    expect(preview.statusCode).not.toBe(200)
+    const revoked = await post(cookie, '/api/v1/updates/discovery/thunderstore', request)
+    expect(revoked.json().meta.acquisition.candidates[0]).toMatchObject({ eligible: false, candidate: null })
+  })
+
   it('keeps acquisition mutation at 423 by default and never calls the downloader service', async () => {
     const service = acquisitionServiceFixture()
     application = await buildApplication(baseConfig(), { artifactAcquisitionService: service })

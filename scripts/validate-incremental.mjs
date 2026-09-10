@@ -141,8 +141,100 @@ const configurationGateSources = new Map([
   ["apps/api/src/configuration-reconcile-coordination.test.ts", "d805c6526e1b91b7596979f74115af7518c65da85d4542079c424d6547cfd81c"]
 ])
 
+// Exact source bindings select affected tests; they do not reuse unexecuted evidence.
+const reviewedRc24ApplicationSources = new Map([
+  [
+    "apps/api/src/app.ts",
+    "cf5ddb604e912f19839652ae7827bc63e6f806776cfbf76ab84a9a56cc132ec8"
+  ],
+  [
+    "apps/api/src/mods/thunderstore-import.ts",
+    "e534d3b049b4f4b8e984368b1fc062a2467caf13625775c5d65bf60034bb7311"
+  ],
+  [
+    "apps/api/src/mods/thunderstore-import.test.ts",
+    "0462abfc25bf688bce4f9823dd14a5fa05bbcf35420bc0eac1116ad0443317c0"
+  ],
+  [
+    "apps/api/src/update-acquisition-routes.test.ts",
+    "e0d8b6fbd3f3e380e1182071df8b308d26685bb98f9ae29a2af2840d178921fa"
+  ],
+  [
+    "apps/api/src/update-pipeline/acquisition-http.ts",
+    "e8e9e404b9917ebd2a7a84ac9822ac82b9cf969ba4259c64a4fb9c9d81a26ec8"
+  ],
+  [
+    "apps/api/src/update-pipeline/acquisition.ts",
+    "a00634ca8ba2679ffdae114b4d71bc021c38e6fb1cefdf1884f9d553d36910d1"
+  ],
+  [
+    "apps/api/src/update-pipeline/acquisition.test.ts",
+    "34b064d3d1bd6c8c1988208af5222957e12f2bf1ba4f4cb59ccec6c4849faaec"
+  ],
+  [
+    "apps/api/src/update-pipeline/bepinex-discovery.ts",
+    "9e71b7e3f7b6468b810abe2e1aedbede8ffd1cd50e647e2ee588607076d53799"
+  ],
+  [
+    "apps/api/src/update-pipeline/bepinex-discovery.test.ts",
+    "48ad7ab06688eb63beb27ca048dab295401a0d05db4bbd8a1ede607aaf76ff7b"
+  ],
+  [
+    "apps/api/src/update-pipeline/discovery.ts",
+    "614f8d7ed2f454052eef6a5d13316ee4daf5fd2839852f54fe08250e623fe482"
+  ],
+  [
+    "apps/api/src/update-pipeline/discovery.test.ts",
+    "2a845ab08982382dd6bdc5a6fd8d5e1aa929fb59551870b9f5a2fa1724750796"
+  ],
+  [
+    "apps/api/src/update-pipeline/trusted-compatibility.ts",
+    "25ad2afae7ba554f21b7d8802392992c8ebd5c786f72aba6eb33cbb561fd185c"
+  ],
+  [
+    "apps/api/src/update-pipeline/trusted-mod-artifacts.ts",
+    "b65afdd57290073f250207c4e77afaee6ac755356224ea3ed228d1adfdfe1b29"
+  ],
+  [
+    "apps/api/src/update-pipeline/trusted-mod-artifacts.test.ts",
+    "943cc66731b7ea6aaf23a647d2a6a6562d68ccff0bf4baf1fa44f429531b7f81"
+  ],
+  [
+    "apps/web/src/model.ts",
+    "4b2b7ff1e0e14c206a81828c09ad6fb69492124c1fb6c427f0092b5f4100b276"
+  ],
+  [
+    "apps/web/src/ModSupplyWorkspace.tsx",
+    "bae0c90442ccca255bafeb54be6ceb7f3a1bf1cd10530f5a1f4693bb2490c712"
+  ],
+  [
+    "apps/web/src/mod-supply-workspace.test.tsx",
+    "05a6c01a1bd8d13b0fbb121c3237ca4d646498cf38710f97e26da4a9adf05e86"
+  ],
+  [
+    "apps/api/src/providers/windows.ts",
+    "de8a4f11f3ffed76390daae1b27b8851928d6b936f7b098fb3038d30eafe0f13"
+  ],
+  [
+    "apps/api/src/providers/windows-lifecycle-broker.ts",
+    "fe99ca01d49c01608cb84207420a197d04b6224472582a40b7f92af25dece027"
+  ],
+  [
+    "apps/api/src/providers/windows-lifecycle-broker.test.ts",
+    "1d74082b7b2c2b58e311f50435c8d12538cfb4dfd1b6a7888c023c4d1ba207f3"
+  ]
+]);
+
 export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
+  if (file === 'scripts/windows/deployment/Test-DysonControlDeployment.ps1' &&
+      aclSourceHash(after) === '248758ae47a5edf9678f0c515eb564c31e3cb127538347556319ba10ae44766a') return 'verified-native-status'
+  const priorReleaseSource = after.replaceAll('0.1.0-rc.24', '0.1.0-rc.23')
+  if (priorReleaseSource !== after && priorReleaseSource.replaceAll('0.1.0-rc.23', '0.1.0-rc.24') === after) {
+    if (rc23VerifiedSources.get(file) === aclSourceHash(priorReleaseSource)) return 'version-only'
+    if (configurationGateSources.get(file) === aclSourceHash(priorReleaseSource)) return 'configuration-gate'
+  }
+  if (reviewedRc24ApplicationSources.get(file) === aclSourceHash(after)) return 'reviewed-rc24-application'
   if (rc23VerifiedSources.get(file) === aclSourceHash(after)) return 'verified-rc23-source'
   if (configurationGateSources.get(file) === aclSourceHash(after)) return 'configuration-gate'
   const startup = startupSources.get(file)
@@ -253,6 +345,19 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
   const isRunnerCheck = ([, args]) => args.includes('src/providers/powershell-runner.test.ts')
   const hostCommands = selected.slice(2).filter(command => !isRunnerCheck(command))
   const commands = [...selected.slice(0, 2), ...selected.slice(2).filter(isRunnerCheck)]
+  if (changes.some(change => change.kind === 'reviewed-rc24-application')) {
+    commands.push(['node', ['apps/api/node_modules/typescript/bin/tsc', '-p', 'apps/api/tsconfig.json', '--noEmit']])
+    commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
+      'src/update-pipeline/trusted-mod-artifacts.test.ts', 'src/update-pipeline/discovery.test.ts',
+      'src/update-pipeline/acquisition.test.ts', 'src/update-pipeline/acquisition-http.test.ts',
+      'src/update-pipeline/trusted-compatibility.test.ts', 'src/update-pipeline/bepinex-discovery.test.ts',
+      'src/update-acquisition-routes.test.ts', 'src/trusted-compatibility-routes.test.ts',
+      'src/mods/thunderstore-import.test.ts', 'src/thunderstore-mod-import-routes.test.ts',
+      'src/providers/windows-lifecycle-broker.test.ts', 'src/providers/windows.test.ts', 'src/app.test.ts']])
+    commands.push(['node', ['apps/web/node_modules/typescript/bin/tsc', '-b', 'apps/web/tsconfig.json', '--pretty', 'false']])
+    commands.push(['node', ['apps/web/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/web', '--maxWorkers=2',
+      'src/mod-supply-workspace.test.tsx']])
+  }
   if (changes.some(change => change.kind === 'configuration-gate')) commands.push(['node',
     ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=2',
       'src/config.test.ts', 'src/configuration-apply-coordination.test.ts', 'src/configuration-reconcile-coordination.test.ts']])
@@ -295,6 +400,8 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
       evidence: componentBaselines[group].evidence })),
     reasons: changes.map(({ file, kind }) => ({ file, kind,
       decision: kind === 'configuration-gate' ? 'run focused shared configuration gate checks' :
+        kind === 'verified-native-status' ? 'reuse exact native read-only deployment status evidence; HTTP readiness remains separate' :
+        kind === 'reviewed-rc24-application' ? 'run exact RC24 artifact trust, readiness and UI checks; native qualification remains required' :
         kind === 'verified-rc23-source' ? 'reuse exact RC23 source evidence; production qualification remains separate' :
         kind === 'control-exit-policy' ? 'reviewed runtime change: execute the focused exit-policy check' :
         kind === 'affected' ? 'run matching checks or reuse the verified component baseline' : 'no production behavior change' })) }

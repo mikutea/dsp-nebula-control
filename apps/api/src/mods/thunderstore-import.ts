@@ -165,6 +165,7 @@ export const thunderstoreModImportReceiptSchema: z.ZodType<ThunderstoreModImport
 
 export interface ThunderstoreModImportAcquisition {
   getReceipt(requestId: unknown): Promise<ArtifactAcquisitionReceipt | null>
+  verifyReceiptAuthority?(requestId: unknown): Promise<void>
 }
 
 export interface ThunderstoreModImporterOptions {
@@ -396,6 +397,7 @@ export class ThunderstoreModImporter {
         receipt.release.kind !== 'plugin' || !sourceIdPattern.test(receipt.release.sourceId)) {
       throw new ThunderstoreModImportError('THUNDERSTORE_MOD_IMPORT_ACQUISITION_INVALID')
     }
+    await this.#verifySourceAuthority(receipt)
     await assertNormalDirectory(this.#acquisitionInboxRoot)
     const artifactPath = managedChild(
       this.#acquisitionInboxRoot,
@@ -411,7 +413,18 @@ export class ThunderstoreModImporter {
     } catch (error) {
       throw new ThunderstoreModImportError('THUNDERSTORE_MOD_IMPORT_ARCHIVE_INVALID', { cause: error })
     }
+    await this.#verifySourceAuthority(receipt)
     return { receipt, artifactPath, prepared: preparePackage(receipt, entries) }
+  }
+
+  async #verifySourceAuthority(receipt: ArtifactAcquisitionReceipt): Promise<void> {
+    if (receipt.artifact.trustedPolicyRevision === undefined) return
+    try {
+      if (this.#acquisition.verifyReceiptAuthority === undefined) throw new Error('authority unavailable')
+      await this.#acquisition.verifyReceiptAuthority(receipt.requestId)
+    } catch (error) {
+      throw new ThunderstoreModImportError('THUNDERSTORE_MOD_IMPORT_ACQUISITION_UNAVAILABLE', { cause: error })
+    }
   }
 
   async #prepareRoots(): Promise<ImportRoots> {

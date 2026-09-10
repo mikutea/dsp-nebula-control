@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { NebulaGithubReleaseClient, ThunderstoreReleaseClient } from './discovery.js'
 import type { FetchLike } from './http.js'
+import { TrustedModArtifactPolicy } from './trusted-mod-artifacts.js'
 
 function response(value: unknown): Response {
   return new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } })
@@ -56,6 +57,28 @@ function githubRelease(
 }
 
 describe('release metadata discovery', () => {
+  it('binds an unreviewed exact release to the current reviewed policy without claiming provider integrity', async () => {
+    const upstream = thunderstoreFixture()
+    upstream.community_listings[0]!.review_status = 'unreviewed'
+    let policy: TrustedModArtifactPolicy | null = new TrustedModArtifactPolicy({
+      format: 'dyson-control-trusted-mod-artifacts', schemaVersion: 1, policyId: 'fictional-review',
+      reviewedAt: '2026-01-01T00:00:00Z', expiresAt: '2027-01-01T00:00:00Z',
+      packages: [{ dependencyId: upstream.latest.full_name, dependencies: upstream.latest.dependencies,
+        sha256: 'a'.repeat(64), sizeBytes: 4096 }]
+    })
+    const client = new ThunderstoreReleaseClient({ fetch: async () => response(upstream),
+      trustedModPolicy: async () => policy, now: () => Date.parse('2026-09-01T00:00:00Z') })
+    const request = { namespace: 'Fictional', name: 'ServerHelper' }
+    expect(await client.discoverLatest(request)).toMatchObject({ eligible: true,
+      artifact: { sha256: 'a'.repeat(64), sizeBytes: 4096,
+        trustedPolicyRevision: policy.revision, integrity: 'locally-computed-required' } })
+    upstream.community_listings[0]!.review_status = 'rejected'
+    expect(await client.discoverLatest(request)).toMatchObject({ eligible: false, artifact: { sha256: null } })
+    upstream.community_listings[0]!.review_status = 'unreviewed'
+    policy = null
+    expect(await client.discoverLatest(request)).toMatchObject({ eligible: false, artifact: { sha256: null } })
+  })
+
   it('normalizes Thunderstore metadata while keeping the artifact untrusted until local staging', async () => {
     const fetch = vi.fn<FetchLike>(async () => response(thunderstoreFixture()))
     const client = new ThunderstoreReleaseClient({ fetch })

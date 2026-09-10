@@ -3,6 +3,7 @@ import { constants } from 'node:fs'
 import { lstat, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
+import { TrustedModArtifactPolicy, trustedModArtifactPolicySchema } from './trusted-mod-artifacts.js'
 import {
   compatibilityMatrixInputSchema,
   evaluateCompatibility,
@@ -32,7 +33,8 @@ export const trustedCompatibilityPolicyInputSchema = z.strictObject({
   schemaVersion: z.literal(1),
   policyId: z.string().min(3).max(96).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/),
   reviewedAt: timestampSchema,
-  matrix: compatibilityMatrixInputSchema
+  matrix: compatibilityMatrixInputSchema,
+  trustedModArtifacts: trustedModArtifactPolicySchema.optional()
 })
 
 export const trustedCompatibilityPreparationRequestSchema = z.strictObject({
@@ -46,6 +48,7 @@ export const trustedCompatibilityPreparationRequestSchema = z.strictObject({
 })
 
 interface NormalizedPolicy {
+  trustedModArtifactsRevision?: string
   format: 'dyson-control-trusted-compatibility-policy'
   schemaVersion: 1
   policyId: string
@@ -484,7 +487,10 @@ function normalizePolicy(input: unknown): NormalizedPolicy {
       schemaVersion: 1,
       policyId: parsed.policyId,
       reviewedAt: new Date(parsed.reviewedAt).toISOString(),
-      matrix
+      matrix,
+      ...(parsed.trustedModArtifacts === undefined ? {} : {
+        trustedModArtifactsRevision: new TrustedModArtifactPolicy(parsed.trustedModArtifacts).revision
+      })
     }
   } catch (error) {
     throw new TrustedCompatibilityError('UPDATE_COMPATIBILITY_POLICY_INVALID', { cause: error })

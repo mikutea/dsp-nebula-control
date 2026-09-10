@@ -307,12 +307,18 @@ export function ModSupplyWorkspace({
     const registration = acquisitionMeta?.candidates.find((entry) => entry.artifactId === release.artifact.artifactId)
     if (!registration || registration.status !== 'registered' || !registration.eligible || !registration.candidate) return null
     const candidate = registration.candidate
+    if (release.artifact.trustedPolicyRevision !== undefined &&
+        (!/^[0-9a-f]{64}$/.test(release.artifact.trustedPolicyRevision) ||
+         release.artifact.sha256 === null || release.artifact.sizeBytes === null)) return null
     return candidate.provider === 'thunderstore' && candidate.release.kind === 'plugin' &&
       candidate.release.sourceId === release.sourceId && candidate.release.version === release.version &&
       exactDependenciesMatch(candidate.release.dependencies, release.dependencies) &&
       typeof candidate.release.dependencyFingerprint === 'string' &&
       /^[0-9a-f]{64}$/.test(candidate.release.dependencyFingerprint) &&
-      candidate.artifact.artifactId === release.artifact.artifactId ? candidate : null
+      candidate.artifact.artifactId === release.artifact.artifactId &&
+      candidate.artifact.trustedPolicyRevision === release.artifact.trustedPolicyRevision &&
+      candidate.artifact.sha256 === release.artifact.sha256 &&
+      candidate.artifact.sizeBytes === release.artifact.sizeBytes ? candidate : null
   }
 
   function updateFlow(dependencyId: string, patch: Partial<PackageFlow>): void {
@@ -369,7 +375,9 @@ export function ModSupplyWorkspace({
       if (!route) return null
       return <article className={`mod-supply-node route-${route.disposition}`} data-mod-supply-row={release.dependencyId} key={release.dependencyId}>
         <div className="mod-supply-node-index"><span>{String(index + 1).padStart(2, '0')}</span><i /></div>
-        <div className="mod-supply-node-identity"><span>{routeLabel(route)}</span><strong>{release.namespace} / {release.name}</strong><code>{release.dependencyId}</code><small>{release.dependencies.length} direct dependencies · {release.eligible ? 'provider eligible' : release.blockers.join(' · ')}</small></div>
+        <div className="mod-supply-node-identity"><span>{routeLabel(route)}</span><strong>{release.namespace} / {release.name}</strong><code>{release.dependencyId}</code><small>{release.dependencies.length} direct dependencies · {release.eligible ? '可获取候选' : release.blockers.join(' · ')}</small>
+          {release.artifact.trustedPolicyRevision ? <small title={release.artifact.trustedPolicyRevision}>管理员固定哈希 · 策略 {release.artifact.trustedPolicyRevision.slice(0, 12)} · {flow?.acquisitionVerified ? '下载校验通过' : '待下载校验'}</small> : null}
+        </div>
         {route.disposition !== 'plugin' ? <div className="mod-platform-route"><ShieldCheck size={18} /><span><strong>{routeLabel(route)}</strong><small>{routeExplanation(route)}</small></span></div> : <>
           <div className="mod-supply-progress" aria-label={`供应链进度 ${release.dependencyId}`}>
             <span className={flow?.acquisitionPlan ? 'done' : ''}>A1<small>获取预演</small></span>
@@ -456,6 +464,9 @@ function candidateExpired(candidate: ArtifactAcquisitionCandidate): boolean {
 function acquisitionPlanMatches(plan: ArtifactAcquisitionPlan, candidate: ArtifactAcquisitionCandidate): boolean {
   return plan.format === 'dyson-control-artifact-acquisition-plan' && plan.schemaVersion === 1 && plan.dryRun === true &&
     plan.candidate.candidateId === candidate.candidateId && plan.candidate.artifact.artifactId === candidate.artifact.artifactId &&
+    plan.candidate.artifact.trustedPolicyRevision === candidate.artifact.trustedPolicyRevision &&
+    plan.candidate.artifact.sha256 === candidate.artifact.sha256 &&
+    plan.candidate.artifact.sizeBytes === candidate.artifact.sizeBytes &&
     plan.candidate.release.sourceId === candidate.release.sourceId && plan.candidate.release.version === candidate.release.version
 }
 
@@ -469,6 +480,9 @@ function acquisitionReceiptMatches(
     receipt.release.sourceId === candidate.release.sourceId && receipt.release.version === candidate.release.version &&
     exactDependenciesMatch(receipt.release.dependencies, candidate.release.dependencies ?? []) &&
     receipt.release.dependencyFingerprint === candidate.release.dependencyFingerprint &&
+    receipt.artifact.trustedPolicyRevision === candidate.artifact.trustedPolicyRevision &&
+    (candidate.artifact.sha256 === null || receipt.artifact.sha256 === candidate.artifact.sha256) &&
+    (candidate.artifact.sizeBytes === null || receipt.artifact.sizeBytes === candidate.artifact.sizeBytes) &&
     receipt.artifact.artifactId === candidate.artifact.artifactId && /^[0-9a-f]{64}$/.test(receipt.artifact.sha256)
 }
 

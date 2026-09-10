@@ -23,6 +23,24 @@ afterEach(() => {
 })
 
 describe('Thunderstore mod supply workspace', () => {
+  it.each([false, true])('shows reviewed hash provenance and blocks mismatched policy bindings: %s', async mismatch => {
+    const release = releaseFixture('Fictional', 'ReviewedPlugin', '1.0.0', [])
+    release.artifact = { ...release.artifact, sha256: 'a'.repeat(64), sizeBytes: 2048,
+      trustedPolicyRevision: 'b'.repeat(64) }
+    const candidate = candidateFixture(release, 'plugin', 'c')
+    candidate.artifact.trustedPolicyRevision = (mismatch ? 'd' : 'b').repeat(64)
+    vi.spyOn(api, 'discoverThunderstore').mockResolvedValue(discoveryEnvelope(release, candidate))
+    vi.spyOn(api, 'discoverThunderstoreDependencies').mockResolvedValue(
+      closureEnvelope([release], { root: candidate, library: candidate, platform: candidate }))
+    render(<ModSupplyWorkspace demo={false} canAcquire canImport activeRevision={'9'.repeat(64)} onDeploymentRequest={vi.fn()} />)
+    fireEvent.change(screen.getByLabelText('Thunderstore namespace'), { target: { value: release.namespace } })
+    fireEvent.change(screen.getByLabelText('Thunderstore package name'), { target: { value: release.name } })
+    fireEvent.click(screen.getByRole('button', { name: '发现精确依赖闭包' }))
+    expect(await screen.findByText(/管理员固定哈希 · 策略 bbbbbbbbbbbb · 待下载校验/)).toBeTruthy()
+    const button = screen.getByRole('button', { name: `预演获取 ${release.dependencyId}` }) as HTMLButtonElement
+    expect(button.disabled).toBe(mismatch)
+  })
+
   it('discovers an exact dependencies-first closure and turns persisted plugin receipts into a logical install request', async () => {
     const onDeploymentRequest = vi.fn<(request: ModDeploymentRequest, label: string) => void>()
     const { root, library, platform } = releases()

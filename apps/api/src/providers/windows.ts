@@ -31,6 +31,10 @@ export class WindowsProvider implements StatusProvider {
 
   async collectStatus(): Promise<ServerStatus> {
     const scriptPath = await this.#resolveScript('Get-DysonStatus.ps1')
+    const brokerEvidence = this.#options.lifecycleBrokerClient
+      ? this.#options.lifecycleBrokerClient.status({ signal: AbortSignal.timeout(this.#options.timeoutMs) })
+        .catch(() => null)
+      : null
     const output = await this.#runPowerShell(scriptPath, [
       '-ProjectRoot', this.#options.projectRoot,
       '-GamePort', String(this.#options.gamePort ?? 8469),
@@ -42,15 +46,9 @@ export class WindowsProvider implements StatusProvider {
       ...parsed,
       capabilities: { refresh: true, start: false, save: false, gracefulStop: false, restart: false }
     }
-    if (!this.#options.lifecycleBrokerClient) return status
-    try {
-      const evidence = await this.#options.lifecycleBrokerClient.status({
-        signal: AbortSignal.timeout(this.#options.timeoutMs)
-      })
-      return applyBrokerStatus(status, evidence)
-    } catch {
-      return applyUnavailableBrokerStatus(status)
-    }
+    if (brokerEvidence === null) return status
+    const evidence = await brokerEvidence
+    return evidence === null ? applyUnavailableBrokerStatus(status) : applyBrokerStatus(status, evidence)
   }
 
   async previewLifecycle(action: LifecycleAction, signal?: AbortSignal): Promise<LifecyclePreview> {

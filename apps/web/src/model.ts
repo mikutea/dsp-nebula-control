@@ -931,6 +931,7 @@ export interface PlayerNoticeReceipt {
 }
 
 export interface DiscoveredArtifact {
+  trustedPolicyRevision?: string
   artifactId: string
   downloadUrl: string
   fileName: string
@@ -978,6 +979,7 @@ export interface ArtifactAcquisitionCandidate {
     dependencyFingerprint?: string
   }
   artifact: {
+    trustedPolicyRevision?: string
     artifactId: string
     fileName: string
     sizeBytes: number | null
@@ -1140,6 +1142,7 @@ export interface ArtifactAcquisitionReceipt {
   provider: ArtifactAcquisitionProvider
   release: ArtifactAcquisitionCandidate['release']
   artifact: {
+    trustedPolicyRevision?: string
     artifactId: string
     fileName: string
     sizeBytes: number

@@ -67,6 +67,7 @@ interface StoredArtifactCandidate {
     sizeBytes: number | null
     sha256: string | null
     integrity: 'provider-sha256' | 'locally-computed-required'
+    trustedPolicyRevision?: string
   }
   registeredAt: string
   expiresAt: string
@@ -110,6 +111,7 @@ export interface ArtifactAcquisitionReceipt {
     sizeBytes: number
     sha256: string
     integrity: 'provider-verified' | 'locally-computed'
+    trustedPolicyRevision?: string
   }
   state: 'acquired'
   reused: boolean
@@ -140,7 +142,8 @@ const storedCandidateSchema: z.ZodType<StoredArtifactCandidate> = z.strictObject
     fileName: safeFileNameSchema,
     sizeBytes: byteCountSchema.nullable(),
     sha256: sha256Schema.nullable(),
-    integrity: z.enum(['provider-sha256', 'locally-computed-required'])
+    integrity: z.enum(['provider-sha256', 'locally-computed-required']),
+    trustedPolicyRevision: sha256Schema.optional()
   }),
   registeredAt: isoDateSchema,
   expiresAt: isoDateSchema
@@ -158,6 +161,11 @@ const storedCandidateSchema: z.ZodType<StoredArtifactCandidate> = z.strictObject
     context.addIssue({ code: 'custom', message: 'Thunderstore acquisition candidate identity is invalid' })
   }
   validateReleaseDependencyBinding(value.release, context)
+  if (value.artifact.trustedPolicyRevision !== undefined && (value.provider !== 'thunderstore' ||
+      value.artifact.integrity !== 'locally-computed-required' ||
+      value.artifact.sha256 === null || value.artifact.sizeBytes === null)) {
+    context.addIssue({ code: 'custom', message: 'Reviewed mod artifact binding is invalid' })
+  }
   if (value.artifact.integrity === 'provider-sha256' &&
       (value.artifact.sizeBytes === null || value.artifact.sha256 === null)) {
     context.addIssue({ code: 'custom', message: 'Provider integrity metadata is incomplete' })
@@ -197,7 +205,8 @@ export const artifactAcquisitionReceiptSchema: z.ZodType<ArtifactAcquisitionRece
     fileName: safeFileNameSchema,
     sizeBytes: byteCountSchema,
     sha256: sha256Schema,
-    integrity: z.enum(['provider-verified', 'locally-computed'])
+    integrity: z.enum(['provider-verified', 'locally-computed']),
+    trustedPolicyRevision: sha256Schema.optional()
   }),
   state: z.literal('acquired'),
   reused: z.boolean(),
@@ -240,6 +249,8 @@ export interface ManagedArtifactAcquisitionOptions {
   candidateTtlMs?: number
   maximumRedirects?: number
   now?: () => Date
+  /** Server-owned authority; re-read current policy rather than trusting browser input. */
+  authorizeCandidate?: (candidate: ArtifactCandidateDescriptor) => Promise<boolean>
 }
 
 export class ManagedArtifactAcquisitionService {
@@ -251,6 +262,7 @@ export class ManagedArtifactAcquisitionService {
   readonly #candidateTtlMs: number
   readonly #maximumRedirects: number
   readonly #now: () => Date
+  readonly #authorizeCandidate: ManagedArtifactAcquisitionOptions['authorizeCandidate']
 
   constructor(options: ManagedArtifactAcquisitionOptions) {
     const parsed = optionsSchema.parse({
@@ -277,6 +289,7 @@ export class ManagedArtifactAcquisitionService {
     this.#candidateTtlMs = parsed.candidateTtlMs
     this.#maximumRedirects = parsed.maximumRedirects
     this.#now = options.now ?? (() => new Date())
+    this.#authorizeCandidate = options.authorizeCandidate
   }
 
   async registerNebulaRelease(input: unknown): Promise<ArtifactCandidateDescriptor> {
@@ -321,6 +334,9 @@ export class ManagedArtifactAcquisitionService {
         if (existingReceipt.candidateId !== request.candidateId) {
           throw new UpdatePipelineError('ACQUISITION_IDEMPOTENCY_CONFLICT')
         }
+        if (this.#authorizeCandidate !== undefined || existingReceipt.artifact.trustedPolicyRevision !== undefined) {
+          await this.#loadCandidate(request.candidateId, roots)
+        }
         return existingReceipt
       }
 
@@ -334,11 +350,13 @@ export class ManagedArtifactAcquisitionService {
       let measured: MeasuredArtifact
       let reused: boolean
       if (existing !== null) {
+        await this.#assertAuthorized(candidate)
         measured = existing
         reused = true
       } else {
         temporary = managedChild(this.#inboxRoot, `.acquire-${request.requestId}-${randomUUID()}.tmp`)
         measured = await this.#download(candidate, temporary, signal)
+        await this.#assertAuthorized(candidate)
         await rename(temporary, target).catch((error: unknown) => {
           throw new UpdatePipelineError('ACQUISITION_INBOX_PUBLISH_FAILED', { cause: error })
         })
@@ -359,7 +377,9 @@ export class ManagedArtifactAcquisitionService {
           fileName: candidate.artifact.fileName,
           sizeBytes: measured.sizeBytes,
           sha256: measured.sha256,
-          integrity: candidate.artifact.sha256 === null ? 'locally-computed' : 'provider-verified'
+          integrity: candidate.artifact.integrity === 'provider-sha256' ? 'provider-verified' : 'locally-computed',
+          ...(candidate.artifact.trustedPolicyRevision === undefined ? {} :
+            { trustedPolicyRevision: candidate.artifact.trustedPolicyRevision })
         },
         state: 'acquired',
         reused,
@@ -399,6 +419,7 @@ export class ManagedArtifactAcquisitionService {
         if (Date.parse(existing.expiresAt) <= this.#now().getTime()) {
           throw new UpdatePipelineError('ACQUISITION_CANDIDATE_EXPIRED')
         }
+        await this.#assertAuthorized(existing)
         return descriptor(existing)
       }
       const registeredAt = this.#now()
@@ -407,6 +428,7 @@ export class ManagedArtifactAcquisitionService {
         registeredAt: registeredAt.toISOString(),
         expiresAt: new Date(registeredAt.getTime() + this.#candidateTtlMs).toISOString()
       })
+      await this.#assertAuthorized(candidate)
       await atomicWriteJson(destination, candidate)
       return descriptor(candidate)
     } finally {
@@ -414,15 +436,43 @@ export class ManagedArtifactAcquisitionService {
     }
   }
 
-  async #loadCandidate(candidateId: string, prepared?: PreparedRoots): Promise<StoredArtifactCandidate> {
+  async verifyReceiptAuthority(requestIdInput: unknown): Promise<void> {
+    const receipt = await this.getReceipt(requestIdInput)
+    if (receipt === null) throw new UpdatePipelineError('ACQUISITION_RECEIPT_NOT_FOUND')
+    if (receipt.artifact.trustedPolicyRevision === undefined) return
+    const candidate = await this.#loadCandidate(receipt.candidateId, undefined, false)
+    if (candidate.artifact.trustedPolicyRevision !== receipt.artifact.trustedPolicyRevision ||
+        candidate.provider !== receipt.provider || candidate.artifact.artifactId !== receipt.artifact.artifactId ||
+        candidate.artifact.sha256 !== receipt.artifact.sha256 ||
+        candidate.artifact.sizeBytes !== receipt.artifact.sizeBytes ||
+        canonicalJson(candidate.release) !== canonicalJson(receipt.release)) {
+      throw new UpdatePipelineError('ACQUISITION_RECEIPT_AUTHORITY_MISMATCH')
+    }
+  }
+
+  async #loadCandidate(candidateId: string, prepared?: PreparedRoots, requireFresh = true): Promise<StoredArtifactCandidate> {
     const roots = prepared ?? await this.#prepareRoots()
     const candidate = await readOptionalCandidate(managedChild(roots.candidates, `${candidateId}.json`))
     if (candidate === null) throw new UpdatePipelineError('ACQUISITION_CANDIDATE_NOT_FOUND')
     if (candidate.candidateId !== candidateId) throw new UpdatePipelineError('ACQUISITION_CANDIDATE_INVALID')
-    if (Date.parse(candidate.expiresAt) <= this.#now().getTime()) {
+    if (requireFresh && Date.parse(candidate.expiresAt) <= this.#now().getTime()) {
       throw new UpdatePipelineError('ACQUISITION_CANDIDATE_EXPIRED')
     }
+    await this.#assertAuthorized(candidate)
     return candidate
+  }
+
+  async #assertAuthorized(candidate: StoredArtifactCandidate): Promise<void> {
+    if (this.#authorizeCandidate === undefined) {
+      if (candidate.artifact.trustedPolicyRevision !== undefined) {
+        throw new UpdatePipelineError('ACQUISITION_AUTHORITY_REQUIRED')
+      }
+      return
+    }
+    // Never expose a mutable candidate (or its download URL) to the authority adapter.
+    if (await this.#authorizeCandidate(structuredClone(descriptor(candidate))) !== true) {
+      throw new UpdatePipelineError('ACQUISITION_AUTHORITY_REJECTED')
+    }
   }
 
   async #download(
@@ -635,7 +685,9 @@ function descriptor(candidate: StoredArtifactCandidate): ArtifactCandidateDescri
       fileName: candidate.artifact.fileName,
       sizeBytes: candidate.artifact.sizeBytes,
       sha256: candidate.artifact.sha256,
-      integrity: candidate.artifact.integrity
+      integrity: candidate.artifact.integrity,
+      ...(candidate.artifact.trustedPolicyRevision === undefined ? {} :
+        { trustedPolicyRevision: candidate.artifact.trustedPolicyRevision })
     },
     expiresAt: candidate.expiresAt
   }

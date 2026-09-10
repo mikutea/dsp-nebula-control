@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
+import type { TrustedModArtifactPolicy } from './trusted-mod-artifacts.js'
 import {
   formatThunderstoreDependency,
   parseThunderstoreDependency,
@@ -22,6 +23,7 @@ export interface DiscoveredArtifact {
   sizeBytes: number | null
   sha256: string | null
   integrity: ArtifactIntegrity
+  trustedPolicyRevision?: string
 }
 
 export interface DiscoveredModRelease {
@@ -81,8 +83,13 @@ export const discoveredArtifactSchema: z.ZodType<DiscoveredArtifact> = z.strictO
   fileName: safeFileNameSchema,
   sizeBytes: positiveSizeSchema.nullable(),
   sha256: sha256Schema.nullable(),
-  integrity: z.enum(['provider-sha256', 'locally-computed-required'])
+  integrity: z.enum(['provider-sha256', 'locally-computed-required']),
+  trustedPolicyRevision: sha256Schema.optional()
 }).superRefine((value, context) => {
+  if (value.trustedPolicyRevision !== undefined && (value.integrity !== 'locally-computed-required' ||
+      value.sha256 === null || value.sizeBytes === null)) {
+    context.addIssue({ code: 'custom', message: 'Reviewed artifact requires a local digest and size' })
+  }
   if (value.integrity === 'provider-sha256' && (value.sha256 === null || value.sizeBytes === null)) {
     context.addIssue({ code: 'custom', message: 'provider integrity requires a digest and size' })
   }
@@ -189,6 +196,8 @@ export interface DiscoveryClientOptions {
 }
 
 export interface ThunderstoreDiscoveryClientOptions extends DiscoveryClientOptions {
+  trustedModPolicy?: () => Promise<TrustedModArtifactPolicy | null>
+  now?: () => number
   maxDependencyNodes?: number
   maxDependencyDepth?: number
 }
@@ -202,6 +211,8 @@ export class ThunderstoreReleaseClient {
   readonly #http: BoundedJsonClient
   readonly #maxDependencyNodes: number
   readonly #maxDependencyDepth: number
+  readonly #trustedModPolicy: ThunderstoreDiscoveryClientOptions['trustedModPolicy']
+  readonly #now: () => number
 
   constructor(options: ThunderstoreDiscoveryClientOptions) {
     const config = thunderstoreClientConfigSchema.parse({
@@ -215,12 +226,14 @@ export class ThunderstoreReleaseClient {
     })
     this.#maxDependencyNodes = config.maxDependencyNodes
     this.#maxDependencyDepth = config.maxDependencyDepth
+    this.#trustedModPolicy = options.trustedModPolicy
+    this.#now = options.now ?? Date.now
   }
 
   async discoverLatest(input: unknown, signal?: AbortSignal): Promise<DiscoveredModRelease> {
     const request = thunderstoreRequestSchema.parse(input)
     const parsed = await this.#getPackage(request.namespace, request.name, signal)
-    return createThunderstoreRelease(parsed, parsed.latest, request.community)
+    return createThunderstoreRelease(parsed, parsed.latest, request.community, await this.#trustedModPolicy?.(), this.#now())
   }
 
   async discoverExact(input: unknown, signal?: AbortSignal): Promise<DiscoveredModRelease> {
@@ -306,7 +319,7 @@ export class ThunderstoreReleaseClient {
       this.#getPackage(identity.namespace, identity.name, signal),
       this.#getVersion(identity.namespace, identity.name, identity.version, signal)
     ])
-    return createThunderstoreRelease(pkg, version, community)
+    return createThunderstoreRelease(pkg, version, community, await this.#trustedModPolicy?.(), this.#now())
   }
 
   async #getPackage(namespace: string, name: string, signal?: AbortSignal) {
@@ -343,7 +356,9 @@ export class ThunderstoreReleaseClient {
 function createThunderstoreRelease(
   pkg: z.infer<typeof thunderstorePackageSchema>,
   version: z.infer<typeof thunderstoreVersionSchema>,
-  community: 'dyson-sphere-program'
+  community: 'dyson-sphere-program',
+  policy?: TrustedModArtifactPolicy | null,
+  now = Date.now()
 ): DiscoveredModRelease {
   if (version.namespace !== pkg.namespace || version.name !== pkg.name) {
     throw new UpdatePipelineError('THUNDERSTORE_IDENTITY_MISMATCH')
@@ -371,18 +386,24 @@ function createThunderstoreRelease(
   const communityApproved = pkg.community_listings.some((listing) =>
     listing.community === community && listing.review_status === 'approved'
   )
+  const listings = pkg.community_listings.filter(listing => listing.community === community)
+  const pin = listings.length === 1 ? policy?.resolve({
+    dependencyId: identity.dependencyId, dependencies, community,
+    reviewStatus: listings[0]!.review_status, deprecated: pkg.is_deprecated, active: version.is_active
+  }, now) : null
   const blockers: DiscoveredModRelease['blockers'] = []
   if (pkg.is_deprecated) blockers.push('package-deprecated')
   if (!version.is_active) blockers.push('version-inactive')
-  if (!communityApproved) blockers.push('community-not-approved')
+  if (!communityApproved && !pin) blockers.push('community-not-approved')
   blockers.push('artifact-integrity-pending')
   const artifact: DiscoveredArtifact = {
     artifactId: artifactIdFor(identity.sourceId, identity.version, 'package.zip'),
     downloadUrl,
     fileName: `${identity.namespace}-${identity.name}-${identity.version}.zip`,
-    sizeBytes: null,
-    sha256: null,
-    integrity: 'locally-computed-required'
+    sizeBytes: pin?.sizeBytes ?? null,
+    sha256: pin?.sha256 ?? null,
+    integrity: 'locally-computed-required',
+    ...(pin ? { trustedPolicyRevision: policy!.revision } : {})
   }
   return discoveredModReleaseSchema.parse({
     provider: 'thunderstore',
