@@ -1,6 +1,6 @@
 {
   "name": "dsp-nebula-control",
-  "version": "0.1.0-rc.22",
+  "version": "0.1.0-rc.23",
   "private": true,
   "description": "A safety-first control plane for Dyson Sphere Program and Nebula multiplayer servers.",
   "license": "GPL-3.0-only",

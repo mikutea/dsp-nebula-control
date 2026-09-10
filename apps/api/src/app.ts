@@ -131,6 +131,7 @@ import {
 import { GameConfigValidationError } from './game-config/catalog.js'
 import {
   GameConfigTransactionService,
+  GameConfigTransactionError,
   type GameConfigTransactionResult
 } from './game-config/transaction.js'
 import { GameConfigHistoryService } from './game-config/history.js'
@@ -287,7 +288,12 @@ const configurationPreviewSchema = z.strictObject({
     value: z.union([z.boolean(), z.number(), z.string().max(128)])
   })).min(1).max(32)
 })
-const configurationApplySchema = configurationPreviewSchema.extend({ confirmation: z.literal('APPLY_CONFIG') }).strict()
+const configurationApplySchema = configurationPreviewSchema.extend({
+  confirmation: z.literal('APPLY_CONFIG'), requestId: z.string().uuid().optional()
+}).strict()
+const configurationReconcileSchema = z.strictObject({
+  requestId: z.string().uuid(), confirmation: z.literal('RECONCILE_CONFIG')
+})
 const emptyObjectSchema = z.strictObject({})
 const qualifiedClientDownloadParamsSchema = z.strictObject({
   downloadId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
@@ -834,7 +840,8 @@ export async function buildApplication(
           service: new GameConfigHistoryService({
             configRoot: workspacePaths.configRoot,
             validateStopProof: gameConfigHistoryStopProof?.validate ?? (async () => false),
-            hostMutationCoordinator
+            hostMutationCoordinator,
+            hostMutationRecoveryCoordinator
           }),
           mutationGate: () => config.configHistoryMutationsEnabled,
           stopProofTokenProvider: gameConfigHistoryStopProof?.issue ?? (async () => {
@@ -876,7 +883,7 @@ export async function buildApplication(
       : null
   )
   const saveJobs = saveTransactions
-    ? new SaveJobService(database, saveTransactions, events, { hostMutationCoordinator })
+    ? new SaveJobService(database, saveTransactions, events, { hostMutationCoordinator, hostMutationRecoveryCoordinator })
     : null
   if (saveJobs && config.saveMutationsEnabled) saveJobs.initialize()
   let ownedCutoverStore: SqliteCutoverDurableStore | null = null
@@ -2012,7 +2019,11 @@ export async function buildApplication(
     if (!workspacePaths) return workspaceUnavailable(reply)
     try {
       const files = await readGameConfigurationFiles(workspacePaths.configRoot)
-      return { data: inspectGameConfiguration(files) }
+      return { data: { ...inspectGameConfiguration(files), execution: {
+        enabled: config.configMutationsEnabled && Boolean(hostMutationCoordinator && lifecycleBrokerClient && gameConfigTransactions),
+        recoveryEnabled: config.configMutationsEnabled && Boolean(hostMutationRecoveryCoordinator && lifecycleBrokerClient && gameConfigTransactions),
+        requiresStopped: true
+      } } }
     } catch {
       return reply.code(503).send({
         error: { code: 'CONFIGURATION_UNAVAILABLE', message: '游戏配置暂不可用' }
@@ -2050,15 +2061,55 @@ export async function buildApplication(
 
   app.post('/api/v1/configuration/apply', protectedRoute('configuration.apply'), async (request, reply) => {
     if (!workspacePaths || !gameConfigTransactions) return workspaceUnavailable(reply)
+    if (!config.configMutationsEnabled) {
+      return reply.code(423).send({ error: { code: 'CONFIG_MUTATIONS_DISABLED', message: '配置提交执行开关尚未开启' } })
+    }
+    if (!hostMutationCoordinator) {
+      return reply.code(503).send({ error: { code: 'CONFIG_HOST_LEASE_UNAVAILABLE', message: '配置提交缺少共享变更锁' } })
+    }
     const parsed = configurationApplySchema.safeParse(request.body)
     if (!parsed.success) {
       return reply.code(400).send({ error: { code: 'INVALID_CONFIGURATION_APPLY', message: '配置提交请求无效' } })
     }
     try {
-      const files = await readGameConfigurationFiles(workspacePaths.configRoot)
-      const plan = planGameConfiguration(files, parsed.data.expectedRevision, parsed.data.changes)
-      return configTransactionReply(reply, await gameConfigTransactions.apply(plan))
+      const transactionId = parsed.data.requestId ?? randomUUID()
+      const requestBindingSha256 = createHash('sha256').update(JSON.stringify({
+        expectedRevision: parsed.data.expectedRevision,
+        changes: [...parsed.data.changes].sort((left, right) => left.id.localeCompare(right.id))
+      }), 'utf8').digest('hex')
+      const result = await hostMutationCoordinator.runExclusive(
+        { operation: 'game-config-apply', requestId: transactionId },
+        async scope => {
+          let enteredMutation = false
+          try {
+            scope.assertActive()
+            const completed = await gameConfigTransactions.readCompleted(transactionId, requestBindingSha256)
+            scope.assertActive()
+            if (completed) return hostMutationReturn(completed)
+            await verifyStoppedRuntime(scope.signal)
+            scope.assertActive()
+            const files = await readGameConfigurationFiles(workspacePaths.configRoot)
+            const plan = planGameConfiguration(files, parsed.data.expectedRevision, parsed.data.changes)
+            enteredMutation = true
+            const applied = await gameConfigTransactions.apply(plan, {
+              transactionId,
+              requestBindingSha256,
+              assertMutationActive: () => scope.assertActive(),
+              verifyStopped: async () => { await verifyStoppedRuntime(scope.signal) }
+            })
+            scope.assertActive()
+            return hostMutationReturn(applied,
+              applied.status === 'rollback-failed' || !applied.auditStored ? 'abandon' : 'release')
+          } catch (error) {
+            return hostMutationThrow<GameConfigTransactionResult>(error, enteredMutation ? 'abandon' : 'release')
+          }
+        }
+      )
+      return configTransactionReply(reply, result)
     } catch (error) {
+      if (error instanceof GameConfigTransactionError && error.code === 'CONFIG_IDEMPOTENCY_CONFLICT') {
+        return reply.code(409).send({ error: { code: error.code, message: '该请求编号已用于不同的配置提交' } })
+      }
       if (error instanceof GameConfigPlanError && error.code === 'CONFIG_REVISION_CONFLICT') {
         return reply.code(409).send({
           error: { code: error.code, message: '配置已发生变化，请刷新后重新预览' }
@@ -2072,6 +2123,47 @@ export async function buildApplication(
       return reply.code(503).send({
         error: { code: 'CONFIGURATION_APPLY_UNAVAILABLE', message: '配置提交暂不可用' }
       })
+    }
+  })
+
+  app.post('/api/v1/configuration/reconcile', protectedRoute('configuration.apply'), async (request, reply) => {
+    if (!workspacePaths || !gameConfigTransactions) return workspaceUnavailable(reply)
+    if (!config.configMutationsEnabled) {
+      return reply.code(423).send({ error: { code: 'CONFIG_MUTATIONS_DISABLED', message: '配置提交执行开关尚未开启' } })
+    }
+    if (!hostMutationRecoveryCoordinator) {
+      return reply.code(503).send({ error: { code: 'CONFIG_HOST_LEASE_UNAVAILABLE', message: '配置恢复缺少共享恢复锁' } })
+    }
+    const parsed = configurationReconcileSchema.safeParse(request.body)
+    if (!parsed.success) {
+      return reply.code(400).send({ error: { code: 'INVALID_CONFIGURATION_RECONCILE', message: '配置恢复请求无效' } })
+    }
+    let enteredRecovery = false
+    try {
+      const result = await hostMutationRecoveryCoordinator.runRecoveryExclusive({
+        expectedOperation: 'game-config-apply', expectedRequestId: parsed.data.requestId
+      }, async scope => {
+        enteredRecovery = true
+        try {
+          const value = await gameConfigTransactions.reconcile(parsed.data.requestId,
+            { signal: scope.signal, assertActive: () => scope.assertActive(),
+              toPowerShellBorrowArguments: () => scope.toPowerShellBorrowArguments(), recoveryRequestId: parsed.data.requestId },
+            async () => { await verifyStoppedRuntime(scope.signal) })
+          scope.assertActive()
+          return hostMutationReturn(value)
+        } catch (error) {
+          return hostMutationThrow<GameConfigTransactionResult>(error, 'abandon')
+        }
+      })
+      return reply.code(200).send({ data: result })
+    } catch (error) {
+      if (!enteredRecovery && error instanceof HostMutationOperationCoordinatorError &&
+          error.code === 'HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED') {
+        // No recovery authority: permit only a read-only completed receipt.
+        const terminal = await gameConfigTransactions.readCompleted(parsed.data.requestId).catch(() => null)
+        if (terminal) return reply.code(200).send({ data: terminal })
+      }
+      return reply.code(503).send({ error: { code: 'CONFIGURATION_RECONCILE_UNAVAILABLE', message: '配置恢复未完成，请核对事务与运行状态' } })
     }
   })
 

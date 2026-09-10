@@ -989,7 +989,7 @@ td { color: #bac8d4; }
 .update-request-panel > footer, .update-compatibility-panel > footer, .update-cleanup-panel > footer { min-height: 35px; display: flex; align-items: center; gap: 7px; border-top: 1px solid var(--border-soft); padding: 7px 10px; color: var(--muted); background: rgba(3,23,34,.52); font-size: 8px; line-height: 1.45; }
 .update-request-panel > footer svg, .update-cleanup-panel > footer svg { flex: 0 0 auto; color: var(--cyan); }
 
-.update-compatibility-panel { margin: 0 13px 10px; }
+.update-compatibility-panel { margin: 0 13px 10px; container-type: inline-size; }
 .update-compatibility-panel > header > div span { display: grid; gap: 3px; }
 .update-compatibility-panel > header small { color: var(--muted); font-size: 8px; }
 .update-compatibility-panel > header b { border: 1px solid rgba(17,215,255,.28); padding: 5px 7px; color: var(--cyan); background: rgba(6,56,74,.22); }
@@ -1006,6 +1006,10 @@ td { color: #bac8d4; }
 .update-compatibility-grid span, .update-compatibility-grid small { overflow: hidden; color: var(--muted-2); font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
 .update-compatibility-grid strong { overflow: hidden; color: #cfE7ef; font: 600 10px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .compatibility-control-deck { display: grid; grid-template-columns: minmax(230px,1.2fr) minmax(220px,.9fr) auto minmax(220px,.9fr) auto; align-items: stretch; gap: 7px; border-top: 1px solid rgba(31,82,104,.42); padding: 8px 9px; background: linear-gradient(90deg, rgba(4,31,45,.78), rgba(2,19,29,.88)); }
+@container (max-width: 950px) {
+  .compatibility-control-deck { grid-template-columns: minmax(0,1fr) auto; }
+  .compatibility-state-callout { grid-column: 1 / -1; }
+}
 .compatibility-state-callout { min-width: 0; display: flex; align-items: center; gap: 8px; border: 1px solid rgba(31,82,104,.48); padding: 7px 9px; background: rgba(3,24,36,.74); clip-path: polygon(0 6px, 6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%); }
 .compatibility-state-callout svg { flex: 0 0 auto; color: var(--cyan); }
 .compatibility-state-callout span { min-width: 0; display: grid; gap: 3px; }

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import type {
@@ -185,13 +186,19 @@ export class PowerShellLifecycleRunner implements
         ...invocation
       ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
       let stdout = ''
+      const stdoutDecoder = new StringDecoder('utf8')
       let outputBytes = 0
       let terminalCode: string | null = null
       let settled = false
 
       const failAndStop = (code: string) => {
+        if (settled) return
         if (!terminalCode) terminalCode = code
         child.kill()
+        settled = true
+        clearTimeout(timer)
+        signal.removeEventListener('abort', onAbort)
+        reject(new PowerShellRunnerError(terminalCode))
       }
       const onAbort = () => failAndStop('HOST_SCRIPT_ABORTED')
       signal.addEventListener('abort', onAbort, { once: true })
@@ -199,13 +206,14 @@ export class PowerShellLifecycleRunner implements
       if (signal.aborted) failAndStop('HOST_SCRIPT_ABORTED')
 
       const collect = (chunk: Buffer | string, keep: boolean) => {
-        const text = String(chunk)
-        outputBytes += Buffer.byteLength(text, 'utf8')
+        if (settled) return
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8')
+        outputBytes += bytes.byteLength
         if (outputBytes > this.#maximumOutputBytes) {
           failAndStop('HOST_OUTPUT_LIMIT_EXCEEDED')
           return
         }
-        if (keep) stdout += text
+        if (keep) stdout += stdoutDecoder.write(bytes)
       }
       child.stdout.on('data', (chunk: Buffer | string) => collect(chunk, true))
       child.stderr.on('data', (chunk: Buffer | string) => collect(chunk, false))
@@ -216,14 +224,14 @@ export class PowerShellLifecycleRunner implements
         signal.removeEventListener('abort', onAbort)
         reject(new PowerShellRunnerError(terminalCode ?? 'HOST_SCRIPT_START_FAILED'))
       })
-      child.once('exit', (code) => {
+      child.once('close', (code) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
         signal.removeEventListener('abort', onAbort)
         if (terminalCode) reject(new PowerShellRunnerError(terminalCode))
         else if (code !== 0) reject(new PowerShellRunnerError('HOST_SCRIPT_FAILED'))
-        else resolve(stdout.trim())
+        else resolve((stdout + stdoutDecoder.end()).trim())
       })
     })
   }

@@ -5,6 +5,8 @@ import {
   hostMutationReturn,
   type HostMutationDisposition,
   type HostMutationOperationCoordinator,
+  type HostMutationRecoveryOperationCoordinator,
+  type HostMutationOperationOutcome,
   type HostMutationOperationScope
 } from '../host-mutation/operation-coordinator.js'
 import {
@@ -84,6 +86,7 @@ export interface SaveTransactionExecutor {
 
 export interface SaveJobServiceOptions {
   hostMutationCoordinator?: HostMutationOperationCoordinator
+  hostMutationRecoveryCoordinator?: HostMutationRecoveryOperationCoordinator
   /** Bounded in-process retries; an exhausted job remains durably queued for restart. */
   hostLeaseBusyRetryLimit?: number
   hostLeaseBusyRetryDelayMs?: number
@@ -114,6 +117,7 @@ export class SaveJobService {
   readonly #executor: SaveTransactionExecutor | Pick<SaveTransactionService, 'backup' | 'restore'>
   readonly #events: EventHub
   readonly #hostMutationCoordinator: HostMutationOperationCoordinator | null
+  readonly #hostMutationRecoveryCoordinator: HostMutationRecoveryOperationCoordinator | null
   readonly #hostLeaseBusyRetryLimit: number
   readonly #hostLeaseBusyRetryDelayMs: number
   readonly #wait: (milliseconds: number) => Promise<void>
@@ -147,6 +151,11 @@ export class SaveJobService {
     this.#executor = executor
     this.#events = events
     this.#hostMutationCoordinator = options.hostMutationCoordinator ?? null
+    if (options.hostMutationRecoveryCoordinator !== undefined &&
+        typeof options.hostMutationRecoveryCoordinator.runRecoveryExclusive !== 'function') {
+      throw new SaveJobServiceError('SAVE_JOB_REQUEST_INVALID')
+    }
+    this.#hostMutationRecoveryCoordinator = options.hostMutationRecoveryCoordinator ?? null
     this.#hostLeaseBusyRetryLimit = options.hostLeaseBusyRetryLimit ?? 3
     this.#hostLeaseBusyRetryDelayMs = options.hostLeaseBusyRetryDelayMs ?? 250
     this.#wait = options.wait ?? (async (milliseconds) => {
@@ -363,8 +372,8 @@ export class SaveJobService {
     if (coordinator === null) return 'done'
     let outcome: LeasedRestoreOutcome
     try {
-      outcome = await coordinator.runExclusive(
-        { operation: 'save-restore', requestId: run.idempotencyKey },
+      outcome = await this.#withRestoreLease(
+        run.idempotencyKey, reconciling,
         async (scope) => {
           const current = this.#database.getSaveRun(run.jobId)
           if (!current || current.state !== 'queued') {
@@ -389,7 +398,7 @@ export class SaveJobService {
               expectedRevision: required(current.expectedRevision),
               protectionRequestId: required(current.protectionRequestId),
               dryRun: false
-            }, transactionScope(scope))
+            }, transactionScope(scope, reconciling ? current.idempotencyKey : undefined))
           } catch (error) {
             if (error instanceof SaveRestoreMutationScopeLostError) {
               throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
@@ -466,6 +475,29 @@ export class SaveJobService {
     }
     this.#completeFromResult(run, reconciling, outcome.result)
     return 'done'
+  }
+
+  async #withRestoreLease(
+    requestId: string,
+    reconciling: boolean,
+    operation: (scope: HostMutationOperationScope) => Promise<HostMutationOperationOutcome<LeasedRestoreOutcome>>
+  ): Promise<LeasedRestoreOutcome> {
+    const coordinator = this.#hostMutationCoordinator!
+    if (reconciling && this.#hostMutationRecoveryCoordinator !== null) {
+      let entered = false
+      try {
+        return await this.#hostMutationRecoveryCoordinator.runRecoveryExclusive(
+          { expectedOperation: 'save-restore', expectedRequestId: requestId },
+          async scope => { entered = true; return await operation(scope) }
+        )
+      } catch (error) {
+        // A clean host lease needs no recovery capability. Fall back only if
+        // the coordinator refused before entering any domain operation.
+        if (entered || !(error instanceof HostMutationOperationCoordinatorError) ||
+            error.code !== 'HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED') throw error
+      }
+    }
+    return await coordinator.runExclusive({ operation: 'save-restore', requestId }, operation)
   }
 
   #completeFromResult(
@@ -663,9 +695,10 @@ function parseAndBindResult(
   }
 }
 
-function transactionScope(scope: HostMutationOperationScope): SaveRestoreMutationScope {
+function transactionScope(scope: HostMutationOperationScope, recoveryRequestId?: string): SaveRestoreMutationScope {
   return {
     signal: scope.signal,
+    ...(recoveryRequestId === undefined ? {} : { recoveryRequestId }),
     assertActive: () => {
       try {
         scope.assertActive()

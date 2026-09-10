@@ -11,6 +11,7 @@ import {
   unlink
 } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
+import { acquireCacheMutex, CacheMutexError, type CacheMutex } from './cache-mutex.js'
 import path from 'node:path'
 import { z } from 'zod'
 import {
@@ -267,10 +268,7 @@ interface MeasuredArtifact {
   sha256: string
 }
 
-interface AcquiredLock {
-  handle: FileHandle
-  path: string
-}
+type AcquiredLock = CacheMutex
 
 /**
  * Converts an already-acquired, provider-bound component candidate into the
@@ -811,18 +809,15 @@ async function atomicWriteJson(file: string, value: unknown): Promise<void> {
 
 async function acquireLock(lockPath: string, code: string): Promise<AcquiredLock> {
   try {
-    const handle = await open(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
-    await handle.writeFile(`${process.pid}\n`, 'utf8')
-    return { handle, path: lockPath }
+    return await acquireCacheMutex(lockPath)
   } catch (error) {
-    if (isNodeError(error, 'EEXIST')) throw new UpdatePipelineError(code, { cause: error })
+    if (error instanceof CacheMutexError && error.code === 'CACHE_MUTEX_BUSY') throw new UpdatePipelineError(code, { cause: error })
     throw new UpdatePipelineError('CANDIDATE_PREPARATION_LOCK_FAILED', { cause: error })
   }
 }
 
 async function releaseLock(lock: AcquiredLock): Promise<void> {
-  await lock.handle.close().catch(() => undefined)
-  await unlink(lock.path).catch(() => undefined)
+  try { await lock.release() } catch (error) { throw new UpdatePipelineError('CANDIDATE_PREPARATION_LOCK_FAILED', { cause: error }) }
 }
 
 async function assertNormalDirectory(directory: string): Promise<void> {

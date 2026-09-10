@@ -15,6 +15,7 @@ import {
 import { hostname } from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
+import { removeVerifiedResidualFileLock } from '../host-mutation/residual-file-lock.js'
 import { resolveNormalDirectory, safeImmediateChild } from './boundary.js'
 import { planBackupRetention } from './retention.js'
 import {
@@ -71,6 +72,7 @@ const runtimeStoppedEvidenceSchema = z.strictObject({
 })
 const restoreReceiptSchema = z.strictObject({
   schemaVersion: z.literal(schemaVersion),
+  outcome: z.literal('rolled-back').optional(),
   requestId: requestIdSchema,
   backupId: backupIdSchema,
   protectionBackupId: backupIdSchema,
@@ -79,6 +81,10 @@ const restoreReceiptSchema = z.strictObject({
   afterRevision: pairRevisionSchema,
   pairBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   completedAt: z.string().datetime({ offset: true })
+}).superRefine((receipt, context) => {
+  if (receipt.outcome === 'rolled-back' && receipt.afterRevision !== receipt.beforeRevision) {
+    context.addIssue({ code: 'custom', message: 'Rollback receipt must retain the protected revision' })
+  }
 })
 const transactionLeaseSchema = z.strictObject({
   format: z.literal('dyson-control-save-transaction-lease'),
@@ -88,7 +94,11 @@ const transactionLeaseSchema = z.strictObject({
   pid: z.number().int().positive(),
   instanceId: z.string().uuid(),
   requestId: requestIdSchema,
-  acquiredAt: z.string().datetime({ offset: true })
+  acquiredAt: z.string().datetime({ offset: true }),
+  identity: z.strictObject({
+    device: z.string().regex(/^[0-9]+$/), inode: z.string().regex(/^[1-9][0-9]*$/)
+  }).optional(),
+  requestBindingSha256: z.string().regex(sha256Pattern).optional()
 })
 const restoreJournalPhaseSchema = z.enum([
   'prepared',
@@ -246,6 +256,8 @@ export interface RestoreSavePairRequest {
 export interface SaveRestoreMutationScope {
   readonly signal: AbortSignal
   assertActive(): void
+  /** Set only by trusted restart reconciliation while it holds the host lease. */
+  readonly recoveryRequestId?: string
 }
 
 /** Stable boundary marker used to keep lease loss distinct from domain failures. */
@@ -562,6 +574,7 @@ export class SaveTransactionService {
     mutationScope?: SaveRestoreMutationScope
   ): Promise<SaveTransactionResult> {
     const request = parseRestoreRequest(input)
+    const requestBindingSha256 = restoreRequestBinding(request)
     const protectionBackupId = `tx-${request.protectionRequestId}`
     const startedAt = this.#now().toISOString()
     const readOnlyReplay = await probeCommittedRestoreReceipt(
@@ -598,12 +611,12 @@ export class SaveTransactionService {
       return makeResult({
         requestId: request.requestId,
         operation: 'restore',
-        status: 'succeeded',
+        status: receipt.outcome ?? 'succeeded',
         dryRun: false,
         backupId: receipt.backupId,
         protectionBackupId: receipt.protectionBackupId,
         reused: true,
-        rollback: 'not-required',
+        rollback: receipt.outcome === 'rolled-back' ? 'succeeded' : 'not-required',
         pairBytes: receipt.pairBytes,
         startedAt,
         finishedAt: this.#now().toISOString(),
@@ -622,7 +635,11 @@ export class SaveTransactionService {
     try {
       roots = await prepareRoots(this.#configuredSaveRoot, this.#configuredBackupRoot)
       roots.journalHook = this.#phase.bind(this)
-      lock = await acquireExclusiveLock(roots, request.requestId, startedAt)
+      lock = await acquireExclusiveLock(roots, request.requestId, startedAt, requestBindingSha256)
+      if (lock === null && !request.dryRun && mutationScope !== undefined &&
+          await this.#recoverResidualRestoreLock(roots, request, mutationScope)) {
+        lock = await acquireExclusiveLock(roots, request.requestId, startedAt, requestBindingSha256)
+      }
       if (lock === null) {
         return makeResult({
           requestId: request.requestId,
@@ -657,12 +674,12 @@ export class SaveTransactionService {
           return await this.#finish(roots, {
             requestId: request.requestId,
             operation: 'restore',
-            status: 'succeeded',
+            status: receipt.outcome ?? 'succeeded',
             dryRun: false,
             backupId: receipt.backupId,
             protectionBackupId: receipt.protectionBackupId,
             reused: true,
-            rollback: 'not-required',
+            rollback: receipt.outcome === 'rolled-back' ? 'succeeded' : 'not-required',
             pairBytes: receipt.pairBytes,
             cleanupPending: true,
             maintenanceRequired: true,
@@ -725,12 +742,12 @@ export class SaveTransactionService {
         return await this.#finish(roots, {
           requestId: request.requestId,
           operation: 'restore',
-          status: 'succeeded',
+          status: receipt.outcome ?? 'succeeded',
           dryRun: false,
           backupId: receipt.backupId,
           protectionBackupId: receipt.protectionBackupId,
           reused: true,
-          rollback: 'not-required',
+          rollback: receipt.outcome === 'rolled-back' ? 'succeeded' : 'not-required',
           pairBytes: receipt.pairBytes,
           startedAt,
           beforeRevision: receipt.beforeRevision,
@@ -1193,6 +1210,60 @@ export class SaveTransactionService {
     return makePairEvidence(saveName, dsv, server)
   }
 
+  async #recoverResidualRestoreLock(
+    roots: PreparedRoots,
+    request: z.infer<typeof restoreRequestSchema>,
+    scope: SaveRestoreMutationScope
+  ): Promise<boolean> {
+    if (scope.recoveryRequestId !== request.requestId || inProcessLocks.has(roots.key)) return false
+    assertRestoreMutationScopeActive(scope)
+    const lease = await readTransactionLease(roots.lockPath)
+    // Legacy leases remain readable, but lack the file identity necessary for
+    // automatic recovery. Never infer ownership from age or PID alone.
+    if (!lease.identity || lease.requestId !== request.requestId || lease.host !== hostname() ||
+        lease.requestBindingSha256 !== restoreRequestBinding(request) ||
+        processMayBeAlive(lease.pid)) return false
+    const unresolved = await inspectUnresolvedRestoreJournals(roots, this.#readStablePair.bind(this))
+    const journal = unresolved.journal
+    if (unresolved.blocked || unresolved.maintenanceRequired) return false
+    if (journal !== null) {
+      if (journal.requestId !== request.requestId || journal.backupId !== request.backupId ||
+          journal.protectionBackupId !== `tx-${request.protectionRequestId}` ||
+          journal.beforeRevision !== request.expectedRevision) return false
+    } else {
+      // Before journal publication, no live restore artifact may exist. The
+      // persisted lock binds the entire request, and the live pair must still
+      // equal the caller's protected preimage before the operation can restart.
+      await assertInitialRestoreArtifactsAbsent(roots.saveRoot, request.requestId)
+      const source = await readTrustedBackup(roots.backupRoot, request.backupId, this.#readStablePair.bind(this))
+      const current = await this.#readStablePair(roots.saveRoot, source.manifest.saveName)
+      if (current.revision !== request.expectedRevision) return false
+      const protection = await readExistingBackup(roots.backupRoot, `tx-${request.protectionRequestId}`,
+        this.#readStablePair.bind(this))
+      if (protection !== null && (protection.pair.revision !== current.revision ||
+          protection.manifest.saveName !== source.manifest.saveName)) return false
+    }
+    await this.#assertServiceStopped(scope)
+    const bytes = await readFile(roots.lockPath)
+    await removeVerifiedResidualFileLock({
+      lockPath: roots.lockPath,
+      expectedSha256: createHash('sha256').update(bytes).digest('hex'),
+      scope,
+      authorize: async evidence => {
+        const current = transactionLeaseSchema.parse(JSON.parse(evidence.bytes.toString('utf8')))
+        if (current.instanceId !== lease.instanceId || current.requestId !== request.requestId ||
+            current.requestBindingSha256 !== restoreRequestBinding(request) ||
+            current.host !== hostname() || processMayBeAlive(current.pid) ||
+            current.identity?.device !== evidence.device || current.identity?.inode !== evidence.inode ||
+            lease.identity!.device !== evidence.device || lease.identity!.inode !== evidence.inode) {
+          throw new SaveTransactionError('SAVE_TRANSACTION_BUSY')
+        }
+        assertRestoreMutationScopeActive(scope)
+      }
+    })
+    return true
+  }
+
   async #assertServiceStopped(
     mutationScope?: SaveRestoreMutationScope
   ): Promise<RuntimeStoppedEvidence> {
@@ -1260,6 +1331,15 @@ export class SaveTransactionService {
         ? { errorCode: 'SAVE_COMMIT_CLEANUP_PENDING' as const }
         : {})
     }, minimumAuditIndex)
+    if (input.status === 'rolled-back' && await readRestoreReceipt(roots, journal.requestId) === null) {
+      await writeRestoreReceipt(roots, {
+        schemaVersion, outcome: 'rolled-back', requestId: journal.requestId,
+        backupId: journal.backupId, protectionBackupId: journal.protectionBackupId,
+        saveName: journal.saveName, beforeRevision: journal.beforeRevision,
+        afterRevision: journal.beforeRevision, pairBytes: input.pairBytes,
+        completedAt: this.#now().toISOString()
+      })
+    }
     if (cleanup.state !== 'complete') return finishPending(1)
 
     const completed = await this.#finish(roots, {
@@ -1336,9 +1416,10 @@ export class SaveTransactionService {
     const stage = restoreStagePaths(roots.saveRoot, request.requestId)
     const rollbackPaths = restoreRollbackPaths(roots.saveRoot, request.requestId)
     if (receipt !== null) {
+      const rolledBack = receipt.outcome === 'rolled-back'
       if (receipt.backupId !== journal.backupId || receipt.protectionBackupId !== journal.protectionBackupId ||
           receipt.saveName !== journal.saveName || receipt.beforeRevision !== journal.beforeRevision ||
-          receipt.afterRevision !== journal.afterRevision) {
+          receipt.afterRevision !== (rolledBack ? journal.beforeRevision : journal.afterRevision)) {
         throw new SaveTransactionError('SAVE_IDEMPOTENCY_CONFLICT')
       }
       let cleanup: RestoreArtifactCleanupResult = { state: 'pending' }
@@ -1353,12 +1434,13 @@ export class SaveTransactionService {
           protectionBackupId,
           this.#readStablePair.bind(this)
         )
-        if (source.manifest.saveName !== journal.saveName || source.pair.revision !== receipt.afterRevision ||
-            source.pair.totalBytes !== receipt.pairBytes ||
+        const terminalPair = rolledBack ? protection.pair : source.pair
+        if (source.manifest.saveName !== journal.saveName || terminalPair.revision !== receipt.afterRevision ||
+            terminalPair.totalBytes !== receipt.pairBytes ||
             protection.manifest.saveName !== journal.saveName || protection.pair.revision !== receipt.beforeRevision) {
           throw new SaveTransactionError('SAVE_BACKUP_CORRUPT')
         }
-        journal = await forceRestoreJournalPhase(roots, journal, 'gc-pending', this.#now())
+        journal = await forceRestoreJournalPhase(roots, journal, rolledBack ? 'rolled-back' : 'gc-pending', this.#now())
           .catch(() => journal)
         cleanup = await this.#quarantineAndDeleteRestoreArtifacts(
           roots.saveRoot,
@@ -1367,7 +1449,7 @@ export class SaveTransactionService {
           rollbackPaths,
           protection.pair,
           source.pair,
-          'committed'
+          rolledBack ? 'rolled-back' : 'committed'
         )
       } catch {
         cleanup = { state: 'pending' }
@@ -1375,12 +1457,12 @@ export class SaveTransactionService {
       return await this.#finishJournaledRestore(roots, journal, {
         requestId: request.requestId,
         operation: 'restore',
-        status: 'succeeded',
+        status: rolledBack ? 'rolled-back' : 'succeeded',
         dryRun: false,
         backupId: request.backupId,
         protectionBackupId,
         reused: true,
-        rollback: 'not-required',
+        rollback: rolledBack ? 'succeeded' : 'not-required',
         pairBytes: receipt.pairBytes,
         startedAt,
         beforeRevision: receipt.beforeRevision,
@@ -1710,7 +1792,8 @@ async function ensureNormalChildDirectory(parent: string, name: string): Promise
 async function acquireExclusiveLock(
   roots: PreparedRoots,
   requestId: string,
-  startedAt: string
+  startedAt: string,
+  requestBindingSha256?: string
 ): Promise<AcquiredLock | null> {
   if (inProcessLocks.has(roots.key)) return null
   inProcessLocks.add(roots.key)
@@ -1733,7 +1816,11 @@ async function acquireExclusiveLock(
       pid: process.pid,
       instanceId,
       requestId,
-      acquiredAt: startedAt
+      acquiredAt: startedAt,
+      identity: await handle.stat({ bigint: true }).then(value => ({
+        device: value.dev.toString(), inode: value.ino.toString()
+      })),
+      ...(requestBindingSha256 === undefined ? {} : { requestBindingSha256 })
     })
     await handle.writeFile(`${JSON.stringify(lease)}\n`, 'utf8')
     await handle.sync()
@@ -1792,6 +1879,17 @@ async function readTransactionLease(lockPath: string): Promise<z.infer<typeof tr
   } catch {
     throw new SaveTransactionError('SAVE_TRANSACTION_STORAGE_UNAVAILABLE')
   }
+}
+
+function processMayBeAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true } catch (error) { return !hasCode(error, 'ESRCH') }
+}
+
+function restoreRequestBinding(request: z.infer<typeof restoreRequestSchema>): string {
+  return createHash('sha256').update(JSON.stringify({
+    operation: 'restore', requestId: request.requestId, backupId: request.backupId,
+    expectedRevision: request.expectedRevision, protectionRequestId: request.protectionRequestId
+  })).digest('hex')
 }
 
 async function readExistingBackup(
@@ -2761,7 +2859,7 @@ async function restoreJournalLayoutIsProvable(
         receipt.protectionBackupId === journal.protectionBackupId &&
         receipt.saveName === journal.saveName &&
         receipt.beforeRevision === journal.beforeRevision &&
-        receipt.afterRevision === journal.afterRevision
+        receipt.afterRevision === (receipt.outcome === 'rolled-back' ? journal.beforeRevision : journal.afterRevision)
     }
     if (journal.phase === 'recovery-required') return true
     const [source, protection] = await Promise.all([

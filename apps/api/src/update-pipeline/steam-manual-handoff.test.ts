@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { link, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { hostname, tmpdir, uptime } from 'node:os'
+import { spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type {
@@ -30,6 +31,33 @@ afterEach(async () => {
 })
 
 describe('official Steam client manual handoff transaction', () => {
+  it.each(['previous-boot', 'same-boot', 'live-owner', 'foreign-host', 'future-boot', 'malformed', 'hard-linked'] as const)(
+    'reclaims only a verified dead local lock: %s', async mode => {
+      const fixture = await createFixture()
+      const lockRoot = path.join(fixture.stateRoot, '.locks')
+      await mkdir(lockRoot, { recursive: true })
+      const lockPath = path.join(lockRoot, 'handoff.lock')
+      const child = spawnSync(process.execPath, ['-e', 'process.exit(0)'], { windowsHide: true, timeout: 10_000 })
+      expect(child.status).toBe(0)
+      const boot = Math.round((Date.now() - uptime() * 1_000) / 60_000)
+      const value = { host: mode === 'foreign-host' ? 'fictional-other-host' : hostname(),
+        bootId: (boot + (mode === 'previous-boot' ? -60 : mode === 'future-boot' ? 60 : 0)).toString(36),
+        pid: mode === 'live-owner' ? process.pid : child.pid, acquiredAt: new Date(Date.now() - 60_000).toISOString() }
+      const bytes = mode === 'malformed' ? '{broken lock' : JSON.stringify(value)
+      await writeFile(lockPath, bytes)
+      if (mode === 'hard-linked') await link(lockPath, path.join(lockRoot, 'retained-link'))
+      if (mode === 'previous-boot' || mode === 'same-boot') {
+        expect(await fixture.service.begin(makeRequest())).toMatchObject({ phase: 'awaiting-steam-client-update' })
+        expect(fixture.events).toContain('verify-stopped')
+        await expect(readFile(lockPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      } else {
+        await expect(fixture.service.begin(makeRequest())).rejects.toMatchObject({ code: 'DSP_STEAM_HANDOFF_LOCK_BUSY' })
+        expect(await readFile(lockPath, 'utf8')).toBe(bytes)
+        expect(fixture.events).toEqual([])
+      }
+    }
+  )
+
   it('previews with zero filesystem or adapter mutation and advertises no account automation', async () => {
     const fixture = await createFixture()
     const request = makeRequest()

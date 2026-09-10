@@ -100,7 +100,7 @@ export function classifyChange(file, before, after) {
     if (file.endsWith('package.json') || file.endsWith('package-lock.json')) {
       try {
         const previous = JSON.parse(before), current = JSON.parse(after)
-        if (current.version === '0.1.0-rc.22') {
+        if (current.version === '0.1.0-rc.23') {
           previous.version = current.version
           if (file.endsWith('package-lock.json')) {
             if (current.packages[''].version !== current.version) throw new Error('root version mismatch')
@@ -111,8 +111,8 @@ export function classifyChange(file, before, after) {
       } catch { /* A dependency or structural change requires a reviewed plan. */ }
     } else {
       const priorVersions = new Set(normalize(before).match(/0\.1\.0-rc\.[0-9]+/gu) ?? [])
-      if ([...priorVersions].some(version => version !== '0.1.0-rc.22' &&
-          normalize(before).replaceAll(version, '0.1.0-rc.22') === normalize(after))) return 'version-only'
+      if ([...priorVersions].some(version => version !== '0.1.0-rc.23' &&
+          normalize(before).replaceAll(version, '0.1.0-rc.23') === normalize(after))) return 'version-only'
     }
   }
   if (reviewedPaths.has(file)) return 'affected'

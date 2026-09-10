@@ -16,6 +16,18 @@ const lifecycleExecutionEnvironment = {
 const invalidConsoleCursorSecret = ['too', 'short'].join('-')
 
 describe('production configuration', () => {
+  it('keeps base configuration apply disabled until the complete Windows lifecycle chain is enabled', () => {
+    expect(loadConfig({ NODE_ENV: 'test' }).configMutationsEnabled).toBe(false)
+    expect(() => loadConfig({ NODE_ENV: 'test', DYSON_CONFIG_MUTATIONS_ENABLED: 'true' }))
+      .toThrow(/requires the Windows lifecycle provider/)
+    expect(() => loadConfig({ NODE_ENV: 'test', DYSON_PROVIDER: 'windows',
+      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson', DYSON_CONFIG_MUTATIONS_ENABLED: 'true' }))
+      .toThrow(/requires the Windows lifecycle provider/)
+    expect(loadConfig({ NODE_ENV: 'test', DYSON_PROVIDER: 'windows',
+      DYSON_PROJECT_ROOT: 'C:\\Fictional\\Dyson', ...lifecycleExecutionEnvironment,
+      DYSON_CONFIG_MUTATIONS_ENABLED: 'true' }).configMutationsEnabled).toBe(true)
+  })
+
   it('fails closed on misspelled DYSON variables while ignoring unrelated host variables', () => {
     expect(() => loadConfig({
       NODE_ENV: 'test',
@@ -68,15 +80,15 @@ describe('production configuration', () => {
 
   it('accepts only a bounded deployment release identifier', () => {
     expect(loadConfig({
-      NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: 'v0.1.0-rc.22+fixture'
-    }).deploymentVersion).toBe('v0.1.0-rc.22+fixture')
+      NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: 'v0.1.0-rc.23+fixture'
+    }).deploymentVersion).toBe('v0.1.0-rc.23+fixture')
     expect(() => loadConfig({
       NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: '../untrusted release'
     })).toThrow()
   })
 
   it('defaults the expected Bridge heartbeat to the full repository release version', () => {
-    expect(loadConfig({ NODE_ENV: 'test' }).bridgePluginVersion).toBe('0.1.0-rc.22')
+    expect(loadConfig({ NODE_ENV: 'test' }).bridgePluginVersion).toBe('0.1.0-rc.23')
   })
 
   it('keeps player notices disabled and validates the closed mutation gate', () => {

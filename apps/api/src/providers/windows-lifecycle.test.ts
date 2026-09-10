@@ -235,7 +235,7 @@ describe('Windows lifecycle adapter', () => {
 })
 
 class FakeBridgeClient implements LifecycleBridgeClient {
-  pluginVersion = '0.1.0-rc.22'
+  pluginVersion = '0.1.0-rc.23'
   probeFailure = false
   probeCalls = 0
   failedSaveCode: string | null = null

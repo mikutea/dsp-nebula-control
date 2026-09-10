@@ -1,4 +1,8 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -190,6 +194,7 @@ describe('game configuration transaction', () => {
 
   it('reports rollback-failed distinctly when compensating restoration cannot complete', async () => {
     const root = await seedRoot()
+    const original = await readAllBuffers(root)
     const plan = await makePlan(root, [
       { id: 'nebula.auto-pause', value: false },
       { id: 'galaxy.resource-multiplier', value: 3 }
@@ -211,7 +216,181 @@ describe('game configuration transaction', () => {
       errorCode: 'CONFIG_ROLLBACK_FAILED',
       auditStored: true
     })
+    const afterFailure = await readAllBuffers(root)
+    const contender = new GameConfigTransactionService({ configRoot: root })
+    expect(await contender.apply(await makePlan(root, [{ id: 'bridge.enabled', value: true }])))
+      .toMatchObject({ status: 'busy', auditStored: false })
+    expectBuffersEqual(await readAllBuffers(root), afterFailure)
+    expect(await contender.reconcile(result.transactionId, {
+      recoveryRequestId: result.transactionId, signal: new AbortController().signal,
+      assertActive() {}, toPowerShellBorrowArguments: () => []
+    }, async () => {})).toMatchObject({ status: 'rolled-back', auditStored: true })
+    expectBuffersEqual(await readAllBuffers(root), original)
   })
+
+  it('persists redacted permitted byte states before replacing any live file', async () => {
+    const root = await seedRoot()
+    const transactionId = randomUUID()
+    const before = await readAllBuffers(root)
+    const plan = await makePlan(root, [{ id: 'nebula.server-password', value: 'fictional-next-secret' }])
+    let inspected = false
+    const service = new GameConfigTransactionService({
+      configRoot: root,
+      testHooks: { async onPhase(phase, detail) {
+        if (phase !== 'before-replace' || detail.index !== 0) return
+        const raw = await readFile(path.join(root, '.dyson-control', 'snapshots', transactionId, 'apply-intent.json'), 'utf8')
+        const intent = JSON.parse(raw)
+        expect(raw).not.toContain('fictional-next-secret')
+        expect(raw).not.toContain('fictional-old-secret')
+        expect(raw).not.toContain(root)
+        expect(intent).toMatchObject({ transactionId, baseRevision: plan.baseRevision, nextRevision: plan.nextRevision })
+        for (const file of intent.files) {
+          expect(file.beforeSha256).toBe(createHash('sha256').update(before[file.id]!).digest('hex'))
+          expect(file.afterSha256).toBe(createHash('sha256').update(plan.files[file.id as keyof GameConfigFiles]!).digest('hex'))
+        }
+        expectBuffersEqual(await readAllBuffers(root), before)
+        inspected = true
+      } }
+    })
+    expect(await service.apply(plan, { transactionId })).toMatchObject({ status: 'applied', auditStored: true })
+    expect(inspected).toBe(true)
+  })
+
+  it('quarantines an applied transaction when its terminal audit cannot be persisted', async () => {
+    const root = await seedRoot()
+    const transactionId = randomUUID()
+    const plan = await makePlan(root, [{ id: 'bridge.enabled', value: true }])
+    const service = new GameConfigTransactionService({
+      configRoot: root,
+      testHooks: { async onPhase(phase) {
+        if (phase === 'before-verify') {
+          await mkdir(path.join(root, '.dyson-control', 'audit', `${transactionId}-1-applied.json`))
+        }
+      } }
+    })
+    expect(await service.apply(plan, { transactionId })).toMatchObject({ status: 'applied', auditStored: false })
+    const lock = JSON.parse(await readFile(path.join(root, '.dyson-control', 'configuration.lock'), 'utf8'))
+    expect(lock).toMatchObject({ schemaVersion: 2, transactionId, pid: process.pid, action: 'game-config.apply' })
+    const afterFailure = await readAllBuffers(root)
+    expect(await new GameConfigTransactionService({ configRoot: root }).apply(
+      await makePlan(root, [{ id: 'bridge.enabled', value: false }])
+    )).toMatchObject({ status: 'busy' })
+    expectBuffersEqual(await readAllBuffers(root), afterFailure)
+  })
+
+  it.each(['lock-acquired', 'snapshot-file-written', 'snapshot-created', 'before-replace', 'after-replace', 'before-verify', 'terminal-persisted'])(
+    'retains matching recovery evidence and rejects further writes after process exit at %s', async phase => {
+      const root = await seedRoot()
+      const transactionId = randomUUID()
+      const before = await readAllBuffers(root)
+      const plan = await makePlan(root, [
+        { id: 'nebula.auto-pause', value: false },
+        { id: 'bridge.enabled', value: true }
+      ])
+      const source = new URL('./transaction.ts', import.meta.url).href
+      const loader = pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm')).href
+      const program = `
+        import { GameConfigTransactionService } from ${JSON.stringify(source)};
+        const input = JSON.parse(process.argv[1]);
+        const service = new GameConfigTransactionService({ configRoot: input.root,
+          testHooks: { onPhase(phase) { if (phase === input.phase) process.exit(75) } }
+        });
+        await service.apply(input.plan, { transactionId: input.transactionId });
+        process.exit(76);
+      `
+      const child = spawnSync(process.execPath, ['--import', loader, '--input-type=module', '--eval', program,
+        JSON.stringify({ root, transactionId, plan, phase })],
+      { windowsHide: true, timeout: 15_000, encoding: 'utf8', maxBuffer: 64 * 1024 })
+      expect(child.status, child.stderr).toBe(75)
+      const lockBytes = await readFile(path.join(root, '.dyson-control', 'configuration.lock'))
+      const intentPath = path.join(root, '.dyson-control', 'snapshots', transactionId, 'apply-intent.json')
+      const early = ['lock-acquired', 'snapshot-file-written', 'snapshot-created'].includes(phase)
+      const intent = early ? null : JSON.parse(await readFile(intentPath, 'utf8'))
+      if (intent) expect(intent.lockSha256).toBe(createHash('sha256').update(lockBytes).digest('hex'))
+      else await expect(readFile(intentPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      const afterExit = await readAllBuffers(root)
+      expect(afterExit.nebula!.equals(before.nebula!)).toBe(early || phase === 'before-replace')
+      expect(afterExit.bridge!.equals(before.bridge!)).toBe(!['before-verify', 'terminal-persisted'].includes(phase))
+      for (const file of intent?.files ?? []) {
+        const actual = createHash('sha256').update(afterExit[file.id]!).digest('hex')
+        expect([file.beforeSha256, file.afterSha256]).toContain(actual)
+      }
+      const service = new GameConfigTransactionService({ configRoot: root })
+      expect(await service.verifySnapshot(transactionId)).toMatchObject(
+        ['lock-acquired', 'snapshot-file-written'].includes(phase)
+          ? { valid: false } : { valid: true, beforeRevision: plan.baseRevision })
+      expect(await service.apply(plan, { transactionId })).toMatchObject({ status: 'busy' })
+      expectBuffersEqual(await readAllBuffers(root), afterExit)
+      const scope = { signal: new AbortController().signal, assertActive() {},
+        toPowerShellBorrowArguments: () => [], recoveryRequestId: transactionId }
+      await expect(service.reconcile(transactionId, { ...scope, recoveryRequestId: randomUUID() }, async () => {}))
+        .rejects.toMatchObject({ code: 'CONFIG_RECOVERY_INVALID' })
+      expectBuffersEqual(await readAllBuffers(root), afterExit)
+      if (early) {
+        const staged = path.join(root, `.nebula.cfg.${transactionId}.apply.tmp`)
+        await writeFile(staged, 'unexpected staged bytes')
+        await expect(service.reconcile(transactionId, scope, async () => {}))
+          .rejects.toMatchObject({ code: 'CONFIG_RECOVERY_INVALID' })
+        expectBuffersEqual(await readAllBuffers(root), afterExit)
+        await rm(staged)
+      }
+      if (phase === 'snapshot-file-written') {
+        const fragment = path.join(root, '.dyson-control', 'snapshots', transactionId, 'nebula.bin')
+        await writeFile(fragment, 'foreign snapshot fragment')
+        await expect(service.reconcile(transactionId, scope, async () => {}))
+          .rejects.toMatchObject({ code: 'CONFIG_RECOVERY_INVALID' })
+        expect(await readFile(fragment, 'utf8')).toBe('foreign snapshot fragment')
+        expectBuffersEqual(await readAllBuffers(root), before)
+        await writeFile(fragment, before.nebula!)
+      }
+      if (phase === 'lock-acquired') {
+        await writeFile(path.join(root, initialFiles.nebula.name), 'external revision\n')
+        await expect(service.reconcile(transactionId, scope, async () => {}))
+          .rejects.toMatchObject({ code: 'CONFIG_RECOVERY_INVALID' })
+        expect(await readFile(path.join(root, initialFiles.nebula.name), 'utf8')).toBe('external revision\n')
+        await writeFile(path.join(root, initialFiles.nebula.name), before.nebula!)
+      }
+      if (phase === 'after-replace') {
+        await writeFile(path.join(root, initialFiles.nebula.name), 'unknown external bytes\n')
+        const foreign = await readAllBuffers(root)
+        await expect(service.reconcile(transactionId, scope, async () => {}))
+          .rejects.toMatchObject({ code: 'CONFIG_RECOVERY_INVALID' })
+        expectBuffersEqual(await readAllBuffers(root), foreign)
+        expect(await readFile(path.join(root, '.dyson-control', 'configuration.lock'))).toEqual(lockBytes)
+        await writeFile(path.join(root, initialFiles.nebula.name), afterExit.nebula!)
+
+        const recoverProgram = `
+          import { GameConfigTransactionService } from ${JSON.stringify(source)};
+          const input = JSON.parse(process.argv[1]);
+          const service = new GameConfigTransactionService({ configRoot: input.root,
+            testHooks: { onPhase(phase, detail) {
+              if (phase === 'before-restore' && detail.index === 1) process.exit(75);
+            } }
+          });
+          await service.reconcile(input.transactionId, {
+            recoveryRequestId: input.transactionId, signal: new AbortController().signal,
+            assertActive() {}, toPowerShellBorrowArguments() { return [] }
+          }, async () => {});
+          process.exit(76);
+        `
+        const recoveryChild = spawnSync(process.execPath,
+          ['--import', loader, '--input-type=module', '--eval', recoverProgram, JSON.stringify({ root, transactionId })],
+          { windowsHide: true, timeout: 15_000, encoding: 'utf8', maxBuffer: 64 * 1024 })
+        expect(recoveryChild.status, recoveryChild.stderr).toBe(75)
+        expect(await readFile(path.join(root, '.dyson-control', 'configuration.lock'))).toEqual(lockBytes)
+      }
+      const restored = await service.reconcile(transactionId, scope, async () => {})
+      const committed = phase === 'terminal-persisted'
+      expect(restored).toMatchObject({ status: committed ? 'applied' : 'rolled-back',
+        currentRevision: committed ? plan.nextRevision : plan.baseRevision, auditStored: true })
+      expectBuffersEqual(await readAllBuffers(root), committed ? afterExit : before)
+      // A later administrator edit must survive replay of the completed recovery.
+      await writeFile(path.join(root, initialFiles.nebula.name), `${initialFiles.nebula.content}# later edit\n`)
+      const later = await readAllBuffers(root)
+      expect(await service.reconcile(transactionId, scope, async () => {})).toEqual(restored)
+      expectBuffersEqual(await readAllBuffers(root), later)
+    }
+  )
 
   it('rejects plan-shaped content that changes anything outside catalog-generated patches', async () => {
     const root = await seedRoot()

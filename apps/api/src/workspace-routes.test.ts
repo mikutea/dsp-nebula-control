@@ -5,6 +5,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { buildApplication, type BuiltApplication } from './app.js'
 import { loadConfig } from './config.js'
+import type { WindowsLifecycleBrokerClient } from './providers/windows-lifecycle-broker.js'
 
 let application: BuiltApplication | null = null
 const temporaryRoots: string[] = []
@@ -58,7 +59,25 @@ describe('managed workspace read APIs', () => {
 
   it('returns typed configuration and a redacted no-write preview', async () => {
     const fixture = await createWorkspaceFixture()
-    application = await buildApplication(testConfig(), { workspacePaths: fixture })
+    const config = testConfig()
+    config.configMutationsEnabled = true
+    const unused = async () => { throw new Error('Unexpected fixture broker operation') }
+    application = await buildApplication(config, {
+      workspacePaths: fixture,
+      lifecycleBrokerClient: {
+        preflight: unused, dispatch: unused, status: unused,
+        verify: async () => ({ expected: 'stopped', matched: true, blockers: [], runtime: {
+          lifecycleState: 'stopped_verified', process: { status: 'absent', pid: null, owner: null, sessionId: null },
+          port: { port: config.gamePort, listenerCount: 0 }, pidFile: { present: false, valid: false }
+        } })
+      } as unknown as WindowsLifecycleBrokerClient,
+      hostMutationCoordinator: { async runExclusive(_request, operation) {
+        const result = await operation({ signal: new AbortController().signal,
+          assertActive() {}, toPowerShellBorrowArguments: () => [] })
+        if (result.kind === 'throw') throw result.error
+        return result.value
+      } }
+    })
     const cookie = await login(application)
 
     const configuration = await application.app.inject({

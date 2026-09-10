@@ -651,6 +651,7 @@ export interface GameConfigEntry {
 }
 
 export interface GameConfigSnapshot {
+  execution?: { enabled: boolean; recoveryEnabled: boolean; requiresStopped: boolean }
   revision: string
   entries: GameConfigEntry[]
   invalidSettingIds: string[]
@@ -675,7 +676,7 @@ export interface GameConfigPreview {
 
 export interface GameConfigTransactionResult {
   transactionId: string
-  status: 'applied'
+  status: 'applied' | 'rolled-back'
   dryRun: false
   baseRevision: string
   nextRevision: string

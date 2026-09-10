@@ -62,6 +62,7 @@ const environmentSchema = z.object({
   DYSON_SAVE_RETENTION_MUTATIONS_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_SAVE_RETENTION_PURGE_MINIMUM_HOURS: z.coerce.number().int().min(1).max(8_760).default(168),
   DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED: z.enum(['true', 'false']).default('false'),
+  DYSON_CONFIG_MUTATIONS_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_SAVE_TRANSFER_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_SAVE_TRANSFER_ROOT: z.string().optional(),
   DYSON_LIFECYCLE_ENABLED: z.enum(['true', 'false']).default('false'),
@@ -71,7 +72,7 @@ const environmentSchema = z.object({
   DYSON_RUNTIME_SERVICE_USER: z.string().min(3).max(128).regex(/^[^"\r\n]+$/).optional(),
   DYSON_BRIDGE_CONTROL_ROOT: z.string().optional(),
   DYSON_BRIDGE_SECRET_FILE: z.string().optional(),
-  DYSON_BRIDGE_PLUGIN_VERSION: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,32})?$/).default('0.1.0-rc.22'),
+  DYSON_BRIDGE_PLUGIN_VERSION: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,32})?$/).default('0.1.0-rc.23'),
   DYSON_PLAYER_SNAPSHOT_MAX_AGE_MS: z.coerce.number().int().min(2_000).max(120_000).default(10_000),
   DYSON_PLAYER_NOTICE_MUTATIONS_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_PLAYER_HISTORY_CAPACITY: z.coerce.number().int().min(1).max(2_048).default(512),
@@ -154,6 +155,7 @@ export interface AppConfig {
   saveRetentionMutationsEnabled: boolean
   saveRetentionPurgeMinimumHours: number
   configHistoryMutationsEnabled: boolean
+  configMutationsEnabled: boolean
   saveTransferEnabled: boolean
   saveTransferRoot: string | null
   lifecycleEnabled: boolean
@@ -473,6 +475,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   if (value.DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED === 'true' && value.DYSON_LIFECYCLE_ENABLED !== 'true') {
     throw new Error('DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED requires lifecycle execution')
   }
+  if (value.DYSON_CONFIG_MUTATIONS_ENABLED === 'true' &&
+      (value.DYSON_PROVIDER !== 'windows' || value.DYSON_LIFECYCLE_ENABLED !== 'true')) {
+    throw new Error('DYSON_CONFIG_MUTATIONS_ENABLED requires the Windows lifecycle provider')
+  }
   if (value.DYSON_SAVE_TRANSFER_ROOT && !path.isAbsolute(value.DYSON_SAVE_TRANSFER_ROOT)) {
     throw new Error('DYSON_SAVE_TRANSFER_ROOT must be an absolute path')
   }
@@ -569,6 +575,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     saveRetentionMutationsEnabled: value.DYSON_SAVE_RETENTION_MUTATIONS_ENABLED === 'true',
     saveRetentionPurgeMinimumHours: value.DYSON_SAVE_RETENTION_PURGE_MINIMUM_HOURS,
     configHistoryMutationsEnabled: value.DYSON_CONFIG_HISTORY_MUTATIONS_ENABLED === 'true',
+    configMutationsEnabled: value.DYSON_CONFIG_MUTATIONS_ENABLED === 'true',
     saveTransferEnabled: value.DYSON_SAVE_TRANSFER_ENABLED === 'true',
     saveTransferRoot: value.DYSON_SAVE_TRANSFER_ROOT ? path.resolve(value.DYSON_SAVE_TRANSFER_ROOT) : null,
     lifecycleEnabled: value.DYSON_LIFECYCLE_ENABLED === 'true',

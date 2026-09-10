@@ -5,12 +5,14 @@ import {
   mkdir,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   unlink,
   type FileHandle
 } from 'node:fs/promises'
 import path from 'node:path'
+import { hostname } from 'node:os'
 import {
   gameConfigDefinitionById,
   type GameConfigDefinition,
@@ -18,6 +20,8 @@ import {
 } from './catalog.js'
 import { applyBepInExPatches, findBepInExValue } from './bepinex.js'
 import { inspectGameConfiguration, type GameConfigFiles, type GameConfigPlan } from './planner.js'
+import { removeVerifiedResidualFileLock } from '../host-mutation/residual-file-lock.js'
+import type { HostMutationOperationScope } from '../host-mutation/operation-coordinator.js'
 
 const fileIds = ['nebula', 'galaxy', 'bepinex', 'bridge'] as const
 const configFileNames: Readonly<Record<GameConfigFileId, string>> = Object.freeze({
@@ -31,6 +35,7 @@ const maximumConfigBytes = 512 * 1024
 const sha256Pattern = /^[0-9a-f]{64}$/
 const transactionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const inProcessLocks = new Set<string>()
+const abandonedProcessLocks = new Map<string, string>()
 
 export type GameConfigTransactionStatus =
   | 'dry-run'
@@ -53,6 +58,8 @@ export type GameConfigTransactionErrorCode =
   | 'CONFIG_COMMIT_FAILED'
   | 'CONFIG_COMMIT_VERIFICATION_FAILED'
   | 'CONFIG_ROLLBACK_FAILED'
+  | 'CONFIG_RECOVERY_INVALID'
+  | 'CONFIG_IDEMPOTENCY_CONFLICT'
 
 export interface GameConfigTransactionAuditRecord {
   schemaVersion: 1
@@ -94,11 +101,14 @@ export interface GameConfigSnapshotVerification {
 }
 
 export type GameConfigTransactionHookPhase =
+  | 'lock-acquired'
+  | 'snapshot-file-written'
   | 'snapshot-created'
   | 'before-replace'
   | 'after-replace'
   | 'before-verify'
   | 'before-restore'
+  | 'terminal-persisted'
 
 /**
  * Fault hooks exist solely for deterministic transaction tests. They receive only
@@ -124,6 +134,16 @@ export interface GameConfigTransactionServiceOptions {
 
 export interface ApplyGameConfigTransactionOptions {
   dryRun?: boolean
+  transactionId?: string
+  /** Internal digest of the parsed request, including expected revision. */
+  requestBindingSha256?: string
+  /** Trusted orchestration hooks, never populated from an HTTP body. */
+  assertMutationActive?: () => void
+  verifyStopped?: () => Promise<void>
+}
+
+export class GameConfigMutationScopeLostError extends Error {
+  constructor() { super('CONFIG_MUTATION_SCOPE_LOST'); this.name = 'GameConfigMutationScopeLostError' }
 }
 
 export class GameConfigTransactionService {
@@ -146,7 +166,7 @@ export class GameConfigTransactionService {
     plan: GameConfigPlan,
     options: ApplyGameConfigTransactionOptions = {}
   ): Promise<GameConfigTransactionResult> {
-    const transactionId = this.#createTransactionId()
+    const transactionId = options.transactionId ?? this.#createTransactionId()
     if (!transactionIdPattern.test(transactionId)) {
       throw new GameConfigTransactionError('CONFIG_TRANSACTION_STORAGE_UNAVAILABLE')
     }
@@ -155,10 +175,32 @@ export class GameConfigTransactionService {
     const safePlan = publicPlanFields(plan)
     let root: PreparedRoot | null = null
     let lock: AcquiredLock | null = null
+    let scopeLost = false
+    let unresolvedMutation = false
+    const assertActive = () => {
+      try { options.assertMutationActive?.() } catch {
+        scopeLost = true
+        throw new GameConfigMutationScopeLostError()
+      }
+    }
+    const beforeLiveWrite = async () => {
+      assertActive()
+      try { await options.verifyStopped?.() } finally { assertActive() }
+    }
 
     try {
+      assertActive()
       root = await prepareRoot(this.#configuredRoot)
-      lock = await acquireExclusiveLock(root, transactionId, startedAt)
+      const requestBindingSha256 = options.requestBindingSha256 ?? sha256(Buffer.from(JSON.stringify({
+        baseRevision: plan.baseRevision, nextRevision: plan.nextRevision, files: plan.files
+      }), 'utf8'))
+      if (!sha256Pattern.test(requestBindingSha256)) throw new GameConfigTransactionError('CONFIG_IDEMPOTENCY_CONFLICT')
+      if (!dryRun) {
+        const completed = await this.readCompleted(transactionId, requestBindingSha256)
+        if (completed) return completed
+        await beforeLiveWrite()
+      }
+      lock = await acquireExclusiveLock(root, transactionId, startedAt, safePlan, requestBindingSha256)
       if (!lock) {
         return makeResult({
           transactionId,
@@ -172,6 +214,7 @@ export class GameConfigTransactionService {
         })
       }
 
+      await this.#phase('lock-acquired', {})
       const original = await readConfigBuffers(root.root)
       const currentFiles = buffersToConfigFiles(original)
       const currentRevision = inspectGameConfiguration(currentFiles).revision
@@ -209,9 +252,12 @@ export class GameConfigTransactionService {
 
       let snapshotId: string | undefined
       try {
-        snapshotId = await createVerifiedSnapshot(root, transactionId, original, currentRevision)
+        assertActive()
+        snapshotId = await createVerifiedSnapshot(root, transactionId, original, currentRevision,
+          async (fileId) => { await this.#phase('snapshot-file-written', { fileId }) })
         await this.#phase('snapshot-created', {})
-      } catch {
+      } catch (error) {
+        if (error instanceof GameConfigMutationScopeLostError) throw error
         return await this.#finishWithoutMutation(root, transactionId, {
           status: 'failed', dryRun, safePlan, startedAt,
           errorCode: 'CONFIG_SNAPSHOT_FAILED', currentRevision
@@ -227,8 +273,10 @@ export class GameConfigTransactionService {
         finishedAt: this.#now().toISOString()
       })
       try {
+        assertActive()
         await writeAudit(root, preparedAudit, 0)
-      } catch {
+      } catch (error) {
+        if (error instanceof GameConfigMutationScopeLostError) throw error
         return makeResult({
           transactionId,
           status: 'failed',
@@ -245,25 +293,56 @@ export class GameConfigTransactionService {
 
       const proposed = configFilesToBuffers(plan.files)
       const changedIds = fileIds.filter((id) => !equalBuffers(original[id], proposed[id]))
+      // Persist both permitted byte states before the first live replacement.
+      // Recovery must reject a file which matches neither state; a dead owner
+      // alone must never authorize restoring a snapshot over external edits.
+      assertActive()
+      await writeDurableExclusive(
+        path.join(root.snapshotsRoot, transactionId, 'apply-intent.json'),
+        Buffer.from(`${JSON.stringify({
+          schemaVersion: 1,
+          transactionId,
+          action: 'game-config.apply',
+          lockSha256: lock.sha256,
+          requestBindingSha256,
+          baseRevision: currentRevision,
+          nextRevision: plan.nextRevision,
+          changedSettingIds: safePlan.changedSettingIds,
+          restartRequired: safePlan.restartRequired,
+          newGameOnlyChanged: safePlan.newGameOnlyChanged,
+          startedAt,
+          files: fileIds.map((id) => ({
+            id,
+            beforeSha256: original[id] === null ? null : sha256(original[id]!),
+            afterSha256: proposed[id] === null ? null : sha256(proposed[id]!)
+          }))
+        })}\n`, 'utf8')
+      )
+      await syncDirectory(path.join(root.snapshotsRoot, transactionId))
       const staged = new Map<GameConfigFileId, string>()
       let mutationMayHaveOccurred = false
       let commitErrorCode: GameConfigTransactionErrorCode = 'CONFIG_COMMIT_FAILED'
       try {
         for (const id of changedIds) {
+          assertActive()
           const content = proposed[id]
           if (content === null) throw new GameConfigTransactionError('CONFIG_PLAN_NOT_ALLOWLISTED')
           staged.set(id, await stageBuffer(root.root, configFileNames[id], content, transactionId, 'apply'))
         }
         for (const [index, id] of changedIds.entries()) {
           await this.#phase('before-replace', { fileId: id, index })
+          await beforeLiveWrite()
           // Once replacement begins, even a subsequent flush failure must enter
           // the compensating rollback path because rename may already have won.
           mutationMayHaveOccurred = true
+          unresolvedMutation = true
           await commitStagedFile(root.root, staged.get(id)!, configFileNames[id])
+          assertActive()
           staged.delete(id)
           await this.#phase('after-replace', { fileId: id, index })
         }
         await this.#phase('before-verify', {})
+        assertActive()
         const committed = await readConfigBuffers(root.root)
         if (!equalBufferSets(committed, proposed) ||
             inspectGameConfiguration(buffersToConfigFiles(committed)).revision !== plan.nextRevision) {
@@ -271,6 +350,7 @@ export class GameConfigTransactionService {
           throw new GameConfigTransactionError(commitErrorCode)
         }
       } catch (error) {
+        if (error instanceof GameConfigMutationScopeLostError) throw error
         if (error instanceof GameConfigTransactionError &&
             error.code === 'CONFIG_COMMIT_VERIFICATION_FAILED') {
           commitErrorCode = error.code
@@ -283,12 +363,15 @@ export class GameConfigTransactionService {
           })
         }
         try {
-          await this.#restoreOriginal(root, transactionId, original)
-          return await this.#finishAfterPrepared(root, transactionId, {
+          await this.#restoreOriginal(root, transactionId, original, beforeLiveWrite)
+          const result = await this.#finishAfterPrepared(root, transactionId, {
             status: 'rolled-back', dryRun, safePlan, startedAt, snapshotId,
             errorCode: commitErrorCode, currentRevision
           })
-        } catch {
+          unresolvedMutation = !result.auditStored
+          return result
+        } catch (error) {
+          if (error instanceof GameConfigMutationScopeLostError) throw error
           return await this.#finishAfterPrepared(root, transactionId, {
             status: 'rollback-failed', dryRun, safePlan, startedAt, snapshotId,
             errorCode: 'CONFIG_ROLLBACK_FAILED', currentRevision
@@ -296,11 +379,14 @@ export class GameConfigTransactionService {
         }
       }
 
-      return await this.#finishAfterPrepared(root, transactionId, {
+      const result = await this.#finishAfterPrepared(root, transactionId, {
         status: 'applied', dryRun, safePlan, startedAt, snapshotId,
         currentRevision: plan.nextRevision
       })
+      unresolvedMutation = !result.auditStored
+      return result
     } catch (error) {
+      if (error instanceof GameConfigMutationScopeLostError) throw error
       const errorCode = error instanceof GameConfigTransactionError
         ? error.code
         : 'CONFIG_TRANSACTION_STORAGE_UNAVAILABLE'
@@ -315,7 +401,14 @@ export class GameConfigTransactionService {
         auditStored: false
       })
     } finally {
-      if (lock) await releaseExclusiveLock(lock)
+      if (lock) {
+        try { assertActive() } catch { scopeLost = true }
+        if (scopeLost || unresolvedMutation) {
+          await lock.handle.close().catch(() => undefined)
+          abandonedProcessLocks.set(lock.rootKey, lock.sha256)
+          inProcessLocks.delete(lock.rootKey)
+        } else await releaseExclusiveLock(lock)
+      }
     }
   }
 
@@ -337,10 +430,189 @@ export class GameConfigTransactionService {
     }
   }
 
+  /** Trusted orchestration only: caller must hold the original operation's
+   * exclusive recovery authority. The HTTP body cannot supply this scope. */
+  async reconcile(transactionId: string, scope: HostMutationOperationScope & {
+    recoveryRequestId: string
+  }, verifyStopped: () => Promise<void>): Promise<GameConfigTransactionResult> {
+    const invalid = () => new GameConfigTransactionError('CONFIG_RECOVERY_INVALID')
+    if (!transactionIdPattern.test(transactionId) || scope.recoveryRequestId !== transactionId) throw invalid()
+    const assertActive = () => {
+      scope.assertActive()
+      if (scope.signal.aborted) throw invalid()
+    }
+    assertActive()
+    const root = await prepareRoot(this.#configuredRoot)
+    const rootKey = normalizePath(root.root)
+    if (inProcessLocks.has(rootKey)) throw invalid()
+    inProcessLocks.add(rootKey)
+    try {
+      const snapshotRoot = path.join(root.snapshotsRoot, transactionId)
+      const intentPath = path.join(snapshotRoot, 'apply-intent.json')
+      const intentMetadata = await lstat(intentPath).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+      const manifestMetadata = await lstat(path.join(snapshotRoot, 'manifest.json')).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+      if (!manifestMetadata && intentMetadata) throw invalid()
+      const livePreimage = manifestMetadata ? null : await readConfigBuffers(root.root)
+      const manifest: SnapshotManifest = manifestMetadata ? await readAndVerifySnapshot(root, transactionId) : {
+        schemaVersion: 1, snapshotId: transactionId,
+        beforeRevision: inspectGameConfiguration(buffersToConfigFiles(livePreimage!)).revision,
+        createdAt: this.#now().toISOString(), files: fileIds.map(id => ({ id,
+          present: livePreimage![id] !== null, bytes: livePreimage![id]?.byteLength ?? 0,
+          sha256: bufferHash(livePreimage![id])
+        }))
+      }
+      let candidate: unknown
+      if (intentMetadata) {
+        candidate = JSON.parse(decodeConfig(await readFixedRegularFile(snapshotRoot, 'apply-intent.json', 64 * 1024)))
+      } else {
+        const lockBytes = await readFixedRegularFile(root.controlRoot, 'configuration.lock', 4_096)
+        const owner: unknown = JSON.parse(decodeConfig(lockBytes))
+        if (!isRecord(owner) || !isRecord(owner.safePlan)) throw invalid()
+        candidate = { ...owner.safePlan, schemaVersion: 1, transactionId, action: 'game-config.apply',
+          startedAt: owner.startedAt, requestBindingSha256: owner.requestBindingSha256,
+          lockSha256: sha256(lockBytes), files: manifest.files.map(file => ({
+            id: file.id, beforeSha256: file.sha256, afterSha256: file.sha256
+          })) }
+      }
+      const intent = candidate
+      if (!isApplyIntent(intent, transactionId) || intent.baseRevision !== manifest.beforeRevision ||
+          !fileIds.every((id, index) => intent.files[index]!.beforeSha256 === manifest.files[index]!.sha256)) throw invalid()
+      const original = livePreimage ?? Object.fromEntries(await Promise.all(manifest.files.map(async file => [file.id,
+        file.present ? await readFixedRegularFile(snapshotRoot, `${file.id}.bin`, maximumConfigBytes) : null
+      ]))) as ConfigBuffers
+      // Recheck the exact buffers used for recovery, not only a preceding read.
+      if (!fileIds.every((id, index) => bufferHash(original[id]) === intent.files[index]!.beforeSha256) ||
+          inspectGameConfiguration(buffersToConfigFiles(original)).revision !== intent.baseRevision) throw invalid()
+      const lockExists = await lstat(root.lockPath).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+      if (!lockExists) {
+        const terminal = await readApplyTerminal(root, intent)
+        if (!terminal) throw invalid()
+        assertActive()
+        return terminal
+      }
+      const beforeWrite = async () => {
+        assertActive()
+        await verifyStopped()
+        assertActive()
+        const current = await readConfigBuffers(root.root)
+        if (!fileIds.every((id, index) => {
+          const file = intent.files[index]!
+          return [file.beforeSha256, file.afterSha256].includes(bufferHash(current[id]))
+        })) throw invalid()
+        if (!intentMetadata) {
+          // Staging is downstream of the durable intent. Its presence here
+          // contradicts a pre-write interruption and cannot be reconciled.
+          for (const id of fileIds) for (const purpose of ['apply', 'restore']) {
+            const target = fixedFilePath(root.root, `.${configFileNames[id]}.${transactionId}.${purpose}.tmp`)
+            const exists = await lstat(target).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+            if (exists) throw invalid()
+          }
+        }
+      }
+      let result: GameConfigTransactionResult | undefined
+      await removeVerifiedResidualFileLock({
+        lockPath: root.lockPath, expectedSha256: intent.lockSha256, scope,
+        authorize: async evidence => {
+          const owner: unknown = JSON.parse(evidence.bytes.toString('utf8'))
+          if (!isRecord(owner) || owner.schemaVersion !== 2 || owner.transactionId !== transactionId ||
+              owner.action !== 'game-config.apply' || owner.hostname !== hostname() ||
+              typeof owner.instanceId !== 'string' || !transactionIdPattern.test(owner.instanceId) ||
+              String(owner.device) !== evidence.device || String(owner.inode) !== evidence.inode ||
+              !Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0) throw invalid()
+          const abandonedHere = owner.pid === process.pid && abandonedProcessLocks.get(rootKey) === evidence.sha256
+          if (!abandonedHere) {
+            try { process.kill(Number(owner.pid), 0); throw invalid() } catch (error) {
+              if (!hasErrorCode(error, 'ESRCH')) throw invalid()
+            }
+          }
+          await beforeWrite()
+        },
+        beforeRemove: async () => {
+          if (!intentMetadata) {
+            assertActive()
+            if (!manifestMetadata) await completePrewriteSnapshot(root, transactionId, original, manifest, assertActive)
+            await beforeWrite()
+            await writeDurableExclusive(intentPath, Buffer.from(`${JSON.stringify(intent)}\n`, 'utf8'))
+            await syncDirectory(snapshotRoot)
+            // No configuration write occurred; preserve the verified bytes.
+            result = await this.#finishAfterPrepared(root, transactionId, {
+              status: 'rolled-back', dryRun: false, safePlan: intent,
+              startedAt: intent.startedAt, snapshotId: transactionId,
+              errorCode: 'CONFIG_COMMIT_FAILED', currentRevision: intent.baseRevision
+            })
+            if (!result.auditStored) throw invalid()
+            assertActive()
+            return
+          }
+          const terminal = await readApplyTerminal(root, intent)
+          if (terminal) {
+            const current = await readConfigBuffers(root.root)
+            const expected = terminal.status === 'applied' ? 'afterSha256' : 'beforeSha256'
+            if (!fileIds.every((id, index) => bufferHash(current[id]) === intent.files[index]![expected])) throw invalid()
+            result = terminal
+            return
+          }
+          // A previous recovery may have exited after staging. Only remove exact
+          // transaction-owned files whose bytes still match a permitted state.
+          for (const id of fileIds) {
+            for (const purpose of ['apply', 'restore'] as const) {
+              const name = `.${configFileNames[id]}.${transactionId}.${purpose}.tmp`
+              const target = fixedFilePath(root.root, name)
+              const metadata = await lstat(target).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+              if (!metadata) continue
+              const bytes = await readFixedRegularFile(root.root, name, maximumConfigBytes)
+              const expected = intent.files[fileIds.indexOf(id)]![purpose === 'apply' ? 'afterSha256' : 'beforeSha256']
+              if (bufferHash(bytes) !== expected) throw invalid()
+              assertActive()
+              await unlink(target)
+            }
+          }
+          await beforeWrite()
+          await this.#restoreOriginal(root, transactionId, original, beforeWrite)
+          assertActive()
+          result = await this.#finishAfterPrepared(root, transactionId, {
+            status: 'rolled-back', dryRun: false, safePlan: intent,
+            startedAt: intent.startedAt, snapshotId: transactionId,
+            errorCode: 'CONFIG_COMMIT_FAILED', currentRevision: intent.baseRevision
+          })
+          if (!result.auditStored) throw invalid()
+          assertActive()
+        }
+      })
+      if (!result) throw invalid()
+      if (abandonedProcessLocks.get(rootKey) === intent.lockSha256) abandonedProcessLocks.delete(rootKey)
+      return result
+    } finally {
+      inProcessLocks.delete(rootKey)
+    }
+  }
+
+  /** Terminal replay does not touch live configuration or remove any lock. */
+  async readCompleted(transactionId: string, requestBindingSha256?: string): Promise<GameConfigTransactionResult | null> {
+    if (!transactionIdPattern.test(transactionId)) throw new GameConfigTransactionError('CONFIG_RECOVERY_INVALID')
+    const root = await prepareRoot(this.#configuredRoot)
+    const lock = await lstat(root.lockPath).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+    if (lock) return null
+    const snapshotRoot = path.join(root.snapshotsRoot, transactionId)
+    const exists = await lstat(snapshotRoot).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+    if (!exists) return null
+    const manifest = await readAndVerifySnapshot(root, transactionId)
+    const intent: unknown = JSON.parse(decodeConfig(await readFixedRegularFile(snapshotRoot, 'apply-intent.json', 64 * 1024)))
+    if (!isApplyIntent(intent, transactionId) || intent.baseRevision !== manifest.beforeRevision ||
+        !fileIds.every((id, index) => intent.files[index]!.beforeSha256 === manifest.files[index]!.sha256)) {
+      throw new GameConfigTransactionError('CONFIG_RECOVERY_INVALID')
+    }
+    if (requestBindingSha256 !== undefined && intent.requestBindingSha256 !== requestBindingSha256) {
+      throw new GameConfigTransactionError('CONFIG_IDEMPOTENCY_CONFLICT')
+    }
+    return readApplyTerminal(root, intent)
+  }
+
   async #restoreOriginal(
     root: PreparedRoot,
     transactionId: string,
-    original: ConfigBuffers
+    original: ConfigBuffers,
+    beforeLiveWrite: () => Promise<void>
   ): Promise<void> {
     const staged = new Map<GameConfigFileId, string>()
     try {
@@ -352,6 +624,7 @@ export class GameConfigTransactionService {
       }
       for (const [index, id] of fileIds.entries()) {
         await this.#phase('before-restore', { fileId: id, index })
+        await beforeLiveWrite()
         const content = original[id]
         if (content === null) {
           await removeFixedFile(root.root, configFileNames[id])
@@ -393,6 +666,7 @@ export class GameConfigTransactionService {
     let auditStored = true
     try {
       await writeAudit(root, audit, 1)
+      await this.#phase('terminal-persisted', {})
     } catch {
       auditStored = false
     }
@@ -413,6 +687,70 @@ interface SafePlanFields {
   changedSettingIds: string[]
   restartRequired: boolean
   newGameOnlyChanged: boolean
+}
+
+interface ApplyIntent extends SafePlanFields {
+  schemaVersion: 1
+  transactionId: string
+  action: 'game-config.apply'
+  lockSha256: string
+  requestBindingSha256: string
+  startedAt: string
+  files: Array<{ id: GameConfigFileId; beforeSha256: string | null; afterSha256: string | null }>
+}
+
+function bufferHash(value: Buffer | null): string | null {
+  return value === null ? null : sha256(value)
+}
+
+function isApplyIntent(value: unknown, transactionId: string): value is ApplyIntent {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    'schemaVersion', 'transactionId', 'action', 'lockSha256', 'requestBindingSha256', 'startedAt', 'baseRevision',
+    'nextRevision', 'changedSettingIds', 'restartRequired', 'newGameOnlyChanged', 'files'
+  ]) || value.schemaVersion !== 1 || value.transactionId !== transactionId || value.action !== 'game-config.apply' ||
+      typeof value.lockSha256 !== 'string' || !sha256Pattern.test(value.lockSha256) ||
+      typeof value.requestBindingSha256 !== 'string' || !sha256Pattern.test(value.requestBindingSha256) ||
+      typeof value.baseRevision !== 'string' || !sha256Pattern.test(value.baseRevision) ||
+      typeof value.nextRevision !== 'string' || !sha256Pattern.test(value.nextRevision) ||
+      typeof value.startedAt !== 'string' || !Number.isFinite(Date.parse(value.startedAt)) ||
+      typeof value.restartRequired !== 'boolean' || typeof value.newGameOnlyChanged !== 'boolean' ||
+      !Array.isArray(value.changedSettingIds) || value.changedSettingIds.length > 32 ||
+      !value.changedSettingIds.every(id => typeof id === 'string' && gameConfigDefinitionById.has(id)) ||
+      !Array.isArray(value.files) || value.files.length !== fileIds.length) return false
+  const files: unknown[] = value.files
+  return fileIds.every((id, index) => {
+    const file = files[index]
+    return isRecord(file) && hasExactKeys(file, ['id', 'beforeSha256', 'afterSha256']) && file.id === id &&
+      [file.beforeSha256, file.afterSha256].every(hash => hash === null || typeof hash === 'string' && sha256Pattern.test(hash))
+  })
+}
+
+async function readApplyTerminal(root: PreparedRoot, intent: ApplyIntent): Promise<GameConfigTransactionResult | null> {
+  let result: GameConfigTransactionResult | null = null
+  for (const status of ['applied', 'rolled-back'] as const) {
+    const name = `${intent.transactionId}-1-${status}.json`
+    const exists = await lstat(fixedFilePath(root.auditRoot, name)).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+    if (!exists) continue
+    if (result) throw new GameConfigTransactionError('CONFIG_RECOVERY_INVALID')
+    const value: unknown = JSON.parse(decodeConfig(await readFixedRegularFile(root.auditRoot, name, 64 * 1024)))
+    if (!isRecord(value) || typeof value.finishedAt !== 'string' || !Number.isFinite(Date.parse(value.finishedAt)) ||
+        (status === 'applied' ? value.errorCode !== undefined :
+          !['CONFIG_COMMIT_FAILED', 'CONFIG_COMMIT_VERIFICATION_FAILED'].includes(String(value.errorCode)))) {
+      throw new GameConfigTransactionError('CONFIG_RECOVERY_INVALID')
+    }
+    result = makeResult({
+      transactionId: intent.transactionId, status, dryRun: false, safePlan: intent,
+      startedAt: intent.startedAt, finishedAt: value.finishedAt, snapshotId: intent.transactionId,
+      currentRevision: status === 'applied' ? intent.nextRevision : intent.baseRevision,
+      auditStored: true,
+      ...(status === 'rolled-back' ? { errorCode: value.errorCode as GameConfigTransactionErrorCode } : {})
+    })
+    if (!hasExactKeys(value, Object.keys(result.audit)) ||
+        Object.entries(result.audit).some(([key, expected]) => JSON.stringify(value[key]) !== JSON.stringify(expected))) {
+      throw new GameConfigTransactionError('CONFIG_RECOVERY_INVALID')
+    }
+  }
+  return result
 }
 
 interface FinishInput {
@@ -449,6 +787,7 @@ interface AcquiredLock {
   rootKey: string
   lockPath: string
   handle: FileHandle
+  sha256: string
 }
 
 type ConfigBuffers = Record<GameConfigFileId, Buffer | null>
@@ -602,7 +941,9 @@ async function ensureFixedDirectory(directory: string): Promise<void> {
 async function acquireExclusiveLock(
   root: PreparedRoot,
   transactionId: string,
-  startedAt: string
+  startedAt: string,
+  safePlan: SafePlanFields,
+  requestBindingSha256: string
 ): Promise<AcquiredLock | null> {
   const rootKey = normalizePath(root.root)
   if (inProcessLocks.has(rootKey)) return null
@@ -617,9 +958,16 @@ async function acquireExclusiveLock(
       return null
     }
     try {
-      await handle.writeFile(JSON.stringify({ schemaVersion: 1, transactionId, startedAt }), 'utf8')
+      const identity = await handle.stat({ bigint: true })
+      const lockBytes = Buffer.from(JSON.stringify({
+        schemaVersion: 2, transactionId, startedAt,
+        safePlan, requestBindingSha256,
+        action: 'game-config.apply', pid: process.pid, hostname: hostname(),
+        instanceId: randomUUID(), device: identity.dev.toString(), inode: identity.ino.toString()
+      }), 'utf8')
+      await handle.writeFile(lockBytes)
       await handle.sync()
-      return { rootKey, lockPath: root.lockPath, handle }
+      return { rootKey, lockPath: root.lockPath, handle, sha256: sha256(lockBytes) }
     } catch (error) {
       await handle.close().catch(() => undefined)
       await unlink(root.lockPath).catch(() => undefined)
@@ -677,7 +1025,8 @@ async function createVerifiedSnapshot(
   root: PreparedRoot,
   transactionId: string,
   original: ConfigBuffers,
-  beforeRevision: string
+  beforeRevision: string,
+  onFileWritten?: (id: GameConfigFileId) => Promise<void>
 ): Promise<string> {
   const snapshotRoot = path.join(root.snapshotsRoot, transactionId)
   if (!samePath(path.dirname(snapshotRoot), root.snapshotsRoot)) {
@@ -694,7 +1043,10 @@ async function createVerifiedSnapshot(
       sha256: content === null ? null : sha256(content)
     }
     files.push(file)
-    if (content !== null) await writeDurableExclusive(path.join(snapshotRoot, `${id}.bin`), content)
+    if (content !== null) {
+      await writeDurableExclusive(path.join(snapshotRoot, `${id}.bin`), content)
+      await onFileWritten?.(id)
+    }
   }
   const manifest: SnapshotManifest = {
     schemaVersion: 1,
@@ -710,6 +1062,33 @@ async function createVerifiedSnapshot(
   await syncDirectory(snapshotRoot)
   await readAndVerifySnapshot(root, transactionId)
   return transactionId
+}
+
+async function completePrewriteSnapshot(root: PreparedRoot, transactionId: string,
+  original: ConfigBuffers, manifest: SnapshotManifest, assertActive: () => void): Promise<void> {
+  const snapshotRoot = path.join(root.snapshotsRoot, transactionId)
+  assertActive()
+  await ensureFixedDirectory(snapshotRoot)
+  const expected = manifest.files.filter(file => file.present).map(file => `${file.id}.bin`)
+  const names = await readdir(snapshotRoot)
+  if (names.some(name => !expected.includes(name))) throw new GameConfigTransactionError('CONFIG_RECOVERY_INVALID')
+  // Validate all existing fragments before adding any missing data.
+  for (const file of manifest.files) {
+    if (!names.includes(`${file.id}.bin`)) continue
+    const bytes = await readFixedRegularFile(snapshotRoot, `${file.id}.bin`, maximumConfigBytes)
+    if (bufferHash(bytes) !== file.sha256 || bytes.byteLength !== file.bytes) {
+      throw new GameConfigTransactionError('CONFIG_RECOVERY_INVALID')
+    }
+  }
+  for (const file of manifest.files) {
+    if (!file.present || names.includes(`${file.id}.bin`)) continue
+    assertActive()
+    await writeDurableExclusive(path.join(snapshotRoot, `${file.id}.bin`), original[file.id]!)
+  }
+  assertActive()
+  await writeDurableExclusive(path.join(snapshotRoot, 'manifest.json'), Buffer.from(`${JSON.stringify(manifest)}\n`, 'utf8'))
+  await syncDirectory(snapshotRoot)
+  await readAndVerifySnapshot(root, transactionId)
 }
 
 async function readAndVerifySnapshot(root: PreparedRoot, snapshotId: string): Promise<SnapshotManifest> {

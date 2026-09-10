@@ -1088,7 +1088,7 @@ const demoPlayerRoster: PlayerRoster = {
 
 type ConfigDraftValue = boolean | number | string
 
-function ConfigurationWorkspace({ canPreview, canApply, canManageHistory, demo }: {
+export function ConfigurationWorkspace({ canPreview, canApply, canManageHistory, demo }: {
   canPreview: boolean
   canApply: boolean
   canManageHistory: boolean
@@ -1103,8 +1103,15 @@ function ConfigurationWorkspace({ canPreview, canApply, canManageHistory, demo }
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [applied, setApplied] = useState<GameConfigTransactionResult | null>(null)
   const [error, setError] = useState('')
+  const editGeneration = useRef(0)
+  const submission = useRef<{ requestId: string; expectedRevision: string;
+    changes: Array<{ id: string; value: ConfigDraftValue }> } | null>(null)
+  const applyingRef = useRef(false)
+  const [confirmRecovery, setConfirmRecovery] = useState(false)
+  const executionEnabled = canApply && !demo && snapshot?.execution?.enabled === true
 
   const load = useCallback(async () => {
+    editGeneration.current++; submission.current = null; setConfirmOpen(false); setConfirmRecovery(false)
     setBusy(true); setError(''); setPreview(null)
     try {
       const result = await api.configuration()
@@ -1125,16 +1132,24 @@ function ConfigurationWorkspace({ canPreview, canApply, canManageHistory, demo }
   async function previewChanges() {
     if (!snapshot || changes.length === 0 || !canPreview) return
     setPreviewing(true); setError(''); setPreview(null)
-    try { setPreview((await api.previewConfiguration(snapshot.revision, changes)).data) }
+    const generation = editGeneration.current
+    try {
+      const result = await api.previewConfiguration(snapshot.revision, changes)
+      if (generation !== editGeneration.current) return
+      submission.current ??= { requestId: crypto.randomUUID(), expectedRevision: snapshot.revision, changes }
+      setPreview(result.data)
+    }
     catch (reason) { setError(reason instanceof Error ? reason.message : '配置差异预览失败') }
     finally { setPreviewing(false) }
   }
 
   async function applyChanges() {
-    if (!snapshot || !preview || changes.length === 0 || !canApply) return
+    if (!snapshot || !preview || !submission.current || !executionEnabled || applyingRef.current) return
+    applyingRef.current = true
     setApplying(true); setError(''); setConfirmOpen(false)
     try {
-      const result = await api.applyConfiguration(snapshot.revision, changes)
+      const pending = submission.current
+      const result = await api.applyConfiguration(pending.expectedRevision, pending.changes, pending.requestId)
       setApplied(result.data)
       const refreshed = await api.configuration()
       setSnapshot(refreshed.data)
@@ -1142,39 +1157,54 @@ function ConfigurationWorkspace({ canPreview, canApply, canManageHistory, demo }
         entry.id, entry.type === 'secret' ? '' : entry.value as boolean | number
       ])))
       setPreview(null)
+      submission.current = null
     } catch (reason) { setError(reason instanceof Error ? reason.message : '配置事务失败') }
-    finally { setApplying(false) }
+    finally { applyingRef.current = false; setApplying(false) }
+  }
+
+  async function recoverSubmission() {
+    if (!canApply || demo || snapshot?.execution?.recoveryEnabled !== true || !submission.current || applyingRef.current) return
+    applyingRef.current = true; setApplying(true); setConfirmRecovery(false); setError('')
+    try {
+      const result = await api.reconcileConfiguration(submission.current.requestId)
+      setApplied(result.data)
+      await load()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '配置恢复未完成') }
+    finally { applyingRef.current = false; setApplying(false) }
   }
 
   if (busy) return <div className="loading-state compact"><span className="spinner" />正在解析固定配置 Schema…</div>
   if (!snapshot) return <div className="configuration-workspace">
     <div className="configuration-empty"><FileCog size={34} /><strong>当前配置目录不可用</strong><p>{error || '请先完成 Windows 受管目录安装。'}</p><button onClick={load}>重试当前配置</button></div>
-    <ConfigHistoryWorkspace canManage={canManageHistory} demo={demo} onConfigurationChanged={load} />
+    <ConfigHistoryWorkspace canManage={canManageHistory && !applying} demo={demo} onConfigurationChanged={load} />
   </div>
   const groups = (['nebula', 'galaxy', 'bepinex', 'bridge'] as GameConfigFileId[]).map((file) => ({
     file, entries: snapshot.entries.filter((entry) => entry.file === file)
   })).filter((group) => group.entries.length)
 
   return <div className="configuration-workspace">
-    <div className="workspace-toolbar"><div><strong>Schema 配置编辑器</strong><span>版本 {snapshot.revision.slice(0, 10)} · {changes.length} 项待预览</span></div><button onClick={load}><RefreshCw size={16} />重新读取</button></div>
+    <div className="workspace-toolbar"><div><strong>Schema 配置编辑器</strong><span>版本 {snapshot.revision.slice(0, 10)} · {changes.length} 项待预览</span></div><button disabled={applying} onClick={load}><RefreshCw size={16} />重新读取</button></div>
     {!canPreview && <div className="permission-lock-note"><LockKeyhole size={15} /><span><strong>只读配置会话</strong><small>Viewer 可以查看固定 Schema，但编辑和差异预演保持禁用。</small></span></div>}
     {canPreview && !canApply && <div className="permission-lock-note operator"><LockKeyhole size={15} /><span><strong>Operator 预演模式</strong><small>可以编辑并生成差异；原子应用配置属于 Administrator 高风险操作。</small></span></div>}
+    {canApply && !executionEnabled && <div className="permission-lock-note"><LockKeyhole size={15} /><span><strong>配置提交尚未启用</strong><small>仍可编辑和预览；实际提交还需服务端执行门禁与受控停服。</small></span></div>}
     {error && <div className="inline-error"><TriangleAlert size={17} />{error}</div>}
+    {error && submission.current && <div className="config-actions"><span>请求编号：{submission.current.requestId}</span><button disabled={!canApply || demo || snapshot.execution?.recoveryEnabled !== true || applying} onClick={() => setConfirmRecovery(true)}>恢复未完成事务</button></div>}
+    {confirmRecovery && submission.current && <div role="alertdialog" className="config-confirm" aria-label="确认恢复配置事务"><p>将核对原事务和停服状态。未完成的写入会恢复原始配置；已经完成的提交会保留。</p><button onClick={() => setConfirmRecovery(false)}>取消恢复</button><button disabled={applying} onClick={recoverSubmission}>确认恢复</button></div>}
     {snapshot.invalidSettingIds.length > 0 && <div className="inline-warning"><TriangleAlert size={17} />发现 {snapshot.invalidSettingIds.length} 项无效值；界面显示安全默认值，写入前必须修复。</div>}
     <div className="config-groups">{groups.map((group) => <section className="config-group" key={group.file}>
       <header><strong>{configFileLabel(group.file)}</strong><span>{group.entries.length} 个固定字段</span></header>
-      <div>{group.entries.map((entry) => <ConfigField key={entry.id} entry={entry} value={drafts[entry.id]} disabled={!canPreview} onChange={(value) => {
-        setDrafts((current) => ({ ...current, [entry.id]: value })); setPreview(null)
+      <div>{group.entries.map((entry) => <ConfigField key={entry.id} entry={entry} value={drafts[entry.id]} disabled={!canPreview || applying} onChange={(value) => {
+        editGeneration.current++; submission.current = null; setConfirmOpen(false); setConfirmRecovery(false); setDrafts((current) => ({ ...current, [entry.id]: value })); setPreview(null)
       }} />)}</div>
     </section>)}</div>
-    {applied && <div className="config-applied"><Check size={17} /><div><strong>配置事务已提交</strong><span>事务 {applied.transactionId.slice(0, 8)} · 审计{applied.auditStored ? '已保存' : '未保存'} · {applied.restartRequired ? '需要稍后受控重启服务端' : '无需重启'}</span></div><button onClick={() => setApplied(null)}>关闭</button></div>}
-    <div className="config-actions"><div><ShieldCheck size={18} /><span><strong>{preview ? '差异已通过固定字段校验' : '先生成差异预览'}</strong><small>应用会创建四文件字节快照；不会自动重启游戏或改变已创建星系。</small></span></div><button className="primary-action" disabled={!canPreview || !changes.length || previewing || applying} onClick={previewChanges}><ScanSearch className={previewing ? 'spin' : ''} size={16} />{previewing ? '校验中…' : `预览 ${changes.length} 项变更`}</button><button disabled={!canApply || !preview || applying} title={canApply ? '进入管理员确认' : '配置应用仅对 Administrator 开放'} onClick={() => setConfirmOpen(true)}><FileCog size={16} />{applying ? '提交中…' : '应用配置'}</button></div>
+    {applied && <div className="config-applied"><Check size={17} /><div><strong>{applied.status === 'rolled-back' ? '配置事务已恢复原始配置' : '配置事务已提交'}</strong><span>事务 {applied.transactionId.slice(0, 8)} · 审计{applied.auditStored ? '已保存' : '未保存'} · {applied.restartRequired ? '需要稍后受控重启服务端' : '无需重启'}</span></div><button onClick={() => setApplied(null)}>关闭</button></div>}
+    <div className="config-actions"><div><ShieldCheck size={18} /><span><strong>{preview ? '差异已通过固定字段校验' : '先生成差异预览'}</strong><small>应用会创建四文件字节快照；不会自动重启游戏或改变已创建星系。</small></span></div><button className="primary-action" disabled={!canPreview || !changes.length || previewing || applying} onClick={previewChanges}><ScanSearch className={previewing ? 'spin' : ''} size={16} />{previewing ? '校验中…' : `预览 ${changes.length} 项变更`}</button><button disabled={!executionEnabled || !preview || applying} title={canApply ? '进入管理员确认' : '配置应用仅对 Administrator 开放'} onClick={() => setConfirmOpen(true)}><FileCog size={16} />{applying ? '提交中…' : '应用配置'}</button></div>
     {preview && <section className="config-preview"><header><div><Check size={17} /><strong>差异预览已生成</strong></div><span>{preview.restartRequired ? '需要重启服务端' : '无需重启'}{preview.newGameOnlyChanged ? ' · 包含仅新游戏参数' : ''}</span></header>
       <div>{preview.diff.filter((entry) => entry.changed).map((entry) => <div key={entry.id}><span>{entry.label}<small>{entry.activation === 'new-game-only' ? '仅创建新星系时生效' : '重启服务端后生效'}</small></span><code>{displayConfigValue(entry.before)} → {displayConfigValue(entry.after)}</code></div>)}</div>
       <p><ShieldCheck size={15} />提交将在独占锁内重新校验 revision，并在失败时恢复四个文件的原始字节。</p>
     </section>}
-    {confirmOpen && preview && canApply && <div className="config-confirm" role="alertdialog" aria-labelledby="config-confirm-title"><div><TriangleAlert size={20} /><span><strong id="config-confirm-title">确认提交 {preview.diff.filter((entry) => entry.changed).length} 项配置变更</strong><small>将创建可验证快照并原子替换配置；不会自动重启服务器。包含“仅新游戏”参数时，现有星系不会被改写。</small></span></div><div><button onClick={() => setConfirmOpen(false)}>取消</button><button className="confirm-execute" onClick={applyChanges}>确认应用</button></div></div>}
-    <ConfigHistoryWorkspace canManage={canManageHistory} demo={demo} onConfigurationChanged={load} />
+    {confirmOpen && preview && executionEnabled && <div className="config-confirm" role="alertdialog" aria-labelledby="config-confirm-title"><div><TriangleAlert size={20} /><span><strong id="config-confirm-title">确认提交 {preview.diff.filter((entry) => entry.changed).length} 项配置变更</strong><small>将创建可验证快照并原子替换配置；不会自动重启服务器。包含“仅新游戏”参数时，现有星系不会被改写。</small></span></div><div><button onClick={() => setConfirmOpen(false)}>取消</button><button className="confirm-execute" disabled={applying} onClick={applyChanges}>确认应用</button></div></div>}
+    <ConfigHistoryWorkspace canManage={canManageHistory && !applying} demo={demo} onConfigurationChanged={load} />
   </div>
 }
 

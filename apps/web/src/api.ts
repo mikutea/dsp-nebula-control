@@ -568,11 +568,15 @@ export const api = {
   }),
   applyConfiguration: (
     expectedRevision: string,
-    changes: Array<{ id: string; value: boolean | number | string }>
+    changes: Array<{ id: string; value: boolean | number | string }>,
+    requestId: string
   ) => request<{ data: GameConfigTransactionResult }>('/api/v1/configuration/apply', {
-    method: 'POST', body: JSON.stringify({ expectedRevision, changes, confirmation: 'APPLY_CONFIG' })
+    method: 'POST', body: JSON.stringify({ expectedRevision, changes, requestId, confirmation: 'APPLY_CONFIG' })
   }),
   gameConfigHistory: (signal?: AbortSignal) => gameConfigHistoryList(signal),
+  reconcileConfiguration: (requestId: string) => request<{ data: GameConfigTransactionResult }>('/api/v1/configuration/reconcile', {
+    method: 'POST', body: JSON.stringify({ requestId, confirmation: 'RECONCILE_CONFIG' })
+  }),
   gameConfigHistoryDetail: (snapshotId: string, signal?: AbortSignal) =>
     gameConfigHistoryDetail(snapshotId, signal),
   gameConfigHistoryDiff: (snapshotId: string, signal?: AbortSignal) =>

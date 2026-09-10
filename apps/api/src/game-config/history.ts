@@ -13,12 +13,15 @@ import {
   type FileHandle
 } from 'node:fs/promises'
 import path from 'node:path'
+import { hostname } from 'node:os'
+import { removeVerifiedResidualFileLock } from '../host-mutation/residual-file-lock.js'
 import {
   HostMutationOperationCoordinatorError,
   hostMutationReturn,
   hostMutationThrow,
   type HostMutationDisposition,
   type HostMutationOperationCoordinator,
+  type HostMutationRecoveryOperationCoordinator,
   type HostMutationOperationScope
 } from '../host-mutation/operation-coordinator.js'
 import { gameConfigCatalog, type GameConfigFileId } from './catalog.js'
@@ -85,6 +88,8 @@ export type GameConfigHistoryHookPhase =
   | 'before-rollback'
   | 'before-reconcile'
   | 'before-lock-release'
+  | 'before-journal'
+  | 'after-displace-file'
 
 export interface GameConfigHistoryTestHooks {
   onPhase?: (
@@ -100,6 +105,7 @@ export interface GameConfigHistoryServiceOptions {
   configRoot: string
   validateStopProof: GameConfigStopProofValidator
   hostMutationCoordinator?: HostMutationOperationCoordinator
+  hostMutationRecoveryCoordinator?: HostMutationRecoveryOperationCoordinator
   limits?: GameConfigHistoryLimits
   /** @internal Deterministic test clock. */
   now?: () => Date
@@ -289,6 +295,7 @@ interface GameConfigHostMutationContext {
   readonly scope: HostMutationOperationScope
   markPossibleLiveWrite(): void
   markDurableVerifiedTerminal(): void
+  afterDisplace?: (fileId: GameConfigFileId, index: number) => Promise<void>
 }
 
 type ConfigBuffers = Record<GameConfigFileId, Buffer | null>
@@ -304,6 +311,7 @@ export class GameConfigHistoryService {
   readonly #configuredRoot: string
   readonly #stopProofValidator: GameConfigStopProofValidator
   readonly #hostMutationCoordinator: HostMutationOperationCoordinator | null
+  readonly #hostMutationRecoveryCoordinator: HostMutationRecoveryOperationCoordinator | null
   readonly #limits: NormalizedLimits
   readonly #now: () => Date
   readonly #createId: () => string
@@ -319,6 +327,7 @@ export class GameConfigHistoryService {
     this.#configuredRoot = path.resolve(options.configRoot)
     this.#stopProofValidator = options.validateStopProof
     this.#hostMutationCoordinator = options.hostMutationCoordinator ?? null
+    this.#hostMutationRecoveryCoordinator = options.hostMutationRecoveryCoordinator ?? null
     this.#limits = normalizeLimits(options.limits)
     this.#now = options.now ?? (() => new Date())
     this.#createId = options.createId ?? randomUUID
@@ -383,7 +392,10 @@ export class GameConfigHistoryService {
     const fingerprint = restoreFingerprint(normalized)
     const startedAt = this.#now().toISOString()
     const root = await prepareRoot(this.#configuredRoot)
-    const lock = await acquireLock(root, normalized.requestId, startedAt)
+    const lock = await acquireLock(root, normalized.requestId, startedAt, fingerprint, {
+      requestId: normalized.requestId, snapshotId: normalized.snapshotId,
+      expectedCurrentRevision: normalized.expectedCurrentRevision, dryRun: normalized.dryRun
+    })
     if (!lock) {
       return makeReceipt({
         request: normalized, status: 'busy', targetRevision: null, finalRevision: null,
@@ -510,6 +522,7 @@ export class GameConfigHistoryService {
           startedAt,
           state: 'prepared'
         }
+        await this.#phase('before-journal', {})
         await writeJournal(transactionRoot, journal)
         await stageBuffers(transactionRoot, 'target', target.buffers)
         await assertCurrentState(root.root, protectedCurrent)
@@ -603,6 +616,31 @@ export class GameConfigHistoryService {
   async reconcileInterrupted(stopProofToken: string): Promise<GameConfigRecoveryResult[]> {
     assertStopProofToken(stopProofToken)
     const root = await prepareRoot(this.#configuredRoot)
+    const residual = await lstat(root.lockPath).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+    if (residual) return this.#recoverResidualLock(root, stopProofToken)
+    if (this.#hostMutationRecoveryCoordinator) {
+      const interrupted = await listInterruptedRoots(root, this.#limits)
+      if (interrupted.length > 1) throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+      if (interrupted.length === 1) {
+        const journal = await readJournal(interrupted[0]!.path)
+        return this.#hostMutationRecoveryCoordinator.runRecoveryExclusive({
+          expectedOperation: 'game-config-restore', expectedRequestId: journal.requestId
+        }, async scope => {
+          const owned = await acquireLock(root, journal.requestId, this.#now().toISOString(), journal.fingerprint)
+          if (!owned) return hostMutationThrow<GameConfigRecoveryResult[]>(new GameConfigHistoryError('CONFIG_HISTORY_BUSY'), 'abandon')
+          try {
+            const result = await this.#reconcileCandidates(root, stopProofToken, {
+              scope, markPossibleLiveWrite() {}, markDurableVerifiedTerminal() {}
+            }, journal.requestId)
+            if (result.length !== 1) throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+            assertHostMutationActive(scope)
+            return hostMutationReturn(result, reconcileHostMutationDisposition(result))
+          } catch (error) {
+            return hostMutationThrow<GameConfigRecoveryResult[]>(sanitizeHistoryError(error), 'abandon')
+          } finally { await this.#releaseLock(owned) }
+        })
+      }
+    }
     const lockId = this.#nextId()
     const lock = await acquireLock(root, lockId, this.#now().toISOString())
     if (!lock) throw new GameConfigHistoryError('CONFIG_HISTORY_BUSY')
@@ -611,8 +649,150 @@ export class GameConfigHistoryService {
         'game-config-reconcile',
         lockId,
         async (hostMutationContext) => {
+          return this.#reconcileCandidates(root, stopProofToken, hostMutationContext)
+        },
+        reconcileHostMutationDisposition
+      )
+    } catch (error) {
+      throw sanitizeHistoryError(error)
+    } finally {
+      await this.#releaseLock(lock)
+    }
+  }
+
+  async #recoverResidualLock(root: PreparedRoot, stopProofToken: string): Promise<GameConfigRecoveryResult[]> {
+    const coordinator = this.#hostMutationRecoveryCoordinator
+    if (!coordinator || processLocks.has(normalizePath(root.root))) throw new GameConfigHistoryError('CONFIG_HISTORY_BUSY')
+    const bytes = await readStableRequiredFile(root.controlRoot, 'configuration.lock', 4_096)
+    const owner: unknown = JSON.parse(decodeUtf8(bytes))
+    if (!isRecord(owner) || owner.format !== 'dyson-control-game-config-history-lock' || owner.version !== 2 ||
+        typeof owner.requestId !== 'string' || !uuidPattern.test(owner.requestId) ||
+        typeof owner.fingerprint !== 'string' || !sha256Pattern.test(owner.fingerprint)) {
+      throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+    }
+    const requestId = owner.requestId
+    try {
+      return await coordinator.runRecoveryExclusive({ expectedOperation: 'game-config-restore', expectedRequestId: requestId }, async scope => {
+        const key = normalizePath(root.root)
+        if (processLocks.has(key)) return hostMutationThrow<GameConfigRecoveryResult[]>(new GameConfigHistoryError('CONFIG_HISTORY_BUSY'), 'abandon')
+        processLocks.add(key)
+        let results: GameConfigRecoveryResult[] | undefined
+        let preJournal = false
+        let emptyTransactionRoot: string | null = null
+        try {
+          await removeVerifiedResidualFileLock({ lockPath: root.lockPath, expectedSha256: sha256(bytes), scope,
+            authorize: async evidence => {
+              if (owner.hostname !== hostname() || !Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0 ||
+                  typeof owner.instanceId !== 'string' || !uuidPattern.test(owner.instanceId) ||
+                  owner.device !== evidence.device || owner.inode !== evidence.inode) {
+                throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+              }
+              try { process.kill(Number(owner.pid), 0); throw new Error('Owner alive') } catch (error) {
+                if (!hasErrorCode(error, 'ESRCH')) throw new GameConfigHistoryError('CONFIG_HISTORY_BUSY')
+              }
+              const candidates = (await listInterruptedRoots(root, this.#limits)).filter(item => item.requestId === requestId)
+              if (candidates.length > 1) throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+              if (candidates.length === 1) {
+                const candidate = candidates[0]!
+                const journalExists = await lstat(fixedChild(candidate.path, 'journal.json')).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+                if (!journalExists) {
+                  if ((await readdir(candidate.path)).length !== 0) throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+                  preJournal = true; emptyTransactionRoot = candidate.path
+                } else {
+                  const journal = await readJournal(candidate.path)
+                  if (journal.requestId !== requestId || journal.fingerprint !== owner.fingerprint) {
+                    throw new GameConfigHistoryError('CONFIG_HISTORY_REQUEST_CONFLICT')
+                  }
+                }
+              } else {
+                const stored = await readStoredReceipt(root, requestId, this.#limits)
+                if (!stored) { preJournal = true; return }
+                if (stored.fingerprint !== owner.fingerprint ||
+                    !['restored', 'rolled-back', 'interrupted-recovered'].includes(stored.receipt.status) ||
+                    revisionOf(await readConfigBuffers(root.root)) !== stored.receipt.finalRevision) {
+                  throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+                }
+                results = [{ requestId, status: 'committed-cleanup', finalRevision: stored.receipt.finalRevision, errorCode: 'NONE' }]
+              }
+            },
+            beforeRemove: async () => {
+              if (preJournal) {
+                results = [await this.#recoverBeforeJournal(root, owner, stopProofToken, scope)]
+                if (emptyTransactionRoot) {
+                  if ((await readdir(emptyTransactionRoot)).length !== 0) throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+                  await removeTransactionRoot(emptyTransactionRoot, path.dirname(emptyTransactionRoot))
+                }
+              }
+              if (!results) results = await this.#reconcileCandidates(root, stopProofToken, {
+                scope, markPossibleLiveWrite() {}, markDurableVerifiedTerminal() {}
+              }, requestId)
+              if (results.length !== 1 || results.some(result => result.status === 'recovery-required')) {
+                throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+              }
+              assertHostMutationActive(scope)
+            }
+          })
+          return hostMutationReturn(results!, 'release')
+        } catch (error) {
+          return results ? hostMutationReturn(results.map(result => ({ ...result,
+            status: 'recovery-required' as const, errorCode: 'CONFIG_HISTORY_RECONCILIATION_REQUIRED' as const
+          })), 'abandon') : hostMutationThrow<GameConfigRecoveryResult[]>(sanitizeHistoryError(error), 'abandon')
+        } finally { processLocks.delete(key) }
+      })
+    } catch (error) { throw sanitizeHistoryError(error) }
+  }
+
+  async #recoverBeforeJournal(root: PreparedRoot, owner: Record<string, unknown>, stopProofToken: string,
+    scope: HostMutationOperationScope): Promise<GameConfigRecoveryResult> {
+    if (!isRecord(owner.recoveryRequest) || typeof owner.startedAt !== 'string' || !isIsoTimestamp(owner.startedAt)) {
+      throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+    }
+    const bound = owner.recoveryRequest
+    if (!hasExactKeys(bound, ['requestId', 'snapshotId', 'expectedCurrentRevision', 'dryRun']) ||
+        typeof bound.requestId !== 'string' || typeof bound.snapshotId !== 'string' ||
+        typeof bound.expectedCurrentRevision !== 'string' || bound.dryRun !== false) {
+      throw new GameConfigHistoryError('CONFIG_HISTORY_REQUEST_CONFLICT')
+    }
+    const request = normalizeRestoreRequest({ requestId: bound.requestId, snapshotId: bound.snapshotId,
+      expectedCurrentRevision: bound.expectedCurrentRevision, dryRun: false, stopProofToken })
+    if (request.dryRun || request.requestId !== owner.requestId || restoreFingerprint(request) !== owner.fingerprint) {
+      throw new GameConfigHistoryError('CONFIG_HISTORY_REQUEST_CONFLICT')
+    }
+    const current = await readConfigBuffers(root.root)
+    if (revisionOf(current) !== request.expectedCurrentRevision) throw new GameConfigHistoryError('CONFIG_HISTORY_REVISION_CONFLICT')
+    const target = await readSnapshot(root, request.snapshotId, this.#limits)
+    if (!await this.#stopProof(request, 'reconcile', scope)) throw new GameConfigHistoryError('CONFIG_HISTORY_STOP_PROOF_REJECTED')
+    const stored = await readStoredReceipt(root, request.requestId, this.#limits)
+    if (stored) {
+      if (stored.fingerprint !== owner.fingerprint || stored.receipt.status !== 'interrupted-recovered' ||
+          stored.receipt.finalRevision !== request.expectedCurrentRevision) throw new GameConfigHistoryError('CONFIG_HISTORY_RECONCILIATION_REQUIRED')
+      return { requestId: request.requestId, status: 'committed-cleanup', finalRevision: stored.receipt.finalRevision, errorCode: 'NONE' }
+    }
+    await assertReceiptCapacity(root, this.#limits)
+    const existing = (await listLoadedSnapshots(root, this.#limits)).find(snapshot =>
+      snapshot.manifest.kind === 'pre-restore' && snapshot.manifest.requestId === request.requestId &&
+      snapshot.manifest.revision === request.expectedCurrentRevision && equalBufferSets(snapshot.buffers, current))
+    assertHostMutationActive(scope)
+    const protection = existing ?? await this.#createSnapshot(root, current, 'pre-restore', request.requestId)
+    await assertCurrentState(root.root, current)
+    if (!await this.#stopProof(request, 'reconcile', scope)) throw new GameConfigHistoryError('CONFIG_HISTORY_STOP_PROOF_REJECTED')
+    const receipt = makeReceipt({ request, status: 'interrupted-recovered', targetRevision: target.manifest.revision,
+      finalRevision: request.expectedCurrentRevision, protectionSnapshotId: protection.manifest.snapshotId,
+      errorCode: 'CONFIG_HISTORY_INTERRUPTED_RECOVERED', startedAt: owner.startedAt,
+      finishedAt: this.#now().toISOString(), persisted: true, reused: false })
+    await writeStoredReceipt(root, owner.fingerprint as string, receipt)
+    assertHostMutationActive(scope)
+    return { requestId: request.requestId, status: 'interrupted-recovered', finalRevision: request.expectedCurrentRevision,
+      errorCode: 'CONFIG_HISTORY_INTERRUPTED_RECOVERED' }
+  }
+
+  async #reconcileCandidates(
+    root: PreparedRoot, stopProofToken: string, hostMutationContext: GameConfigHostMutationContext,
+    expectedRequestId?: string
+  ): Promise<GameConfigRecoveryResult[]> {
       const hostMutationScope = hostMutationContext.scope
-      const interrupted = await listInterruptedRoots(root, this.#limits)
+      const interrupted = (await listInterruptedRoots(root, this.#limits))
+        .filter(candidate => expectedRequestId === undefined || candidate.requestId === expectedRequestId)
       const results: GameConfigRecoveryResult[] = []
       for (const candidate of interrupted) {
         let journal: RestoreJournal
@@ -627,7 +807,18 @@ export class GameConfigHistoryService {
           })
           continue
         }
-        const stored = await readStoredReceipt(root, journal.requestId, this.#limits).catch(() => null)
+        let stored: StoredReceipt | null
+        try {
+          stored = await readStoredReceipt(root, journal.requestId, this.#limits)
+          if (stored && stored.fingerprint !== journal.fingerprint) {
+            throw new GameConfigHistoryError('CONFIG_HISTORY_REQUEST_CONFLICT')
+          }
+        } catch {
+          results.push({ requestId: journal.requestId, status: 'recovery-required',
+            finalRevision: safeRevision(await readConfigBuffers(root.root).catch(() => null)),
+            errorCode: 'CONFIG_HISTORY_RECONCILIATION_REQUIRED' })
+          continue
+        }
         if (stored && ['restored', 'rolled-back', 'interrupted-recovered'].includes(stored.receipt.status)) {
           const current = await readConfigBuffers(root.root).catch(() => null)
           if (current && stored.receipt.finalRevision !== null &&
@@ -641,6 +832,11 @@ export class GameConfigHistoryService {
             })
             continue
           }
+          // A durable completed receipt remains authoritative. A later edit
+          // is not evidence that the committed transaction should be undone.
+          results.push({ requestId: journal.requestId, status: 'recovery-required',
+            finalRevision: safeRevision(current), errorCode: 'CONFIG_HISTORY_REVISION_CONFLICT' })
+          continue
         }
 
         await this.#phase('before-reconcile', {})
@@ -662,6 +858,20 @@ export class GameConfigHistoryService {
 
         try {
           const protection = await readSnapshot(root, journal.protectionSnapshotId, this.#limits)
+          const target = await readSnapshot(root, journal.snapshotId, this.#limits)
+          if (protection.manifest.revision !== journal.expectedCurrentRevision ||
+              protection.manifest.requestId !== journal.requestId || target.manifest.revision !== journal.targetRevision) {
+            throw new GameConfigHistoryError('CONFIG_HISTORY_SNAPSHOT_INVALID')
+          }
+          const beforePublish = async () => {
+            assertHostMutationActive(hostMutationScope)
+            await assertRecoverableConfigState(root, candidate.path, protection.buffers, target.buffers)
+            if (!await this.#validateStopProof({ token: stopProofToken, requestId: journal.requestId,
+              snapshotId: journal.snapshotId, phase: 'reconcile' }, hostMutationScope)) {
+              throw new GameConfigHistoryError('CONFIG_HISTORY_STOP_PROOF_REJECTED')
+            }
+          }
+          await beforePublish()
           await stageBuffers(candidate.path, 'reconcile', protection.buffers)
           if (!await this.#validateStopProof({
             token: stopProofToken,
@@ -676,7 +886,8 @@ export class GameConfigHistoryService {
             candidate.path,
             'reconcile',
             protection.buffers,
-            hostMutationContext
+            hostMutationContext,
+            beforePublish
           )
           await assertCurrentState(root.root, protection.buffers)
           const receipt = makeReceipt({
@@ -721,14 +932,6 @@ export class GameConfigHistoryService {
         }
       }
       return results
-        },
-        reconcileHostMutationDisposition
-      )
-    } catch (error) {
-      throw sanitizeHistoryError(error)
-    } finally {
-      await this.#releaseLock(lock)
-    }
   }
 
   async #createSnapshot(
@@ -874,6 +1077,7 @@ export class GameConfigHistoryService {
           let possibleLiveWrite = false
           const context: GameConfigHostMutationContext = {
             scope,
+            afterDisplace: (fileId, index) => this.#phase('after-displace-file', { fileId, index }),
             markPossibleLiveWrite: () => { possibleLiveWrite = true },
             markDurableVerifiedTerminal: () => { possibleLiveWrite = false }
           }
@@ -1037,7 +1241,9 @@ async function assertPlainDirectory(directory: string, parent?: string): Promise
 async function acquireLock(
   root: PreparedRoot,
   requestId: string,
-  startedAt: string
+  startedAt: string,
+  fingerprint: string | null = null,
+  recoveryRequest: Omit<NormalizedRestoreRequest, 'stopProofToken'> | null = null
 ): Promise<AcquiredLock | null> {
   const rootKey = normalizePath(root.root)
   if (processLocks.has(rootKey)) return null
@@ -1057,7 +1263,10 @@ async function acquireLock(
     if (!initial.isFile()) throw new GameConfigHistoryError('CONFIG_HISTORY_STORAGE_UNAVAILABLE')
     identity = lockFileIdentity(initial)
     await handle.writeFile(`${JSON.stringify({
-      format: 'dyson-control-game-config-history-lock', version: 1, requestId, startedAt
+      format: 'dyson-control-game-config-history-lock', version: 2, requestId, startedAt,
+      fingerprint, pid: process.pid, hostname: hostname(), instanceId: randomUUID(),
+      recoveryRequest,
+      device: initial.dev.toString(), inode: initial.ino.toString()
     })}\n`, 'utf8')
     await handle.sync()
     const finalized = await handle.stat({ bigint: true })
@@ -1492,14 +1701,45 @@ async function stageBuffers(
   await syncDirectory(transactionRoot)
 }
 
+async function assertRecoverableConfigState(root: PreparedRoot, transactionRoot: string,
+  before: ConfigBuffers, after: ConfigBuffers): Promise<void> {
+  const current = await readConfigBuffers(root.root)
+  for (const [index, file] of managedFiles.entries()) {
+    if (equalBuffers(current[file.id], before[file.id]) || equalBuffers(current[file.id], after[file.id])) continue
+    if (current[file.id] !== null) throw new GameConfigHistoryError('CONFIG_HISTORY_REVISION_CONFLICT')
+    // Publication can exit between moving the old file and installing its
+    // replacement. Accept this gap only with transaction-owned byte evidence.
+    let provenGap = false
+    for (const stage of ['target', 'rollback', 'reconcile']) {
+      const displacedRoot = fixedChild(transactionRoot, `displaced-${stage}`)
+      const metadata = await lstat(displacedRoot).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+      if (!metadata) continue
+      await assertPlainDirectory(displacedRoot, transactionRoot)
+      const name = `${index}-${file.storedName}`
+      const displaced = await lstat(fixedChild(displacedRoot, name)).catch(error => hasErrorCode(error, 'ENOENT') ? null : Promise.reject(error))
+      if (!displaced) continue
+      const bytes = await readStableRequiredFile(displacedRoot, name, maximumConfigBytes)
+      if (!equalBuffers(bytes, before[file.id]) && !equalBuffers(bytes, after[file.id])) continue
+      const stageRoot = fixedChild(transactionRoot, stage)
+      await assertPlainDirectory(stageRoot, transactionRoot)
+      const staged = await readStableRequiredFile(stageRoot, file.storedName, maximumConfigBytes)
+      const desired = stage === 'target' ? after[file.id] : before[file.id]
+      if (equalBuffers(staged, desired)) { provenGap = true; break }
+    }
+    if (!provenGap) throw new GameConfigHistoryError('CONFIG_HISTORY_REVISION_CONFLICT')
+  }
+}
+
 async function publishAllBuffers(
   root: PreparedRoot,
   transactionRoot: string,
   stageName: string,
   buffers: ConfigBuffers,
-  hostMutationContext: GameConfigHostMutationContext
+  hostMutationContext: GameConfigHostMutationContext,
+  beforePublish?: () => Promise<void>
 ): Promise<void> {
   for (const [index, file] of managedFiles.entries()) {
+    await beforePublish?.()
     await publishOneBuffer(
       root.root,
       transactionRoot,
@@ -1539,6 +1779,7 @@ async function publishOneBuffer(
     await rename(target, displaced)
     await syncDirectory(configRoot)
     await syncDirectory(displacedRoot)
+    await hostMutationContext.afterDisplace?.(file.id, index)
   }
   if (desired !== null) {
     const stageRoot = fixedChild(transactionRoot, stageName)

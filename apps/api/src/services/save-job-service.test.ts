@@ -7,6 +7,7 @@ import {
   type HostMutationOperationCoordinator,
   type HostMutationOperationOutcome,
   type HostMutationOperationRequest,
+  type HostMutationRecoveryOperationRequest,
   type HostMutationOperationScope
 } from '../host-mutation/operation-coordinator.js'
 import type { PersistedSaveJobRequest } from '../saves/job-types.js'
@@ -46,6 +47,48 @@ class SaveJobService extends CoreSaveJobService {
 }
 
 describe('durable paired-save job service', () => {
+  it.each(['recover', 'clean', 'mismatch', 'error-after-entry'] as const)(
+    'uses exact recovery authority without replaying an entered callback: %s', async mode => {
+      const database = new ControlDatabase('unused', true)
+      const created = database.createSaveJob(persistedRestore(), 'Administrator', 'queued fixture')
+      claimRunningFixture(database, created.job.id)
+      database.completeSaveRun(created.job.id, 'interrupted', 'cleanup pending fixture',
+        'SAVE_COMMIT_CLEANUP_PENDING', true, {
+          status: 'succeeded', backupId: sourceBackupId, protectionBackupId: `tx-${protectionKey}`,
+          pairBytes: 2048, rollback: 'not-required', reused: false, auditStored: true,
+          cleanupPending: true, maintenanceRequired: true
+        })
+      const ordinary = new RecordingHostMutationCoordinator()
+      const recoveryRequests: HostMutationRecoveryOperationRequest[] = []
+      const executor = new ScriptedExecutor(async (operation, input) => transactionResult(operation, input))
+      const service = new SaveJobService(database, executor, new EventHub(), {
+        hostMutationCoordinator: ordinary,
+        hostMutationRecoveryCoordinator: {
+          async runRecoveryExclusive<T>(request: HostMutationRecoveryOperationRequest,
+            operation: (scope: HostMutationOperationScope) => Promise<HostMutationOperationOutcome<T>> | HostMutationOperationOutcome<T>): Promise<T> {
+            recoveryRequests.push(request)
+            if (mode === 'clean') throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED')
+            if (mode === 'mismatch') throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_RECOVERY_MISMATCH')
+            const outcome = await operation({ signal: new AbortController().signal,
+              assertActive() {}, toPowerShellBorrowArguments: () => [] })
+            if (mode === 'error-after-entry') throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED')
+            if (outcome.kind === 'throw') throw outcome.error
+            return outcome.value
+          }
+        }
+      })
+      try {
+        service.initialize()
+        service.reconcile(created.job.id, 'Administrator')
+        await service.close()
+        expect(recoveryRequests).toEqual([{ expectedOperation: 'save-restore', expectedRequestId: restoreKey }])
+        expect(ordinary.requests).toHaveLength(mode === 'clean' ? 1 : 0)
+        expect(executor.calls).toHaveLength(mode === 'mismatch' ? 0 : 1)
+        if (executor.calls.length) expect(executor.restoreScopes[0]?.recoveryRequestId).toBe(restoreKey)
+      } finally { await service.close(); database.close() }
+    }
+  )
+
   it('returns queued immediately, serializes concurrent jobs, and reuses the same UUID exactly once', async () => {
     const database = new ControlDatabase('unused', true)
     let active = 0

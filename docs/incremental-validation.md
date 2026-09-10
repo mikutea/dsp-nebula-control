@@ -1,5 +1,67 @@
 # Risk-based validation
 
+## Acquisition and candidate cache mutexes
+
+Changes to `update-pipeline/cache-mutex.ts` require its tests and acquisition,
+candidate-preparation, and staging service/controller/route tests plus API
+typechecking. Validate real child-process exit and reacquisition, downloaded byte
+hashes and receipt replay, partial unpublished staging followed by verified
+publication, and active/foreign/legacy/hard-linked ownership rejection. Check
+that release never deletes a replaced lock. Request and artifact mutexes protect
+cache metadata only; they grant no live installation authority. Legacy PID-only
+locks and unproven partial records remain operator-review items. Preserve earlier
+partial-attempt evidence until separately authorized cleanup. Obtain final-candidate
+target-host evidence before treating these checks as production acceptance.
+
+## Steam handoff metadata lock recovery
+
+Changes to Steam handoff lock recovery require its service, HTTP controller, and
+application-route tests plus API typechecking. Verify prior-boot and same-boot
+locks owned by an exited child process, live-owner rejection, foreign-host rejection,
+future/invalid ownership metadata, and hard-link rejection. Reclamation must keep
+the file open while checking bounded contents and filesystem identity. This local
+metadata mutex does not replace the global operation/recovery lease or prove an
+actual Steam update; final candidate validation on the target host remains required.
+
+## Configuration transaction recovery batch (in progress)
+
+The configuration page consumes server execution metadata and fails closed when
+it is missing. Its UI checks cover disabled gates, unchanged retry UUIDs, new UUIDs
+after editing, stale preview rejection, and explicit recovery of the pending
+request. Run `configuration-workspace.test.tsx`, its history workspace regression,
+and affected API route tests. Validate the final built page in a browser; component
+tests alone do not establish rendered layout or production execution acceptance.
+
+Changes to configuration apply coordination, durable intent, or residual-lock
+ownership require the configuration transaction, configuration apply/reconcile coordination,
+configuration history, and workspace-route tests plus API typechecking. Transaction
+tests must include a real child-process exit immediately after lock acquisition,
+during snapshot creation, after snapshot completion, before replacement, after the first
+replacement, after all replacements but before terminal verification, and after
+the terminal audit is durable but before lock release. Verify
+the retained snapshot and lock binding, byte-state classification, and rejection
+of a subsequent writer. Also inject compensating rollback and terminal-audit
+storage failures; neither may release an unresolved transaction's lock.
+For pre-intent recovery, require the original request revision, complete lock
+ownership, unchanged live bytes, absence of staged replacements, and validation
+of every existing snapshot fragment before completing the snapshot. Corrupt or
+foreign fragments must be preserved and rejected.
+Configuration history recovery also requires `history-hard-exit.test.ts`: original
+global recovery authority must precede residual-lock removal or fresh local-lock
+acquisition. Cover publication exit, terminal-before-unlock exit, a retained journal
+without a local lock, foreign live bytes, mismatched authority, and receipt replay.
+Keep invalid receipts and later edits intact. Validate any absent-file publication
+gap against the transaction's displaced file and staged replacement before recovery.
+
+These interruption/quarantine checks alone do not establish automatic recovery.
+Release also requires exact-authority recovery and terminal replay tests, including
+foreign lock, changed file, malformed evidence, and interrupted recovery rejection.
+Verify that completed-apply replay preserves later configuration edits and that
+reuse of a request ID with different input is rejected. Run the affected scenarios from the final candidate on the
+target Windows host with disposable configuration fixtures, followed by authenticated
+configuration apply/restore acceptance under the production stop-proof and global
+lease. Keep real paths, configuration contents, and evidence outside this repository.
+
 Validate changed behavior, not every historical change on the branch. Reuse evidence
 when its implementation, dependencies, contract and relevant environment remain valid.
 Source validation does not imply production acceptance.

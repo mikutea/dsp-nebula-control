@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { constants } from 'node:fs'
 import { mkdir, lstat, open, readFile, realpath, rename, rm, unlink, writeFile, copyFile } from 'node:fs/promises'
-import type { FileHandle } from 'node:fs/promises'
+import { acquireCacheMutex, CacheMutexError, type CacheMutex } from './cache-mutex.js'
 import path from 'node:path'
 import { z } from 'zod'
 import { normalizeVersion, sha256Schema, sourceIdSchema, type VersionComponent } from '../updates/version.js'
@@ -193,18 +193,11 @@ export class OfflineArtifactStager {
     const lockPath = managedChild(locksRoot, `${request.artifactId}.lock`)
     const sourcePath = managedChild(this.#inboxRoot, `${request.artifactId}.artifact`)
     const plan = createArtifactStagePlan(request.artifactId)
-    let lockHandle: FileHandle
+    let lock: CacheMutex
     try {
-      lockHandle = await open(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+      lock = await acquireCacheMutex(lockPath)
     } catch (error) {
-      if (isNodeError(error, 'EEXIST')) throw new UpdatePipelineError('STAGING_LOCK_BUSY', { cause: error })
-      throw new UpdatePipelineError('STAGING_LOCK_FAILED', { cause: error })
-    }
-    try {
-      await lockHandle.writeFile(`${process.pid}\n`, 'utf8')
-    } catch (error) {
-      await lockHandle.close().catch(() => undefined)
-      await unlink(lockPath).catch(() => undefined)
+      if (error instanceof CacheMutexError && error.code === 'CACHE_MUTEX_BUSY') throw new UpdatePipelineError('STAGING_LOCK_BUSY', { cause: error })
       throw new UpdatePipelineError('STAGING_LOCK_FAILED', { cause: error })
     }
 
@@ -285,8 +278,7 @@ export class OfflineArtifactStager {
         assertManagedPath(this.#stagingRoot, temporaryDirectory)
         await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => undefined)
       }
-      await lockHandle.close().catch(() => undefined)
-      await unlink(lockPath).catch(() => undefined)
+      try { await lock.release() } catch (error) { throw new UpdatePipelineError('STAGING_LOCK_FAILED', { cause: error }) }
     }
   }
 }

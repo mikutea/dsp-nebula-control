@@ -12,6 +12,7 @@ import {
   writeFile
 } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
+import { acquireCacheMutex, CacheMutexError, type CacheMutex } from './cache-mutex.js'
 import path from 'node:path'
 import { z } from 'zod'
 import {
@@ -811,22 +812,19 @@ function parseContentLength(value: string | null): number | null {
   return parsed
 }
 
-interface AcquiredLock { handle: FileHandle; path: string }
+type AcquiredLock = CacheMutex
 
 async function acquireLock(lockPath: string, code: string): Promise<AcquiredLock> {
   try {
-    const handle = await open(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
-    await handle.writeFile(`${process.pid}\n`, 'utf8')
-    return { handle, path: lockPath }
+    return await acquireCacheMutex(lockPath)
   } catch (error) {
-    if (isNodeError(error, 'EEXIST')) throw new UpdatePipelineError(code, { cause: error })
+    if (error instanceof CacheMutexError && error.code === 'CACHE_MUTEX_BUSY') throw new UpdatePipelineError(code, { cause: error })
     throw new UpdatePipelineError('ACQUISITION_LOCK_FAILED', { cause: error })
   }
 }
 
 async function releaseLock(lock: AcquiredLock): Promise<void> {
-  await lock.handle.close().catch(() => undefined)
-  await unlink(lock.path).catch(() => undefined)
+  try { await lock.release() } catch (error) { throw new UpdatePipelineError('ACQUISITION_LOCK_FAILED', { cause: error }) }
 }
 
 async function readOptionalCandidate(file: string): Promise<StoredArtifactCandidate | null> {

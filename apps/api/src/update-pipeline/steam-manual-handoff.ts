@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises'
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { hostname, uptime } from 'node:os'
 import path from 'node:path'
@@ -1048,15 +1048,42 @@ async function acquireLock(lockPath: string): Promise<FileHandle> {
 }
 
 async function removeStaleLock(lockPath: string): Promise<boolean> {
+  let handle: FileHandle | null = null
   try {
-    const value = JSON.parse(await readFile(lockPath, 'utf8')) as Record<string, unknown>
-    if (value.host !== hostname() || value.bootId !== currentBootId() ||
-        typeof value.pid !== 'number' || !Number.isInteger(value.pid) || value.pid <= 0 || processAlive(value.pid)) {
+    const before = await lstat(lockPath, { bigint: true })
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.ino === 0n ||
+        before.size < 1n || before.size > 4_096n ||
+        path.resolve(await realpath(lockPath)).toLowerCase() !== path.resolve(lockPath).toLowerCase()) return false
+    handle = await open(lockPath, 'r')
+    const opened = await handle.stat({ bigint: true })
+    if (opened.dev !== before.dev || opened.ino !== before.ino) return false
+    const buffer = Buffer.alloc(4_097)
+    const initialRead = await handle.read(buffer, 0, buffer.length, 0)
+    if (initialRead.bytesRead !== Number(opened.size) || initialRead.bytesRead > 4_096) return false
+    const bytes = Buffer.from(buffer.subarray(0, initialRead.bytesRead))
+    const value = JSON.parse(bytes.toString('utf8')) as Record<string, unknown>
+    // The boot marker prevents malformed/future ownership from being reclaimed.
+    // An older boot is valid evidence, but never bypasses the dead-process check:
+    // a reused PID or uncertain process lookup must still fail closed.
+    const boot = typeof value.bootId === 'string' && /^[0-9a-z]+$/.test(value.bootId)
+      ? Number.parseInt(value.bootId, 36) : NaN
+    const acquiredAt = typeof value.acquiredAt === 'string' ? Date.parse(value.acquiredAt) : NaN
+    if (value.host !== hostname() || !Number.isSafeInteger(boot) || boot < 0 ||
+        boot.toString(36) !== value.bootId || boot > Number.parseInt(currentBootId(), 36) + 1 ||
+        !Number.isFinite(acquiredAt) || acquiredAt > Date.now() ||
+        typeof value.pid !== 'number' || !Number.isSafeInteger(value.pid) || value.pid <= 0 || processAlive(value.pid)) {
       return false
     }
+    const current = await lstat(lockPath, { bigint: true })
+    if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1n ||
+        current.dev !== opened.dev || current.ino !== opened.ino || current.size !== opened.size ||
+        current.mtimeNs !== opened.mtimeNs || current.ctimeNs !== opened.ctimeNs) return false
+    const reread = Buffer.alloc(4_097)
+    const read = await handle.read(reread, 0, reread.length, 0)
+    if (read.bytesRead !== bytes.length || !bytes.equals(reread.subarray(0, read.bytesRead))) return false
     await unlink(lockPath)
     return true
-  } catch { return false }
+  } catch { return false } finally { await handle?.close().catch(() => undefined) }
 }
 
 function processAlive(pid: number): boolean {

@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -21,6 +24,30 @@ afterEach(async () => {
 })
 
 describe('managed artifact acquisition', () => {
+  it('retries both request and artifact locks after the downloader process exits', async () => {
+    const value = await fixture()
+    const fetch = vi.fn(async () => zipResponse(value.bytes))
+    const service = acquisition(value, fetch)
+    const candidate = await service.registerNebulaRelease(nebulaRelease(value))
+    const request = requestFor(candidate)
+    const source = new URL('./acquisition.ts', import.meta.url).href
+    const loader = pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm')).href
+    const program = `import { ManagedArtifactAcquisitionService } from ${JSON.stringify(source)};
+      const input = JSON.parse(process.argv[1]);
+      const service = new ManagedArtifactAcquisitionService({ inboxRoot: input.inboxRoot, stateRoot: input.stateRoot,
+        now: () => new Date('2026-08-30T08:00:00.000Z'), fetch: async () => { process.exit(75); } });
+      await service.acquire(input.request); process.exit(76);`
+    const child = spawnSync(process.execPath, ['--import', loader, '--input-type=module', '--eval', program,
+      JSON.stringify({ inboxRoot: value.inboxRoot, stateRoot: value.stateRoot, request })],
+    { windowsHide: true, timeout: 15_000, encoding: 'utf8', maxBuffer: 64 * 1024 })
+    expect(child.status, child.stderr).toBe(75)
+    const first = await service.acquire(request)
+    expect(first).toMatchObject({ state: 'acquired', artifact: { sha256: value.sha256 } })
+    expect(await readFile(path.join(value.inboxRoot, `${value.artifactId}.artifact`))).toEqual(value.bytes)
+    expect(await service.acquire(request)).toEqual(first)
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
   it('binds discovery server-side, downloads into the fixed inbox, persists a redacted receipt, and replays idempotently', async () => {
     const value = await fixture()
     const fetch = vi.fn(async () => zipResponse(value.bytes))

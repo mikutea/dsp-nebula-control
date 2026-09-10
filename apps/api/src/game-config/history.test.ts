@@ -662,6 +662,46 @@ describe('game configuration snapshot history', () => {
     expect(repeated).toMatchObject({ status: 'interrupted-recovered', reused: true, persisted: true })
   })
 
+  it.each(['malformed-receipt', 'foreign-fingerprint', 'later-edit'] as const)(
+    'preserves evidence and live bytes when recovery encounters %s', async mode => {
+      const root = await seedRoot()
+      const snapshot = await createService(root, { ids: [uuid(170), uuid(171)] }).capture()
+      await mutateCurrent(root)
+      const request = makeRestore(snapshot.snapshotId, await currentRevision(root), uuid(172))
+      await expect(createService(root, { ids: [uuid(173)],
+        hooks: { simulateInterruptionAfterFileIndex: 0 }
+      }).restore(request)).rejects.toThrow('TEST_SIMULATED_PROCESS_EXIT')
+      const pending = path.join(root, '.dyson-control', 'config-history', 'pending', `restore-${request.requestId}`)
+      const journalPath = path.join(pending, 'journal.json')
+      const journalBytes = await readFile(journalPath)
+      const receiptPath = path.join(root, '.dyson-control', 'config-history', 'receipts', `${request.requestId}.json`)
+      if (mode === 'malformed-receipt') {
+        await writeFile(receiptPath, '{incomplete receipt')
+      } else {
+        expect((await createService(root, { ids: [uuid(174)] }).reconcileInterrupted('fictional-stop-proof'))[0]!.status)
+          .toBe('interrupted-recovered')
+        // Recreate only the retained journal to model a crash at terminal cleanup.
+        await mkdir(pending)
+        await writeFile(journalPath, journalBytes)
+        if (mode === 'foreign-fingerprint') {
+          const stored = JSON.parse(await readFile(receiptPath, 'utf8'))
+          stored.fingerprint = '0'.repeat(64)
+          await writeFile(receiptPath, JSON.stringify(stored))
+        } else {
+          await writeFile(path.join(root, 'nebula.cfg'), 'later administrator configuration\n')
+        }
+      }
+      const before = await readManagedBuffers(root)
+      const receiptBytes = await readFile(receiptPath)
+      const result = await createService(root, { ids: [uuid(175)] }).reconcileInterrupted('fictional-stop-proof')
+      expect(result).toEqual([expect.objectContaining({ requestId: request.requestId, status: 'recovery-required',
+        errorCode: mode === 'later-edit' ? 'CONFIG_HISTORY_REVISION_CONFLICT' : 'CONFIG_HISTORY_RECONCILIATION_REQUIRED' })])
+      expectBuffers(await readManagedBuffers(root), before)
+      expect(await readFile(receiptPath)).toEqual(receiptBytes)
+      expect(await readFile(journalPath)).toEqual(journalBytes)
+    }
+  )
+
   it('fails reconciliation closed without a coordinator and abandons unresolved recovery', async () => {
     const root = await seedRoot()
     const snapshot = await createService(root, { ids: [uuid(140), uuid(141)] }).capture()

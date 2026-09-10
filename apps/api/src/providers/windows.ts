@@ -124,7 +124,7 @@ export class WindowsProvider implements StatusProvider {
       child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk })
       child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
       child.once('error', (error) => finish(() => reject(error)))
-      child.once('exit', (code) => {
+      child.once('close', (code) => {
         finish(() => {
           if (code === 0) resolve(stdout.trim())
           else reject(new Error(`Status collector failed with exit code ${code}: ${stderr.trim()}`))

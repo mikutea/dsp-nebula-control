@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -31,6 +34,32 @@ async function fixture() {
 }
 
 describe('offline artifact staging', () => {
+  it('retries after a real exit with an unpublished partial staging directory', async () => {
+    const value = await fixture()
+    const source = new URL('./staging.ts', import.meta.url).href
+    const loader = pathToFileURL(createRequire(import.meta.url).resolve('tsx/esm')).href
+    const program = `import { OfflineArtifactStager } from ${JSON.stringify(source)};
+      const input = JSON.parse(process.argv[1]);
+      const stager = new OfflineArtifactStager({ inboxRoot: input.inboxRoot, stagingRoot: input.stagingRoot,
+        now() { process.exit(75); } });
+      await stager.stage(input.request); process.exit(76);`
+    const child = spawnSync(process.execPath, ['--import', loader, '--input-type=module', '--eval', program,
+      JSON.stringify({ inboxRoot: value.inboxRoot, stagingRoot: value.stagingRoot, request: value.request })],
+    { windowsHide: true, timeout: 15_000, encoding: 'utf8', maxBuffer: 64 * 1024 })
+    expect(child.status, child.stderr).toBe(75)
+    const partials = (await readdir(value.stagingRoot)).filter(name => name.startsWith('.tmp-'))
+    expect(partials).toHaveLength(1)
+    expect(await readdir(path.join(value.stagingRoot, 'releases'))).toEqual([])
+    const stager = new OfflineArtifactStager({ inboxRoot: value.inboxRoot, stagingRoot: value.stagingRoot })
+    const result = await stager.stage(value.request)
+    expect(result).toMatchObject({ created: true, manifest: { sha256: value.sha256 } })
+    expect(await readFile(path.join(value.stagingRoot, 'releases', value.artifactId, 'artifact.bin'))).toEqual(value.bytes)
+    expect((await stager.stage(value.request)).created).toBe(false)
+    expect(await readdir(path.join(value.stagingRoot, '.locks'))).toEqual([])
+    // Recovery does not indiscriminately delete an earlier attempt's evidence.
+    expect(await readFile(path.join(value.stagingRoot, partials[0]!, 'artifact.bin'))).toEqual(value.bytes)
+  })
+
   it('verifies and atomically publishes a fixed-inbox artifact, then reuses it idempotently', async () => {
     const value = await fixture()
     const stager = new OfflineArtifactStager({
