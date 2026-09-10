@@ -3,8 +3,8 @@ import test from 'node:test'
 import { classifyChange, selectCommands, planExecution } from './validate-incremental.mjs'
 
 test('version reuse permits only the exact reviewed version substitution', () => {
-  assert.equal(classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17\r\n', 'v=0.1.0-rc.21\n'), 'version-only')
-  assert.throws(() => classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17', 'v=0.1.0-rc.21; unsafe=true'))
+  assert.equal(classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17\r\n', 'v=0.1.0-rc.22\n'), 'version-only')
+  assert.throws(() => classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17', 'v=0.1.0-rc.22; unsafe=true'))
   assert.throws(() => classifyChange('apps/api/package-lock.json', 'old dependency', 'new dependency'))
 })
 
@@ -181,4 +181,12 @@ test('the reviewed startup bundle selects bounded checks without repeating deplo
     assert.throws(()=>classifyChange(file,'unreviewed before','unreviewed after'))
   }
   function expectNoPending(plan) { assert.equal(plan.pendingHostCommands.length,0) }
+})
+
+test('component baselines reuse only root package versions, never dependency versions', () => {
+  const file='apps/api/package-lock.json'
+  const before=JSON.stringify({version:'0.1.0-rc.21',packages:{'':{version:'0.1.0-rc.21'},'node_modules/example':{version:'0.1.0-rc.21'}}})
+  const after=JSON.stringify({version:'0.1.0-rc.22',packages:{'':{version:'0.1.0-rc.22'},'node_modules/example':{version:'0.1.0-rc.21'}}})
+  assert.equal(classifyChange(file,before,after),'version-only')
+  assert.throws(()=>classifyChange(file,before,after.replace('"node_modules/example":{"version":"0.1.0-rc.21"','"node_modules/example":{"version":"0.1.0-rc.22"')))
 })
