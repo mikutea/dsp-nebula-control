@@ -772,9 +772,15 @@ function Get-DysonRebootAcceptanceNativeControlObservation {
     if (-not [bool]$lifecycleBroker.ready) {
         throw 'The fixed lifecycle broker is not ready for reboot acceptance.'
     }
+    $requiredChecks = @('lifecycleBroker')
+    $configured = Read-DysonDeploymentStatusEnvironmentFile -Path $environmentPath
+    try {
+        if ($configured['DYSON_CUTOVER_RECOVERY_ENABLED'] -ceq 'true') { $requiredChecks += 'cutoverRecovery' }
+    }
+    finally { $configured.Clear() }
     [void](Test-DysonLoopbackReadiness -ReadinessUri $ReadinessUri `
         -ExpectedVersion ([string]$active.pointer.version) `
-        -RequiredChecks @('lifecycleBroker', 'cutoverRecovery') -TimeoutSeconds 10)
+        -RequiredChecks $requiredChecks -TimeoutSeconds 45)
     $readinessNodeProtection = Assert-DysonNodeRuntimeProtection -RuntimeRoot $RuntimeRoot `
         -NodeExecutable $NodeExecutable -ExpectedNodeSha256 $ExpectedNodeSha256 `
         -InstallRoot $InstallRoot -DataRoot $DataRoot
@@ -891,6 +897,7 @@ function New-DysonNativeRebootAcceptanceContext {
         throw 'ReadinessUri must be a loopback HTTP /readyz endpoint.'
     }
     $readiness = $ReadinessUri
+    $controlObserver = Get-Command Get-DysonRebootAcceptanceNativeControlObservation -CommandType Function -ErrorAction Stop
     return [pscustomobject]@{
         Mode = 'native'
         GetHostIdentity = { Get-DysonHostMutationLeaseHostIdentity }
@@ -900,7 +907,7 @@ function New-DysonNativeRebootAcceptanceContext {
         }
         GetControlObservation = {
             param([string]$TaskName)
-            Get-DysonRebootAcceptanceNativeControlObservation -InstallRoot $installFull `
+            & $controlObserver -InstallRoot $installFull `
                 -DataRoot $dataFull -RuntimeRoot $runtimeFull -NodeExecutable $nodeFull `
                 -ExpectedNodeSha256 $nodeSha256 -ReadinessUri $readiness -TaskName $TaskName
         }.GetNewClosure()

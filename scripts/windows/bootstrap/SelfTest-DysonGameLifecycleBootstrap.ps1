@@ -1,9 +1,33 @@
 [CmdletBinding()]
-param()
+param([switch]$ExitPolicyOnly)
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 . (Join-Path $PSScriptRoot 'DysonGameLifecycleBootstrap.Common.ps1')
+
+function Assert-BootstrapStartExitPolicy {
+    $source = Join-Path (Split-Path $PSScriptRoot -Parent) 'Start-DysonServer.ps1'
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw 'Start script syntax is invalid' }
+    $guards = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+        $node.Extent.Text.Contains('$process.ExitCode -ne 0')
+    }, $true))
+    if ($guards.Count -ne 1) { throw 'Start exit policy is not uniquely identifiable' }
+    $guard = [scriptblock]::Create($guards[0].Extent.Text)
+    foreach ($code in @(0, -1073741510, 1, 7, -1073741819)) {
+        $process = [pscustomobject]@{ ExitCode = $code }
+        $accepted = $true
+        try { & $guard } catch { $accepted = $false }
+        if ($accepted -ne ($code -in @(0, -1073741510))) { throw "Start exit policy rejected its contract for code $code" }
+    }
+}
+Assert-BootstrapStartExitPolicy
+if ($ExitPolicyOnly) {
+    [ordered]@{protocol='DYSON_START_EXIT_POLICY_SELFTEST_V1';state='passed';cases=5;productionChanged=$false}|ConvertTo-Json -Compress
+    return
+}
 
 $temporaryBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $testRoot = Join-Path $temporaryBase ('dyson-game-bootstrap-selftest-' + [guid]::NewGuid().ToString('N'))

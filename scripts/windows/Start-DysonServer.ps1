@@ -83,7 +83,12 @@ try {
     }
     [System.IO.File]::WriteAllText($pidPath, [string]$process.Id, [System.Text.Encoding]::ASCII)
     $process.WaitForExit()
-    if ($process.ExitCode -ne 0) { throw 'The managed DSP process exited with a non-zero result.' }
+    # Windows reports a delivered console interrupt as STATUS_CONTROL_C_EXIT.
+    # The stable bootstrap still requires its durable completed stop intent;
+    # unrelated non-zero exits remain failures.
+    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne -1073741510) {
+        throw 'The managed DSP process exited with a non-zero result.'
+    }
 }
 finally {
     $process.Refresh()

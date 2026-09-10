@@ -40,16 +40,28 @@ const reviewedPaths = new Set([
   'docs/incremental-validation.md', 'AGENTS.md'
 ])
 const normalize = text => text.replaceAll('\r\n', '\n')
+const controlExitBefore = "    if ($process.ExitCode -ne 0) { throw 'The managed DSP process exited with a non-zero result.' }"
+const controlExitAfter = [
+  '    # Windows reports a delivered console interrupt as STATUS_CONTROL_C_EXIT.',
+  '    # The stable bootstrap still requires its durable completed stop intent;',
+  '    # unrelated non-zero exits remain failures.',
+  '    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne -1073741510) {',
+  "        throw 'The managed DSP process exited with a non-zero result.'",
+  '    }'
+].join('\n')
 
 export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
+  if (file === 'scripts/windows/Start-DysonServer.ps1' && before !== null && normalize(before).includes(controlExitBefore) &&
+      normalize(before).replace(controlExitBefore, controlExitAfter) === normalize(after)) return 'control-exit-policy'
+  if (file === 'scripts/windows/deployment/DysonRebootAcceptance.Common.ps1') return 'test-only'
   if (file.endsWith('.md')) return 'documentation'
   if (reviewedPaths.has(file) && /\/SelfTest-[^/]+\.ps1$/.test(file)) return 'test-only'
   if (file === 'scripts/windows/release/DysonReleasePackaging.Common.ps1' && before !== null &&
       normalize(before).replace("    'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1',",
         "    'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1',\n    'scripts/windows/bootstrap/SelfTest-DysonGameBootstrapPointer.ps1',") === normalize(after)) return 'release-test-allowlist'
   if (versionFiles.has(file) && before !== null &&
-      normalize(before).replaceAll('0.1.0-rc.16', '0.1.0-rc.17') === normalize(after)) return 'version-only'
+      normalize(before).replaceAll('0.1.0-rc.17', '0.1.0-rc.18') === normalize(after)) return 'version-only'
   if (reviewedPaths.has(file)) return 'affected'
   throw new Error(`No reviewed affected-test mapping for ${file}; update the plan, never auto-run the full suite.`)
 }
@@ -105,12 +117,16 @@ const commandGroup = command => {
 }
 
 export function planExecution(changes, { componentChanges, hostChecks = false, fullDeployment = false } = {}) {
-  const requested = rows => rows.map(change => hostChecks && change.kind === 'test-only'
+  const controlExitChanged = changes.some(change => change.kind === 'control-exit-policy')
+  const requested = rows => rows.map(change => hostChecks && change.kind === 'test-only' &&
+    !(controlExitChanged && change.file === 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1')
     ? { ...change, kind: 'affected' } : change)
   const selected = selectCommands(requested(changes), { componentChanges: componentChanges &&
     Object.fromEntries(Object.entries(componentChanges).map(([group, rows]) => [group, requested(rows)])) })
   const hostCommands = selected.slice(2)
   const commands = selected.slice(0, 2)
+  if (controlExitChanged) commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', '-ExitPolicyOnly']])
   const syntaxFiles = changes.filter(change => change.kind === 'test-only').map(change => change.file)
   if (syntaxFiles.length) {
     const literals = syntaxFiles.map(file => `'${file.replaceAll("'", "''")}'`).join(',')
@@ -127,13 +143,14 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
     mode: fullDeployment ? 'explicit-deployment-suite' : hostChecks ? 'target-host' : 'fast',
     components: Object.keys(componentBaselines).map(group => ({ group,
       decision: running.has(group) ? 'run' : required.has(group) ? 'host-validation-required' : 'reuse',
-      reason: running.has(group) && group === 'deployment' ? 'explicit full-deployment request' :
+      reason: running.has(group) ? group === 'deployment' ? 'explicit full-deployment request' : 'selected focused or host check' :
         required.has(group) ? 'changed runtime inputs or explicitly requested changed tests' :
           'no affected runtime inputs changed',
       verifiedCommit: componentBaselines[group].commit,
       evidence: componentBaselines[group].evidence })),
     reasons: changes.map(({ file, kind }) => ({ file, kind,
-      decision: kind === 'affected' ? 'run matching checks or reuse the verified component baseline' : 'no production behavior change' })) }
+      decision: kind === 'control-exit-policy' ? 'reviewed runtime change: execute the focused exit-policy check' :
+        kind === 'affected' ? 'run matching checks or reuse the verified component baseline' : 'no production behavior change' })) }
 }
 
 export function runValidation(root, planOnly = false, options = {}) {

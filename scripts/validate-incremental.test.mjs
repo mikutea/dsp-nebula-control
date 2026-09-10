@@ -3,8 +3,8 @@ import test from 'node:test'
 import { classifyChange, selectCommands, planExecution } from './validate-incremental.mjs'
 
 test('version reuse permits only the exact reviewed version substitution', () => {
-  assert.equal(classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.16\r\n', 'v=0.1.0-rc.17\n'), 'version-only')
-  assert.throws(() => classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.16', 'v=0.1.0-rc.17; unsafe=true'))
+  assert.equal(classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17\r\n', 'v=0.1.0-rc.18\n'), 'version-only')
+  assert.throws(() => classifyChange('apps/api/src/config.ts', 'v=0.1.0-rc.17', 'v=0.1.0-rc.18; unsafe=true'))
   assert.throws(() => classifyChange('apps/api/package-lock.json', 'old dependency', 'new dependency'))
 })
 
@@ -99,6 +99,22 @@ test('bootstrap resolution selects pointer and runtime regressions', () => {
     assert.ok(commands.some(([, args]) => args.includes(`scripts/windows/bootstrap/${script}`)))
   }
   assert.ok(commands.every(([, args]) => !args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')))
+})
+
+test('the reviewed console-exit change uses only its focused source guard regression', () => {
+  const changes = [
+    { file: 'scripts/windows/Start-DysonServer.ps1', kind: 'control-exit-policy' },
+    { file: 'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', kind: 'test-only' }
+  ]
+  for (const options of [{}, { hostChecks: true }]) {
+    const plan = planExecution(changes, options)
+    assert.equal(plan.pendingHostCommands.length, 0)
+    const bootstrap = plan.commands.filter(([, args]) => args.includes('scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1'))
+    assert.equal(bootstrap.length, 1)
+    assert.ok(bootstrap[0][1].includes('-ExitPolicyOnly'))
+    assert.ok(plan.commands.every(([, args]) => !args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')))
+  }
+  assert.throws(() => classifyChange('scripts/windows/Start-DysonServer.ps1', 'old unrelated code', 'new unrelated code'))
 })
 test('the status adapter and validation infrastructure have explicit mappings', () => {
   for (const file of ['scripts/windows/Get-DysonStatus.ps1', '.github/workflows/ci.yml', 'global.json']) {

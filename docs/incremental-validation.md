@@ -76,6 +76,14 @@ diagnostic text, test-helper, documentation or packaging-only edits. The narrowl
 reviewed artifact allowlist addition is checked separately; real artifact/package
 validation and sensitive-data scanning remain required for the release artifact.
 
+The reviewed `STATUS_CONTROL_C_EXIT` launcher correction has an exact-diff mapping
+to `SelfTest-DysonGameLifecycleBootstrap.ps1 -ExitPolicyOnly`. This executes the
+actual source guard against normal exit, console interruption and unrelated error
+codes. It does not assert that the complete production stop transaction succeeded.
+Other launcher changes still require a new impact plan. The reboot-acceptance
+helper is test tooling; its native observation callback is checked on the target
+host, and its source receives a syntax check without a deployment-suite rerun.
+
 Existing client-join, save, recovery and other real-host results may be reused for
 unchanged behavior. Repeat only checks invalidated by a changed address/protocol,
 game/mod version, configuration, runtime owner or other relevant dependency.
