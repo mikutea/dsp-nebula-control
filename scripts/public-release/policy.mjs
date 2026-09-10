@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const POLICY_ID = 'dyson-public-release-hygiene'
-export const POLICY_VERSION = '1.4.17'
+export const POLICY_VERSION = '1.4.18'
 
 export const DEFAULT_LIMITS = Object.freeze({
   maximumWorktreeFiles: 50_000,
@@ -114,6 +114,8 @@ export const EXACT_ALLOWLIST = Object.freeze([
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1', blobId: 'b61ea568d290d89a3e6e1b322b38d31f12453564' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1', blobId: '5ec20be499907bdf4afa526bfc8836ae9617e82d' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: 'fbc9442ed303e6bde58f534513a4a9c98c25a3f0' },
+  // This reviewed historical test blob also contains only generic extended-path prefix conversion.
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: '48002a94ba7cab80cc46b4a49ff649b7ca4a8c09' },
   // The added Bridge configuration test uses fictional paths; authentication fixtures remain fictional.
   { scope: 'history', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'apps/api/src/config.test.ts', blobId: 'd4aad480b97f2369497db3aec19773be0d962015' },
   // The builder uses generic Windows extended paths to clean its checked temporary directory.

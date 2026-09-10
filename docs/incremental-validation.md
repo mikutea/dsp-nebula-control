@@ -1,5 +1,12 @@
 # Risk-based validation
 
+## Historical hygiene fixture review
+
+Policy 1.4.18 adds one exact history/path/blob exception for generic extended-path
+prefix conversion in a deployment test. It does not exempt future content at that
+path. The runner binds the reviewed policy source and selects the scanner's
+regression suite. A clean-commit history scan remains required before publication.
+
 ## RC24 deployment status diagnostic
 
 The status script now constructs the task's expected arguments from the runtime

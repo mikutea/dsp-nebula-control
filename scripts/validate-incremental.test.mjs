@@ -38,6 +38,15 @@ test('native status evidence cannot authorize a changed diagnostic script', () =
   assert.throws(() => classifyChange(file, null, source + '\nUnexpected-Change\n'))
 })
 
+test('a reviewed historical hygiene exception requires scanner regression checks', () => {
+  const file = 'scripts/public-release/policy.mjs'
+  const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
+  assert.equal(classifyChange(file, null, source), 'reviewed-hygiene-policy')
+  assert.throws(() => classifyChange(file, null, source + '\nchangedPolicy();\n'))
+  const plan = planExecution([{ file, kind: 'reviewed-hygiene-policy' }])
+  assert.ok(plan.commands.some(([, args]) => args.includes('scripts/public-release/scanner.test.mjs')))
+})
+
 test('a metadata-only candidate reuses functional results', () => {
   const commands = selectCommands([{ file: 'package.json', kind: 'version-only' }])
   assert.equal(commands.length, 2)

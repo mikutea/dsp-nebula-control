@@ -227,6 +227,8 @@ const reviewedRc24ApplicationSources = new Map([
 
 export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
+  if (file === 'scripts/public-release/policy.mjs' &&
+      aclSourceHash(after) === '91269327d4eb6194fb97f6bc361f3d9939686477de73b1153c7a31ba22d8aa6c') return 'reviewed-hygiene-policy'
   if (file === 'scripts/windows/deployment/Test-DysonControlDeployment.ps1' &&
       aclSourceHash(after) === '248758ae47a5edf9678f0c515eb564c31e3cb127538347556319ba10ae44766a') return 'verified-native-status'
   const priorReleaseSource = after.replaceAll('0.1.0-rc.24', '0.1.0-rc.23')
@@ -345,6 +347,9 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
   const isRunnerCheck = ([, args]) => args.includes('src/providers/powershell-runner.test.ts')
   const hostCommands = selected.slice(2).filter(command => !isRunnerCheck(command))
   const commands = [...selected.slice(0, 2), ...selected.slice(2).filter(isRunnerCheck)]
+  if (changes.some(change => change.kind === 'reviewed-hygiene-policy')) {
+    commands.push(['node', ['--test', 'scripts/public-release/scanner.test.mjs']])
+  }
   if (changes.some(change => change.kind === 'reviewed-rc24-application')) {
     commands.push(['node', ['apps/api/node_modules/typescript/bin/tsc', '-p', 'apps/api/tsconfig.json', '--noEmit']])
     commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
