@@ -3,15 +3,33 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { classifyChange, selectCommands, planExecution } from './validate-incremental.mjs'
 
-test('the reviewed mod trust batch selects checks only for its exact source', () => {
-  const source = readFileSync(new URL('../apps/api/src/app.ts', import.meta.url), 'utf8')
-  assert.equal(classifyChange('apps/api/src/app.ts', null, source), 'reviewed-rc24-application')
-  assert.throws(() => classifyChange('apps/api/src/app.ts', null, source + '\nchangedRuntime();\n'))
-  const plan = planExecution([{ file: 'apps/api/src/app.ts', kind: 'reviewed-rc24-application' }])
-  assert.ok(plan.commands.some(([, args]) => args.includes('src/update-acquisition-routes.test.ts')))
-  assert.ok(plan.commands.some(([, args]) => args.includes('src/mods/thunderstore-import.test.ts')))
-  assert.ok(plan.commands.some(([, args]) => args.includes('src/mod-supply-workspace.test.tsx')))
+test('RC24 CI evidence is reused only for its exact source', () => {
+  const file = 'apps/api/src/update-pipeline/trusted-mod-artifacts.ts'
+  const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
+  assert.equal(classifyChange(file, null, source), 'verified-rc24-source')
+  assert.throws(() => classifyChange(file, null, source + '\nchangedRuntime();\n'))
+  const plan = planExecution([{ file, kind: 'verified-rc24-source' }])
+  assert.ok(plan.commands.every(([, args]) => !args.some(arg => arg.includes('vitest'))))
   assert.equal(plan.pendingHostCommands.length, 0)
+})
+
+test('entry document caching changes select stale-entry regression checks', () => {
+  const file = 'apps/api/src/web-assets.ts'
+  const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
+  assert.equal(classifyChange(file, null, source), 'reviewed-entry-cache')
+  assert.throws(() => classifyChange(file, null, source + '\nchangedServing();\n'))
+  const plan = planExecution([{ file, kind: 'reviewed-entry-cache' }])
+  assert.ok(plan.commands.some(([, args]) => args.includes('src/web-assets.test.ts')))
+})
+
+test('predecessor binding selects rollback and production assembly checks without broad suite repetition', () => {
+  const file = 'apps/api/src/update-pipeline/activation.ts'
+  const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
+  assert.equal(classifyChange(file, null, source), 'reviewed-predecessor-binding')
+  assert.throws(() => classifyChange(file, null, source + '\nUnreviewedChange();\n'))
+  const plan = planExecution([{ file, kind: 'reviewed-predecessor-binding' }, { file: 'apps/api/src/web-assets.ts', kind: 'reviewed-entry-cache' }])
+  assert.ok(plan.commands.some(([, args]) => args.includes('src/windows-update-production-assembly.test.ts')))
+  assert.equal(plan.commands.filter(([, args]) => args.includes('apps/api/tsconfig.json')).length, 1)
 })
 
 test('version reuse permits only the exact reviewed version substitution', () => {
@@ -20,7 +38,7 @@ test('version reuse permits only the exact reviewed version substitution', () =>
   assert.throws(() => classifyChange('apps/api/package-lock.json', 'old dependency', 'new dependency'))
 })
 
-test('RC24 reuses only the exact predecessor with uniform version substitution', () => {
+test('reviewed follow-up releases reuse only uniform version substitutions', () => {
   const file = 'apps/api/src/config.ts'
   const source = readFileSync(new URL('../apps/api/src/config.ts', import.meta.url), 'utf8')
   assert.equal(classifyChange(file, null, source), 'configuration-gate')
@@ -28,7 +46,7 @@ test('RC24 reuses only the exact predecessor with uniform version substitution',
   const lockFile = 'apps/api/package-lock.json'
   const lockSource = readFileSync(new URL('../apps/api/package-lock.json', import.meta.url), 'utf8')
   assert.equal(classifyChange(lockFile, null, lockSource), 'version-only')
-  assert.throws(() => classifyChange(lockFile, null, lockSource.replace('0.1.0-rc.24', '0.1.0-rc.23')))
+  assert.throws(() => classifyChange(lockFile, null, lockSource.replace(JSON.parse(lockSource).version, '0.1.0-rc.23')))
 })
 
 test('native status evidence cannot authorize a changed diagnostic script', () => {

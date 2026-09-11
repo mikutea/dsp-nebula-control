@@ -129,6 +129,19 @@ describe('Windows component update activation adapters', () => {
     expect(fixture.probeCalls).toEqual([])
   })
 
+  it('accepts an unmanaged predecessor version only for rollback, never for candidate activation', async () => {
+    const status = healthyStatus()
+    status.versions.bepInEx = '5.4.17.0'
+    const rollback = createFixture({ status })
+    const request = { ...smokeRequest('bepinex', 'rollback', '5.4.17.0'), expectedReleaseId: null }
+    expect(await rollback.adapter.smoke(request, hostMutationScope))
+      .toMatchObject({ observedVersion: '5.4.17.0', versionMatches: true, processHealthy: true })
+    const candidate = createFixture({ status })
+    await expect(candidate.adapter.smoke({ ...request, phase: 'candidate' }, hostMutationScope))
+      .rejects.toMatchObject({ code: 'WINDOWS_UPDATE_REQUEST_INVALID' })
+    expect(candidate.events).toEqual([])
+  })
+
   it('derives the same lifecycle context for an idempotent smoke and separates phase/component contexts', async () => {
     const first = createFixture()
     const request = smokeRequest('nebula', 'candidate', '0.9.22')

@@ -6,7 +6,7 @@ import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
 import cookie from '@fastify/cookie'
 import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
-import fastifyStatic from '@fastify/static'
+import { registerWebAssets } from './web-assets.js'
 import { z } from 'zod'
 import { TrustedModArtifactPolicy, trustedModAcquisitionAuthority } from './update-pipeline/trusted-mod-artifacts.js'
 import { trustedCompatibilityPolicyInputSchema } from './update-pipeline/trusted-compatibility.js'
@@ -1217,7 +1217,18 @@ export async function buildApplication(
       modDeploymentService: modDeployments,
       runtimeEvidenceSource,
       runtimeCompatibilitySource,
-      gameRuntimeReceiptSource: gameRuntimeReceipts
+      gameRuntimeReceiptSource: gameRuntimeReceipts,
+      readPreviousComponentVersion: async (component, signal) => {
+        signal.throwIfAborted()
+        if (component === 'bridge' || component === 'control') {
+          if (!managedPluginVersionProbe) throw new Error('Component version source unavailable')
+          return managedPluginVersionProbe({ component, signal })
+        }
+        if (!trustedCompatibilityService) throw new Error('Runtime inventory unavailable')
+        const { inventory } = await trustedCompatibilityService.status()
+        signal.throwIfAborted()
+        return component === 'bepinex' ? inventory.bepInEx : inventory.nebula
+      }
     })
     defaultUpdateProviderAuthorityRevision = authorityRevision
   }
@@ -3317,13 +3328,7 @@ export async function buildApplication(
 
   const webRoot = path.resolve(import.meta.dirname, '..', '..', 'web', 'dist')
   if (fs.existsSync(webRoot)) {
-    await app.register(fastifyStatic, { root: webRoot, prefix: '/' })
-    app.setNotFoundHandler((request, reply) => {
-      if (request.url.startsWith('/api/')) {
-        return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Route not found' } })
-      }
-      return reply.sendFile('index.html')
-    })
+    await registerWebAssets(app, webRoot)
   }
 
   return {

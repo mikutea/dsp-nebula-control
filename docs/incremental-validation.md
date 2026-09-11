@@ -1,5 +1,41 @@
 # Risk-based validation
 
+## Existing component rollback version binding (in progress)
+
+The rollback baseline can retain the server-observed predecessor version even
+when no managed release existed before the update. The value participates in
+the durable rollback binding hash and is used for rollback and recovery smoke
+checks. Managed inventory drift is rejected before publication. Only rollback
+may pair an observed version with no prior release ID; candidate activation
+still requires its release identity. Legacy bindings without the optional field
+retain their existing interpretation and hash.
+
+Run activation service/controller, Windows update adapter/transaction-provider,
+application wiring and production assembly checks plus API typechecking.
+Cover real file restoration on first managed update, predecessor drift,
+missing source evidence, current save-generation proof and candidate rejection
+without a release ID. The target's currently unmanaged BepInEx installation
+still requires this change to be deployed and its native rollback exercised.
+
+The exact RC24 application hashes inherit
+[CI 34553851609](https://github.com/mikutea/dsp-nebula-control/actions/runs/34553851609)
+for commit `79fe8ce5854d4a8fa071c647d524706b4bf3423b`. The running target upgrade
+also retained game process identity and passed deep readiness. Only unchanged
+source hashes reuse the CI result; the entry-document fix below selects its own
+checks and still requires deployment. This does not assert completion of the
+remaining mod, compatibility, rollback or migration qualification.
+
+## Entry document caching after deterministic package upgrades
+
+Equal-length entry HTML from two releases can share the archive's fixed mtime
+and therefore collide under a size/mtime weak ETag. The explicit root/index and
+SPA fallback now send entry HTML without ETag or Last-Modified revalidation and
+with `Cache-Control: no-store`. Asset revalidation is retained; missing assets
+return 404 rather than entry HTML. Run `web-assets.test.ts`, `app.test.ts` and API
+typechecking, then verify a cached browser entry against the deployed update.
+The regression uses different HTML with equal size and timestamps and the old
+response validators. This source change still needs a versioned deployment.
+
 ## Historical hygiene fixture review
 
 Policy 1.4.18 adds one exact history/path/blob exception for generic extended-path

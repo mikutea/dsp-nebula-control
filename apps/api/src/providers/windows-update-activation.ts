@@ -64,7 +64,8 @@ const smokeRequestSchema = z.strictObject({
   expectedReleaseId: releaseIdSchema.nullable(),
   expectedLoadedSaveIdentity: sha256Schema
 }).superRefine((request, context) => {
-  if ((request.expectedVersion === null) !== (request.expectedReleaseId === null)) {
+  const unmanagedRollback = request.phase === 'rollback' && request.expectedVersion !== null && request.expectedReleaseId === null
+  if (!unmanagedRollback && (request.expectedVersion === null) !== (request.expectedReleaseId === null)) {
     context.addIssue({ code: 'custom', message: 'expected version and release identity must both be present or absent' })
   }
   if (request.expectedReleaseId !== null && !request.expectedReleaseId.startsWith(`${request.component}-`)) {
@@ -116,6 +117,7 @@ const protectionLifecycleResultSchema = z.strictObject({
 })
 
 const rollbackBaselineSchema: z.ZodType<ComponentUpdateRollbackBaseline> = z.strictObject({
+  previousComponentVersion: boundedVersionSchema.nullable().optional(),
   configurationSnapshotId: opaqueSnapshotIdSchema,
   configurationRevision: sha256Schema,
   serverModLockSha256: sha256Schema,

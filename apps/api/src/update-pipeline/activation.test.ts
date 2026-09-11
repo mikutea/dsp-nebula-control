@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { hostname, tmpdir, uptime } from 'node:os'
 import { deflateRawSync } from 'node:zlib'
@@ -191,6 +191,54 @@ describe('component update activation transaction', () => {
     expect(await readFile(path.join(fixture.liveRoot, 'BepInEx', 'core', 'BepInEx.dll'), 'utf8'))
       .toBe('5.4.22:BepInEx/core/BepInEx.dll')
     expect(await pathExists(path.join(fixture.liveRoot, '.doorstop_version'))).toBe(false)
+  })
+
+  it('rolls back a first managed update to the captured existing component version', async () => {
+    const fixture = await createFixture()
+    const oldCore = path.join(fixture.liveRoot, 'BepInEx', 'core', 'BepInEx.dll')
+    await mkdir(path.dirname(oldCore), { recursive: true })
+    await writeFile(oldCore, 'previous-unmanaged-bepinex')
+    const candidate = await stageComponent(fixture.stagingRoot, {
+      component: 'bepinex', targetVersion: '5.4.23.2', sourceId: 'github:BepInEx/BepInEx',
+      stageKind: 'bepinex', artifactId: 'bepinex-unmanaged-rollback', payloads: makeBepInExPayloads('5.4.23.2')
+    })
+    const observedRollbackVersions: Array<string | null> = []
+    const controlled = createAdapters({ baseline: async () => ({
+      previousComponentVersion: '5.4.17.0', configurationSnapshotId: 'config-snapshot-fixture',
+      configurationRevision: '1'.repeat(64), serverModLockSha256: '2'.repeat(64),
+      serverModLockRevision: '3'.repeat(64), previousLoadedSaveIdentity: 'c'.repeat(64)
+    }), smoke: async request => {
+      if (request.phase === 'rollback') {
+        observedRollbackVersions.push(request.expectedVersion)
+        expect(request.expectedReleaseId).toBeNull()
+        return { ...smokeResult(request, true), observedVersion: '5.4.17.0', versionMatches: request.expectedVersion === '5.4.17.0' }
+      }
+      return smokeResult(request, false)
+    } })
+    const service = createService(fixture, controlled.adapters)
+    const result = await service.execute(makeRequest('bepinex', '5.4.23.2', candidate, initialComponentUpdateRevision))
+    expect(result).toMatchObject({ status: 'rolled-back', rollbackVerified: true, recoveryRequired: false })
+    expect(observedRollbackVersions).toEqual(['5.4.17.0'])
+    expect(await readFile(oldCore, 'utf8')).toBe('previous-unmanaged-bepinex')
+  })
+
+  it('rejects predecessor version drift before protecting or replacing an already managed component', async () => {
+    const fixture = await createFixture()
+    let previousComponentVersion: string | null = null
+    const controlled = createAdapters({ baseline: async () => ({
+      previousComponentVersion, configurationSnapshotId: 'config-snapshot-fixture',
+      configurationRevision: '1'.repeat(64), serverModLockSha256: '2'.repeat(64),
+      serverModLockRevision: '3'.repeat(64), previousLoadedSaveIdentity: 'c'.repeat(64)
+    }) })
+    const service = createService(fixture, controlled.adapters)
+    const old = await stageComponent(fixture.stagingRoot, defaultStage({ artifactId: 'nebula-baseline-drift-old' }))
+    const installed = await service.execute(makeRequest('nebula', '0.9.1', old, initialComponentUpdateRevision))
+    previousComponentVersion = '0.8.0'
+    const candidate = await stageComponent(fixture.stagingRoot, defaultStage({ artifactId: 'nebula-baseline-drift-new', targetVersion: '0.9.2' }))
+    await expect(service.execute(makeRequest('nebula', '0.9.2', candidate, installed.resultingRevision,
+      baseInventory({ nebula: '0.9.1' })))).rejects.toMatchObject({ code: 'UPDATE_PREVIOUS_COMPONENT_VERSION_MISMATCH' })
+    expect(controlled.protectionCalls).toBe(1)
+    expect(await readFile(path.join(fixture.liveRoot, 'plugins', 'nebula-NebulaMultiplayerMod', 'Nebula.dll'), 'utf8')).toBe('nebula')
   })
 
   it('binds rollback to config, mod-lock, protection manifest and exact save then restores and rereads each surface', async () => {
@@ -1385,7 +1433,7 @@ interface StageOptions {
 }
 
 async function createFixture(): Promise<Fixture> {
-  const root = await mkdtemp(path.join(tmpdir(), 'dyson-update-activation-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-update-activation-')))
   temporaryRoots.push(root)
   const projectRoot = path.join(root, 'project')
   const stagingRoot = path.join(root, 'staging')

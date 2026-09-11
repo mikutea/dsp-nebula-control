@@ -77,6 +77,7 @@ const protectionRequestSchema = z.strictObject({
   backupId: protectionReferenceSchema
 })
 const rollbackBindingSchema = z.strictObject({
+  previousComponentVersion: versionSchema.nullable().optional(),
   configurationSnapshotId: requestIdSchema,
   configurationRevision: sha256Schema,
   serverModLockSha256: sha256Schema,
@@ -162,6 +163,7 @@ const modStateSchema: z.ZodType<ModDeploymentStateSummary> = z.strictObject({
 })
 
 export interface WindowsUpdateTransactionProviderOptions {
+  readPreviousComponentVersion?: (component: FixedUpdateSmokeRequest['component'], signal: AbortSignal) => Promise<string | null>
   /** Only trusted construction selects this root; requests cannot override it. */
   projectRoot: string
   configStopProof: {
@@ -208,6 +210,7 @@ export class WindowsUpdateActivationTransactionProvider implements
   readonly #modDeploymentService: WindowsUpdateTransactionProviderOptions['modDeploymentService']
   readonly #runtimeEvidenceSource: WindowsUpdateRuntimeEvidenceSource
   readonly #runtimeCompatibilitySource: WindowsRuntimeCompatibilitySource
+  readonly #readPreviousComponentVersion: WindowsUpdateTransactionProviderOptions['readPreviousComponentVersion']
   readonly #gameRuntimeReceiptSource: WindowsUpdateTransactionProviderOptions['gameRuntimeReceiptSource']
 
   constructor(options: WindowsUpdateTransactionProviderOptions) {
@@ -219,7 +222,8 @@ export class WindowsUpdateActivationTransactionProvider implements
         typeof options.runtimeEvidenceSource?.readCurrentRuntimeEvidence !== 'function' ||
         typeof options.runtimeEvidenceSource?.readPersistedRuntimeEvidence !== 'function' ||
         typeof options.runtimeCompatibilitySource?.inspect !== 'function' ||
-        typeof options.gameRuntimeReceiptSource?.list !== 'function') {
+        typeof options.gameRuntimeReceiptSource?.list !== 'function' ||
+        (options.readPreviousComponentVersion !== undefined && typeof options.readPreviousComponentVersion !== 'function')) {
       throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_TRANSACTION_OPTIONS_INVALID')
     }
     this.#projectRoot = path.resolve(options.projectRoot)
@@ -235,6 +239,7 @@ export class WindowsUpdateActivationTransactionProvider implements
     this.#modDeploymentService = options.modDeploymentService
     this.#runtimeEvidenceSource = options.runtimeEvidenceSource
     this.#runtimeCompatibilitySource = options.runtimeCompatibilitySource
+    this.#readPreviousComponentVersion = options.readPreviousComponentVersion
     this.#gameRuntimeReceiptSource = options.gameRuntimeReceiptSource
   }
 
@@ -262,12 +267,17 @@ export class WindowsUpdateActivationTransactionProvider implements
       const loaded = await this.#readPersistedEvidence(hostMutation)
       const receipt = await this.#latestRuntimeReceipt()
       assertStoppedRuntimeBinding(loaded, receipt)
+      const previousComponentVersion = this.#readPreviousComponentVersion === undefined
+        ? undefined
+        : versionSchema.nullable().parse(await this.#readPreviousComponentVersion(request.component, hostMutation.signal))
       if (loaded.loadedSaveIdentity !== save.identity) {
         throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_STOPPED_SAVE_BINDING_MISMATCH')
       }
       await this.#proveStopped(hostMutation.signal)
       hostMutation.assertActive()
       return {
+        ...(previousComponentVersion === undefined ? {} : { previousComponentVersion: previousComponentVersion === null
+          ? null : normalizeVersion(previousComponentVersion, request.component === 'bepinex' ? 'bepinex' : request.component === 'nebula' ? 'nebula' : 'plugin') }),
         configurationSnapshotId: configuration.snapshotId,
         configurationRevision: configuration.revision,
         serverModLockSha256: modLock.sha256,

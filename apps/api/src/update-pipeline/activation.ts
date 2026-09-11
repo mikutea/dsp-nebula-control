@@ -33,7 +33,7 @@ import {
   type CompatibilityDecision,
   type NormalizedRuntimeInventory
 } from '../updates/compatibility.js'
-import { normalizeVersion, sha256Schema } from '../updates/version.js'
+import { compareVersions, normalizeVersion, sha256Schema } from '../updates/version.js'
 import {
   inspectComponentArchive,
   componentReleaseManifestSchema,
@@ -209,6 +209,7 @@ const storedTransactionSchema: z.ZodType<StoredTransaction> = z.strictObject({
   previousRevision: revisionSchema,
   protectionBackupId: backupIdSchema,
   rollback: z.strictObject({
+    previousComponentVersion: z.string().min(1).max(64).nullable().optional(),
     configurationSnapshotId: backupIdSchema,
     configurationRevision: revisionSchema,
     serverModLockSha256: sha256Schema,
@@ -342,6 +343,7 @@ const smokeResultSchema: z.ZodType<FixedUpdateSmokeResult> = z.strictObject({
 })
 
 const rollbackBaselineSchema: z.ZodType<ComponentUpdateRollbackBaseline> = z.strictObject({
+  previousComponentVersion: z.string().min(1).max(64).nullable().optional(),
   configurationSnapshotId: backupIdSchema,
   configurationRevision: revisionSchema,
   serverModLockSha256: sha256Schema,
@@ -532,6 +534,14 @@ export class ComponentUpdateActivationService {
                 context
               )
               const rollbackBaseline = await this.#captureRollbackBaselineChecked(request, context)
+              const previousComponent = state.components.find(component => component.component === request.component)
+              if (previousComponent && rollbackBaseline.previousComponentVersion !== undefined &&
+                  (rollbackBaseline.previousComponentVersion === null || compareVersions(
+                    rollbackBaseline.previousComponentVersion, previousComponent.version,
+                    request.component === 'bepinex' ? 'bepinex' : request.component === 'nebula' ? 'nebula' : 'plugin'
+                  ) !== 0)) {
+                throw new ComponentUpdateActivationError('UPDATE_PREVIOUS_COMPONENT_VERSION_MISMATCH')
+              }
               const protection = await this.#createProtection(request, context)
               protectionBackupId = protection.backupId
               rollbackBinding = createRollbackBinding(rollbackBaseline, protection)
@@ -904,14 +914,14 @@ export class ComponentUpdateActivationService {
         requestId: transaction.requestId,
         component: transaction.component,
         phase: 'rollback',
-        expectedVersion: previousComponent?.version ?? null,
+        expectedVersion: previousRollbackVersion(transaction, previousComponent),
         expectedReleaseId: previousComponent?.releaseId ?? null,
         expectedLoadedSaveIdentity: requireRollbackBinding(transaction).previousLoadedSaveIdentity
       }, context)
       rollbackVerified = smokeIsHealthy(
         rollback,
         transaction.component,
-        previousComponent?.version ?? null,
+        previousRollbackVersion(transaction, previousComponent),
         requireRollbackBinding(transaction).previousLoadedSaveIdentity
       )
     } catch (error) {
@@ -1088,14 +1098,14 @@ export class ComponentUpdateActivationService {
         requestId: transaction.requestId,
         component: transaction.component,
         phase: 'rollback',
-        expectedVersion: previousComponent?.version ?? null,
+        expectedVersion: previousRollbackVersion(transaction, previousComponent),
         expectedReleaseId: previousComponent?.releaseId ?? null,
         expectedLoadedSaveIdentity: requireRollbackBinding(transaction).previousLoadedSaveIdentity
       }, context)
       rollbackVerified = smokeIsHealthy(
         smoke,
         transaction.component,
-        previousComponent?.version ?? null,
+        previousRollbackVersion(transaction, previousComponent),
         requireRollbackBinding(transaction).previousLoadedSaveIdentity
       )
     } catch (error) {
@@ -1345,6 +1355,10 @@ export class ComponentUpdateActivationService {
         targetVersion: request.targetVersion,
         expectedRevision: request.expectedRevision
       }, context.scope))
+      if (baseline.previousComponentVersion !== undefined && baseline.previousComponentVersion !== null &&
+          normalizeManagedVersion(baseline.previousComponentVersion, request.component) !== baseline.previousComponentVersion) {
+        throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_BASELINE_FAILED')
+      }
       context.scope.assertActive()
       context.resolvePossibleWrite()
       return baseline
@@ -2721,6 +2735,11 @@ function createRollbackBinding(
     ...value,
     bindingSha256: createHash('sha256').update(canonicalJson(value)).digest('hex')
   }
+}
+
+function previousRollbackVersion(transaction: StoredTransaction, component: StoredActiveComponent | undefined): string | null {
+  const bound = requireRollbackBinding(transaction).previousComponentVersion
+  return bound === undefined ? component?.version ?? null : bound
 }
 
 function requireRollbackBinding(transaction: StoredTransaction): ComponentUpdateRollbackBinding {

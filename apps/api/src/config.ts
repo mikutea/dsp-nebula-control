@@ -71,7 +71,7 @@ const environmentSchema = z.object({
   DYSON_RUNTIME_SERVICE_USER: z.string().min(3).max(128).regex(/^[^"\r\n]+$/).optional(),
   DYSON_BRIDGE_CONTROL_ROOT: z.string().optional(),
   DYSON_BRIDGE_SECRET_FILE: z.string().optional(),
-  DYSON_BRIDGE_PLUGIN_VERSION: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,32})?$/).default('0.1.0-rc.24'),
+  DYSON_BRIDGE_PLUGIN_VERSION: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,32})?$/).default('0.1.0-rc.25'),
   DYSON_PLAYER_SNAPSHOT_MAX_AGE_MS: z.coerce.number().int().min(2_000).max(120_000).default(10_000),
   DYSON_PLAYER_NOTICE_MUTATIONS_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_PLAYER_HISTORY_CAPACITY: z.coerce.number().int().min(1).max(2_048).default(512),

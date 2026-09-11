@@ -142,6 +142,7 @@ const configurationGateSources = new Map([
 ])
 
 // Exact source bindings select affected tests; they do not reuse unexecuted evidence.
+// Exact source evidence: CI 34553851609, commit 79fe8ce5854d4a8fa071c647d524706b4bf3423b.
 const reviewedRc24ApplicationSources = new Map([
   [
     "apps/api/src/app.ts",
@@ -225,18 +226,76 @@ const reviewedRc24ApplicationSources = new Map([
   ]
 ]);
 
+const reviewedEntryCacheSources = new Map([
+  [
+    "apps/api/src/app.ts",
+    "e3fedae925e1e34a0ef03fc2bd7e25b2891708d16b37065999feab4905332dcb"
+  ],
+  [
+    "apps/api/src/web-assets.ts",
+    "eae463e526d91fb35676743755d7c10b8be861076694bae0a360544fe4ff6ca8"
+  ],
+  [
+    "apps/api/src/web-assets.test.ts",
+    "5849cae43e2a47fde7911858c5fdabbbbb4b236ec435c0788fe6d7e636e907ac"
+  ]
+]);
+
+const reviewedPredecessorSources = new Map([
+  [
+    "apps/api/src/app.ts",
+    "430248ca4ab3d3d316a32c8d91fc92c9cad3c21cec4d4a1bb419a911c38b2318"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation-types.ts",
+    "d38235f815b9b992e71a33539eab38d8b01c8f9202179ee08712c76c501307ac"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation.ts",
+    "c63ccb54a930b95c99dfe0e70257c9e8cbf09bc39888114a77983155c9076918"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation.test.ts",
+    "667775c7da3bb6ffcb5bc11953a4ed3554711706399a2033d4385fa54b339fce"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation-http.ts",
+    "5f3af8317b4dc06ad157bd576fba04419f4f8b7d962f67ca6a7cb08a153fd1dc"
+  ],
+  [
+    "apps/api/src/providers/windows-update-activation.ts",
+    "27353c39ccb8524af5e4f759ab83283d27d34efe68f18ea4d7d3b5ce41d2daa6"
+  ],
+  [
+    "apps/api/src/providers/windows-update-activation.test.ts",
+    "396ccbfe413d55aca4b214a8b3440ea26980e096f13dd48443d8208d1296e97f"
+  ],
+  [
+    "apps/api/src/providers/windows-update-transaction-provider.ts",
+    "e739b2a8b9704ab6ef72712bc5efccf91a995cd3dc39c9466803a71b5a40ecc7"
+  ],
+  [
+    "apps/api/src/providers/windows-update-transaction-provider.test.ts",
+    "d0010a85e189ce869a7c72c7a6b58fcfbe74200f1bfa6266d0963c46b47a3a11"
+  ]
+]);
+
 export function classifyChange(file, before, after) {
+  if (after !== null && reviewedEntryCacheSources.get(file) === aclSourceHash(after)) return 'reviewed-entry-cache'
+  if (after !== null && reviewedPredecessorSources.get(file) === aclSourceHash(after)) return 'reviewed-predecessor-binding'
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
   if (file === 'scripts/public-release/policy.mjs' &&
       aclSourceHash(after) === '91269327d4eb6194fb97f6bc361f3d9939686477de73b1153c7a31ba22d8aa6c') return 'reviewed-hygiene-policy'
   if (file === 'scripts/windows/deployment/Test-DysonControlDeployment.ps1' &&
       aclSourceHash(after) === '248758ae47a5edf9678f0c515eb564c31e3cb127538347556319ba10ae44766a') return 'verified-native-status'
-  const priorReleaseSource = after.replaceAll('0.1.0-rc.24', '0.1.0-rc.23')
-  if (priorReleaseSource !== after && priorReleaseSource.replaceAll('0.1.0-rc.23', '0.1.0-rc.24') === after) {
-    if (rc23VerifiedSources.get(file) === aclSourceHash(priorReleaseSource)) return 'version-only'
-    if (configurationGateSources.get(file) === aclSourceHash(priorReleaseSource)) return 'configuration-gate'
+  for (const releaseVersion of ['0.1.0-rc.24', '0.1.0-rc.25']) {
+    const priorReleaseSource = after.replaceAll(releaseVersion, '0.1.0-rc.23')
+    if (priorReleaseSource !== after && priorReleaseSource.replaceAll('0.1.0-rc.23', releaseVersion) === after) {
+      if (rc23VerifiedSources.get(file) === aclSourceHash(priorReleaseSource)) return 'version-only'
+      if (configurationGateSources.get(file) === aclSourceHash(priorReleaseSource)) return 'configuration-gate'
+    }
   }
-  if (reviewedRc24ApplicationSources.get(file) === aclSourceHash(after)) return 'reviewed-rc24-application'
+  if (reviewedRc24ApplicationSources.get(file) === aclSourceHash(after)) return 'verified-rc24-source'
   if (rc23VerifiedSources.get(file) === aclSourceHash(after)) return 'verified-rc23-source'
   if (configurationGateSources.get(file) === aclSourceHash(after)) return 'configuration-gate'
   const startup = startupSources.get(file)
@@ -347,21 +406,21 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
   const isRunnerCheck = ([, args]) => args.includes('src/providers/powershell-runner.test.ts')
   const hostCommands = selected.slice(2).filter(command => !isRunnerCheck(command))
   const commands = [...selected.slice(0, 2), ...selected.slice(2).filter(isRunnerCheck)]
+  if (changes.some(change => ['reviewed-entry-cache', 'reviewed-predecessor-binding'].includes(change.kind))) {
+    commands.push(['node', ['apps/api/node_modules/typescript/bin/tsc', '-p', 'apps/api/tsconfig.json', '--noEmit']])
+  }
+  if (changes.some(change => change.kind === 'reviewed-entry-cache')) {
+    commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=2',
+      'src/web-assets.test.ts', 'src/app.test.ts']])
+  }
+  if (changes.some(change => change.kind === 'reviewed-predecessor-binding')) {
+    commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
+      'src/update-pipeline/activation.test.ts', 'src/update-pipeline/activation-http.test.ts',
+      'src/providers/windows-update-activation.test.ts', 'src/providers/windows-update-transaction-provider.test.ts',
+      'src/update-activation-app-wiring.test.ts', 'src/windows-update-production-assembly.test.ts']])
+  }
   if (changes.some(change => change.kind === 'reviewed-hygiene-policy')) {
     commands.push(['node', ['--test', 'scripts/public-release/scanner.test.mjs']])
-  }
-  if (changes.some(change => change.kind === 'reviewed-rc24-application')) {
-    commands.push(['node', ['apps/api/node_modules/typescript/bin/tsc', '-p', 'apps/api/tsconfig.json', '--noEmit']])
-    commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
-      'src/update-pipeline/trusted-mod-artifacts.test.ts', 'src/update-pipeline/discovery.test.ts',
-      'src/update-pipeline/acquisition.test.ts', 'src/update-pipeline/acquisition-http.test.ts',
-      'src/update-pipeline/trusted-compatibility.test.ts', 'src/update-pipeline/bepinex-discovery.test.ts',
-      'src/update-acquisition-routes.test.ts', 'src/trusted-compatibility-routes.test.ts',
-      'src/mods/thunderstore-import.test.ts', 'src/thunderstore-mod-import-routes.test.ts',
-      'src/providers/windows-lifecycle-broker.test.ts', 'src/providers/windows.test.ts', 'src/app.test.ts']])
-    commands.push(['node', ['apps/web/node_modules/typescript/bin/tsc', '-b', 'apps/web/tsconfig.json', '--pretty', 'false']])
-    commands.push(['node', ['apps/web/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/web', '--maxWorkers=2',
-      'src/mod-supply-workspace.test.tsx']])
   }
   if (changes.some(change => change.kind === 'configuration-gate')) commands.push(['node',
     ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=2',
@@ -406,7 +465,7 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
     reasons: changes.map(({ file, kind }) => ({ file, kind,
       decision: kind === 'configuration-gate' ? 'run focused shared configuration gate checks' :
         kind === 'verified-native-status' ? 'reuse exact native read-only deployment status evidence; HTTP readiness remains separate' :
-        kind === 'reviewed-rc24-application' ? 'run exact RC24 artifact trust, readiness and UI checks; native qualification remains required' :
+        kind === 'verified-rc24-source' ? 'reuse exact RC24 CI source evidence; new changes and native qualification remain separate' :
         kind === 'verified-rc23-source' ? 'reuse exact RC23 source evidence; production qualification remains separate' :
         kind === 'control-exit-policy' ? 'reviewed runtime change: execute the focused exit-policy check' :
         kind === 'affected' ? 'run matching checks or reuse the verified component baseline' : 'no production behavior change' })) }

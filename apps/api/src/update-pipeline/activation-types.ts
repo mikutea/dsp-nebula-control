@@ -69,6 +69,8 @@ export interface ComponentUpdateRollbackBaselineRequest {
  * cross this adapter boundary.
  */
 export interface ComponentUpdateRollbackBaseline {
+  /** Server-observed predecessor, including an installed but not yet managed component. */
+  previousComponentVersion?: string | null
   configurationSnapshotId: string
   configurationRevision: string
   serverModLockSha256: string

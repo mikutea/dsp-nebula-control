@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -11,7 +11,8 @@ import type { ComponentUpdateRollbackBinding } from '../update-pipeline/activati
 import type { AcceptedWindowsUpdateRuntimeEvidence } from './windows-update-runtime-evidence.js'
 import {
   WindowsUpdateActivationTransactionProvider,
-  WindowsUpdateTransactionProviderError
+  WindowsUpdateTransactionProviderError,
+  type WindowsUpdateTransactionProviderOptions
 } from './windows-update-transaction-provider.js'
 
 const fixedSaveName = '_lastexit_'
@@ -46,8 +47,21 @@ afterEach(async () => {
 })
 
 describe('WindowsUpdateActivationTransactionProvider', () => {
+  it('captures the canonical predecessor version from the server source and rejects missing evidence', async () => {
+    const valid = await createFixture(async component => {
+      expect(component).toBe('bepinex')
+      return '5.4.17.0'
+    })
+    const request = { requestId, component: 'bepinex' as const, targetVersion: '5.4.23.5', expectedRevision: shaA }
+    expect(await valid.provider.captureRollbackBaseline(request, valid.hostMutation))
+      .toMatchObject({ previousComponentVersion: '5.4.17.0' })
+    const missing = await createFixture(async () => undefined as never)
+    await expect(missing.provider.captureRollbackBaseline(request, missing.hostMutation))
+      .rejects.toMatchObject({ code: 'WINDOWS_UPDATE_ROLLBACK_BASELINE_UNAVAILABLE' })
+  })
+
   it('captures all rollback authorities, restores configuration and pair, then rereads every binding', async () => {
-    const fixture = await createFixture()
+    const fixture = await createFixture(async () => '0.9.22')
     const baseline = await fixture.provider.captureRollbackBaseline({
       requestId,
       component: 'nebula',
@@ -56,6 +70,7 @@ describe('WindowsUpdateActivationTransactionProvider', () => {
     }, fixture.hostMutation) as Baseline
 
     expect(baseline).toEqual(expect.objectContaining({
+      previousComponentVersion: '0.9.22',
       configurationSnapshotId: expect.stringMatching(/^[0-9a-f-]{36}$/),
       configurationRevision: expect.stringMatching(/^[0-9a-f]{64}$/),
       serverModLockSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
@@ -249,8 +264,8 @@ interface Baseline {
   previousLoadedSaveIdentity: string
 }
 
-async function createFixture() {
-  const projectRoot = await mkdtemp(path.join(tmpdir(), 'dyson-update-provider-'))
+async function createFixture(readPreviousComponentVersion?: WindowsUpdateTransactionProviderOptions['readPreviousComponentVersion']) {
+  const projectRoot = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-update-provider-')))
   temporaryRoots.push(projectRoot)
   const configRoot = path.join(projectRoot, 'server', 'BepInEx', 'config')
   const saveRoot = path.join(projectRoot, 'userdata', 'Save')
@@ -329,6 +344,7 @@ async function createFixture() {
     return stoppedEvidence
   }
   const provider = new WindowsUpdateActivationTransactionProvider({
+    readPreviousComponentVersion,
     projectRoot,
     configStopProof: {
       async issue() {
