@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -324,7 +324,7 @@ type FixtureOptions = Partial<Record<EnabledFlag, boolean>> & {
 }
 
 async function createFixture(options: FixtureOptions) {
-  const root = await mkdtemp(path.join(tmpdir(), 'dyson-windows-update-production-assembly-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-windows-update-production-assembly-')))
   temporaryRoots.push(root)
   const projectRoot = path.join(root, 'fictional-project')
   const dataRoot = path.join(root, 'fictional-data')

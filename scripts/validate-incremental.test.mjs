@@ -29,6 +29,9 @@ test('predecessor binding selects rollback and production assembly checks withou
   assert.throws(() => classifyChange(file, null, source + '\nUnreviewedChange();\n'))
   const plan = planExecution([{ file, kind: 'reviewed-predecessor-binding' }, { file: 'apps/api/src/web-assets.ts', kind: 'reviewed-entry-cache' }])
   assert.ok(plan.commands.some(([, args]) => args.includes('src/windows-update-production-assembly.test.ts')))
+  const rollbackCommand = plan.commands.find(([, args]) => args.includes('src/update-pipeline/activation.test.ts'))
+  assert.ok(rollbackCommand[1].includes('--testTimeout=30000'))
+  assert.ok(rollbackCommand[1].includes('--hookTimeout=30000'))
   assert.equal(plan.commands.filter(([, args]) => args.includes('apps/api/tsconfig.json')).length, 1)
 })
 

@@ -277,6 +277,14 @@ const reviewedPredecessorSources = new Map([
   [
     "apps/api/src/providers/windows-update-transaction-provider.test.ts",
     "d0010a85e189ce869a7c72c7a6b58fcfbe74200f1bfa6266d0963c46b47a3a11"
+  ],
+  [
+    "apps/api/src/update-activation-app-wiring.test.ts",
+    "5bae00ecb08b9aead6d25c7275e01e4b050a12df4617c631fc331651640f68e6"
+  ],
+  [
+    "apps/api/src/windows-update-production-assembly.test.ts",
+    "68963e13fc6fcf838acb982e6b20b1dfc088e2f62ac6693e10fa883ea37a624c"
   ]
 ]);
 
@@ -415,6 +423,7 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
   }
   if (changes.some(change => change.kind === 'reviewed-predecessor-binding')) {
     commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
+      '--testTimeout=30000', '--hookTimeout=30000',
       'src/update-pipeline/activation.test.ts', 'src/update-pipeline/activation-http.test.ts',
       'src/providers/windows-update-activation.test.ts', 'src/providers/windows-update-transaction-provider.test.ts',
       'src/update-activation-app-wiring.test.ts', 'src/windows-update-production-assembly.test.ts']])

@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readdir, rm, writeFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -158,7 +158,7 @@ interface Fixture {
 }
 
 async function createFixture(updateActivationEnabled: boolean): Promise<Fixture> {
-  const root = await mkdtemp(path.join(tmpdir(), 'dyson-activation-app-wiring-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-activation-app-wiring-')))
   temporaryRoots.push(root)
   const projectRoot = path.join(root, 'fictional-project')
   const stagingRoot = path.join(root, 'fictional-update-staging')
