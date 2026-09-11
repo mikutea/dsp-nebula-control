@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -400,7 +400,7 @@ interface Fixture {
 }
 
 async function createFixture(): Promise<Fixture> {
-  const root = await mkdtemp(path.join(tmpdir(), 'dyson-thunderstore-import-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-thunderstore-import-')))
   temporaryRoots.push(root)
   const inboxRoot = path.join(root, 'inbox')
   const stagingRoot = path.join(root, 'staging')

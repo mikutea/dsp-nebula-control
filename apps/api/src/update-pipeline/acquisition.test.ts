@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -406,7 +406,7 @@ interface Fixture {
 }
 
 async function fixture(): Promise<Fixture> {
-  const root = await mkdtemp(path.join(tmpdir(), 'dyson-acquisition-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-acquisition-')))
   temporaryRoots.push(root)
   const inboxRoot = path.join(root, 'inbox')
   const stateRoot = path.join(root, 'state')

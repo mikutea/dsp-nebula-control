@@ -510,7 +510,7 @@ function enabledConfig(roots: { inboxRoot: string; stagingRoot: string }) {
 }
 
 async function stagingRoots() {
-  const root = await mkdtemp(path.join(tmpdir(), 'dyson-acquisition-routes-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-acquisition-routes-')))
   temporaryRoots.push(root)
   const inboxRoot = path.join(root, 'inbox')
   const stagingRoot = path.join(root, 'staging')

@@ -153,11 +153,11 @@ const reviewedRc24ApplicationSources = new Map([
   ],
   [
     "apps/api/src/mods/thunderstore-import.test.ts",
-    "0462abfc25bf688bce4f9823dd14a5fa05bbcf35420bc0eac1116ad0443317c0"
+    "a9667ec105455f6592042f9c93aacaf48291eaee9c9b7a7e03e98a99a1df8323"
   ],
   [
     "apps/api/src/update-acquisition-routes.test.ts",
-    "e0d8b6fbd3f3e380e1182071df8b308d26685bb98f9ae29a2af2840d178921fa"
+    "b0063cd955bd7583daac1486bd3774d9204e030a439e59176e5ce8da4dac0e1e"
   ],
   [
     "apps/api/src/update-pipeline/acquisition-http.ts",
@@ -169,7 +169,7 @@ const reviewedRc24ApplicationSources = new Map([
   ],
   [
     "apps/api/src/update-pipeline/acquisition.test.ts",
-    "34b064d3d1bd6c8c1988208af5222957e12f2bf1ba4f4cb59ccec6c4849faaec"
+    "4b9a9f6cc50da0eccc374b64d628f3c35117c2fa47f54113d8286490b73c11de"
   ],
   [
     "apps/api/src/update-pipeline/bepinex-discovery.ts",
