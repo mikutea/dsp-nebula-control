@@ -1,0 +1,10 @@
+[Bridge]
+Enabled = false
+ControlRoot = {{CONTROL_ROOT}}
+SecretFile = {{SECRET_FILE}}
+
+[Timing]
+PollMilliseconds = 250
+StabilityMilliseconds = 2000
+SaveTimeoutSeconds = 30
+SaveCooldownSeconds = 60

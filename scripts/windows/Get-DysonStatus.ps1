@@ -20,6 +20,31 @@ function Convert-ToIsoUtc {
     return $Value.ToUniversalTime().ToString('o')
 }
 
+function Get-DysonProjectGlobalMappingAvailability {
+    param([Parameter(Mandatory)][string]$Root)
+
+    try {
+        $normalizedRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+        $drive = [IO.Path]::GetPathRoot($normalizedRoot).TrimEnd('\')
+        if ($drive -match '^[A-Za-z]:$') {
+            $mappings = @(Get-SmbGlobalMapping -LocalPath $drive -ErrorAction Stop)
+        }
+        elseif ($normalizedRoot.StartsWith('\\', [StringComparison]::Ordinal)) {
+            $mappings = @(Get-SmbGlobalMapping -ErrorAction Stop | Where-Object {
+                $remote = ([string]$_.RemotePath).TrimEnd('\')
+                $remote.Length -gt 2 -and (
+                    $normalizedRoot.Equals($remote, [StringComparison]::OrdinalIgnoreCase) -or
+                    $normalizedRoot.StartsWith($remote + '\', [StringComparison]::OrdinalIgnoreCase)
+                )
+            })
+        }
+        else { return $null }
+        if ($mappings.Count -ne 1) { return $null }
+        return [bool]([string]$mappings[0].Status -eq 'OK')
+    }
+    catch { return $null }
+}
+
 function Get-SafeProcess {
     param([Parameter(Mandatory)][string]$ExpectedPath)
 
@@ -85,24 +110,336 @@ function Get-SafeSaveName {
     return $name
 }
 
+function Get-HostCpuTelemetry {
+    param([AllowNull()][Nullable[int]]$ExpectedLogicalProcessors)
+
+    try {
+        $instances = @(Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor -ErrorAction Stop)
+        $totalInstance = $instances | Where-Object { [string]$_.Name -eq '_Total' } | Select-Object -First 1
+        $totalPercent = $null
+        if ($totalInstance -and $null -ne $totalInstance.PercentProcessorTime) {
+            $candidateTotal = [double]$totalInstance.PercentProcessorTime
+            if (-not [double]::IsNaN($candidateTotal) -and -not [double]::IsInfinity($candidateTotal) -and
+                $candidateTotal -ge 0 -and $candidateTotal -le 100) {
+                $totalPercent = [math]::Round($candidateTotal, 1)
+            }
+        }
+
+        $parsedCores = @()
+        foreach ($instance in $instances) {
+            $instanceName = [string]$instance.Name
+            if ($instanceName -eq '_Total') { continue }
+
+            $group = 0
+            $processor = -1
+            if ($instanceName -match '^(?<processor>\d+)$') {
+                $processor = [int]$Matches['processor']
+            }
+            elseif ($instanceName -match '^(?<group>\d+),(?<processor>\d+)$') {
+                $group = [int]$Matches['group']
+                $processor = [int]$Matches['processor']
+            }
+            else {
+                continue
+            }
+
+            if ($null -eq $instance.PercentProcessorTime) { continue }
+            $percent = [double]$instance.PercentProcessorTime
+            if ([double]::IsNaN($percent) -or [double]::IsInfinity($percent) -or $percent -lt 0 -or $percent -gt 100) {
+                continue
+            }
+            $parsedCores += [pscustomobject]@{
+                group = $group
+                processor = $processor
+                percent = [math]::Round($percent, 1)
+            }
+        }
+
+        $parsedCores = @($parsedCores | Sort-Object group, processor)
+        # PowerShell boxes a non-null Nullable[int] argument as System.Int32, so
+        # `.Value` resolves to $null. Read the boxed value directly or a
+        # processor-group-limited sample (for example 64 of 128 processors)
+        # can be mistaken for a complete set.
+        $expectedCount = if ($null -ne $ExpectedLogicalProcessors -and [int]$ExpectedLogicalProcessors -gt 0) {
+            [int]$ExpectedLogicalProcessors
+        } else {
+            $parsedCores.Count
+        }
+        if ($expectedCount -le 0 -or $parsedCores.Count -ne $expectedCount) {
+            return [ordered]@{
+                totalPercent = $totalPercent
+                coreSamples = $null
+                unavailableReason = 'inconsistent-sample'
+            }
+        }
+
+        $samples = @()
+        for ($index = 0; $index -lt $parsedCores.Count; $index++) {
+            $samples += [ordered]@{ index = $index; percent = [double]$parsedCores[$index].percent }
+        }
+        return [ordered]@{
+            totalPercent = $totalPercent
+            coreSamples = @($samples)
+            unavailableReason = $null
+        }
+    }
+    catch {
+        return [ordered]@{
+            totalPercent = $null
+            coreSamples = $null
+            unavailableReason = 'cim-unavailable'
+        }
+    }
+}
+
+function Get-NativeVolumeCapacity {
+    param([Parameter(Mandatory)][string]$PathRoot)
+
+    if ($null -eq ('DysonStatusVolumeNativeMethodsV1' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class DysonStatusVolumeNativeMethodsV1
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetDiskFreeSpaceEx(
+        string directoryName,
+        out ulong freeBytesAvailable,
+        out ulong totalNumberOfBytes,
+        out ulong totalNumberOfFreeBytes);
+}
+'@ -Language CSharp -ErrorAction Stop
+    }
+
+    [uint64]$freeBytesAvailable = 0
+    [uint64]$totalNumberOfBytes = 0
+    [uint64]$totalNumberOfFreeBytes = 0
+    if (-not [DysonStatusVolumeNativeMethodsV1]::GetDiskFreeSpaceEx(
+        $PathRoot,
+        [ref]$freeBytesAvailable,
+        [ref]$totalNumberOfBytes,
+        [ref]$totalNumberOfFreeBytes
+    )) {
+        throw 'Native volume capacity is unavailable.'
+    }
+    return [pscustomobject][ordered]@{
+        totalBytes = $totalNumberOfBytes
+        availableBytes = $freeBytesAvailable
+    }
+}
+
+function Get-VolumeTelemetry {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
+        if ([string]::IsNullOrWhiteSpace($pathRoot)) { throw 'Volume root is unavailable.' }
+
+        $totalBytes = $null
+        $availableBytes = $null
+        $driveId = $pathRoot.TrimEnd([char]'\')
+        if ($driveId -match '^[A-Za-z]:$') {
+            try {
+                $escapedDriveId = $driveId.Replace("'", "''")
+                $logicalDisk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID = '$escapedDriveId'" -ErrorAction Stop |
+                    Select-Object -First 1
+                if ($logicalDisk -and $null -ne $logicalDisk.Size -and $null -ne $logicalDisk.FreeSpace) {
+                    $totalBytes = [long]$logicalDisk.Size
+                    $availableBytes = [long]$logicalDisk.FreeSpace
+                }
+            }
+            catch {
+                # A mapped drive can be usable even when CIM cannot enumerate it.
+            }
+        }
+        if ($null -eq $totalBytes -or $null -eq $availableBytes) {
+            $nativeCapacity = Get-NativeVolumeCapacity -PathRoot $pathRoot
+            $totalBytes = [uint64]$nativeCapacity.totalBytes
+            $availableBytes = [uint64]$nativeCapacity.availableBytes
+        }
+        if ($null -eq $totalBytes -or $null -eq $availableBytes) {
+            $driveInfo = [System.IO.DriveInfo]::new($pathRoot)
+            if (-not $driveInfo.IsReady) { throw 'Volume is not ready.' }
+            $totalBytes = [long]$driveInfo.TotalSize
+            $availableBytes = [long]$driveInfo.AvailableFreeSpace
+        }
+
+        if ($totalBytes -le 0 -or $availableBytes -lt 0 -or $availableBytes -gt $totalBytes -or
+            $totalBytes -gt 9007199254740991 -or $availableBytes -gt 9007199254740991) {
+            return [ordered]@{
+                totalBytes = $null
+                availableBytes = $null
+                usedPercent = $null
+                unavailableReason = 'inconsistent-sample'
+            }
+        }
+        return [ordered]@{
+            totalBytes = $totalBytes
+            availableBytes = $availableBytes
+            usedPercent = [math]::Round((($totalBytes - $availableBytes) / [double]$totalBytes) * 100, 2)
+            unavailableReason = $null
+        }
+    }
+    catch {
+        return [ordered]@{
+            totalBytes = $null
+            availableBytes = $null
+            usedPercent = $null
+            unavailableReason = 'volume-unavailable'
+        }
+    }
+}
+
+function Get-NetworkCounterSnapshot {
+    try {
+        $interfaces = @(
+            [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+                Where-Object {
+                    $_.NetworkInterfaceType -ne [System.Net.NetworkInformation.NetworkInterfaceType]::Loopback -and
+                    $_.OperationalStatus -eq [System.Net.NetworkInformation.OperationalStatus]::Up
+                }
+        )
+        if ($interfaces.Count -eq 0) {
+            return [ordered]@{ counters = $null; unavailableReason = 'no-eligible-network-interface' }
+        }
+
+        $counters = @{}
+        foreach ($interface in $interfaces) {
+            $identity = [string]$interface.Id
+            if ([string]::IsNullOrWhiteSpace($identity) -or $counters.ContainsKey($identity)) {
+                return [ordered]@{ counters = $null; unavailableReason = 'inconsistent-sample' }
+            }
+            $statistics = $interface.GetIPStatistics()
+            $received = [long]$statistics.BytesReceived
+            $sent = [long]$statistics.BytesSent
+            if ($received -lt 0 -or $sent -lt 0) {
+                return [ordered]@{ counters = $null; unavailableReason = 'inconsistent-sample' }
+            }
+            # Interface identities are used only to match two in-process samples.
+            # They are never copied into the JSON result.
+            $counters[$identity] = [ordered]@{ received = $received; sent = $sent }
+        }
+        return [ordered]@{ counters = $counters; unavailableReason = $null }
+    }
+    catch {
+        return [ordered]@{ counters = $null; unavailableReason = 'network-counters-unavailable' }
+    }
+}
+
+function Get-NetworkRateTelemetry {
+    param(
+        [Parameter(Mandatory)]$Before,
+        [Parameter(Mandatory)]$After,
+        [Parameter(Mandatory)][double]$ElapsedSeconds
+    )
+
+    if ($Before.unavailableReason) {
+        return [ordered]@{
+            receiveBytesPerSecond = $null
+            sendBytesPerSecond = $null
+            sampledInterfaceCount = $null
+            unavailableReason = [string]$Before.unavailableReason
+        }
+    }
+    if ($After.unavailableReason) {
+        return [ordered]@{
+            receiveBytesPerSecond = $null
+            sendBytesPerSecond = $null
+            sampledInterfaceCount = $null
+            unavailableReason = [string]$After.unavailableReason
+        }
+    }
+    if ($ElapsedSeconds -le 0 -or $Before.counters.Count -le 0 -or
+        $Before.counters.Count -ne $After.counters.Count) {
+        return [ordered]@{
+            receiveBytesPerSecond = $null
+            sendBytesPerSecond = $null
+            sampledInterfaceCount = $null
+            unavailableReason = 'inconsistent-sample'
+        }
+    }
+
+    [long]$receivedDelta = 0
+    [long]$sentDelta = 0
+    foreach ($identity in $Before.counters.Keys) {
+        if (-not $After.counters.ContainsKey($identity)) {
+            return [ordered]@{
+                receiveBytesPerSecond = $null
+                sendBytesPerSecond = $null
+                sampledInterfaceCount = $null
+                unavailableReason = 'inconsistent-sample'
+            }
+        }
+        $received = [long]$After.counters[$identity].received - [long]$Before.counters[$identity].received
+        $sent = [long]$After.counters[$identity].sent - [long]$Before.counters[$identity].sent
+        if ($received -lt 0 -or $sent -lt 0) {
+            return [ordered]@{
+                receiveBytesPerSecond = $null
+                sendBytesPerSecond = $null
+                sampledInterfaceCount = $null
+                unavailableReason = 'inconsistent-sample'
+            }
+        }
+        $receivedDelta += $received
+        $sentDelta += $sent
+    }
+
+    $receiveRate = [math]::Round($receivedDelta / $ElapsedSeconds, 0)
+    $sendRate = [math]::Round($sentDelta / $ElapsedSeconds, 0)
+    if ([double]::IsNaN($receiveRate) -or [double]::IsInfinity($receiveRate) -or
+        [double]::IsNaN($sendRate) -or [double]::IsInfinity($sendRate) -or
+        $receiveRate -lt 0 -or $sendRate -lt 0 -or
+        $receiveRate -gt 9007199254740991 -or $sendRate -gt 9007199254740991) {
+        return [ordered]@{
+            receiveBytesPerSecond = $null
+            sendBytesPerSecond = $null
+            sampledInterfaceCount = $null
+            unavailableReason = 'inconsistent-sample'
+        }
+    }
+    return [ordered]@{
+        receiveBytesPerSecond = [long]$receiveRate
+        sendBytesPerSecond = [long]$sendRate
+        sampledInterfaceCount = [int]$Before.counters.Count
+        unavailableReason = $null
+    }
+}
+
 $resolvedProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot -ErrorAction Stop).ProviderPath
 $expectedExecutable = Join-Path $resolvedProjectRoot 'server\DSPGAME.exe'
 $process = Get-SafeProcess -ExpectedPath $expectedExecutable
 
+$computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+$operatingSystem = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+$logicalProcessors = if ($computerSystem -and [int]$computerSystem.NumberOfLogicalProcessors -gt 0) {
+    [int]$computerSystem.NumberOfLogicalProcessors
+} else { [Environment]::ProcessorCount }
+$processorGroups = if ($logicalProcessors -gt 0) { [int][math]::Ceiling($logicalProcessors / 64.0) } else { $null }
+
+$cpuStart = if ($process -and $null -ne $process.CPU) { [double]$process.CPU } else { $null }
+$networkBefore = Get-NetworkCounterSnapshot
+$sampleTimer = [System.Diagnostics.Stopwatch]::StartNew()
+Start-Sleep -Milliseconds $CpuSampleMilliseconds
+$freshProcess = if ($process) { Get-Process -Id $process.Id -ErrorAction SilentlyContinue } else { $null }
+$networkAfter = Get-NetworkCounterSnapshot
+$sampleTimer.Stop()
+$networkTelemetry = Get-NetworkRateTelemetry -Before $networkBefore -After $networkAfter -ElapsedSeconds $sampleTimer.Elapsed.TotalSeconds
+
 $processCoresUsed = $null
-if ($process -and $null -ne $process.CPU) {
-    $cpuStart = [double]$process.CPU
-    $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    Start-Sleep -Milliseconds $CpuSampleMilliseconds
-    $freshProcess = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
-    $timer.Stop()
+if ($process) {
     if ($freshProcess) {
         $process = $freshProcess
-        if ($null -ne $freshProcess.CPU -and $timer.Elapsed.TotalSeconds -gt 0) {
-            $processCoresUsed = [math]::Round(([double]$freshProcess.CPU - $cpuStart) / $timer.Elapsed.TotalSeconds, 2)
+        if ($null -ne $cpuStart -and $null -ne $freshProcess.CPU -and $sampleTimer.Elapsed.TotalSeconds -gt 0) {
+            $candidateCoresUsed = ([double]$freshProcess.CPU - $cpuStart) / $sampleTimer.Elapsed.TotalSeconds
+            if (-not [double]::IsNaN($candidateCoresUsed) -and -not [double]::IsInfinity($candidateCoresUsed) -and
+                $candidateCoresUsed -ge 0 -and $candidateCoresUsed -le $logicalProcessors) {
+                $processCoresUsed = [math]::Round($candidateCoresUsed, 2)
+            }
         }
-    }
-    else {
+    } else {
         $process = $null
     }
 }
@@ -118,16 +455,15 @@ if ($process) {
     }
 }
 
-$computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-$operatingSystem = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-$logicalProcessors = if ($computerSystem -and [int]$computerSystem.NumberOfLogicalProcessors -gt 0) {
-    [int]$computerSystem.NumberOfLogicalProcessors
-} else { [Environment]::ProcessorCount }
-$processorGroups = if ($logicalProcessors -gt 0) { [int][math]::Ceiling($logicalProcessors / 64.0) } else { $null }
-$hostCpuValues = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | ForEach-Object { $_.LoadPercentage } | Where-Object { $null -ne $_ })
-$hostCpuPercent = if ($hostCpuValues.Count -gt 0) {
-    [math]::Round((($hostCpuValues | Measure-Object -Average).Average), 1)
-} else { $null }
+$hostCpuTelemetry = Get-HostCpuTelemetry -ExpectedLogicalProcessors $logicalProcessors
+$hostCpuPercent = $hostCpuTelemetry.totalPercent
+if ($null -eq $hostCpuPercent) {
+    $hostCpuValues = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.LoadPercentage } | Where-Object { $null -ne $_ })
+    $hostCpuPercent = if ($hostCpuValues.Count -gt 0) {
+        [math]::Round((($hostCpuValues | Measure-Object -Average).Average), 1)
+    } else { $null }
+}
 
 $logPath = Join-Path $resolvedProjectRoot 'server\BepInEx\LogOutput.log'
 $logLines = if (Test-Path -LiteralPath $logPath) {
@@ -148,6 +484,8 @@ $compatible = if ($null -eq $gameLoaded -or -not $dspVersion -or -not $nebulaVer
 
 $activeSaveName = Get-SafeSaveName -Candidate (Get-LastMatchingValue -Lines $logLines -Pattern 'Starting dedicated server, loading save\s*:\s*(?<value>.+?)\s*$')
 $saveRoot = Join-Path $resolvedProjectRoot 'userdata\Save'
+$projectVolumeTelemetry = Get-VolumeTelemetry -Path $resolvedProjectRoot
+$saveVolumeTelemetry = Get-VolumeTelemetry -Path $saveRoot
 $latestDsv = if (Test-Path -LiteralPath $saveRoot) {
     Get-ChildItem -LiteralPath $saveRoot -Filter '*.dsv' -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
@@ -186,17 +524,7 @@ catch {
     $gamePortListening = $false
 }
 
-$globalMappingAvailable = $null
-try {
-    $projectDrive = [System.IO.Path]::GetPathRoot($resolvedProjectRoot).TrimEnd('\')
-    if ($projectDrive -match '^[A-Za-z]:$') {
-        $mapping = Get-SmbGlobalMapping -LocalPath $projectDrive -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($mapping) { $globalMappingAvailable = [bool]($mapping.Status -eq 'OK') }
-    }
-}
-catch {
-    $globalMappingAvailable = $null
-}
+$globalMappingAvailable = Get-DysonProjectGlobalMappingAvailability -Root $resolvedProjectRoot
 
 $startedAt = if ($process) {
     try { Convert-ToIsoUtc -Value $process.StartTime } catch { $null }
@@ -231,6 +559,13 @@ $status = [ordered]@{
         cpuPercent = $hostCpuPercent
         memoryTotalGiB = if ($operatingSystem) { [math]::Round(([double]$operatingSystem.TotalVisibleMemorySize * 1KB) / 1GB, 2) } else { $null }
         memoryFreeGiB = if ($operatingSystem) { [math]::Round(([double]$operatingSystem.FreePhysicalMemory * 1KB) / 1GB, 2) } else { $null }
+        cpuCores = [ordered]@{
+            samples = $hostCpuTelemetry.coreSamples
+            unavailableReason = $hostCpuTelemetry.unavailableReason
+        }
+        projectVolume = $projectVolumeTelemetry
+        saveVolume = $saveVolumeTelemetry
+        network = $networkTelemetry
     }
     versions = [ordered]@{
         dsp = $dspVersion
@@ -267,7 +602,7 @@ $status = [ordered]@{
         },
         [ordered]@{ id = 'public-wss'; label = 'Public WSS'; status = 'unknown'; detail = 'External probe is not configured' }
     )
-    capabilities = [ordered]@{ refresh = $true; save = $false; gracefulStop = $false; restart = $false }
+    capabilities = [ordered]@{ refresh = $true; start = $false; save = $false; gracefulStop = $false; restart = $false }
 }
 
 $status | ConvertTo-Json -Depth 8 -Compress

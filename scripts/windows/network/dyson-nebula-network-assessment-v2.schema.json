@@ -1,0 +1,820 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dyson-control:schema:nebula-network-assessment:v2",
+  "title": "Dyson Nebula network assessment v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "schemaVersion",
+    "mode",
+    "generatedAt",
+    "productionChanged",
+    "remoteProbeEnabled",
+    "networkMutationImplemented",
+    "networkMutationAuthorized",
+    "qualificationValidationOperation",
+    "qualificationAcceptanceState",
+    "privacy",
+    "qualification",
+    "nebulaClientSemantics",
+    "localListener",
+    "planes",
+    "passWallBypassEvidence",
+    "decision",
+    "findings"
+  ],
+  "properties": {
+    "protocol": { "const": "DYSON_NEBULA_NETWORK_ASSESSMENT_V2" },
+    "schemaVersion": { "const": 2 },
+    "mode": { "enum": ["local-read-only", "remote-read-only", "shadow"] },
+    "generatedAt": { "$ref": "#/$defs/utc" },
+    "productionChanged": { "const": false },
+    "remoteProbeEnabled": { "type": "boolean" },
+    "networkMutationImplemented": { "const": false },
+    "networkMutationAuthorized": { "const": false },
+    "qualificationValidationOperation": { "enum": ["none", "preview", "consume"] },
+    "qualificationAcceptanceState": {
+      "enum": ["not-established", "preview-only", "consumed-or-idempotently-confirmed"]
+    },
+    "privacy": { "$ref": "#/$defs/privacy" },
+    "qualification": { "$ref": "#/$defs/qualification" },
+    "nebulaClientSemantics": { "$ref": "#/$defs/clientSemantics" },
+    "localListener": { "$ref": "#/$defs/localListener" },
+    "planes": { "$ref": "#/$defs/planes" },
+    "passWallBypassEvidence": { "$ref": "#/$defs/passWallEvidence" },
+    "decision": { "$ref": "#/$defs/decision" },
+    "findings": {
+      "type": "array",
+      "maxItems": 96,
+      "items": { "$ref": "#/$defs/finding" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": { "decision": { "const": "not-provided" } },
+            "required": ["decision"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": { "$ref": "#/$defs/stockState" }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": { "decision": { "const": "preview-valid" } },
+            "required": ["decision"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": { "$ref": "#/$defs/previewState" }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": { "decision": { "const": "blocked" } },
+            "required": ["decision"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": { "$ref": "#/$defs/blockedState" }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": { "decision": { "const": "qualified" } },
+            "required": ["decision"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": { "$ref": "#/$defs/qualifiedState" }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": { "validationMode": { "const": "preview" }, "decision": { "const": "blocked" } },
+            "required": ["validationMode", "decision"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": { "properties": { "qualificationValidationOperation": { "const": "preview" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "qualification": {
+            "properties": { "validationMode": { "const": "consume" }, "decision": { "const": "blocked" } },
+            "required": ["validationMode", "decision"]
+          }
+        },
+        "required": ["qualification"]
+      },
+      "then": { "properties": { "qualificationValidationOperation": { "const": "consume" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "nebulaClientSemantics": {
+            "properties": { "qualificationDerived": { "const": true } },
+            "required": ["qualificationDerived"]
+          }
+        },
+        "required": ["nebulaClientSemantics"]
+      },
+      "then": { "$ref": "#/$defs/qualifiedState" }
+    },
+    {
+      "if": {
+        "properties": {
+          "passWallBypassEvidence": {
+            "properties": { "qualificationBound": { "const": true } },
+            "required": ["qualificationBound"]
+          }
+        },
+        "required": ["passWallBypassEvidence"]
+      },
+      "then": { "$ref": "#/$defs/qualifiedState" }
+    },
+    {
+      "if": {
+        "properties": { "qualificationAcceptanceState": { "const": "consumed-or-idempotently-confirmed" } },
+        "required": ["qualificationAcceptanceState"]
+      },
+      "then": { "$ref": "#/$defs/qualifiedState" }
+    },
+    {
+      "if": {
+        "properties": {
+          "decision": {
+            "properties": { "ready": { "const": true } },
+            "required": ["ready"]
+          }
+        },
+        "required": ["decision"]
+      },
+      "then": {
+        "allOf": [
+          { "$ref": "#/$defs/qualifiedState" },
+          { "$ref": "#/$defs/readyEvidenceState" }
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "utc": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "qualifiedState": {
+      "type": "object",
+      "required": [
+        "remoteProbeEnabled", "qualificationValidationOperation", "qualificationAcceptanceState",
+        "qualification", "nebulaClientSemantics", "passWallBypassEvidence"
+      ],
+      "properties": {
+        "remoteProbeEnabled": { "const": true },
+        "qualificationValidationOperation": { "const": "consume" },
+        "qualificationAcceptanceState": { "const": "consumed-or-idempotently-confirmed" },
+        "qualification": {
+          "required": ["source", "decision", "exactProjectionValidated", "validationMode", "contractDigestBinding"],
+          "properties": {
+            "source": { "const": "protected-hostname-wss-verifier-v1" },
+            "decision": { "const": "qualified" },
+            "exactProjectionValidated": { "const": true },
+            "validationMode": { "const": "consume" },
+            "contractDigestBinding": { "const": "verifier-validated" }
+          }
+        },
+        "nebulaClientSemantics": {
+          "required": ["qualificationDerived"],
+          "properties": { "qualificationDerived": { "const": true } }
+        },
+        "passWallBypassEvidence": {
+          "required": ["source", "qualificationBound", "decision"],
+          "properties": {
+            "source": { "const": "protected-qualification-receipt-chain" },
+            "qualificationBound": { "const": true },
+            "decision": { "const": "receipt-chain-bound" }
+          }
+        }
+      }
+    },
+    "unqualifiedState": {
+      "type": "object",
+      "required": ["nebulaClientSemantics", "passWallBypassEvidence", "decision"],
+      "properties": {
+        "nebulaClientSemantics": {
+          "required": ["qualificationDerived"],
+          "properties": { "qualificationDerived": { "const": false } }
+        },
+        "passWallBypassEvidence": {
+          "required": ["source", "qualificationBound", "decision"],
+          "properties": {
+            "source": { "const": "none" },
+            "qualificationBound": { "const": false },
+            "decision": { "const": "not-established" }
+          }
+        },
+        "decision": {
+          "required": ["state", "ready", "blockerCount"],
+          "properties": {
+            "state": { "const": "blocked" },
+            "ready": { "const": false },
+            "blockerCount": { "minimum": 1 }
+          }
+        }
+      }
+    },
+    "stockState": {
+      "allOf": [
+        { "$ref": "#/$defs/unqualifiedState" },
+        {
+          "properties": {
+            "qualificationValidationOperation": { "const": "none" },
+            "qualificationAcceptanceState": { "const": "not-established" },
+            "qualification": {
+              "required": ["decision", "validationMode"],
+              "properties": {
+                "decision": { "const": "not-provided" },
+                "validationMode": { "const": "stock" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "previewState": {
+      "allOf": [
+        { "$ref": "#/$defs/unqualifiedState" },
+        {
+          "properties": {
+            "qualificationValidationOperation": { "const": "preview" },
+            "qualificationAcceptanceState": { "const": "preview-only" },
+            "qualification": {
+              "required": ["decision", "validationMode"],
+              "properties": {
+                "decision": { "const": "preview-valid" },
+                "validationMode": { "const": "preview" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "blockedState": {
+      "allOf": [
+        { "$ref": "#/$defs/unqualifiedState" },
+        {
+          "properties": {
+            "qualificationAcceptanceState": { "const": "not-established" },
+            "qualification": {
+              "required": ["decision"],
+              "properties": { "decision": { "const": "blocked" } }
+            }
+          }
+        }
+      ]
+    },
+    "readyEvidenceState": {
+      "type": "object",
+      "required": ["localListener", "planes", "decision"],
+      "properties": {
+        "localListener": {
+          "required": ["state", "bindingCount", "processIdentity"],
+          "properties": {
+            "state": { "const": "listening" },
+            "bindingCount": { "minimum": 1 },
+            "processIdentity": {
+              "required": ["state", "observedProcessCount", "observedProcessNames", "expectedNameMatched", "singleOwner"],
+              "properties": {
+                "state": { "const": "matched" },
+                "observedProcessCount": { "const": 1 },
+                "observedProcessNames": {
+                  "type": "array", "minItems": 1, "maxItems": 1,
+                  "items": { "const": "DSPGAME" }
+                },
+                "expectedNameMatched": { "const": true },
+                "singleOwner": { "const": true }
+              }
+            }
+          }
+        },
+        "planes": {
+          "required": ["gameData"],
+          "properties": {
+            "gameData": {
+              "required": ["configured", "targetKind", "port", "transport", "dns", "tcp", "websocket"],
+              "properties": {
+                "configured": { "const": true },
+                "targetKind": { "const": "hostname" },
+                "port": { "const": 443 },
+                "transport": { "const": "wss" },
+                "dns": {
+                  "required": ["status", "addressCount", "selectedFirstClass"],
+                  "properties": {
+                    "status": { "const": "resolved" },
+                    "addressCount": { "minimum": 1 },
+                    "selectedFirstClass": { "const": "public" }
+                  }
+                },
+                "tcp": {
+                  "required": ["outcome"],
+                  "properties": { "outcome": { "const": "reachable" } }
+                },
+                "websocket": {
+                  "required": [
+                    "path", "transport", "outcome", "statusCode", "upgradeHeaderPresent",
+                    "connectionHeaderUpgrade", "acceptHeaderPresent", "acceptHeaderValid",
+                    "tlsCertificateValidated", "authoritySemantics"
+                  ],
+                  "properties": {
+                    "path": { "const": "/socket" },
+                    "transport": { "const": "wss" },
+                    "outcome": { "const": "upgrade-accepted" },
+                    "statusCode": { "const": 101 },
+                    "upgradeHeaderPresent": { "const": true },
+                    "connectionHeaderUpgrade": { "const": true },
+                    "acceptHeaderPresent": { "const": true },
+                    "acceptHeaderValid": { "const": true },
+                    "tlsCertificateValidated": { "const": true },
+                    "authoritySemantics": { "const": "hostname-preserved" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "decision": {
+          "required": ["state", "ready", "blockerCount"],
+          "properties": {
+            "state": { "const": "ready" },
+            "ready": { "const": true },
+            "blockerCount": { "const": 0 }
+          }
+        }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "targetValuesEmitted",
+        "addressesEmitted",
+        "pathsEmitted",
+        "credentialsAccepted",
+        "processIdsEmitted",
+        "executablePathsEmitted",
+        "authorityEmitted",
+        "keyMaterialEmitted",
+        "rawEvidenceEmitted"
+      ],
+      "properties": {
+        "targetValuesEmitted": { "const": false },
+        "addressesEmitted": { "const": false },
+        "pathsEmitted": { "const": false },
+        "credentialsAccepted": { "const": false },
+        "processIdsEmitted": { "const": false },
+        "executablePathsEmitted": { "const": false },
+        "authorityEmitted": { "const": false },
+        "keyMaterialEmitted": { "const": false },
+        "rawEvidenceEmitted": { "const": false }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "verifierProtocol",
+        "qualificationId",
+        "runId",
+        "bindingSha256",
+        "expiresAtUtc",
+        "decision",
+        "blockerCodes",
+        "exactProjectionValidated",
+        "validationMode",
+        "contractDigestBinding"
+      ],
+      "properties": {
+        "source": { "enum": ["none", "protected-hostname-wss-verifier-v1"] },
+        "verifierProtocol": {
+          "oneOf": [
+            { "type": "null" },
+            { "const": "DYSON_NEBULA_HOSTNAME_WSS_QUALIFICATION_V1" }
+          ]
+        },
+        "qualificationId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/uuid" }] },
+        "runId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/uuid" }] },
+        "bindingSha256": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/digest" }] },
+        "expiresAtUtc": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/utc" }] },
+        "decision": { "enum": ["not-provided", "qualified", "blocked", "preview-valid"] },
+        "blockerCodes": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Z0-9_]{1,128}$" }
+        },
+        "exactProjectionValidated": { "type": "boolean" },
+        "validationMode": { "enum": ["stock", "preview", "consume"] },
+        "contractDigestBinding": { "enum": ["not-established", "verifier-validated"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "decision": { "const": "not-provided" } }, "required": ["decision"] },
+          "then": {
+            "properties": {
+              "source": { "const": "none" },
+              "verifierProtocol": { "type": "null" },
+              "qualificationId": { "type": "null" },
+              "runId": { "type": "null" },
+              "bindingSha256": { "type": "null" },
+              "expiresAtUtc": { "type": "null" },
+              "exactProjectionValidated": { "const": false },
+              "validationMode": { "const": "stock" },
+              "contractDigestBinding": { "const": "not-established" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "decision": { "const": "qualified" } }, "required": ["decision"] },
+          "then": {
+            "properties": {
+              "source": { "const": "protected-hostname-wss-verifier-v1" },
+              "verifierProtocol": { "const": "DYSON_NEBULA_HOSTNAME_WSS_QUALIFICATION_V1" },
+              "qualificationId": { "$ref": "#/$defs/uuid" },
+              "runId": { "$ref": "#/$defs/uuid" },
+              "bindingSha256": { "$ref": "#/$defs/digest" },
+              "expiresAtUtc": { "$ref": "#/$defs/utc" },
+              "blockerCodes": { "type": "array", "maxItems": 0 },
+              "exactProjectionValidated": { "const": true },
+              "validationMode": { "const": "consume" },
+              "contractDigestBinding": { "const": "verifier-validated" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "decision": { "const": "preview-valid" } }, "required": ["decision"] },
+          "then": {
+            "properties": {
+              "source": { "const": "protected-hostname-wss-verifier-v1" },
+              "verifierProtocol": { "const": "DYSON_NEBULA_HOSTNAME_WSS_QUALIFICATION_V1" },
+              "qualificationId": { "$ref": "#/$defs/uuid" },
+              "runId": { "$ref": "#/$defs/uuid" },
+              "bindingSha256": { "$ref": "#/$defs/digest" },
+              "expiresAtUtc": { "$ref": "#/$defs/utc" },
+              "blockerCodes": {
+                "type": "array", "minItems": 1, "maxItems": 1,
+                "items": { "const": "DYSON_HOSTNAME_WSS_QUALIFICATION_NOT_CONSUMED" }
+              },
+              "exactProjectionValidated": { "const": true },
+              "validationMode": { "const": "preview" },
+              "contractDigestBinding": { "const": "not-established" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "decision": { "const": "blocked" } }, "required": ["decision"] },
+          "then": {
+            "properties": {
+              "source": { "const": "protected-hostname-wss-verifier-v1" },
+              "verifierProtocol": { "const": "DYSON_NEBULA_HOSTNAME_WSS_QUALIFICATION_V1" },
+              "qualificationId": { "$ref": "#/$defs/uuid" },
+              "runId": { "$ref": "#/$defs/uuid" },
+              "bindingSha256": { "$ref": "#/$defs/digest" },
+              "expiresAtUtc": { "$ref": "#/$defs/utc" },
+              "blockerCodes": { "type": "array", "minItems": 1 },
+              "exactProjectionValidated": { "const": true },
+              "validationMode": { "enum": ["preview", "consume"] },
+              "contractDigestBinding": { "const": "not-established" }
+            }
+          }
+        }
+      ]
+    },
+    "clientSemantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "qualificationDerived",
+        "sourceContract",
+        "topology",
+        "transport",
+        "port",
+        "websocketPath",
+        "hostnameResolution",
+        "authoritySemantics",
+        "wssHostnameRouteReadyByPrefixOnly"
+      ],
+      "properties": {
+        "profile": { "enum": ["stock", "hostname-preserving-wss"] },
+        "qualificationDerived": { "type": "boolean" },
+        "sourceContract": {
+          "enum": ["current-official-source", "protected-hostname-wss-qualification-v1"]
+        },
+        "topology": { "enum": ["not-qualified", "http-websocket-tunnel"] },
+        "transport": { "enum": ["not-qualified", "wss"] },
+        "port": { "enum": [0, 443] },
+        "websocketPath": { "oneOf": [{ "type": "null" }, { "const": "/socket" }] },
+        "hostnameResolution": { "const": "dns-first-address-only" },
+        "authoritySemantics": { "enum": ["resolved-ip-endpoint", "hostname-preserved"] },
+        "wssHostnameRouteReadyByPrefixOnly": { "const": false }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "qualificationDerived": { "const": true } }, "required": ["qualificationDerived"] },
+          "then": {
+            "properties": {
+              "profile": { "const": "hostname-preserving-wss" },
+              "sourceContract": { "const": "protected-hostname-wss-qualification-v1" },
+              "topology": { "const": "http-websocket-tunnel" },
+              "transport": { "const": "wss" },
+              "port": { "const": 443 },
+              "websocketPath": { "const": "/socket" },
+              "authoritySemantics": { "const": "hostname-preserved" }
+            }
+          },
+          "else": {
+            "properties": {
+              "profile": { "const": "stock" },
+              "sourceContract": { "const": "current-official-source" },
+              "topology": { "const": "not-qualified" },
+              "transport": { "const": "not-qualified" },
+              "port": { "const": 0 },
+              "websocketPath": { "type": "null" },
+              "authoritySemantics": { "const": "resolved-ip-endpoint" }
+            }
+          }
+        }
+      ]
+    },
+    "addressClassCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "loopback", "private", "documentation", "link-local", "public",
+        "unspecified", "multicast", "unknown"
+      ],
+      "properties": {
+        "loopback": { "type": "integer", "minimum": 0 },
+        "private": { "type": "integer", "minimum": 0 },
+        "documentation": { "type": "integer", "minimum": 0 },
+        "link-local": { "type": "integer", "minimum": 0 },
+        "public": { "type": "integer", "minimum": 0 },
+        "unspecified": { "type": "integer", "minimum": 0 },
+        "multicast": { "type": "integer", "minimum": 0 },
+        "unknown": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "processIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state", "observedProcessCount", "observedProcessNames", "expectedNameMatched",
+        "singleOwner", "executablePathsEmitted", "processIdsEmitted"
+      ],
+      "properties": {
+        "state": { "enum": ["matched", "mismatched", "ambiguous", "query-unavailable", "not-listening"] },
+        "observedProcessCount": { "type": "integer", "minimum": 0 },
+        "observedProcessNames": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" }
+        },
+        "expectedNameMatched": { "type": "boolean" },
+        "singleOwner": { "type": "boolean" },
+        "executablePathsEmitted": { "const": false },
+        "processIdsEmitted": { "const": false }
+      }
+    },
+    "localListener": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["originPort", "state", "bindingCount", "bindingClassCounts", "processIdentity"],
+      "properties": {
+        "originPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "state": { "enum": ["listening", "not-listening", "query-unavailable"] },
+        "bindingCount": { "type": "integer", "minimum": 0 },
+        "bindingClassCounts": { "$ref": "#/$defs/addressClassCounts" },
+        "processIdentity": { "$ref": "#/$defs/processIdentity" }
+      }
+    },
+    "dns": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status", "addressCount", "ipv4Count", "ipv6Count", "addressClassCounts",
+        "clientSelectionSemantics", "selectedFirstClass", "selectedFirstFamily", "rawAnswersEmitted"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "not-configured", "remote-probes-disabled", "resolved", "literal-address",
+            "no-address", "nxdomain", "temporary-failure", "timeout", "error"
+          ]
+        },
+        "addressCount": { "type": "integer", "minimum": 0 },
+        "ipv4Count": { "type": "integer", "minimum": 0 },
+        "ipv6Count": { "type": "integer", "minimum": 0 },
+        "addressClassCounts": { "$ref": "#/$defs/addressClassCounts" },
+        "clientSelectionSemantics": { "const": "first-address-only" },
+        "selectedFirstClass": {
+          "enum": ["none", "loopback", "private", "documentation", "link-local", "public", "unspecified", "multicast", "unknown"]
+        },
+        "selectedFirstFamily": { "enum": ["none", "ipv4", "ipv6", "unknown"] },
+        "rawAnswersEmitted": { "const": false }
+      }
+    },
+    "tcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "endpointEmitted"],
+      "properties": {
+        "outcome": {
+          "enum": [
+            "not-configured", "remote-probes-disabled", "dns-unavailable", "reachable",
+            "connection-refused", "timeout", "network-unreachable", "address-unreachable", "error"
+          ]
+        },
+        "endpointEmitted": { "const": false }
+      }
+    },
+    "websocket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path", "transport", "outcome", "statusCode", "upgradeHeaderPresent",
+        "connectionHeaderUpgrade", "acceptHeaderPresent", "acceptHeaderValid",
+        "tlsCertificateValidated", "authoritySemantics", "requestAuthorityEmitted",
+        "responseHeadersEmitted"
+      ],
+      "properties": {
+        "path": { "oneOf": [{ "type": "null" }, { "const": "/socket" }] },
+        "transport": { "enum": ["not-qualified", "wss"] },
+        "outcome": {
+          "enum": [
+            "not-qualified", "remote-probes-disabled", "dns-unavailable", "upgrade-accepted",
+            "tls-failure", "non-101", "auth-required", "wrong-path", "invalid-upgrade",
+            "protocol-error", "connection-refused", "timeout", "network-unreachable",
+            "address-unreachable", "error"
+          ]
+        },
+        "statusCode": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+        "upgradeHeaderPresent": { "type": "boolean" },
+        "connectionHeaderUpgrade": { "type": "boolean" },
+        "acceptHeaderPresent": { "type": "boolean" },
+        "acceptHeaderValid": { "type": "boolean" },
+        "tlsCertificateValidated": { "type": "boolean" },
+        "authoritySemantics": { "enum": ["resolved-ip-endpoint", "hostname-preserved"] },
+        "requestAuthorityEmitted": { "const": false },
+        "responseHeadersEmitted": { "const": false }
+      }
+    },
+    "managementPlane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role", "configured", "targetRef", "targetKind", "targetValueEmitted",
+        "port", "transport", "dns", "tcp"
+      ],
+      "properties": {
+        "role": { "const": "management" },
+        "configured": { "type": "boolean" },
+        "targetRef": { "const": "management-plane" },
+        "targetKind": { "enum": ["none", "hostname", "ip-literal"] },
+        "targetValueEmitted": { "const": false },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "transport": { "enum": ["tcp", "http", "https"] },
+        "dns": { "$ref": "#/$defs/dns" },
+        "tcp": { "$ref": "#/$defs/tcp" }
+      }
+    },
+    "gamePlane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role", "configured", "targetRef", "targetKind", "targetValueEmitted",
+        "port", "transport", "dns", "tcp", "websocket"
+      ],
+      "properties": {
+        "role": { "const": "game-data" },
+        "configured": { "type": "boolean" },
+        "targetRef": { "const": "game-data-plane" },
+        "targetKind": { "enum": ["none", "hostname", "ip-literal"] },
+        "targetValueEmitted": { "const": false },
+        "port": { "const": 443 },
+        "transport": { "enum": ["not-qualified", "wss"] },
+        "dns": { "$ref": "#/$defs/dns" },
+        "tcp": { "$ref": "#/$defs/tcp" },
+        "websocket": { "$ref": "#/$defs/websocket" }
+      }
+    },
+    "planes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logicalRolesSeparated", "sameAuthority", "management", "gameData"],
+      "properties": {
+        "logicalRolesSeparated": { "const": true },
+        "sameAuthority": { "type": "boolean" },
+        "management": { "$ref": "#/$defs/managementPlane" },
+        "gameData": { "$ref": "#/$defs/gamePlane" }
+      }
+    },
+    "passWallEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source", "requiredForAcceptance", "qualificationBound", "rawPassWallEnumsAccepted",
+        "rawRuleTextEmitted", "rawInterfaceNameEmitted", "decision"
+      ],
+      "properties": {
+        "source": { "enum": ["none", "protected-qualification-receipt-chain"] },
+        "requiredForAcceptance": { "const": true },
+        "qualificationBound": { "type": "boolean" },
+        "rawPassWallEnumsAccepted": { "const": false },
+        "rawRuleTextEmitted": { "const": false },
+        "rawInterfaceNameEmitted": { "const": false },
+        "decision": { "enum": ["not-established", "receipt-chain-bound"] }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "qualificationBound": { "const": true } },
+            "required": ["qualificationBound"]
+          },
+          "then": {
+            "properties": {
+              "source": { "const": "protected-qualification-receipt-chain" },
+              "decision": { "const": "receipt-chain-bound" }
+            }
+          },
+          "else": {
+            "properties": {
+              "source": { "const": "none" },
+              "decision": { "const": "not-established" }
+            }
+          }
+        }
+      ]
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "ready", "blockerCount", "findingCount"],
+      "properties": {
+        "state": { "enum": ["ready", "blocked", "incomplete"] },
+        "ready": { "type": "boolean" },
+        "blockerCount": { "type": "integer", "minimum": 0 },
+        "findingCount": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "const": "ready" } }, "required": ["state"] },
+          "then": {
+            "properties": { "ready": { "const": true }, "blockerCount": { "const": 0 } }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "const": "blocked" } }, "required": ["state"] },
+          "then": {
+            "properties": { "ready": { "const": false }, "blockerCount": { "minimum": 1 } }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "const": "incomplete" } }, "required": ["state"] },
+          "then": {
+            "properties": { "ready": { "const": false }, "blockerCount": { "const": 0 } }
+          }
+        }
+      ]
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "plane"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z0-9_]{1,128}$" },
+        "severity": { "enum": ["blocker", "warning", "info"] },
+        "plane": { "enum": ["qualification", "local-listener", "game-data", "management", "passwall", "tool"] }
+      }
+    }
+  }
+}

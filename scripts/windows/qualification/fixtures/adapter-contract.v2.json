@@ -1,0 +1,54 @@
+{
+  "protocol": "DYSON_QUALIFICATION_ADAPTER_CONTRACT_V2",
+  "schemaVersion": 2,
+  "productionExecutionImplemented": true,
+  "defaultProductionExecutionEnabled": false,
+  "hostIdentityRule": "sha256-domain-separated-normalized-windows-machine-guid",
+  "confirmationBindsFullPreviewSha256": true,
+  "maximumPersistedResumeAgeDays": 31,
+  "maximumRenewedCompensationSeconds": 300,
+  "actions": [
+    {
+      "action": "control-plane-restart",
+      "adapterId": "fixed-control-plane-process-v2",
+      "timeoutMinimumSeconds": 30,
+      "timeoutMaximumSeconds": 900,
+      "identityRule": "exact-pid-path-file-sha256-and-scheduled-task-xml-sha256",
+      "compensation": "start-exact-profile-task-and-reinspect",
+      "forbiddenTargets": ["dsp-process", "gsmanager-process", "image-name-match"]
+    },
+    {
+      "action": "dsp-crash-recovery",
+      "adapterId": "fixed-dsp-process-v2",
+      "timeoutMinimumSeconds": 30,
+      "timeoutMaximumSeconds": 900,
+      "identityRule": "exact-pid-path-file-sha256-and-scheduled-task-xml-sha256",
+      "compensation": "start-exact-profile-recovery-task-and-reinspect",
+      "forbiddenTargets": ["image-name-match", "all-processes", "unmatched-pid"]
+    },
+    {
+      "action": "storage-interruption",
+      "adapterId": "fixed-smb-global-mapping-v2",
+      "timeoutMinimumSeconds": 40,
+      "timeoutMaximumSeconds": 900,
+      "maximumInterruptionSeconds": 300,
+      "recoveryReserveSeconds": 5,
+      "identityRule": "exact-local-and-remote-mapping-plus-restore-task-xml-sha256",
+      "compensation": "start-exact-profile-restore-task-before-deadline",
+      "forbiddenTargets": ["filesystem-root", "wildcard-share", "unmatched-volume", "network-adapter"]
+    },
+    {
+      "action": "disk-pressure",
+      "adapterId": "fixed-disposable-file-v2",
+      "timeoutMinimumSeconds": 30,
+      "timeoutMaximumSeconds": 900,
+      "maximumAllocationBytes": 68719476736,
+      "maximumUsedPercent": 85,
+      "minimumFreeBytes": 10737418240,
+      "identityRule": "marked-empty-non-reparse-non-compressed-disposable-directory-and-exact-request-file",
+      "allocationRule": "fresh-random-chunks-with-capacity-check-before-and-during-write",
+      "compensation": "delete-only-exact-request-allocation-and-reinspect",
+      "forbiddenTargets": ["system-root", "application-root", "data-root", "save-root", "backup-root", "recovery-root", "evidence-root", "other-volume"]
+    }
+  ]
+}

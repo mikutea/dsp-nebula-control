@@ -1,0 +1,16 @@
+.operator-rollback-panel { padding: 18px; margin-top: 18px; }
+.operator-rollback-panel header, .operator-rollback-panel .rollback-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.operator-rollback-panel header { justify-content: space-between; }
+.operator-rollback-panel h3 { margin: 0; }
+.operator-rollback-panel p { line-height: 1.6; overflow-wrap: anywhere; }
+.operator-rollback-panel .config-field { margin: 12px 0; max-width: 680px; }
+.operator-rollback-panel .rollback-confirm { display: flex; align-items: flex-start; gap: 8px; margin: 16px 0; }
+.operator-rollback-panel .rollback-pending { margin: 14px 0; }
+.operator-rollback-panel input:not([type="checkbox"]) { width: 100%; min-width: 0; }
+.operator-rollback-panel button { min-height: 36px; padding: 8px 12px; border: 1px solid var(--border); color: var(--text); background: linear-gradient(135deg, #0b3448, #071c2a); font: inherit; cursor: pointer; }
+.operator-rollback-panel button:hover:not(:disabled) { border-color: var(--cyan); }
+.operator-rollback-panel button:disabled { opacity: .45; cursor: not-allowed; }
+.operator-rollback-panel .config-field { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.operator-rollback-panel input:not([type="checkbox"]) { box-sizing: border-box; min-height: 38px; padding: 9px 10px; border: 1px solid var(--border); color: var(--text); background: #041723; font: 12px monospace; }
+.operator-rollback-panel [role="alert"] { border-left: 3px solid #e9b65c; padding-left: 12px; }
+@media (max-width: 600px) { .operator-rollback-panel { padding: 12px; } .operator-rollback-panel header { align-items: flex-start; } }

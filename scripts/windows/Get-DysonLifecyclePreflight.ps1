@@ -4,11 +4,13 @@ param(
     [string]$ProjectRoot,
     [Parameter(Mandatory)]
     [string]$AllowedScriptRoot,
+    [string]$AllowedTaskScriptRoot,
     [Parameter(Mandatory)]
-    [ValidateSet('save', 'graceful-stop', 'restart')]
+    [ValidateSet('start', 'save', 'graceful-stop', 'restart')]
     [string]$Action,
     [string]$ServerTaskName = 'Dyson-Nebula-Server',
-    [string]$StopTaskName = 'Dyson-Nebula-Stop'
+    [string]$StopTaskName = 'Dyson-Nebula-Stop',
+    [ValidateRange(1, 65535)][int]$GamePort = 8469
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,7 +45,11 @@ function Test-PathInsideRoot {
 
 function Get-TaskOrNull {
     param([Parameter(Mandatory)][string]$Name)
-    try { return Get-ScheduledTask -TaskName $Name -ErrorAction Stop }
+    try {
+        $matches = @(Get-ScheduledTask -TaskName $Name -ErrorAction Stop)
+        if ($matches.Count -eq 1) { return $matches[0] }
+        return $null
+    }
     catch { return $null }
 }
 
@@ -68,9 +74,63 @@ function Get-FileSha256Hex {
     }
 }
 
+function Test-FixedTaskAction {
+    param(
+        [Parameter(Mandatory)][object]$Task,
+        [Parameter(Mandatory)][string]$ExpectedScriptName,
+        [Parameter(Mandatory)][string]$ExpectedProjectRoot,
+        [Parameter(Mandatory)][string]$ScriptRoot
+    )
+
+    try {
+        $actions = @($Task.Actions)
+        if ($actions.Count -ne 1) { return $false }
+        $actionDefinition = $actions[0]
+        $expectedPowerShell = [System.IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+        $actualPowerShell = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$actionDefinition.Execute))
+        if (-not $actualPowerShell.Equals($expectedPowerShell, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+
+        $arguments = [string]$actionDefinition.Arguments
+        if ($arguments -match '[\r\n\0]') { return $false }
+        $argumentPattern = if ($ExpectedScriptName -eq 'Start-DysonServer.ps1') {
+            '(?i)^-NoLogo\s+-NoProfile\s+-NonInteractive\s+-ExecutionPolicy\s+Bypass\s+-File\s+"(?<script>[^"]+)"\s+-ProjectRoot\s+"(?<root>[^"]+)"\s+-Ups\s+(?<bounded>\d{1,3})$'
+        }
+        else {
+            '(?i)^-NoLogo\s+-NoProfile\s+-NonInteractive\s+-ExecutionPolicy\s+Bypass\s+-File\s+"(?<script>[^"]+)"\s+-ProjectRoot\s+"(?<root>[^"]+)"\s+-TimeoutSeconds\s+(?<bounded>\d{1,3})$'
+        }
+        $definitionMatch = [regex]::Match($arguments, $argumentPattern)
+        if (-not $definitionMatch.Success) { return $false }
+        $boundedValue = [int]$definitionMatch.Groups['bounded'].Value
+        if ($ExpectedScriptName -eq 'Start-DysonServer.ps1' -and ($boundedValue -lt 5 -or $boundedValue -gt 240)) { return $false }
+        if ($ExpectedScriptName -eq 'Stop-DysonServer.ps1' -and ($boundedValue -lt 10 -or $boundedValue -gt 300)) { return $false }
+
+        $expectedScript = (Resolve-Path -LiteralPath (Join-Path $ScriptRoot $ExpectedScriptName) -ErrorAction Stop).ProviderPath
+        $scriptItem = Get-Item -LiteralPath $expectedScript -Force -ErrorAction Stop
+        if ($scriptItem.PSIsContainer -or ($scriptItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
+        $actualScript = (Resolve-Path -LiteralPath $definitionMatch.Groups['script'].Value -ErrorAction Stop).ProviderPath
+        $actualProjectRoot = (Resolve-Path -LiteralPath $definitionMatch.Groups['root'].Value -ErrorAction Stop).ProviderPath
+        return [string]::Equals($actualScript, $expectedScript, [System.StringComparison]::OrdinalIgnoreCase) -and
+            [string]::Equals($actualProjectRoot, $ExpectedProjectRoot, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    catch { return $false }
+}
+
 $resolvedProjectRoot = $null
 try { $resolvedProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot -ErrorAction Stop).ProviderPath }
 catch { $resolvedProjectRoot = $null }
+$resolvedTaskScriptRoot = $null
+try {
+    if ([string]::IsNullOrWhiteSpace($AllowedTaskScriptRoot)) {
+        throw 'The stable runtime bootstrap root was not configured.'
+    }
+    $taskScriptRootItem = Get-Item -LiteralPath $AllowedTaskScriptRoot -Force -ErrorAction Stop
+    if (-not $taskScriptRootItem.PSIsContainer -or
+        ($taskScriptRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw 'The stable runtime bootstrap root is unavailable or redirected.'
+    }
+    $resolvedTaskScriptRoot = $taskScriptRootItem.FullName
+}
+catch { $resolvedTaskScriptRoot = $null }
 
 if ($resolvedProjectRoot) {
     Add-Check -Id 'project-root' -Status 'pass' -Message 'The configured project root is available.'
@@ -79,34 +139,81 @@ else {
     Add-Check -Id 'project-root' -Status 'block' -Message 'The configured project root is unavailable.' -Blocker 'project-root-unavailable'
 }
 
+$expectedExecutable = $null
+$managedExecutableReady = $false
+$managedProcesses = @()
+$unverifiedDspProcessCount = 0
 $managedProcess = $null
-$managedProcessVerified = $false
+$pidPresent = $false
 $pidVerified = $false
 $processOwner = $null
+$gamePortEvidenceReady = $false
+$gamePortListening = $false
+$gamePortOwnedByManaged = $false
 $savePairReady = $false
 $backupPairReady = $false
 $backupValidationReason = 'missing-components'
 
 if ($resolvedProjectRoot) {
-    $expectedExecutable = Join-Path $resolvedProjectRoot 'server\DSPGAME.exe'
+    $expectedExecutable = [System.IO.Path]::GetFullPath((Join-Path $resolvedProjectRoot 'server\DSPGAME.exe'))
+    try {
+        $executableItem = Get-Item -LiteralPath $expectedExecutable -Force -ErrorAction Stop
+        $managedExecutableReady = -not $executableItem.PSIsContainer -and
+            -not ($executableItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    }
+    catch { $managedExecutableReady = $false }
+
+    foreach ($candidate in @(Get-Process -Name 'DSPGAME' -ErrorAction SilentlyContinue)) {
+        $verifiedManagedProcess = $false
+        try {
+            if ($candidate.Path -and [System.IO.Path]::GetFullPath($candidate.Path).Equals(
+                $expectedExecutable,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                $managedProcesses += $candidate
+                $verifiedManagedProcess = $true
+            }
+        }
+        catch { }
+        if (-not $verifiedManagedProcess) { $unverifiedDspProcessCount += 1 }
+    }
+    if ($managedProcesses.Count -eq 1) {
+        $managedProcess = $managedProcesses[0]
+        $processOwner = Get-ProcessOwnerName -ProcessId $managedProcess.Id
+    }
+
     $pidPath = Join-Path $resolvedProjectRoot 'run\dspgame.pid'
     $pidValue = 0
     if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
+        $pidPresent = $true
         $pidText = (Get-Content -LiteralPath $pidPath -Raw).Trim()
         if ([int]::TryParse($pidText, [ref]$pidValue)) {
-            $managedProcess = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
-            $pidVerified = $null -ne $managedProcess
+            $pidProcess = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+            if ($pidProcess) {
+                try {
+                    $pidVerified = $managedProcesses.Count -eq 1 -and
+                        $pidProcess.Id -eq $managedProcess.Id -and
+                        [System.IO.Path]::GetFullPath($pidProcess.Path).Equals(
+                            $expectedExecutable,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )
+                }
+                catch { $pidVerified = $false }
+            }
         }
     }
 
-    if ($managedProcess) {
-        try {
-            $managedProcessVerified = $managedProcess.Name -eq 'DSPGAME' -and
-                [string]::Equals($managedProcess.Path, $expectedExecutable, [System.StringComparison]::OrdinalIgnoreCase)
+    try {
+        $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_.LocalPort -eq $GamePort })
+        $gamePortEvidenceReady = $true
+        $gamePortListening = $listeners.Count -gt 0
+        if ($managedProcesses.Count -eq 1 -and $gamePortListening) {
+            $ownedListeners = @($listeners | Where-Object { [int]$_.OwningProcess -eq [int]$managedProcess.Id })
+            $foreignListeners = @($listeners | Where-Object { [int]$_.OwningProcess -ne [int]$managedProcess.Id })
+            $gamePortOwnedByManaged = $ownedListeners.Count -gt 0 -and $foreignListeners.Count -eq 0
         }
-        catch { $managedProcessVerified = $false }
-        $processOwner = Get-ProcessOwnerName -ProcessId $managedProcess.Id
     }
+    catch { $gamePortEvidenceReady = $false }
 
     $saveRoot = Join-Path $resolvedProjectRoot 'userdata\Save'
     $latestDsv = if (Test-Path -LiteralPath $saveRoot) {
@@ -118,6 +225,7 @@ if ($resolvedProjectRoot) {
     } else { $null }
     $savePairReady = [bool]($latestDsv -and $latestSidecar)
 
+    if ($Action -ne 'start') {
     $backupRoot = Join-Path $resolvedProjectRoot 'backups\saves'
     $latestBackup = if (Test-Path -LiteralPath $backupRoot) {
         Get-ChildItem -LiteralPath $backupRoot -Directory -ErrorAction SilentlyContinue |
@@ -179,20 +287,68 @@ if ($resolvedProjectRoot) {
             $backupValidationReason = 'error-' + $backupValidationPhase
         }
     }
+    }
 }
 
-if ($managedProcessVerified) {
-    Add-Check -Id 'managed-process' -Status 'pass' -Message 'The managed DSP process matches the configured executable.'
+if ($managedExecutableReady) {
+    Add-Check -Id 'managed-executable' -Status 'pass' -Message 'The fixed managed DSP executable is available and not redirected.'
 }
 else {
-    Add-Check -Id 'managed-process' -Status 'block' -Message 'The managed DSP process could not be verified.' -Blocker 'managed-process-unverified'
+    Add-Check -Id 'managed-executable' -Status 'block' -Message 'The fixed managed DSP executable is unavailable or redirected.' -Blocker 'managed-executable-unavailable'
 }
 
-if ($pidVerified) {
-    Add-Check -Id 'pid-file' -Status 'pass' -Message 'The managed PID file points to a running process.'
+if ($Action -eq 'start') {
+    if ($unverifiedDspProcessCount -gt 0) {
+        Add-Check -Id 'managed-process' -Status 'block' -Message 'A DSP process exists but its executable identity could not be verified.' -Blocker 'managed-process-unverified'
+    }
+    elseif ($managedProcesses.Count -eq 0) {
+        Add-Check -Id 'managed-process' -Status 'pass' -Message 'No process using the fixed managed executable is running.'
+    }
+    else {
+        Add-Check -Id 'managed-process' -Status 'block' -Message 'The managed DSP process is already running; a second instance will not be started.' -Blocker 'server-already-running'
+    }
+
+    if (-not $pidPresent) {
+        Add-Check -Id 'pid-file' -Status 'pass' -Message 'No active managed PID file is present.'
+    }
+    elseif ($pidVerified) {
+        Add-Check -Id 'pid-file' -Status 'block' -Message 'The managed PID file identifies an already-running server.' -Blocker 'server-already-running'
+    }
+    else {
+        Add-Check -Id 'pid-file' -Status 'block' -Message 'The managed PID file is stale, malformed, or points to an unverified process.' -Blocker 'pid-file-unverified'
+    }
+
+    if (-not $gamePortEvidenceReady) {
+        Add-Check -Id 'game-port' -Status 'block' -Message 'The game-port listener state could not be verified.' -Blocker 'game-port-unverified'
+    }
+    elseif ($gamePortListening) {
+        Add-Check -Id 'game-port' -Status 'block' -Message 'The configured game port is already listening; startup is blocked.' -Blocker 'game-port-listening'
+    }
+    else {
+        Add-Check -Id 'game-port' -Status 'pass' -Message 'The configured game port has no listener.'
+    }
 }
 else {
-    Add-Check -Id 'pid-file' -Status 'block' -Message 'The managed PID file is missing, invalid, or stale.' -Blocker 'pid-file-unverified'
+    if ($managedProcesses.Count -eq 1 -and $unverifiedDspProcessCount -eq 0) {
+        Add-Check -Id 'managed-process' -Status 'pass' -Message 'The managed DSP process matches the configured executable.'
+    }
+    else {
+        Add-Check -Id 'managed-process' -Status 'block' -Message 'Exactly one managed DSP process could not be verified.' -Blocker 'managed-process-unverified'
+    }
+
+    if ($pidVerified) {
+        Add-Check -Id 'pid-file' -Status 'pass' -Message 'The managed PID file points to the verified running process.'
+    }
+    else {
+        Add-Check -Id 'pid-file' -Status 'block' -Message 'The managed PID file is missing, invalid, or stale.' -Blocker 'pid-file-unverified'
+    }
+
+    if ($gamePortEvidenceReady -and $gamePortListening -and $gamePortOwnedByManaged) {
+        Add-Check -Id 'game-port' -Status 'pass' -Message 'The configured game port is owned by the managed DSP process.'
+    }
+    else {
+        Add-Check -Id 'game-port' -Status 'block' -Message 'The configured game port is not exclusively owned by the managed DSP process.' -Blocker 'game-port-unverified'
+    }
 }
 
 if ($savePairReady) {
@@ -202,7 +358,10 @@ else {
     Add-Check -Id 'save-pair' -Status 'block' -Message 'A matching .dsv and .server save pair is required.' -Blocker 'save-pair-incomplete'
 }
 
-if ($backupPairReady) {
+if ($Action -eq 'start') {
+    Add-Check -Id 'backup-pair' -Status 'not-applicable' -Message 'Starting does not modify the current paired save.'
+}
+elseif ($backupPairReady) {
     Add-Check -Id 'backup-pair' -Status 'pass' -Message 'The latest paired backup matches its hash manifest.'
 }
 else {
@@ -223,13 +382,46 @@ else {
 
 $serverTask = Get-TaskOrNull -Name $ServerTaskName
 $stopTask = Get-TaskOrNull -Name $StopTaskName
+$needsStartTask = $Action -in @('start', 'restart')
 $needsStopTask = $Action -in @('graceful-stop', 'restart')
 
-if ($Action -eq 'restart') {
-    if ($serverTask) { Add-Check -Id 'server-task' -Status 'pass' -Message 'The allowlisted server start task exists.' }
-    else { Add-Check -Id 'server-task' -Status 'block' -Message 'The allowlisted server start task is missing.' -Blocker 'server-task-missing' }
+if ($needsStartTask) {
+    if (-not $serverTask) { Add-Check -Id 'server-task' -Status 'block' -Message 'The fixed server start task is missing.' -Blocker 'server-task-missing' }
+    elseif ($serverTask.State.ToString() -eq 'Disabled') { Add-Check -Id 'server-task' -Status 'block' -Message 'The fixed server start task is disabled.' -Blocker 'server-task-disabled' }
+    elseif ($Action -eq 'start' -and $serverTask.State.ToString() -ne 'Ready') { Add-Check -Id 'server-task' -Status 'block' -Message 'The fixed server start task is not ready while the runtime is stopped.' -Blocker 'server-task-not-ready' }
+    else { Add-Check -Id 'server-task' -Status 'pass' -Message 'The fixed server start task exists and is enabled.' }
 }
 else { Add-Check -Id 'server-task' -Status 'not-applicable' -Message 'The server start task is not used by this preview.' }
+
+if ($needsStartTask -and $serverTask) {
+    $serverTaskUser = [string]$serverTask.Principal.UserId
+    $serverTaskInteractive = $serverTask.Principal.LogonType.ToString() -eq 'Interactive'
+    $serverPrincipalMatches = $serverTaskUser.Length -gt 0
+    if ($Action -eq 'restart' -and $processOwner) {
+        $serverPrincipalMatches = [string]::Equals(
+            ($serverTaskUser -split '\\')[-1],
+            $processOwner,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    }
+    if (-not $serverTaskInteractive) {
+        Add-Check -Id 'server-task-principal' -Status 'block' -Message 'The server start task is not configured for an interactive session.' -Blocker 'server-task-not-interactive'
+    }
+    elseif (-not $serverPrincipalMatches) {
+        Add-Check -Id 'server-task-principal' -Status 'block' -Message 'The server start task principal is missing or does not match the managed session.' -Blocker 'server-task-principal-mismatch'
+    }
+    else { Add-Check -Id 'server-task-principal' -Status 'pass' -Message 'The server start task uses the verified interactive principal.' }
+}
+else { Add-Check -Id 'server-task-principal' -Status 'not-applicable' -Message 'Start-task principal validation is not used by this preview.' }
+
+if ($needsStartTask -and $serverTask -and $resolvedProjectRoot -and $resolvedTaskScriptRoot -and
+    (Test-FixedTaskAction -Task $serverTask -ExpectedScriptName 'Start-DysonServer.ps1' -ExpectedProjectRoot $resolvedProjectRoot -ScriptRoot $resolvedTaskScriptRoot)) {
+    Add-Check -Id 'server-task-action' -Status 'pass' -Message 'The server task invokes the exact allowlisted start script and project root.'
+}
+elseif ($needsStartTask) {
+    Add-Check -Id 'server-task-action' -Status 'block' -Message 'The server task action does not match the fixed allowlisted start definition.' -Blocker 'server-task-action-unallowlisted'
+}
+else { Add-Check -Id 'server-task-action' -Status 'not-applicable' -Message 'Start-task action validation is not used by this preview.' }
 
 if ($needsStopTask) {
     if ($stopTask) { Add-Check -Id 'stop-task' -Status 'pass' -Message 'The graceful-stop task exists.' }
@@ -255,26 +447,12 @@ if ($needsStopTask -and $stopTask) {
 else { Add-Check -Id 'stop-task-principal' -Status 'not-applicable' -Message 'Stop-task principal validation is not used by this preview.' }
 
 $stopActionAllowlisted = $false
-$receiptChannelReady = $false
 if ($needsStopTask -and $stopTask) {
-    $actionDefinition = @($stopTask.Actions | Select-Object -First 1)[0]
-    if ($actionDefinition -and $actionDefinition.Execute -match '(?i)powershell\.exe$') {
-        $fileMatch = [regex]::Match([string]$actionDefinition.Arguments, '(?i)(?:^|\s)-File\s+(?:"(?<path>[^"]+)"|(?<path>\S+))')
-        if ($fileMatch.Success) {
-            $actionScriptPath = $fileMatch.Groups['path'].Value
-            $stopActionAllowlisted = Test-PathInsideRoot -Candidate $actionScriptPath -Root $AllowedScriptRoot
-            if ($stopActionAllowlisted) {
-                try {
-                    $actionScriptText = Get-Content -LiteralPath $actionScriptPath -Raw -ErrorAction Stop
-                    $receiptChannelReady = $actionScriptText -match 'DYSON_CONTROL_RECEIPT_V1'
-                }
-                catch { $receiptChannelReady = $false }
-            }
-        }
-    }
+    $stopActionAllowlisted = $resolvedProjectRoot -and $resolvedTaskScriptRoot -and
+        (Test-FixedTaskAction -Task $stopTask -ExpectedScriptName 'Stop-DysonServer.ps1' -ExpectedProjectRoot $resolvedProjectRoot -ScriptRoot $resolvedTaskScriptRoot)
 
-    if ($stopActionAllowlisted) { Add-Check -Id 'stop-task-action' -Status 'pass' -Message 'The stop task uses an allowlisted local action script.' }
-    else { Add-Check -Id 'stop-task-action' -Status 'block' -Message 'The stop task action is outside the allowlisted script root.' -Blocker 'stop-task-action-unallowlisted' }
+    if ($stopActionAllowlisted) { Add-Check -Id 'stop-task-action' -Status 'pass' -Message 'The stop task invokes the exact allowlisted stop script and project root.' }
+    else { Add-Check -Id 'stop-task-action' -Status 'block' -Message 'The stop task action does not match the fixed allowlisted stop definition.' -Blocker 'stop-task-action-unallowlisted' }
 }
 else { Add-Check -Id 'stop-task-action' -Status 'not-applicable' -Message 'Stop-task action validation is not used by this preview.' }
 
@@ -288,20 +466,37 @@ if ($needsStopTask -and $stopTask) {
 }
 else { Add-Check -Id 'stop-task-result' -Status 'not-applicable' -Message 'Stop-task result validation is not used by this preview.' }
 
-if ($needsStopTask) {
+$needsScheduledTask = $needsStartTask -or $needsStopTask
+$receiptChannelReady = $false
+if ($needsScheduledTask) {
+    try {
+        $receiptScript = (Resolve-Path -LiteralPath (Join-Path $AllowedScriptRoot 'Invoke-DysonScheduledTask.ps1') -ErrorAction Stop).ProviderPath
+        $receiptItem = Get-Item -LiteralPath $receiptScript -Force -ErrorAction Stop
+        $receiptText = Get-Content -LiteralPath $receiptScript -Raw -ErrorAction Stop
+        $receiptChannelReady = -not $receiptItem.PSIsContainer -and
+            -not ($receiptItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
+            $receiptText -match 'DYSON_CONTROL_TASK_RECEIPT_V1'
+    }
+    catch { $receiptChannelReady = $false }
+
     $taskLog = Get-WinEvent -ListLog 'Microsoft-Windows-TaskScheduler/Operational' -ErrorAction SilentlyContinue
     if ($taskLog -and $taskLog.IsEnabled) { Add-Check -Id 'task-history' -Status 'pass' -Message 'Task Scheduler operational history is enabled.' }
     else { Add-Check -Id 'task-history' -Status 'warning' -Message 'Task Scheduler history is disabled; durable receipts remain mandatory.' }
 
-    if ($receiptChannelReady) { Add-Check -Id 'receipt-channel' -Status 'pass' -Message 'The stop adapter declares a durable lifecycle receipt.' }
-    else { Add-Check -Id 'receipt-channel' -Status 'block' -Message 'A durable lifecycle receipt channel is not installed.' -Blocker 'receipt-channel-missing' }
+    if ($receiptChannelReady) { Add-Check -Id 'receipt-channel' -Status 'pass' -Message 'The fixed task dispatcher declares a durable lifecycle receipt.' }
+    else { Add-Check -Id 'receipt-channel' -Status 'block' -Message 'The fixed durable lifecycle receipt dispatcher is unavailable.' -Blocker 'receipt-channel-missing' }
 }
 else {
     Add-Check -Id 'task-history' -Status 'not-applicable' -Message 'Task history is not used by this preview.'
-    Add-Check -Id 'receipt-channel' -Status 'not-applicable' -Message 'A stop receipt is not used by this preview.'
+    Add-Check -Id 'receipt-channel' -Status 'not-applicable' -Message 'A scheduled-task receipt is not used by this preview.'
 }
 
-Add-Check -Id 'save-trigger' -Status 'block' -Message 'A separately verifiable save acknowledgement is not installed.' -Blocker 'save-trigger-unverified'
+if ($Action -eq 'start') {
+    Add-Check -Id 'save-trigger' -Status 'not-applicable' -Message 'Starting a stopped server does not request an in-game save.'
+}
+else {
+    Add-Check -Id 'save-trigger' -Status 'block' -Message 'A separately verifiable save acknowledgement is not installed.' -Blocker 'save-trigger-unverified'
+}
 Add-Check -Id 'execution-lock' -Status 'block' -Message 'Lifecycle execution is disabled; this endpoint is dry-run only.' -Blocker 'execution-disabled'
 
 $rollbackStrategy = 'no-op'
@@ -311,6 +506,11 @@ if ($Action -eq 'save') {
     $rollbackStrategy = 'paired-save-backup'
     $rollbackReady = $backupPairReady
     $rollbackSummary = 'A fresh paired-save backup is required before save activation.'
+}
+elseif ($Action -eq 'start') {
+    $rollbackStrategy = 'no-op'
+    $rollbackReady = $true
+    $rollbackSummary = 'Start does not modify the installation or paired save; failed health verification requires runtime reconciliation, not an automatic stop.'
 }
 elseif ($Action -eq 'graceful-stop') {
     $rollbackStrategy = 'restart-from-same-save'

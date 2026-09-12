@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/dyson-control-panel-observation-v2.schema.json",
+  "title": "Dyson Control authenticated panel observation v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "schemaVersion",
+    "receiptId",
+    "runId",
+    "action",
+    "actionTargetId",
+    "targetIdentity",
+    "subjectCommit",
+    "runtimePayloadSha256",
+    "releaseIdentity",
+    "endpoint",
+    "tls",
+    "authenticatedSession",
+    "authorization",
+    "nodeListener",
+    "routeSeparation",
+    "observedAtUtc",
+    "expiresAtUtc",
+    "receiptSha256"
+  ],
+  "properties": {
+    "protocol": { "const": "DYSON_CONTROL_PANEL_OBSERVATION_V2" },
+    "schemaVersion": { "const": 2 },
+    "receiptId": { "$ref": "#/$defs/uuid" },
+    "runId": { "$ref": "#/$defs/uuid" },
+    "action": { "const": "authenticated-panel" },
+    "actionTargetId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "targetIdentity": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "subjectCommit": { "$ref": "#/$defs/commit" },
+    "runtimePayloadSha256": { "$ref": "#/$defs/digest" },
+    "releaseIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["releaseVersion", "releaseManifestSha256", "subjectCommit", "runtimePayloadSha256"],
+      "properties": {
+        "releaseVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" },
+        "releaseManifestSha256": { "$ref": "#/$defs/digest" },
+        "subjectCommit": { "$ref": "#/$defs/commit" },
+        "runtimePayloadSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "publicHost", "port", "sniAuthority", "hostHeaderAuthority"],
+      "properties": {
+        "scheme": { "const": "https" },
+        "publicHost": { "$ref": "#/$defs/hostname" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "sniAuthority": { "$ref": "#/$defs/hostname" },
+        "hostHeaderAuthority": { "type": "string", "minLength": 1, "maxLength": 260 }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["negotiatedProtocol", "certificateDnsName", "certificateSha256", "chainTrusted", "dnsNameMatched", "notBeforeUtc", "notAfterUtc", "negotiatedAtUtc"],
+      "properties": {
+        "negotiatedProtocol": { "enum": ["tls12", "tls13"] },
+        "certificateDnsName": { "$ref": "#/$defs/certificateDnsIdentity" },
+        "certificateSha256": { "$ref": "#/$defs/digest" },
+        "chainTrusted": { "const": true },
+        "dnsNameMatched": { "const": true },
+        "notBeforeUtc": { "$ref": "#/$defs/utc" },
+        "notAfterUtc": { "$ref": "#/$defs/utc" },
+        "negotiatedAtUtc": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "authenticatedSession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authenticated", "authenticationMethod", "sessionStore", "sessionCookieOpaque", "sessionCookieSecure", "sessionCookieHttpOnly", "principalRole", "sessionId", "sessionBindingSha256"],
+      "properties": {
+        "authenticated": { "const": true },
+        "authenticationMethod": { "const": "password" },
+        "sessionStore": { "const": "server-side" },
+        "sessionCookieOpaque": { "const": true },
+        "sessionCookieSecure": { "const": true },
+        "sessionCookieHttpOnly": { "const": true },
+        "principalRole": { "const": "Administrator" },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "sessionBindingSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["viewerMutation", "administratorRead"],
+      "properties": {
+        "viewerMutation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "method", "route", "expectedStatusCode", "actualStatusCode", "mutationObserved", "auditOutcome"],
+          "properties": {
+            "role": { "const": "Viewer" },
+            "method": { "enum": ["POST", "PUT", "PATCH", "DELETE"] },
+            "route": { "$ref": "#/$defs/apiRoute" },
+            "expectedStatusCode": { "const": 403 },
+            "actualStatusCode": { "const": 403 },
+            "mutationObserved": { "const": false },
+            "auditOutcome": { "const": "denied" }
+          }
+        },
+        "administratorRead": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "method", "route", "expectedStatusCode", "actualStatusCode", "authenticatedResponse"],
+          "properties": {
+            "role": { "const": "Administrator" },
+            "method": { "const": "GET" },
+            "route": { "$ref": "#/$defs/apiRoute" },
+            "expectedStatusCode": { "const": 200 },
+            "actualStatusCode": { "const": 200 },
+            "authenticatedResponse": { "const": true }
+          }
+        }
+      }
+    },
+    "nodeListener": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address", "port", "loopbackOnly", "processIdentitySha256", "runtimePayloadSha256"],
+      "properties": {
+        "address": { "enum": ["127.0.0.1", "::1"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "loopbackOnly": { "const": true },
+        "processIdentitySha256": { "$ref": "#/$defs/digest" },
+        "runtimePayloadSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "routeSeparation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["managementPublicTransport", "managementApplicationProtocol", "managementOriginAddress", "managementOriginPort", "managementRouteIdentitySha256", "managementHttpObserved", "gamePublicTransport", "gameApplicationProtocol", "gameOriginAddress", "gameOriginPort", "gameRouteIdentitySha256", "gameTcpObserved", "sharedOrigin", "routeSeparationObserved"],
+      "properties": {
+        "managementPublicTransport": { "const": "https" },
+        "managementApplicationProtocol": { "const": "http" },
+        "managementOriginAddress": { "enum": ["127.0.0.1", "::1"] },
+        "managementOriginPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "managementRouteIdentitySha256": { "$ref": "#/$defs/digest" },
+        "managementHttpObserved": { "const": true },
+        "gamePublicTransport": { "const": "tcp" },
+        "gameApplicationProtocol": { "const": "nebula-tcp" },
+        "gameOriginAddress": { "type": "string", "pattern": "^[A-Za-z0-9.:%_-]+$", "minLength": 1, "maxLength": 253 },
+        "gameOriginPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "gameRouteIdentitySha256": { "$ref": "#/$defs/digest" },
+        "gameTcpObserved": { "const": true },
+        "sharedOrigin": { "const": false },
+        "routeSeparationObserved": { "const": true }
+      }
+    },
+    "observedAtUtc": { "$ref": "#/$defs/utc" },
+    "expiresAtUtc": { "$ref": "#/$defs/utc" },
+    "receiptSha256": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "hostname": { "type": "string", "pattern": "^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$" },
+    "certificateDnsIdentity": { "type": "string", "pattern": "^(?:\\*\\.)?(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$" },
+    "apiRoute": { "type": "string", "pattern": "^/api(?:/[A-Za-z0-9._~-]+)*$", "maxLength": 256 }
+  }
+}

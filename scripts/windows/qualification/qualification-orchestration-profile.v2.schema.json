@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dyson-control:schema:qualification-orchestration-profile:v2",
+  "title": "Dyson qualification orchestration private profile v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "schemaVersion", "profileId", "profileLabel", "enabled", "targetIdentity", "subjectCommit", "runtimePayloadSha256", "expiresAtUtc", "stateRoot", "evidenceRoot", "adapters"],
+  "properties": {
+    "protocol": { "const": "DYSON_QUALIFICATION_ORCHESTRATION_PROFILE_V2" },
+    "schemaVersion": { "const": 2 },
+    "profileId": { "$ref": "#/$defs/uuid" },
+    "profileLabel": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,63}$" },
+    "enabled": { "type": "boolean", "default": false },
+    "targetIdentity": { "$ref": "#/$defs/digest" },
+    "subjectCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "runtimePayloadSha256": { "$ref": "#/$defs/digest" },
+    "expiresAtUtc": { "$ref": "#/$defs/utc" },
+    "stateRoot": { "$ref": "#/$defs/localPath" },
+    "evidenceRoot": { "$ref": "#/$defs/localPath" },
+    "adapters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pairedSaveRestore", "windowsRebootRecovery", "updateRollback", "sideBySideDeployment", "gsmanagerRecoverableSwitch", "gsmanagerRemoval", "sixHourSoak", "seventyTwoHourSoak", "authenticatedPanel", "gameProtocolPath", "externalClientE2e"],
+      "properties": {
+        "pairedSaveRestore": { "$ref": "#/$defs/adapter" },
+        "windowsRebootRecovery": { "$ref": "#/$defs/adapter" },
+        "updateRollback": { "$ref": "#/$defs/adapter" },
+        "sideBySideDeployment": { "$ref": "#/$defs/adapter" },
+        "gsmanagerRecoverableSwitch": { "$ref": "#/$defs/adapter" },
+        "gsmanagerRemoval": { "$ref": "#/$defs/adapter" },
+        "sixHourSoak": { "$ref": "#/$defs/adapter" },
+        "seventyTwoHourSoak": { "$ref": "#/$defs/adapter" },
+        "authenticatedPanel": { "$ref": "#/$defs/adapter" },
+        "gameProtocolPath": { "$ref": "#/$defs/adapter" },
+        "externalClientE2e": { "$ref": "#/$defs/adapter" }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "identifier": { "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[a-z0-9](?:[a-z0-9._-]{6,126}[a-z0-9])$" },
+    "localPath": { "type": "string", "minLength": 4, "maxLength": 240, "pattern": "^[A-Za-z]:\\\\" },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "actionTargetId", "adapterId", "verifierId", "keyId"],
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "actionTargetId": { "$ref": "#/$defs/identifier" },
+        "adapterId": { "$ref": "#/$defs/identifier" },
+        "verifierId": { "$ref": "#/$defs/identifier" },
+        "keyId": { "$ref": "#/$defs/identifier" }
+      }
+    }
+  }
+}

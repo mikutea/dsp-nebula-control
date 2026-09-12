@@ -1,0 +1,232 @@
+{
+  "protocol": "DYSON_QUALIFICATION_ORCHESTRATION_ADAPTER_CONTRACT_V2",
+  "schemaVersion": 2,
+  "productionMutationImplemented": false,
+  "defaultEnabled": false,
+  "environmentGateName": "DYSON_QUALIFICATION_ORCHESTRATION_V2",
+  "environmentGateValue": "ALLOW_PROTECTED_RECEIPT_ADAPTERS_V2",
+  "fixtureGateName": "DYSON_QUALIFICATION_ORCHESTRATION_FIXTURE_V2",
+  "fixtureGateValue": "FIXTURE_ONLY_PROTECTED_RECEIPTS_V2",
+  "maximumResumeAgeSeconds": 86400,
+  "actions": [
+    {
+      "action": "paired-save-restore",
+      "actionKey": "pairedSaveRestore",
+      "adapterId": "paired-save-restore-receipt-adapter-v2",
+      "verifierId": "paired-save-restore-verifier-v2",
+      "keyId": "paired-save-restore-key-v2",
+      "maximumEvidenceAgeSeconds": 14400,
+      "timeoutSeconds": 14400,
+      "minimumElapsedSeconds": 1,
+      "maximumElapsedSeconds": 14400,
+      "minimumSampleCount": 1,
+      "maximumSampleGapSeconds": 0,
+      "requiresProtectionPoint": true,
+      "rollbackRole": "restore-rollback-receipt",
+      "artifacts": [
+        { "role": "restore-receipt", "protocol": "DYSON_CONTROL_DATA_ROOT_RECOVERY_RECEIPT_V1", "schemaVersion": 1 },
+        { "role": "restored-world-observation", "protocol": "DYSON_QUALIFICATION_PAIRED_SAVE_LOAD_OBSERVATION_V2", "schemaVersion": 2 },
+        { "role": "restore-rollback-receipt", "protocol": "DYSON_CONTROL_DATA_ROOT_RECOVERY_RECEIPT_V1", "schemaVersion": 1 }
+      ],
+      "requiredCheckCodes": ["new-save-pair-verified", "paired-restore-receipt-verified", "restored-world-loaded", "rollback-receipt-verified"]
+    },
+    {
+      "action": "windows-reboot-recovery",
+      "actionKey": "windowsRebootRecovery",
+      "adapterId": "windows-reboot-checkpoint-resume-adapter-v2",
+      "verifierId": "windows-reboot-verifier-v2",
+      "keyId": "windows-reboot-key-v2",
+      "maximumEvidenceAgeSeconds": 14400,
+      "timeoutSeconds": 7200,
+      "minimumElapsedSeconds": 1,
+      "maximumElapsedSeconds": 7200,
+      "minimumSampleCount": 1,
+      "maximumSampleGapSeconds": 0,
+      "requiresProtectionPoint": false,
+      "rollbackRole": null,
+      "artifacts": [
+        { "role": "reboot-checkpoint", "protocol": "DYSON_CONTROL_REBOOT_ACCEPTANCE_V1", "schemaVersion": 3 },
+        { "role": "reboot-resume-observation", "protocol": "DYSON_QUALIFICATION_REBOOT_RESUME_OBSERVATION_V2", "schemaVersion": 2 }
+      ],
+      "requiredCheckCodes": ["checkpoint-verified", "new-boot-observed", "runtime-readiness-verified", "startup-tasks-observed"]
+    },
+    {
+      "action": "update-rollback",
+      "actionKey": "updateRollback",
+      "adapterId": "component-update-rollback-receipt-adapter-v2",
+      "verifierId": "component-update-rollback-verifier-v2",
+      "keyId": "component-update-rollback-key-v2",
+      "maximumEvidenceAgeSeconds": 14400,
+      "timeoutSeconds": 7200,
+      "minimumElapsedSeconds": 1,
+      "maximumElapsedSeconds": 7200,
+      "minimumSampleCount": 1,
+      "maximumSampleGapSeconds": 0,
+      "requiresProtectionPoint": true,
+      "rollbackRole": "update-rollback-receipt",
+      "artifacts": [
+        { "role": "update-rollback-receipt", "protocol": "dyson-control-component-update-receipt", "schemaVersion": 1 },
+        { "role": "post-rollback-external-transcript", "protocol": "DYSON_PRODUCTION_QUALIFICATION_V1", "schemaVersion": 1 }
+      ],
+      "requiredCheckCodes": ["paired-save-verified", "previous-release-loaded", "rollback-complete", "update-receipt-verified"]
+    },
+    {
+      "action": "side-by-side-deployment",
+      "actionKey": "sideBySideDeployment",
+      "adapterId": "side-by-side-deployment-receipt-adapter-v2",
+      "verifierId": "side-by-side-deployment-verifier-v2",
+      "keyId": "side-by-side-deployment-key-v2",
+      "maximumEvidenceAgeSeconds": 14400,
+      "timeoutSeconds": 7200,
+      "minimumElapsedSeconds": 1,
+      "maximumElapsedSeconds": 7200,
+      "minimumSampleCount": 1,
+      "maximumSampleGapSeconds": 0,
+      "requiresProtectionPoint": true,
+      "rollbackRole": "deployment-rollback-receipt",
+      "artifacts": [
+        { "role": "deployment-receipt", "protocol": "DYSON_CONTROL_DEPLOYMENT_V1", "schemaVersion": 0 },
+        { "role": "candidate-isolation-observation", "protocol": "DYSON_QUALIFICATION_SIDE_BY_SIDE_OBSERVATION_V2", "schemaVersion": 2 },
+        { "role": "deployment-rollback-receipt", "protocol": "DYSON_CONTROL_DEPLOYMENT_V1", "schemaVersion": 0 }
+      ],
+      "requiredCheckCodes": ["candidate-health-verified", "candidate-manifest-verified", "gsmanager-recoverable", "isolated-roots-verified"]
+    },
+    {
+      "action": "gsmanager-recoverable-switch",
+      "actionKey": "gsmanagerRecoverableSwitch",
+      "adapterId": "gsmanager-cutover-receipt-adapter-v2",
+      "verifierId": "gsmanager-cutover-verifier-v2",
+      "keyId": "gsmanager-cutover-key-v2",
+      "maximumEvidenceAgeSeconds": 14400,
+      "timeoutSeconds": 14400,
+      "minimumElapsedSeconds": 1,
+      "maximumElapsedSeconds": 14400,
+      "minimumSampleCount": 7,
+      "maximumSampleGapSeconds": 3600,
+      "requiresProtectionPoint": true,
+      "rollbackRole": "cutover-rollback-receipt",
+      "artifacts": [
+        { "role": "cutover-receipt", "protocol": "DYSON_REVERSIBLE_CUTOVER_SWITCH_RECEIPT_V2", "schemaVersion": 2 },
+        { "role": "cutover-rollback-receipt", "protocol": "DYSON_REVERSIBLE_CUTOVER_SWITCH_RECEIPT_V2", "schemaVersion": 2 },
+        { "role": "reversible-cutover-observation", "protocol": "DYSON_REVERSIBLE_CUTOVER_OBSERVATION_V2", "schemaVersion": 2 }
+      ],
+      "requiredCheckCodes": ["dyson-health-verified", "preimages-verified", "rollback-receipt-verified", "single-authority-observed"]
+    },
+    {
+      "action": "gsmanager-removal",
+      "actionKey": "gsmanagerRemoval",
+      "adapterId": "gsmanager-removal-receipt-adapter-v2",
+      "verifierId": "gsmanager-removal-verifier-v2",
+      "keyId": "gsmanager-removal-key-v2",
+      "maximumEvidenceAgeSeconds": 3600,
+      "timeoutSeconds": 14400,
+      "minimumElapsedSeconds": 3600,
+      "maximumElapsedSeconds": 14400,
+      "minimumSampleCount": 7,
+      "maximumSampleGapSeconds": 1800,
+      "requiresProtectionPoint": true,
+      "rollbackRole": "removal-restore-receipt",
+      "artifacts": [
+        { "role": "removal-receipt", "protocol": "DYSON_GSMANAGER_REMOVAL_RECEIPT_V1", "schemaVersion": 1 },
+        { "role": "removal-restore-receipt", "protocol": "DYSON_GSMANAGER_REMOVAL_RESTORE_RECEIPT_V1", "schemaVersion": 1 },
+        { "role": "post-removal-observation", "protocol": "DYSON_POST_GSMANAGER_REMOVAL_OBSERVATION_V2", "schemaVersion": 2 }
+      ],
+      "requiredCheckCodes": ["no-residual-authority", "recovery-package-verified", "removal-receipt-verified", "restore-receipt-verified"]
+    },
+    {
+      "action": "six-hour-soak",
+      "actionKey": "sixHourSoak",
+      "adapterId": "six-hour-monotonic-soak-adapter-v2",
+      "verifierId": "production-soak-verifier-v2",
+      "keyId": "six-hour-soak-key-v2",
+      "maximumEvidenceAgeSeconds": 3600,
+      "timeoutSeconds": 259200,
+      "minimumElapsedSeconds": 21600,
+      "maximumElapsedSeconds": 259200,
+      "minimumSampleCount": 1441,
+      "maximumSampleGapSeconds": 30,
+      "requiresProtectionPoint": false,
+      "rollbackRole": null,
+      "artifacts": [
+        { "role": "soak-observation", "protocol": "DYSON_SOAK_OBSERVATION_V2", "schemaVersion": 2 }
+      ],
+      "requiredCheckCodes": ["continuous-telemetry", "early-external-join", "late-external-rejoin", "paired-save-stable", "real-monotonic-clock", "representative-workload"]
+    },
+    {
+      "action": "seventy-two-hour-soak",
+      "actionKey": "seventyTwoHourSoak",
+      "adapterId": "seventy-two-hour-monotonic-soak-adapter-v2",
+      "verifierId": "production-soak-verifier-v2",
+      "keyId": "seventy-two-hour-soak-key-v2",
+      "maximumEvidenceAgeSeconds": 3600,
+      "timeoutSeconds": 345600,
+      "minimumElapsedSeconds": 259200,
+      "maximumElapsedSeconds": 345600,
+      "minimumSampleCount": 17281,
+      "maximumSampleGapSeconds": 30,
+      "requiresProtectionPoint": false,
+      "rollbackRole": null,
+      "artifacts": [
+        { "role": "soak-observation", "protocol": "DYSON_SOAK_OBSERVATION_V2", "schemaVersion": 2 }
+      ],
+      "requiredCheckCodes": ["continuous-telemetry", "early-external-join", "late-external-rejoin", "paired-save-stable", "real-monotonic-clock", "representative-workload", "seventy-two-hour-window"]
+    },
+    {
+      "action": "authenticated-panel",
+      "actionKey": "authenticatedPanel",
+      "adapterId": "authenticated-panel-observation-adapter-v2",
+      "verifierId": "authenticated-panel-verifier-v2",
+      "keyId": "authenticated-panel-key-v2",
+      "maximumEvidenceAgeSeconds": 3600,
+      "timeoutSeconds": 3600,
+      "minimumElapsedSeconds": 1,
+      "maximumElapsedSeconds": 3600,
+      "minimumSampleCount": 1,
+      "maximumSampleGapSeconds": 0,
+      "requiresProtectionPoint": false,
+      "rollbackRole": null,
+      "artifacts": [
+        { "role": "panel-observation", "protocol": "DYSON_CONTROL_PANEL_OBSERVATION_V2", "schemaVersion": 2 }
+      ],
+      "requiredCheckCodes": ["authentication-verified", "authorization-denials-verified", "loopback-origin-verified", "route-separation-verified", "tls-route-verified"]
+    },
+    {
+      "action": "game-protocol-path",
+      "actionKey": "gameProtocolPath",
+      "adapterId": "hostname-wss-qualification-adapter-v2",
+      "verifierId": "hostname-wss-qualification-verifier-v1",
+      "keyId": "game-protocol-path-key-v2",
+      "maximumEvidenceAgeSeconds": 3600,
+      "timeoutSeconds": 3600,
+      "minimumElapsedSeconds": 1,
+      "maximumElapsedSeconds": 3600,
+      "minimumSampleCount": 1,
+      "maximumSampleGapSeconds": 0,
+      "requiresProtectionPoint": false,
+      "rollbackRole": null,
+      "artifacts": [
+        { "role": "hostname-wss-qualification", "protocol": "DYSON_NEBULA_HOSTNAME_WSS_QUALIFICATION_V1", "schemaVersion": 1 }
+      ],
+      "requiredCheckCodes": ["hostname-preserved", "ingress-verified", "passwall-direct-counter-delta", "server-authoritative-session", "wss-443-verified"]
+    },
+    {
+      "action": "external-client-e2e",
+      "actionKey": "externalClientE2e",
+      "adapterId": "external-join-observation-adapter-v2",
+      "verifierId": "external-join-observation-verifier-v2",
+      "keyId": "external-client-transcript-key-v2",
+      "maximumEvidenceAgeSeconds": 3600,
+      "timeoutSeconds": 2400,
+      "minimumElapsedSeconds": 1,
+      "maximumElapsedSeconds": 2400,
+      "minimumSampleCount": 12,
+      "maximumSampleGapSeconds": 600,
+      "requiresProtectionPoint": false,
+      "rollbackRole": null,
+      "artifacts": [
+        { "role": "external-join-observation", "protocol": "DYSON_EXTERNAL_JOIN_OBSERVATION_V2", "schemaVersion": 2 }
+      ],
+      "requiredCheckCodes": ["dual-party-transcript-bound", "external-sequence-verified", "fresh-session-rejoin", "independent-save-acknowledged", "server-authoritative-join"]
+    }
+  ]
+}
