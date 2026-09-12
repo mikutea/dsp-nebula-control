@@ -290,6 +290,10 @@ const reviewedPredecessorSources = new Map([
 
 const reviewedRuntimeLayoutSources = new Map([
   [
+    "apps/api/src/lifecycle/game-runtime-receipts.test.ts",
+    "b82d20638f8ae6930eae275fd4ceca4915577d4f74881481d9ef581d08ae0239"
+  ],
+  [
     "apps/api/src/app.ts",
     "0fdc0d67b838c7c085812be3cad2d6649356c5ee0e14f262d55f2a455c964f81"
   ],

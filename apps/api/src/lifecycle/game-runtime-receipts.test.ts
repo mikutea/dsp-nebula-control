@@ -42,7 +42,7 @@ let projectRoot = ''
 let receiptRoot = ''
 
 beforeEach(async () => {
-  fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'dyson-runtime-receipts-'))
+  fixtureRoot = await realpath(await mkdtemp(path.join(os.tmpdir(), 'dyson-runtime-receipts-')))
   dataRoot = path.join(fixtureRoot, 'data')
   projectRoot = path.join(fixtureRoot, 'project')
   receiptRoot = path.join(dataRoot, 'state', 'game-runtime-receipts')
