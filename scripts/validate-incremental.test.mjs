@@ -282,3 +282,12 @@ test('CI host flags execute only mapped host work and keep metadata-only changes
   const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
   assert.match(workflow, /run: node scripts\/validate-incremental\.mjs --host-checks --full-deployment/)
 })
+
+test('DACL restoration changes require native configuration and deployment gates', () => {
+  const files = ['scripts/windows/deployment/DysonDeployment.Common.ps1', 'scripts/windows/deployment/SelfTest-DysonDeploymentConfigurationIntegration.ps1']
+  const changes = files.map(file => ({ file, kind: classifyChange(file, null, readFileSync(new URL('../' + file, import.meta.url), 'utf8')) }))
+  assert.ok(changes.every(change => change.kind === 'reviewed-operator-batch'))
+  const pending = planExecution(changes).pendingHostCommands
+  assert.ok(pending.some(([, args]) => args.includes('scripts/windows/deployment/SelfTest-DysonDeploymentConfigurationIntegration.ps1')))
+  assert.ok(pending.some(([, args]) => args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')))
+})

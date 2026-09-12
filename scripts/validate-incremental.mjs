@@ -289,6 +289,8 @@ const reviewedPredecessorSources = new Map([
 ]);
 
 const reviewedOperatorBatchSources = new Map([
+  ["scripts/windows/deployment/SelfTest-DysonDeploymentConfigurationIntegration.ps1", "a76a62b482ced1838d724e0621711069f2de8951ace95cb3e47b835029d98b5f"],
+  ["scripts/windows/deployment/DysonDeployment.Common.ps1", "a5c30216907649e1e72780bbf3047394273423208c348f378bdc9f3468f00d69"],
   ["apps/api/src/update-pipeline/steam-manual-handoff.test.ts", "1169cda955e9146239491183bde46179fc1991dd3a3aa354d645f82e303af30e"],
   ["apps/web/src/recoverable-cleanup-panel.test.tsx", "0e63eec7996a82ee63164c43899c0dc6b16d3df5681328e43962e7cb75f2a69a"],
   ["apps/web/src/RecoverableCleanupPanel.tsx", "d1cb2ab6bed980200aef9397148f1079a314f2db48a8404dcac1ad6507ec7dd2"],
