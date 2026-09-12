@@ -71,6 +71,8 @@ export const RULE_IDS = Object.freeze([
  * be reviewed independently; prefixes and glob expressions are not accepted.
  */
 export const EXACT_ALLOWLIST = Object.freeze([
+  // Reviewed DACL-only restoration retains generic Windows path normalization.
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1', blobId: 'aa5c7e7162516a98ea2434061f00f3a08e73b3c4' },
   // Fixture root canonicalization retains the reviewed escaped-string regex.
   { scope: 'history', ruleId: 'UNC_PATH', path: 'apps/api/src/providers/windows-update-runtime-evidence.test.ts', blobId: '72410c340e0acd7e52d4c88fe9e6bf7331c74b6f' },
   // Reviewed Win32 extended-path prefix normalization, not a network endpoint.

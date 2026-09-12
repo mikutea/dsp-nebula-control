@@ -62,6 +62,7 @@ $previousSelfTestGate = [System.Environment]::GetEnvironmentVariable(
     'DYSON_DEPLOYMENT_ALLOW_SELFTEST_TASKS', 'Process'
 )
 
+$testFailure = $null
 try {
     [System.IO.Directory]::CreateDirectory($dataRoot) | Out-Null
     [System.IO.Directory]::CreateDirectory($installRoot) | Out-Null
@@ -207,6 +208,25 @@ try {
     Assert-ConfigurationIntegrationFixture (-not (Test-Path -LiteralPath `
         (Join-Path $dataRoot 'data\qualified-client'))) `
         'qualified-client storage rollback did not remove its newly-created layout'
+
+    # Explicitly deny WRITE_OWNER while retaining DACL management. Neither
+    # removal preparation nor unchanged-owner restore may request that right.
+    $accessOnlyRoot = Join-Path $testRoot 'acl-access-only'
+    [void][IO.Directory]::CreateDirectory($accessOnlyRoot)
+    $accessOnlySid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $denyOwner = [Security.AccessControl.FileSystemAccessRule]::new($accessOnlySid,
+        [Security.AccessControl.FileSystemRights]::TakeOwnership,
+        [Security.AccessControl.AccessControlType]::Deny)
+    $accessOnlyAcl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $accessOnlyRoot
+    [void]$accessOnlyAcl.AddAccessRule($denyOwner)
+    Set-DysonQualifiedClientDirectorySecurity -Path $accessOnlyRoot -Security $accessOnlyAcl
+    $accessOnlySddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $accessOnlyRoot).Sddl
+    Set-DysonQualifiedClientStorageRemovalAcl -Path $accessOnlyRoot
+    $accessOnlyAcl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $accessOnlyRoot
+    [void]$accessOnlyAcl.AddAccessRule($denyOwner)
+    Set-DysonQualifiedClientDirectorySecurity -Path $accessOnlyRoot -Security $accessOnlyAcl
+    Restore-DysonDeploymentDirectorySecurityPreimage -Path $accessOnlyRoot -Sddl $accessOnlySddl
+    Assert-ConfigurationIntegrationFixture ((Microsoft.PowerShell.Security\Get-Acl -LiteralPath $accessOnlyRoot).Sddl -ceq $accessOnlySddl) 'DACL-only rollback did not preserve the exact ownership preimage'
 
     $adoptionDataRoot = Join-Path $testRoot 'program-data\QualifiedClientAdoption'
     $adoptionContainer = Join-Path $adoptionDataRoot 'data\qualified-client'
@@ -449,6 +469,7 @@ try {
     [ordered]@{
         protocol = 'DYSON_CONTROL_DEPLOYMENT_CONFIGURATION_INTEGRATION_SELFTEST_V1'
         state = 'passed'
+        unchangedOwnerDaclRestoreValidated = $true
         protectedDataRootAclValidated = $true
         serviceRootReadExecuteOnly = $true
         ordinaryDescendantModifyInheritanceValidated = $true
@@ -472,6 +493,10 @@ try {
         productionChanged = $false
     } | ConvertTo-Json -Depth 5 -Compress
 }
+catch {
+    $testFailure = $_
+    throw
+}
 finally {
     [System.Environment]::SetEnvironmentVariable(
         'DYSON_DEPLOYMENT_ALLOW_SELFTEST_TASKS', $previousSelfTestGate, 'Process'
@@ -483,6 +508,10 @@ finally {
         'dyson-control-deployment-selftest-'
     if ($testFull.StartsWith($requiredPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
         (Test-Path -LiteralPath $testFull)) {
-        [System.IO.Directory]::Delete($testFull, $true)
+        try { [System.IO.Directory]::Delete($testFull, $true) }
+        catch {
+            if ($null -eq $testFailure) { throw }
+            Write-Warning 'Fixture cleanup also failed; the original integration failure is preserved.'
+        }
     }
 }

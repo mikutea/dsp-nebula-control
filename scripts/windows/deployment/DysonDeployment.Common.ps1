@@ -3181,8 +3181,8 @@ function Set-DysonQualifiedClientStorageRemovalAcl {
     $identity = $existingSecurity.GetOwner([System.Security.Principal.SecurityIdentifier])
     $security = [System.Security.AccessControl.DirectorySecurity]::new()
     $security.SetAccessRuleProtection($true, $false)
-    $security.SetOwner($identity)
-    $security.SetGroup($existingSecurity.GetGroup([System.Security.Principal.SecurityIdentifier]))
+    # Only the DACL changes. Reassigning an unchanged owner/group would
+    # unnecessarily require WRITE_OWNER on an otherwise removable directory.
     $sidMap = @{}
     foreach ($sid in @(
         $identity,
@@ -3274,9 +3274,14 @@ namespace DysonControl {
     }
     $bytes = [byte[]]::new($descriptor.BinaryLength)
     $descriptor.GetBinaryForm($bytes, 0)
-    # OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION.
-    # Audit rules are deliberately outside the captured and restored sections.
-    if (-not [DysonControl.DeploymentDirectoryAclRestore]::SetFileSecurityW($target, 7, $bytes)) {
+    # Restore ownership only when it actually differs. Rewriting unchanged
+    # owner/group requires WRITE_OWNER unnecessarily for DACL-only rollback.
+    $currentSecurity = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $target -ErrorAction Stop
+    [uint32]$information = 4 # DACL_SECURITY_INFORMATION
+    if ($currentSecurity.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -cne $descriptor.Owner.Value) { $information = $information -bor 1 }
+    if ($currentSecurity.GetGroup([System.Security.Principal.SecurityIdentifier]).Value -cne $descriptor.Group.Value) { $information = $information -bor 2 }
+    # Exact full-descriptor verification below remains mandatory.
+    if (-not [DysonControl.DeploymentDirectoryAclRestore]::SetFileSecurityW($target, $information, $bytes)) {
         $nativeError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
         throw "The deployment ACL preimage could not be restored (Win32 $nativeError)."
     }
