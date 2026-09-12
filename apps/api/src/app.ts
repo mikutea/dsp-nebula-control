@@ -763,8 +763,9 @@ export async function buildApplication(
   const protectedRoute = (permission: ControlPermission) => ({
     preHandler: [auth.authenticate, requirePermission(permission)]
   })
+  const gameRuntimeReceiptLocation = await resolveGameRuntimeReceiptLocation(config)
   const gameRuntimeReceipts = dependencies.gameRuntimeReceiptSource ?? new FileGameRuntimeReceiptSource({
-    dataRoot: config.dataDir,
+    dataRoot: gameRuntimeReceiptLocation.dataRoot,
     projectRoot: config.projectRoot
   })
   const workspacePaths = dependencies.workspacePaths ?? (config.projectRoot ? {
@@ -4126,6 +4127,8 @@ async function readWindowsUpdateProviderAuthorityRevision(
       !config.bridgeSecretFile || !config.updateCompatibilityPolicyFile) {
     return null
   }
+  let runtimeReceiptLocation: Awaited<ReturnType<typeof resolveGameRuntimeReceiptLocation>>
+  try { runtimeReceiptLocation = await resolveGameRuntimeReceiptLocation(config) } catch { return null }
   const mutableModPluginsParent = path.dirname(config.modPluginsRoot)
   const directories = [
     config.projectRoot,
@@ -4138,7 +4141,7 @@ async function readWindowsUpdateProviderAuthorityRevision(
     config.bridgeControlRoot,
     path.join(config.bridgeControlRoot, 'requests'),
     path.join(config.bridgeControlRoot, 'receipts'),
-    path.join(config.dataDir, 'state', 'game-runtime-receipts')
+    path.join(runtimeReceiptLocation.dataRoot, 'state', 'game-runtime-receipts')
   ]
   if (![...directories, config.modPluginsRoot, config.bridgeSecretFile, config.updateCompatibilityPolicyFile]
       .every((entry) => path.isAbsolute(entry))) return null
@@ -4173,6 +4176,7 @@ async function readWindowsUpdateProviderAuthorityRevision(
     )
     const bridgeSecretSha256 = createHash('sha256').update(normalizedSecret, 'utf8').digest('hex')
     const digest = createHash('sha256').update('dyson-update-provider-authority-v2\0', 'utf8')
+    digest.update('runtime-layout\0', 'utf8').update(runtimeReceiptLocation.layoutSha256 ?? 'direct', 'ascii')
     for (const evidence of directoryEvidence) appendAuthorityIdentity(digest, evidence)
     appendMutableAuthorityPath(digest, mutableModPluginsEvidence)
     appendAuthorityIdentity(digest, bridgeSecretEvidence)
@@ -4182,6 +4186,40 @@ async function readWindowsUpdateProviderAuthorityRevision(
     return { revision: digest.digest('hex'), bridgeSecretSha256 }
   } catch {
     return null
+  }
+}
+
+export async function resolveGameRuntimeReceiptLocation(
+  config: Pick<AppConfig, 'dataDir' | 'runtimeBootstrapRoot' | 'nodeEnv' | 'deploymentVersion' | 'lifecycleEnabled'>
+): Promise<{ dataRoot: string; layoutSha256: string | null }> {
+  const direct = { dataRoot: path.resolve(config.dataDir), layoutSha256: null }
+  if (!config.runtimeBootstrapRoot) return direct
+  const required = config.nodeEnv === 'production' && config.lifecycleEnabled && config.deploymentVersion !== null
+  let file: CanonicalAuthorityFile
+  try {
+    file = await readCanonicalAuthorityFile(path.join(config.runtimeBootstrapRoot, 'bootstrap-layout.json'), 1, 4096)
+  } catch (error) {
+    if (!required && typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') return direct
+    throw new Error('GAME_RUNTIME_LAYOUT_INVALID')
+  }
+  try {
+    const layout = z.strictObject({
+      protocol: z.literal('DYSON_CONTROL_GAME_BOOTSTRAP_LAYOUT_V1'),
+      schemaVersion: z.literal(1), dataRoot: z.string().min(1).max(1024),
+      dataRootIdentity: z.string().regex(/^[0-9a-f]{64}$/),
+      createdAt: z.string().datetime({ offset: true })
+    }).parse(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(file.bytes)))
+    const dataRoot = path.resolve(layout.dataRoot)
+    if (!path.isAbsolute(layout.dataRoot) || layout.dataRoot.toUpperCase() !== dataRoot.toUpperCase() ||
+        (normalizeAuthorityPath(direct.dataRoot) !== normalizeAuthorityPath(dataRoot) &&
+         normalizeAuthorityPath(direct.dataRoot) !== normalizeAuthorityPath(path.join(dataRoot, 'data'))) ||
+        createHash('sha256').update(dataRoot.toUpperCase(), 'utf8').digest('hex') !== layout.dataRootIdentity) {
+      throw new Error('layout binding mismatch')
+    }
+    await readCanonicalAuthorityDirectory(dataRoot)
+    return { dataRoot, layoutSha256: createHash('sha256').update(file.bytes).digest('hex') }
+  } catch {
+    throw new Error('GAME_RUNTIME_LAYOUT_INVALID')
   }
 }
 

@@ -1,5 +1,17 @@
 # Risk-based validation
 
+## Bootstrap-bound game runtime receipts (in progress)
+
+The API and update authority now derive the runtime receipt directory from the
+fixed bootstrap layout instead of conflating application data with deployment
+data. The layout's schema, canonical directory, path identity and relationship
+to the configured application data directory are checked. Managed production
+lifecycle requires the marker; direct/nondeployment use retains its explicit
+data directory. Layout bytes participate in update authority revision binding.
+Validate redirected/missing/mismatched layouts, real receipt identity checks and
+production assembly. Existing receipts are neither copied nor fabricated to
+satisfy the authority gate. The correction still needs a versioned deployment.
+
 ## Existing component rollback version binding (in progress)
 
 The rollback baseline can retain the server-observed predecessor version even

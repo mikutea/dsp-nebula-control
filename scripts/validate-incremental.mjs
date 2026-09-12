@@ -288,15 +288,27 @@ const reviewedPredecessorSources = new Map([
   ]
 ]);
 
+const reviewedRuntimeLayoutSources = new Map([
+  [
+    "apps/api/src/app.ts",
+    "0fdc0d67b838c7c085812be3cad2d6649356c5ee0e14f262d55f2a455c964f81"
+  ],
+  [
+    "apps/api/src/runtime-receipt-location.test.ts",
+    "f66df92035fb0dfcdbe536cda4a8ac7f7de4d66ce9beb5854efa68204a8465e7"
+  ]
+]);
+
 export function classifyChange(file, before, after) {
   if (after !== null && reviewedEntryCacheSources.get(file) === aclSourceHash(after)) return 'reviewed-entry-cache'
   if (after !== null && reviewedPredecessorSources.get(file) === aclSourceHash(after)) return 'reviewed-predecessor-binding'
+  if (after !== null && reviewedRuntimeLayoutSources.get(file) === aclSourceHash(after)) return 'reviewed-runtime-layout'
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
   if (file === 'scripts/public-release/policy.mjs' &&
       aclSourceHash(after) === '91269327d4eb6194fb97f6bc361f3d9939686477de73b1153c7a31ba22d8aa6c') return 'reviewed-hygiene-policy'
   if (file === 'scripts/windows/deployment/Test-DysonControlDeployment.ps1' &&
       aclSourceHash(after) === '248758ae47a5edf9678f0c515eb564c31e3cb127538347556319ba10ae44766a') return 'verified-native-status'
-  for (const releaseVersion of ['0.1.0-rc.24', '0.1.0-rc.25']) {
+  for (const releaseVersion of ['0.1.0-rc.24', '0.1.0-rc.25', '0.1.0-rc.26']) {
     const priorReleaseSource = after.replaceAll(releaseVersion, '0.1.0-rc.23')
     if (priorReleaseSource !== after && priorReleaseSource.replaceAll('0.1.0-rc.23', releaseVersion) === after) {
       if (rc23VerifiedSources.get(file) === aclSourceHash(priorReleaseSource)) return 'version-only'
@@ -414,6 +426,13 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
   const isRunnerCheck = ([, args]) => args.includes('src/providers/powershell-runner.test.ts')
   const hostCommands = selected.slice(2).filter(command => !isRunnerCheck(command))
   const commands = [...selected.slice(0, 2), ...selected.slice(2).filter(isRunnerCheck)]
+  if (changes.some(change => change.kind === 'reviewed-runtime-layout')) {
+    commands.push(['node', ['apps/api/node_modules/typescript/bin/tsc', '-p', 'apps/api/tsconfig.json', '--noEmit']])
+    commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
+      '--testTimeout=30000', '--hookTimeout=30000', 'src/runtime-receipt-location.test.ts',
+      'src/lifecycle/game-runtime-receipts.test.ts', 'src/app.test.ts',
+      'src/update-activation-app-wiring.test.ts', 'src/windows-update-production-assembly.test.ts']])
+  }
   if (changes.some(change => ['reviewed-entry-cache', 'reviewed-predecessor-binding'].includes(change.kind))) {
     commands.push(['node', ['apps/api/node_modules/typescript/bin/tsc', '-p', 'apps/api/tsconfig.json', '--noEmit']])
   }

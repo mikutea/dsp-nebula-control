@@ -22,6 +22,15 @@ test('entry document caching changes select stale-entry regression checks', () =
   assert.ok(plan.commands.some(([, args]) => args.includes('src/web-assets.test.ts')))
 })
 
+test('runtime receipt layout changes require root-binding and production wiring checks', () => {
+  const file = 'apps/api/src/app.ts'
+  const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
+  assert.equal(classifyChange(file, null, source), 'reviewed-runtime-layout')
+  assert.throws(() => classifyChange(file, null, source + '\nChangedLayoutTrust();\n'))
+  const plan = planExecution([{ file, kind: 'reviewed-runtime-layout' }])
+  assert.ok(plan.commands.some(([, args]) => args.includes('src/runtime-receipt-location.test.ts')))
+})
+
 test('predecessor binding selects rollback and production assembly checks without broad suite repetition', () => {
   const file = 'apps/api/src/update-pipeline/activation.ts'
   const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
