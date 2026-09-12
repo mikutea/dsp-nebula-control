@@ -274,3 +274,11 @@ test('reviewed scanner fixture changes select hygiene checks only for their exac
   assert.equal(classifyChange(file, null, source), 'reviewed-hygiene-policy')
   assert.throws(() => classifyChange(file, null, source + '\nnewScannerBehavior();\n'))
 })
+
+test('CI host flags execute only mapped host work and keep metadata-only changes narrow', () => {
+  const plan = planExecution([{ file: 'README.md', kind: 'documentation' }], { hostChecks: true, fullDeployment: true })
+  assert.equal(plan.pendingHostCommands.length, 0)
+  assert.ok(!plan.commands.some(([, args]) => args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')))
+  const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  assert.match(workflow, /run: node scripts\/validate-incremental\.mjs --host-checks --full-deployment/)
+})

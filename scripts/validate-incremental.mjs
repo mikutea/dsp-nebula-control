@@ -721,7 +721,7 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
     commands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]])
   }
   if (hostChecks) commands.push(...hostCommands.filter(command => !isDeploymentCommand(command)))
-  if (fullDeployment) commands.push(apiBuildCommand, deploymentCommand)
+  if (fullDeployment && hostCommands.some(isDeploymentCommand)) commands.push(apiBuildCommand, deploymentCommand)
   const pendingHostCommands = hostCommands.filter(command =>
     isDeploymentCommand(command) ? !fullDeployment : !hostChecks)
   const required = new Set(hostCommands.map(commandGroup))
