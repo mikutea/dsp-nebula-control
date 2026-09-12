@@ -41,6 +41,11 @@ const jobKindLabels: Readonly<Record<JobKind, string>> = {
   'save.restore': '存档恢复',
   'player.notice.preview': '玩家通知预演',
   'player.notice': '玩家通知',
+  'component.cleanup': '组件材料隔离',
+  'component.cleanup.recovery': '组件清理恢复',
+  'component.cleanup.restore': '组件材料还原',
+  'component.rollback': '组件回退',
+  'component.rollback.recovery': '组件回退恢复',
   'audit.export': '审计导出'
 }
 

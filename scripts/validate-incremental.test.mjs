@@ -2,6 +2,14 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { classifyChange, selectCommands, planExecution } from './validate-incremental.mjs'
+test('operator batch selects integration and frontend checks while retaining explicit host gates', () => {
+  const plan = planExecution([{ file: 'apps/api/src/app.ts', kind: 'reviewed-operator-batch' }])
+  assert.ok(plan.commands.some(([, args]) => args.includes('src/update-pipeline/operator-rollback-store.test.ts')))
+  assert.ok(plan.commands.some(([, args]) => args.includes('src/operator-rollback-panel.test.tsx')))
+  assert.ok(plan.pendingHostCommands.some(([, args]) => args.some(arg => arg.endsWith('SelfTest-DysonControlDeployment.ps1'))))
+  assert.ok(plan.pendingHostCommands.some(([, args]) => args.some(arg => arg.endsWith('SelfTest-DysonGameLifecycleBootstrap.ps1'))))
+  assert.ok(plan.commands.every(([, args]) => !args.includes('check')))
+})
 
 test('RC24 CI evidence is reused only for its exact source', () => {
   const file = 'apps/api/src/update-pipeline/trusted-mod-artifacts.ts'
@@ -25,7 +33,7 @@ test('entry document caching changes select stale-entry regression checks', () =
 test('runtime receipt layout changes require root-binding and production wiring checks', () => {
   const file = 'apps/api/src/app.ts'
   const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
-  assert.equal(classifyChange(file, null, source), 'reviewed-runtime-layout')
+  assert.equal(classifyChange(file, null, source), 'reviewed-operator-batch')
   assert.throws(() => classifyChange(file, null, source + '\nChangedLayoutTrust();\n'))
   const plan = planExecution([{ file, kind: 'reviewed-runtime-layout' }])
   assert.ok(plan.commands.some(([, args]) => args.includes('src/runtime-receipt-location.test.ts')))
@@ -34,7 +42,7 @@ test('runtime receipt layout changes require root-binding and production wiring 
 test('predecessor binding selects rollback and production assembly checks without broad suite repetition', () => {
   const file = 'apps/api/src/update-pipeline/activation.ts'
   const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
-  assert.equal(classifyChange(file, null, source), 'reviewed-predecessor-binding')
+  assert.equal(classifyChange(file, null, source), 'reviewed-operator-batch')
   assert.throws(() => classifyChange(file, null, source + '\nUnreviewedChange();\n'))
   const plan = planExecution([{ file, kind: 'reviewed-predecessor-binding' }, { file: 'apps/api/src/web-assets.ts', kind: 'reviewed-entry-cache' }])
   assert.ok(plan.commands.some(([, args]) => args.includes('src/windows-update-production-assembly.test.ts')))
@@ -50,10 +58,10 @@ test('version reuse permits only the exact reviewed version substitution', () =>
   assert.throws(() => classifyChange('apps/api/package-lock.json', 'old dependency', 'new dependency'))
 })
 
-test('reviewed follow-up releases reuse only uniform version substitutions', () => {
+test('reviewed runtime config stays mapped while lockfiles reuse only uniform version substitutions', () => {
   const file = 'apps/api/src/config.ts'
   const source = readFileSync(new URL('../apps/api/src/config.ts', import.meta.url), 'utf8')
-  assert.equal(classifyChange(file, null, source), 'configuration-gate')
+  assert.equal(classifyChange(file, null, source), 'reviewed-operator-batch')
   assert.throws(() => classifyChange(file, null, source + '\nnewRuntimeBehavior();\n'))
   const lockFile = 'apps/api/package-lock.json'
   const lockSource = readFileSync(new URL('../apps/api/package-lock.json', import.meta.url), 'utf8')
@@ -258,4 +266,11 @@ test('component baselines reuse only root package versions, never dependency ver
   const after=JSON.stringify({version:'0.1.0-rc.23',packages:{'':{version:'0.1.0-rc.23'},'node_modules/example':{version:'0.1.0-rc.21'}}})
   assert.equal(classifyChange(file,before,after),'version-only')
   assert.throws(()=>classifyChange(file,before,after.replace('"node_modules/example":{"version":"0.1.0-rc.21"','"node_modules/example":{"version":"0.1.0-rc.23"')))
+})
+
+test('reviewed scanner fixture changes select hygiene checks only for their exact bytes', () => {
+  const file = 'scripts/public-release/scanner.test.mjs'
+  const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
+  assert.equal(classifyChange(file, null, source), 'reviewed-hygiene-policy')
+  assert.throws(() => classifyChange(file, null, source + '\nnewScannerBehavior();\n'))
 })

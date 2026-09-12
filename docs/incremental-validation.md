@@ -314,3 +314,33 @@ configuration, application, adapter and durable-service tests, plus the actual
 PowerShell dispatch-state guard. The changed worker's complete Shadow broker
 suite also passed on the Windows validation host (107 assertions, no production
 scheduler calls); repeat that only when another worker change invalidates it.
+
+## Consolidated operator rollback batch
+
+This batch changes API assembly, lifecycle observation and cancellation, trusted
+compatibility expiry and rollback warning approvals, final-save receipt writing
+and reading, committed rollback retention/execution, operator checkpoint storage,
+HTTP permissions and frontend recovery interaction. The exact source fingerprints
+must be registered together after final review; existing RC26 fingerprints do not
+cover these edits.
+
+Required affected checks:
+- API typechecking and all changed provider/receipt/operator tests; activation,
+  live publication, activation HTTP/routes, production assembly, and Steam handoff
+  integration must run together against the final batch.
+- Web typechecking/build, operator API/panel tests and the existing version-update
+  workspace tests. Rendered desktop and 390px checks have been performed on a VM
+  development build; final candidate behavior must still be checked.
+- Full bootstrap self-test including final paired-save proof, plus installer,
+  configuration-integration and package allowlist checks affected by the new
+  stable bootstrap helper. Bootstrap self-test passed on the VM; the final
+  installer/package checks remain outstanding.
+- Exact source/artifact hygiene, fixed-version consistency and exact-commit CI
+  before a versioned candidate is accepted.
+- Actual DSP save/stop, new final-save proof readback, BepInEx update, successful
+  operator rollback and interrupted recovery on the target VM. Fixture tests,
+  native compilation and read-only broker proofs do not replace these gates.
+
+Do not classify this batch as verified merely because its source fingerprints are
+registered. Mapping selects checks; only their results and native acceptance can
+establish the associated claims. Do not automatically run npm run check.

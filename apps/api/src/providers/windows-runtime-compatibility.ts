@@ -7,6 +7,14 @@ import {
   type TrustedCompatibilityStatus
 } from '../update-pipeline/trusted-compatibility.js'
 import { evaluateCompatibility } from '../updates/compatibility.js'
+import { normalizeVersion } from '../updates/version.js'
+import { rollbackWarningsApproved } from '../update-pipeline/rollback-health-policy.js'
+
+export interface RollbackWarningCheck {
+  component: 'nebula' | 'bepinex' | 'bridge' | 'control'
+  expectedVersion: string
+  warnings: readonly string[]
+}
 
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/)
 const versionSchema = z.string().trim().min(1).max(64)
@@ -37,6 +45,7 @@ export interface WindowsRuntimeCompatibilityEvidence {
 
 export interface WindowsRuntimeCompatibilitySource {
   inspect(signal?: AbortSignal): Promise<WindowsRuntimeCompatibilityEvidence>
+  approveRollbackWarnings?(input: RollbackWarningCheck, signal?: AbortSignal): Promise<boolean>
 }
 
 export interface WindowsTrustedRuntimeCompatibilityInspectorOptions {
@@ -114,6 +123,29 @@ export class WindowsTrustedRuntimeCompatibilityInspector implements
       signal?.throwIfAborted()
       if (error instanceof WindowsRuntimeCompatibilityError) throw error
       throw new WindowsRuntimeCompatibilityError('WINDOWS_RUNTIME_COMPATIBILITY_UNAVAILABLE')
+    }
+  }
+
+  async approveRollbackWarnings(input: RollbackWarningCheck, signal?: AbortSignal): Promise<boolean> {
+    signal?.throwIfAborted()
+    try {
+      const current = statusSchema.parse(await this.#service.status())
+      const normalized = statusSchema.parse(await this.#policyVerifier.status())
+      signal?.throwIfAborted()
+      if (!current.available || current.policyRevision === null ||
+          current.policyRevision !== normalized.policyRevision || current.policyId !== normalized.policyId ||
+          current.inventoryRevision !== normalized.inventoryRevision) return false
+      const observed = input.component === 'nebula' ? current.inventory.nebula
+        : input.component === 'bepinex' ? current.inventory.bepInEx
+          : current.inventory.plugins.find(plugin => plugin.sourceId.toLowerCase() ===
+            `thunderstore:dysoncontrol/${input.component}`)?.version
+      const kind = input.component === 'bepinex' ? 'bepinex' : input.component === 'nebula' ? 'nebula' : 'plugin'
+      if (!observed || normalizeVersion(observed, kind) !== normalizeVersion(input.expectedVersion, kind)) return false
+      return rollbackWarningsApproved({ phase: 'rollback', approvals: this.#policy.rollbackWarningApprovals,
+        matrix: this.#policy.matrix, inventory: current.inventory, warnings: input.warnings })
+    } catch {
+      signal?.throwIfAborted()
+      return false
     }
   }
 }

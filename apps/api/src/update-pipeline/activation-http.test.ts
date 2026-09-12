@@ -15,6 +15,23 @@ import {
 import { UpdatePipelineError } from './errors.js'
 
 describe('component update activation HTTP contract', () => {
+  it('exposes rollback preview with strict input and no mutation dispatch', async () => {
+    const request = { requestId: randomUUID(), sourceRequestId: randomUUID(), expectedRevision: 'a'.repeat(64) }
+    const plan = { format: 'dyson-control-component-rollback-plan' as const, schemaVersion: 1 as const,
+      dryRun: true as const, ...request, component: 'nebula' as const, targetVersion: '0.9.1',
+      materialSha256: 'b'.repeat(64), rollbackBindingSha256: 'c'.repeat(64),
+      sourceProtectionBackupId: 'backup-fixture', restoreFileCount: 1, removeFileCount: 0, planSha256: 'd'.repeat(64),
+      currentConfigurationRevision: 'e'.repeat(64) }
+    const service = { ...createService(), previewRollback: vi.fn(async () => plan) }
+    const controller = new ComponentUpdateActivationHttpController({ service })
+    await expect(controller.previewRollback(request)).resolves.toEqual({ statusCode: 200, body: { ok: true, data: plan } })
+    await expect(controller.previewRollback({ ...request, path: 'C:\\untrusted' })).resolves.toMatchObject({ statusCode: 400 })
+    expect(service.previewRollback).toHaveBeenCalledTimes(1)
+    expect(service.execute).not.toHaveBeenCalled()
+    const unavailable = new ComponentUpdateActivationHttpController({ service: createService() })
+    await expect(unavailable.previewRollback(request)).resolves.toMatchObject({ statusCode: 503 })
+  })
+
   it('previews a deeply validated request and returns the core plan as 200', async () => {
     const service = createService()
     const controller = new ComponentUpdateActivationHttpController({ service })

@@ -288,6 +288,233 @@ const reviewedPredecessorSources = new Map([
   ]
 ]);
 
+const reviewedOperatorBatchSources = new Map([
+  ["apps/web/src/recoverable-cleanup-panel.test.tsx", "0e63eec7996a82ee63164c43899c0dc6b16d3df5681328e43962e7cb75f2a69a"],
+  ["apps/web/src/RecoverableCleanupPanel.tsx", "d1cb2ab6bed980200aef9397148f1079a314f2db48a8404dcac1ad6507ec7dd2"],
+  ["apps/web/src/recoverable-cleanup-api.test.ts", "6edecef10d5d9f72a24f8f8615fa518adcc4b40e7cb1195fb5bc6a722570ece5"],
+  ["apps/web/src/recoverable-cleanup-api.ts", "3f3e49a4488720d8fe4323e3532260344ca2c4b55c79a8845f57750652e5034f"],
+  [".env.example", "c2691fd8bbe92565144af301611e99d48a42db1d17b9dd182fd05a6945fb9c3a"],
+  ["scripts/windows/configuration/dyson-control.environment-contract.json", "ceb58c8a4c19dc8092641d9a9897cb8e50a0f0c82f789618c2d612c6bdddd17c"],
+  ["apps/api/src/config.test.ts", "683610009f11bf3915da3db97d23361c8a45dc0703a3f263ed811c28c33762f7"],
+  ["apps/api/src/config.ts", "9e4cc7507bfa10f643fbcd737c8143effc1dc674fa926cac86f244b101aceb68"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-http.test.ts", "78069bbfb7d4558e6caca3f768d845a77542bb0c5505eb80fdb2e112ce47f7c5"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-http.ts", "9cfe0784758d785b642c6914fab86ca5e468df7f0e5f4487a2d9ed196bf26f33"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-coordinator.test.ts", "e402bac0b9e05bd7e42ec24063806a0233c304eb918a6b751ebf99d5108de617"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-coordinator.ts", "5ab64a97f2867705c778ab104f38d118d11f1fab5138bba1b19507023ca1c329"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-execution.test.ts", "a741e821c8c172e672bd08b17a56071ac689360250701ed485fab9c173640cb8"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-execution.ts", "eb58ceebff8a04a171173e0700511f72e5faf475db83fe22ad7e41f9dbe8fef7"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-records.test.ts", "a10111e8e1da42a365d9ac1864c5f107631587dc23d5bf85c2aa2fc1e9a757e3"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-records.ts", "70c47ecf201c62cd2a7be50d28c44267f1ce2896d84a6746de8d59cbc46ecc22"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-files.test.ts", "cb9ac329410bf855e1a77f8f7d222426fe79f288db3ceefdd4d096c6fc16140a"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-files.ts", "b0f854635757653107da2f27b26b7a318db19c4b9d92f603999cbd97700c1189"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-inventory.test.ts", "db301dcd2e7414eed38afb99e030688cc44c1c91a1b51f524d127027e40a492b"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-inventory.ts", "6f7df8653f5fa8feb036d99deba4013a4cd61170882e28b270c4cce0771725e6"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-move.test.ts", "a8fbca240d4d2adb1f0bf8d69218bb0c64f172210b0a4857eefdef7c512b3f14"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-move.ts", "3f64867d39610c09e7fe0aa9b503a51e5106ade8c3234d51d8ee9992ac7056b5"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-plan.test.ts", "957ad8537ca622a13ce96f3d9bbe7c72ec71f50a9e3d7699682de7a4fcd8a507"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-plan.ts", "527d131fb591a872a962c2e1eb9194ea4468540ab4d0dac3283b0c1e780c6a42"],
+  ["apps/api/src/storage/database.test.ts", "0e2ce6f9f0a6fc769d0197354d3ea9582d39f755e207f2c985af26e8d6be0bfe"],
+  ["apps/api/src/storage/database.ts", "bfb67d031aedf8cb1968b7099dc261cb2e31453528b356a7a1e88dbb9f1ffd72"],
+  ["apps/web/src/TasksAuditWorkspace.tsx", "2dc3e69cb5ab8c2c90b6bbccc04831fdd2b43659e2dbdc1a20649443e2e21c53"],
+  ["apps/web/src/model.ts", "86b7b41a9d138ce101bbd90acfc56faec41a9a17c8092f9afeeca6795ca9beaa"],
+  ["apps/api/src/domain.ts", "d09dbcd0ae4590826950db3be8bc9936cc9e4ceb3e7482bd4ca62ded5e462f4e"],
+  ["apps/web/src/App.tsx", "24b26e1fbcb10278712a7d5894ce93e436c4a6e965a7a3a4a1cc43bfecf650fd"],
+  [
+    "apps/api/src/app.ts",
+    "c816035010e9dfc146478b85090d4510307ca9fc883355d72af9801540a0190e"
+  ],
+  [
+    "apps/api/src/lifecycle/game-runtime-receipts.test.ts",
+    "df9f7532030878b54e14bae5a62b9ab6fa89851e0b451f0d5067fbcac074e66b"
+  ],
+  [
+    "apps/api/src/lifecycle/game-runtime-receipts.ts",
+    "34bf0f205b8aecea38c01d194035546e94340b0f62c5dac188ebce0c9bbf508a"
+  ],
+  [
+    "apps/api/src/providers/windows-lifecycle.test.ts",
+    "42bfd6e1bbfa49e82b085ca49eb83ea55c9bbaea2d1922eb4055379ae19f45a7"
+  ],
+  [
+    "apps/api/src/providers/windows-lifecycle.ts",
+    "eb4ee98c8a98c54d2bfd202acbd726cf9e9d86edcaa9d56654656180f5c7f9af"
+  ],
+  [
+    "apps/api/src/providers/windows-runtime-compatibility.test.ts",
+    "18b85372ae9b0f390ff5069382e05998784a2ea73aaebf0369ffaed12a3326f1"
+  ],
+  [
+    "apps/api/src/providers/windows-runtime-compatibility.ts",
+    "d258edf5a9e49c4e2e6c0efe2c48811e0852058796bfcf8a1bb969b4f170d4fd"
+  ],
+  [
+    "apps/api/src/providers/windows-update-activation.test.ts",
+    "360981495cf844bc2a0b12b91c6da5e67772aaa69d9de51bade005703fa68183"
+  ],
+  [
+    "apps/api/src/providers/windows-update-activation.ts",
+    "a60afcab83c6bc0813eb265b7dc793333a7e640dd384237c1e2584ae2ca929a3"
+  ],
+  [
+    "apps/api/src/providers/windows-update-lifecycle-composition.test.ts",
+    "5243bffc8333e2f7a639c4023f76d2172ef02ba627a0faaf5e67f7ee10808aef"
+  ],
+  [
+    "apps/api/src/providers/windows-update-runtime-evidence.test.ts",
+    "245a32de860d4c080b66aad9936f77f89ce87554a0d9698a5577ab3b4abc92a6"
+  ],
+  [
+    "apps/api/src/providers/windows-update-runtime-evidence.ts",
+    "351a25e6625593fa6ed5cfff032ec8cb836fb8cd4d27fcad747685be302ae8c7"
+  ],
+  [
+    "apps/api/src/providers/windows-update-transaction-provider.test.ts",
+    "c21d664ff3a8f31de2fb6c5b69a7817d648a9ad7adb3f76bdba23c922c536f3c"
+  ],
+  [
+    "apps/api/src/providers/windows-update-transaction-provider.ts",
+    "1d06a838c29bf7dae107b2de1ca0f96e49c463e06608735f31a27a72a0ee5fc9"
+  ],
+  [
+    "apps/api/src/update-activation-routes.test.ts",
+    "1c035c5c39a8e3047752a2e014d0a8e6aabd653041bdea90a769d3627588d5e0"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation-http.test.ts",
+    "11435ca03b64ac6e7037b7ea99e915449ad880c6ccb90a0ab75d6c32dec0c430"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation-http.ts",
+    "479fbea361b841b4fe3546da60ebf54ce16faa75819ba58c9b45e61ef5128058"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation-live.test.ts",
+    "40e0c59d053a20d5099aa937855bcf513edd9ceb31833180fde8a2e60e8abfce"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation-live.ts",
+    "b78f3cca6497475ab8ce3629bbc130b71b29ec2d55441dd0d0df4a89aeaba118"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation-types.ts",
+    "c102958b661cdd5c586890a921da2a565e2260119fd4a1b6f35153ed2c336ade"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation.test.ts",
+    "aae448e4b34d6c02e3afcf8b7258de5cf41aec81ec053a31bac2ac97eb496026"
+  ],
+  [
+    "apps/api/src/update-pipeline/activation.ts",
+    "f2b33ffc1b283c81bbffd9c4eb8c9df94879f15bc4cf4b0cf4ea6130ffd8a6e5"
+  ],
+  [
+    "apps/api/src/update-pipeline/operator-rollback-http.test.ts",
+    "d352250d287a766a88c199830dd455cb4b52e722592aa078930a0a327bb47dfa"
+  ],
+  [
+    "apps/api/src/update-pipeline/operator-rollback-http.ts",
+    "2f7df01992bf9f7e624fc0c2de7e41eedd52836b69c9638f15765547546336d7"
+  ],
+  [
+    "apps/api/src/update-pipeline/operator-rollback-records.test.ts",
+    "c6cc289cd38ef5df33081436b3c0810be79889b43bf4da17e34a56fbcd72594d"
+  ],
+  [
+    "apps/api/src/update-pipeline/operator-rollback-records.ts",
+    "d17099355dd6eeb3db875c67608b4a644d68e46b78ecae874e5539cbad93ab11"
+  ],
+  [
+    "apps/api/src/update-pipeline/operator-rollback-store.test.ts",
+    "5bfada82a987910fdfeabe8cfead12ef8d69e61d6a54a626a67ced77223bfff8"
+  ],
+  [
+    "apps/api/src/update-pipeline/operator-rollback-store.ts",
+    "a58dbe5fcf13790905f7585e181a06d528453a7face4b47ca48827823b1e7841"
+  ],
+  [
+    "apps/api/src/update-pipeline/operator-rollback.test.ts",
+    "295f2f72a35bdab6424a8062477460c708b4b92d0af38c24a722f4ce5c9c98d7"
+  ],
+  [
+    "apps/api/src/update-pipeline/operator-rollback.ts",
+    "beadffde372be2eaad2c96e0271222e9c07d80db0a215eaa29de15d54b994b45"
+  ],
+  [
+    "apps/api/src/update-pipeline/rollback-health-policy.test.ts",
+    "d3ba67a4e4157345dfc9b980203de15f7f24456ee4dd2a00c2d362b47e323f7c"
+  ],
+  [
+    "apps/api/src/update-pipeline/rollback-health-policy.ts",
+    "0b56be2b7538efe84aca92c1eb0764a77346dee2145c726f4745ae7b90d86c72"
+  ],
+  [
+    "apps/api/src/update-pipeline/trusted-compatibility.test.ts",
+    "e32eb1e5ca165fec1721ba74544612c72de4abc6518921e607b496c4ab27d07c"
+  ],
+  [
+    "apps/api/src/update-pipeline/trusted-compatibility.ts",
+    "ec0a4fa601f4a5622478892b2a907a454be8c38dbe607b91b7a917d420df6727"
+  ],
+  [
+    "apps/web/src/OperatorRollbackPanel.css",
+    "462af27ce696812ac11c295a82ee3c1603c09e8b4e951aec0b58faf16069a99d"
+  ],
+  [
+    "apps/web/src/OperatorRollbackPanel.tsx",
+    "3cb4a3f9b3e63723bbee69ca5ef11d12cb32da4e35aeb958abbefe84fed327f8"
+  ],
+  [
+    "apps/web/src/VersionUpdateWorkspace.tsx",
+    "e52dcf4849c5dd54ab2a8a59df055f011d58d6ceacc37fa36f8ff77361b9003b"
+  ],
+  [
+    "apps/web/src/operator-rollback-api.test.ts",
+    "ef84585014e242c13b42c70c3653c23cae2eec8521b083ea4fb74fbf3d1a9116"
+  ],
+  [
+    "apps/web/src/operator-rollback-api.ts",
+    "f62e354ec71c043a7feef3d0fd90ebd32650ca1166c01e3f6740e16abf78c4b8"
+  ],
+  [
+    "apps/web/src/operator-rollback-panel.test.tsx",
+    "1fc2f632d5cc0fe9901724234e60cd813285699cbe7269ad78beb43c30b415b6"
+  ],
+  [
+    "apps/web/src/update-activation-workspace.test.tsx",
+    "2d4e946e3ab7c3ee59c5435b58b6734a5cf7f9483d71f346e266c495ecf79c56"
+  ],
+  [
+    "scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1",
+    "d81d5fbc5bd23b1814c5e249e0b0e175f0f54786a5f05aacb10936cbb624fb9a"
+  ],
+  [
+    "scripts/windows/bootstrap/DysonStoppedSaveCapture.ps1",
+    "961952612e6d2efff0c0462eb6792d21cbc310a511cd8d800cacecec55998303"
+  ],
+  [
+    "scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1",
+    "101986c99a58c276409df1a68de3837d12e9ef6f48815611062bda4c72eb9249"
+  ],
+  [
+    "scripts/windows/bootstrap/Start-DysonServer.ps1",
+    "d0b76dbaa9eebcd3331e354476538261f9f8dd7d7d7a82500451af04e7aca65a"
+  ],
+  [
+    "scripts/windows/deployment/Install-DysonControl.ps1",
+    "8e0f26e262c657aa735e16be7f531a5ab06ff3c454a9ee27962095fcec48dd40"
+  ],
+  [
+    "scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1",
+    "8c970281e9e5643842cb618292348ab083451b90eeaa7e37030cd2f764079f87"
+  ],
+  [
+    "scripts/windows/release/DysonReleasePackaging.Common.ps1",
+    "c95affd318d91ca36dabf961aa36950db609585bc12433815bb4a53416ec5637"
+  ]
+]);
+const operatorBatchApiTests = ["src/config.test.ts","src/update-pipeline/recoverable-cleanup-http.test.ts","src/update-pipeline/recoverable-cleanup-coordinator.test.ts","src/update-pipeline/recoverable-cleanup-execution.test.ts","src/update-pipeline/recoverable-cleanup-records.test.ts","src/update-pipeline/recoverable-cleanup-files.test.ts","src/update-pipeline/recoverable-cleanup-inventory.test.ts","src/update-pipeline/recoverable-cleanup-move.test.ts","src/update-pipeline/recoverable-cleanup-plan.test.ts","src/storage/database.test.ts","src/jobs/audit.test.ts","src/app.test.ts","src/game-runtime-receipt-routes.test.ts","src/lifecycle/game-runtime-receipts.test.ts","src/providers/windows-lifecycle.test.ts","src/providers/windows-runtime-compatibility.test.ts","src/providers/windows-update-activation.test.ts","src/providers/windows-update-lifecycle-composition.test.ts","src/providers/windows-update-runtime-evidence.test.ts","src/providers/windows-update-transaction-provider.test.ts","src/steam-manual-handoff-routes.test.ts","src/update-activation-app-wiring.test.ts","src/update-activation-routes.test.ts","src/update-pipeline/activation-http.test.ts","src/update-pipeline/activation-live.test.ts","src/update-pipeline/activation.test.ts","src/update-pipeline/operator-rollback-http.test.ts","src/update-pipeline/operator-rollback-records.test.ts","src/update-pipeline/operator-rollback-store.test.ts","src/update-pipeline/operator-rollback.test.ts","src/update-pipeline/rollback-health-policy.test.ts","src/update-pipeline/steam-manual-handoff-http.test.ts","src/update-pipeline/steam-manual-handoff.test.ts","src/update-pipeline/trusted-compatibility.test.ts","src/windows-update-production-assembly.test.ts"];
+const operatorBatchWebTests = ["src/recoverable-cleanup-panel.test.tsx","src/recoverable-cleanup-api.test.ts","src/tasks-audit-workspace.test.tsx","src/operator-rollback-api.test.ts","src/operator-rollback-panel.test.tsx","src/update-activation-workspace.test.tsx"];
+
 const reviewedRuntimeLayoutSources = new Map([
   [
     "apps/api/src/lifecycle/game-runtime-receipts.test.ts",
@@ -304,15 +531,17 @@ const reviewedRuntimeLayoutSources = new Map([
 ]);
 
 export function classifyChange(file, before, after) {
+  if (after !== null && reviewedOperatorBatchSources.get(file) === aclSourceHash(after)) return "reviewed-operator-batch"
   if (after !== null && reviewedEntryCacheSources.get(file) === aclSourceHash(after)) return 'reviewed-entry-cache'
   if (after !== null && reviewedPredecessorSources.get(file) === aclSourceHash(after)) return 'reviewed-predecessor-binding'
   if (after !== null && reviewedRuntimeLayoutSources.get(file) === aclSourceHash(after)) return 'reviewed-runtime-layout'
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
+  if (file === 'scripts/public-release/scanner.test.mjs' && aclSourceHash(after) === 'e04dc3b368859772a29127de141af4c618d93850efb2c84f968e7fb731a1d581') return 'reviewed-hygiene-policy'
   if (file === 'scripts/public-release/policy.mjs' &&
-      aclSourceHash(after) === '91269327d4eb6194fb97f6bc361f3d9939686477de73b1153c7a31ba22d8aa6c') return 'reviewed-hygiene-policy'
+      aclSourceHash(after) === '33d3ab536f308e2c73c95117cd39ad1f134833ff9c253336b3dd998cb5fec636') return 'reviewed-hygiene-policy'
   if (file === 'scripts/windows/deployment/Test-DysonControlDeployment.ps1' &&
       aclSourceHash(after) === '248758ae47a5edf9678f0c515eb564c31e3cb127538347556319ba10ae44766a') return 'verified-native-status'
-  for (const releaseVersion of ['0.1.0-rc.24', '0.1.0-rc.25', '0.1.0-rc.26']) {
+  for (const releaseVersion of ['0.1.0-rc.24', '0.1.0-rc.25', '0.1.0-rc.26', '0.1.0-rc.27']) {
     const priorReleaseSource = after.replaceAll(releaseVersion, '0.1.0-rc.23')
     if (priorReleaseSource !== after && priorReleaseSource.replaceAll('0.1.0-rc.23', releaseVersion) === after) {
       if (rc23VerifiedSources.get(file) === aclSourceHash(priorReleaseSource)) return 'version-only'
@@ -430,6 +659,17 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
   const isRunnerCheck = ([, args]) => args.includes('src/providers/powershell-runner.test.ts')
   const hostCommands = selected.slice(2).filter(command => !isRunnerCheck(command))
   const commands = [...selected.slice(0, 2), ...selected.slice(2).filter(isRunnerCheck)]
+  if (changes.some(change => change.kind === 'reviewed-operator-batch')) {
+    commands.push(apiBuildCommand);
+    commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4', '--testTimeout=30000', '--hookTimeout=30000', ...operatorBatchApiTests]]);
+    commands.push(['node', ['apps/web/node_modules/typescript/bin/tsc', '-b', 'apps/web/tsconfig.json']]);
+    commands.push(['node', ['apps/web/node_modules/vite/bin/vite.js', 'build', 'apps/web']]);
+    commands.push(['node', ['apps/web/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/web', '--maxWorkers=2', ...operatorBatchWebTests]]);
+    for (const script of ['bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1', 'deployment/SelfTest-DysonDeploymentConfigurationIntegration.ps1', 'release/SelfTest-DysonControlReleasePackage.ps1']) {
+      hostCommands.push(['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', 'scripts/windows/' + script]]);
+    }
+    hostCommands.push(deploymentCommand);
+  }
   if (changes.some(change => change.kind === 'reviewed-runtime-layout')) {
     commands.push(['node', ['apps/api/node_modules/typescript/bin/tsc', '-p', 'apps/api/tsconfig.json', '--noEmit']])
     commands.push(['node', ['apps/api/node_modules/vitest/vitest.mjs', 'run', '--root', 'apps/api', '--maxWorkers=4',
@@ -495,7 +735,9 @@ export function planExecution(changes, { componentChanges, hostChecks = false, f
       verifiedCommit: componentBaselines[group].commit,
       evidence: componentBaselines[group].evidence })),
     reasons: changes.map(({ file, kind }) => ({ file, kind,
-      decision: kind === 'configuration-gate' ? 'run focused shared configuration gate checks' :
+      decision: kind === 'reviewed-operator-batch' ? 'reviewed runtime changes: run mapped integration, UI and native acceptance gates; release is not yet qualified' :
+        kind.startsWith('reviewed-') ? 'run the checks mapped to this exact reviewed source; retain independent native release gates' :
+        kind === 'configuration-gate' ? 'run focused shared configuration gate checks' :
         kind === 'verified-native-status' ? 'reuse exact native read-only deployment status evidence; HTTP readiness remains separate' :
         kind === 'verified-rc24-source' ? 'reuse exact RC24 CI source evidence; new changes and native qualification remain separate' :
         kind === 'verified-rc23-source' ? 'reuse exact RC23 source evidence; production qualification remains separate' :

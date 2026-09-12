@@ -4,6 +4,7 @@ import {
   serverStatusSchema,
   type LifecycleMutationAdapter,
   type LifecycleOperationContext,
+  type LifecyclePhaseResult,
   type StatusProvider
 } from '../domain.js'
 import type { HostMutationOperationScope } from '../host-mutation/operation-coordinator.js'
@@ -77,7 +78,8 @@ const stoppedLifecycleResultSchema = z.strictObject({
   summary: boundedSummarySchema,
   evidence: z.strictObject({
     processVerified: z.literal(true),
-    gamePortListening: z.literal(false)
+    gamePortListening: z.literal(false),
+    lifecycleState: z.literal('stopped_verified')
   })
 })
 
@@ -85,23 +87,28 @@ const runningLifecycleResultSchema = z.strictObject({
   summary: boundedSummarySchema,
   evidence: z.strictObject({
     processVerified: z.literal(true),
-    gamePortListening: z.literal(true)
+    gamePortListening: z.literal(true),
+    lifecycleState: z.literal('running_verified')
   })
 })
 
 const startLifecycleResultSchema = z.strictObject({
   summary: boundedSummarySchema,
   evidence: z.strictObject({
-    outcome: z.enum(['started', 'already-running']),
-    processVerified: z.literal(true)
+    dispatched: z.literal(true),
+    recovered: z.boolean(),
+    taskName: z.string().min(1).max(128),
+    readyVerified: z.literal(true)
   })
 })
 
 const stopLifecycleResultSchema = z.strictObject({
   summary: boundedSummarySchema,
   evidence: z.strictObject({
-    outcome: z.enum(['stopped', 'already-stopped']),
-    processVerified: z.literal(true)
+    dispatched: z.literal(true),
+    recovered: z.boolean(),
+    taskName: z.string().min(1).max(128),
+    readyVerified: z.literal(true)
   })
 })
 
@@ -112,6 +119,8 @@ const protectionLifecycleResultSchema = z.strictObject({
     dsvBytes: safeByteCountSchema,
     serverBytes: safeByteCountSchema,
     manifestVerified: z.literal(true),
+    sourcePairVerified: z.literal(true),
+    mutationPerformed: z.boolean(),
     reused: z.boolean()
   })
 })
@@ -207,6 +216,8 @@ export type FixedComponentVersionProbe = (
 ) => Promise<string | null>
 
 export interface WindowsUpdateActivationAdaptersOptions {
+  /** Per-phase deadline; internal configuration, never an HTTP argument. */
+  lifecyclePhaseTimeoutMs?: number
   lifecycleAdapter: LifecycleMutationAdapter
   statusProvider: StatusProvider
   componentVersionProbe: FixedComponentVersionProbe
@@ -219,6 +230,9 @@ export interface WindowsUpdateActivationAdaptersOptions {
 }
 
 export interface WindowsUpdateActivationTransactionProvider {
+  inspectRollbackMaterial?(request: Readonly<ComponentUpdateRollbackRestoreRequest>): Promise<unknown>
+  approveRollbackWarnings?(request: Readonly<FixedUpdateSmokeRequest>, warnings: readonly string[],
+    hostMutation: HostMutationOperationScope): Promise<boolean>
   captureRollbackBaseline(
     request: Readonly<ComponentUpdateRollbackBaselineRequest>,
     hostMutation: HostMutationOperationScope
@@ -288,6 +302,7 @@ export class WindowsUpdateActivationAdapterError extends Error {
  * It owns no executable, path, task name, URL, credential, or shell argument.
  */
 export class WindowsUpdateActivationAdapters implements ComponentUpdateActivationAdapters, SteamManualHandoffAdapters {
+  readonly #lifecyclePhaseTimeoutMs: number
   readonly #lifecycleAdapter: LifecycleMutationAdapter
   readonly #statusProvider: StatusProvider
   readonly #componentVersionProbe: FixedComponentVersionProbe
@@ -295,6 +310,11 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     Partial<WindowsSteamManualHandoffTransactionProvider>) | null
 
   constructor(options: WindowsUpdateActivationAdaptersOptions) {
+    const phaseTimeout = options.lifecyclePhaseTimeoutMs ?? 600_000
+    if (!Number.isSafeInteger(phaseTimeout) || phaseTimeout < 1 || phaseTimeout > 900_000) {
+      throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_PHASE_TIMEOUT_INVALID')
+    }
+    this.#lifecyclePhaseTimeoutMs = phaseTimeout
     if (options.lifecycleAdapter.mutationEnabled !== true) {
       throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_LIFECYCLE_DISABLED')
     }
@@ -319,10 +339,10 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     const context = createLifecycleContext(
       request.requestId,
       `update-stop-check:${request.component}:${request.phase}:${request.requestId}`,
-      hostMutation.signal
+      hostMutation
     )
     try {
-      stoppedLifecycleResultSchema.parse(await this.#lifecycleAdapter.verifyStopped(context))
+      stoppedLifecycleResultSchema.parse(await this.#runLifecyclePhase('verifyStopped', context))
       hostMutation.assertActive()
       return { processStopped: true, portClosed: true }
     } catch {
@@ -340,11 +360,11 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     const context = createLifecycleContext(
       request.requestId,
       `update-save-protection:${request.component}:${request.requestId}`,
-      hostMutation.signal
+      hostMutation
     )
     try {
       const result = protectionLifecycleResultSchema.parse(
-        await this.#lifecycleAdapter.createProtectionPoint(context)
+        await this.#runLifecyclePhase('createProtectionPoint', context)
       )
       hostMutation.assertActive()
       const binding = protectionBindingSchema.parse(await this.#requireTransactionProvider()
@@ -413,6 +433,12 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     return await this.#restoreRollbackStep('paired-save', request, hostMutation)
   }
 
+  async inspectRollbackMaterial(request: ComponentUpdateRollbackRestoreRequest) {
+    const result = await this.#requireTransactionProvider().inspectRollbackMaterial?.(request)
+    return z.strictObject({ configurationSnapshotVerified: z.literal(true), protectionVerified: z.literal(true),
+      serverModLockVerified: z.literal(true), currentConfigurationRevision: sha256Schema }).parse(result)
+  }
+
   async inspectRollbackReadback(
     request: ComponentUpdateRollbackRestoreRequest,
     hostMutation: HostMutationOperationScope
@@ -460,11 +486,11 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     const context = createLifecycleContext(
       deriveWindowsSteamHandoffLifecycleRequestId(request.requestId, 'prepare'),
       `steam-handoff-protection:${request.requestId}`,
-      hostMutation.signal
+      hostMutation
     )
     try {
       const result = protectionLifecycleResultSchema.parse(
-        await this.#lifecycleAdapter.createProtectionPoint(context)
+        await this.#runLifecyclePhase('createProtectionPoint', context)
       )
       hostMutation.assertActive()
       const binding = protectionBindingSchema.parse(await this.#requireTransactionProvider()
@@ -497,10 +523,10 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     const context = createLifecycleContext(
       deriveWindowsSteamHandoffLifecycleRequestId(request.requestId, 'prepare'),
       `steam-handoff-stop:${request.requestId}`,
-      hostMutation.signal
+      hostMutation
     )
     try {
-      stopLifecycleResultSchema.parse(await this.#lifecycleAdapter.requestGracefulStop(context))
+      stopLifecycleResultSchema.parse(await this.#runLifecyclePhase('requestGracefulStop', context))
       hostMutation.assertActive()
       return { dispatched: true }
     } catch {
@@ -518,10 +544,10 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     const context = createLifecycleContext(
       deriveWindowsSteamHandoffLifecycleRequestId(request.requestId, 'prepare'),
       `steam-handoff-stop:${request.requestId}`,
-      hostMutation.signal
+      hostMutation
     )
     try {
-      stoppedLifecycleResultSchema.parse(await this.#lifecycleAdapter.verifyStopped(context))
+      stoppedLifecycleResultSchema.parse(await this.#runLifecyclePhase('verifyStopped', context))
       hostMutation.assertActive()
       return { processStopped: true, portClosed: true }
     } catch {
@@ -563,15 +589,15 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     const context = createLifecycleContext(
       deriveWindowsSteamHandoffLifecycleRequestId(request.requestId, 'complete'),
       `steam-handoff-start:${request.requestId}`,
-      hostMutation.signal
+      hostMutation
     )
     let attemptedStart = false
     let primaryError: WindowsUpdateActivationAdapterError | null = null
     try {
       attemptedStart = true
-      startLifecycleResultSchema.parse(await this.#lifecycleAdapter.requestStart(context))
+      startLifecycleResultSchema.parse(await this.#runLifecyclePhase('requestStart', context))
       hostMutation.assertActive()
-      runningLifecycleResultSchema.parse(await this.#lifecycleAdapter.verifyRunning(context))
+      runningLifecycleResultSchema.parse(await this.#runLifecyclePhase('verifyRunning', context))
       hostMutation.assertActive()
       const status = await this.#collectBoundedStatus()
       hostMutation.assertActive()
@@ -612,12 +638,12 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
 
     if (attemptedStart) {
       try {
-        stopLifecycleResultSchema.parse(await this.#lifecycleAdapter.requestGracefulStop(context))
+        stopLifecycleResultSchema.parse(await this.#runLifecyclePhase('requestGracefulStop', context))
       } catch {
         // Independent stopped-state proof below decides whether compensation is safe.
       }
       try {
-        stoppedLifecycleResultSchema.parse(await this.#lifecycleAdapter.verifyStopped(context))
+        stoppedLifecycleResultSchema.parse(await this.#runLifecyclePhase('verifyStopped', context))
       } catch {
         throw new WindowsUpdateActivationAdapterError('WINDOWS_STEAM_HANDOFF_FAILED_STOP_UNPROVEN')
       }
@@ -638,7 +664,7 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     const abortFromHostMutation = () => controller.abort(hostMutation.signal.reason)
     if (hostMutation.signal.aborted) abortFromHostMutation()
     else hostMutation.signal.addEventListener('abort', abortFromHostMutation, { once: true })
-    const context = createLifecycleContext(smokeRequestId, `update-smoke:${smokeRequestId}`, controller.signal)
+    const context = createLifecycleContext(smokeRequestId, `update-smoke:${smokeRequestId}`, hostMutation, controller.signal)
     let attemptedStart = false
     let stoppedProven = false
     let result: FixedUpdateSmokeResult | null = null
@@ -648,7 +674,7 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
       attemptedStart = true
       try {
         hostMutation.assertActive()
-        startLifecycleResultSchema.parse(await this.#lifecycleAdapter.requestStart(context))
+        startLifecycleResultSchema.parse(await this.#runLifecyclePhase('requestStart', context))
         hostMutation.assertActive()
       } catch {
         hostMutation.assertActive()
@@ -657,17 +683,13 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
 
       try {
         hostMutation.assertActive()
-        runningLifecycleResultSchema.parse(await this.#lifecycleAdapter.verifyRunning(context))
+        runningLifecycleResultSchema.parse(await this.#runLifecyclePhase('verifyRunning', context))
         hostMutation.assertActive()
       } catch {
         hostMutation.assertActive()
         throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_SMOKE_RUNNING_UNPROVEN')
       }
 
-      const status = await this.#collectBoundedStatus()
-      hostMutation.assertActive()
-      const observedVersion = await this.#observeComponentVersion(request.component, status, controller.signal)
-      hostMutation.assertActive()
       let loadEvidence: z.infer<typeof runtimeLoadEvidenceSchema>
       try {
         loadEvidence = runtimeLoadEvidenceSchema.parse(
@@ -679,13 +701,23 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
         if (error instanceof WindowsUpdateActivationAdapterError) throw error
         throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_SMOKE_LOAD_EVIDENCE_FAILED')
       }
+      const status = await this.#collectBoundedStatus()
+      hostMutation.assertActive()
+      const observedVersion = await this.#observeComponentVersion(request.component, status, controller.signal)
+      hostMutation.assertActive()
       if (status.runtime.processId === null || status.runtime.startedAt === null ||
           loadEvidence.processId !== status.runtime.processId ||
           Date.parse(loadEvidence.startedAt) !== Date.parse(status.runtime.startedAt)) {
         throw new WindowsUpdateActivationAdapterError('WINDOWS_UPDATE_SMOKE_GENERATION_MISMATCH')
       }
-      const loadingHealthy = status.versions.gameLoaded === true && status.versions.compatible === true &&
+      let loadingHealthy = status.versions.gameLoaded === true && status.versions.compatible === true &&
         status.versions.warnings.length === 0
+      if (!loadingHealthy && request.phase === 'rollback' && status.versions.gameLoaded === true &&
+          observedVersion === expectedVersion && status.versions.warnings.length > 0) {
+        loadingHealthy = (await this.#requireTransactionProvider().approveRollbackWarnings?.(
+          request, status.versions.warnings, hostMutation)) === true
+        hostMutation.assertActive()
+      }
       const normalizedBepInEx = normalizeStatusVersion(status.versions.bepInEx, 'bepinex')
       const normalizedNebula = normalizeStatusVersion(status.versions.nebula, 'nebula')
       const gamePortChecks = status.connections.filter((connection) => connection.id === 'game-port')
@@ -706,7 +738,7 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
 
       try {
         hostMutation.assertActive()
-        stopLifecycleResultSchema.parse(await this.#lifecycleAdapter.requestGracefulStop(context))
+        stopLifecycleResultSchema.parse(await this.#runLifecyclePhase('requestGracefulStop', context))
         hostMutation.assertActive()
       } catch {
         hostMutation.assertActive()
@@ -714,7 +746,7 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
       }
       try {
         hostMutation.assertActive()
-        stoppedLifecycleResultSchema.parse(await this.#lifecycleAdapter.verifyStopped(context))
+        stoppedLifecycleResultSchema.parse(await this.#runLifecyclePhase('verifyStopped', context))
         hostMutation.assertActive()
         stoppedProven = true
       } catch {
@@ -726,12 +758,12 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
     } finally {
       if (attemptedStart && !stoppedProven) {
         try {
-          stopLifecycleResultSchema.parse(await this.#lifecycleAdapter.requestGracefulStop(context))
+          stopLifecycleResultSchema.parse(await this.#runLifecyclePhase('requestGracefulStop', context))
         } catch {
           // A failed stop dispatch is followed by an independent stopped-state proof.
         }
         try {
-          stoppedLifecycleResultSchema.parse(await this.#lifecycleAdapter.verifyStopped(context))
+          stoppedLifecycleResultSchema.parse(await this.#runLifecyclePhase('verifyStopped', context))
           stoppedProven = true
         } catch {
           stoppedProven = false
@@ -795,6 +827,28 @@ export class WindowsUpdateActivationAdapters implements ComponentUpdateActivatio
       throw new WindowsUpdateActivationAdapterError('WINDOWS_STEAM_HANDOFF_CAPABILITY_UNAVAILABLE')
     }
     return provider as WindowsUpdateActivationTransactionProvider & WindowsSteamManualHandoffTransactionProvider
+  }
+
+  async #runLifecyclePhase(
+    method: 'verifyStopped' | 'verifyRunning' | 'createProtectionPoint' | 'requestStart' | 'requestGracefulStop',
+    context: LifecycleOperationContext
+  ): Promise<LifecyclePhaseResult> {
+    context.hostMutation?.assertActive()
+    context.signal.throwIfAborted()
+    const deadline = new AbortController()
+    const timer = setTimeout(() => deadline.abort(new Error('WINDOWS_UPDATE_LIFECYCLE_PHASE_TIMEOUT')),
+      this.#lifecyclePhaseTimeoutMs)
+    const signal = AbortSignal.any([context.signal, deadline.signal])
+    try {
+      // Await cancellation acknowledgement from the real adapter before a
+      // cleanup phase can run. Do not race a still-mutating task and release its lease.
+      const result = await this.#lifecycleAdapter[method]({ ...context, signal })
+      signal.throwIfAborted()
+      context.hostMutation?.assertActive()
+      return result
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   async #collectBoundedStatus(): Promise<z.infer<typeof serverStatusSchema>> {
@@ -869,13 +923,15 @@ export function deriveWindowsSteamHandoffLifecycleRequestId(
 function createLifecycleContext(
   requestId: string,
   jobId: string,
-  signal: AbortSignal = new AbortController().signal
+  hostMutation: HostMutationOperationScope,
+  signal: AbortSignal = hostMutation.signal
 ): LifecycleOperationContext {
   return Object.freeze({
     jobId,
     requestId: requestId.toLowerCase(),
     action: 'restart' as const,
     protectionPointId: null,
+    hostMutation,
     signal
   })
 }

@@ -1,3 +1,4 @@
+import { ControlDatabase } from '../storage/database.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile, realpath } from 'node:fs/promises'
@@ -6,6 +7,7 @@ import { hostname, tmpdir, uptime } from 'node:os'
 import { deflateRawSync } from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
 import { HostMutationLeaseError } from '../host-mutation/lease.js'
+import { FileOperatorRollbackStore } from './operator-rollback-store.js'
 import {
   HostMutationOperationCoordinatorError,
   type HostMutationDisposition,
@@ -64,6 +66,110 @@ afterEach(async () => {
 })
 
 describe('component update activation transaction', () => {
+  it('refuses operator recovery when restored live bytes changed after the checkpoint', async () => {
+    const fixture = await createFixture()
+    let failConfiguration = false
+    const controlled = createAdapters({ restoreConfiguration: async () => {
+      if (failConfiguration) throw new Error('injected configuration interruption')
+      return { restored: true, rereadVerified: true }
+    } })
+    const recovery = new TestHostMutationRecoveryCoordinator()
+    const service = createService(fixture, controlled.adapters, { hostMutationRecoveryCoordinator: recovery })
+    const firstStage = await stageComponent(fixture.stagingRoot, defaultStage())
+    const first = await service.execute(makeRequest('nebula', '0.9.1', firstStage, initialComponentUpdateRevision))
+    const secondStage = await stageComponent(fixture.stagingRoot, defaultStage({ targetVersion: '0.9.2',
+      artifactId: 'nebula-recovery-readback-test', payloads: [{
+        name: 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll', bytes: Buffer.from('newer-nebula')
+      }] }))
+    const source = makeRequest('nebula', '0.9.2', secondStage, first.resultingRevision, baseInventory({ nebula: '0.9.1' }))
+    const installed = await service.execute(source)
+    const request = { requestId: randomUUID(), sourceRequestId: source.requestId, expectedRevision: installed.resultingRevision }
+    const plan = await service.previewRollback(request)
+    const input = { ...request, expectedPlanSha256: plan.planSha256 }
+    failConfiguration = true
+    await expect(service.executeRollback(input)).rejects.toBeDefined()
+    const live = path.join(liveComponentRoots(fixture).nebula, 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll')
+    await writeFile(live, 'foreign-edit')
+    failConfiguration = false
+    await expect(createService(fixture, controlled.adapters, { hostMutationRecoveryCoordinator: recovery }).recoverRollback(input))
+      .rejects.toMatchObject({ code: 'UPDATE_LIVE_TARGET_CHANGED' })
+    expect(await readFile(live, 'utf8')).toBe('foreign-edit')
+    expect(recovery.requests.at(-1)).toEqual({ expectedOperation: 'component-update-rollback', expectedRequestId: request.requestId })
+    await expect(service.getState()).resolves.toMatchObject({ recoveryRequired: true })
+  })
+
+  it('coordinates committed rollback with protection, environment restoration, health and durable state', async () => {
+    const fixture = await createFixture()
+    const controlled = createAdapters()
+    const service = createService(fixture, controlled.adapters, {
+      hostMutationRecoveryCoordinator: new TestHostMutationRecoveryCoordinator()
+    })
+    const firstStage = await stageComponent(fixture.stagingRoot, defaultStage())
+    const first = await service.execute(makeRequest('nebula', '0.9.1', firstStage, initialComponentUpdateRevision))
+    const secondStage = await stageComponent(fixture.stagingRoot, defaultStage({ targetVersion: '0.9.2',
+      artifactId: 'nebula-artifact-full-rollback', payloads: [{
+        name: 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll', bytes: Buffer.from('newer-nebula')
+      }] }))
+    const source = makeRequest('nebula', '0.9.2', secondStage, first.resultingRevision, baseInventory({ nebula: '0.9.1' }))
+    const installed = await service.execute(source)
+    const request = { requestId: randomUUID(), sourceRequestId: source.requestId, expectedRevision: installed.resultingRevision }
+    const plan = await service.previewRollback(request)
+    const protections = controlled.protectionCalls
+    const previousRollbackCalls = controlled.rollbackCalls.length
+    const receipt = await service.executeRollback({ ...request, expectedPlanSha256: plan.planSha256 })
+    expect(receipt).toMatchObject({ status: 'succeeded', recoveryRequired: false, sourceRequestId: source.requestId,
+      resultingRevision: first.resultingRevision })
+    expect(controlled.protectionCalls).toBe(protections + 1)
+    expect(controlled.rollbackCalls.slice(previousRollbackCalls)).toEqual(['configuration', 'server-mod-lock', 'paired-save', 'readback'])
+    expect(controlled.smokeCalls.at(-1)).toBe('rollback')
+    expect(await service.getState()).toMatchObject({ revision: first.resultingRevision, recoveryRequired: false })
+    expect((await service.getReceipt(source.requestId))?.status).toBe('succeeded')
+    const repeated = await service.executeRollback({ ...request, expectedPlanSha256: plan.planSha256 })
+    expect(repeated).toEqual(receipt)
+    expect(controlled.protectionCalls).toBe(protections + 1)
+  })
+
+  it('previews rollback only for the current successful transaction without mutation', async () => {
+    const fixture = await createFixture()
+    const controlled = createAdapters()
+    const service = createService(fixture, controlled.adapters, { hostMutationCoordinator: new TestHostMutationCoordinator() })
+    const firstStage = await stageComponent(fixture.stagingRoot, defaultStage())
+    const firstRequest = makeRequest('nebula', '0.9.1', firstStage, initialComponentUpdateRevision)
+    const first = await service.execute(firstRequest)
+    const secondStage = await stageComponent(fixture.stagingRoot, defaultStage({
+      targetVersion: '0.9.2', artifactId: 'nebula-artifact-rollback-2',
+      payloads: [{ name: 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll', bytes: Buffer.from('new-nebula') }]
+    }))
+    const secondRequest = makeRequest('nebula', '0.9.2', secondStage, first.resultingRevision, baseInventory({ nebula: '0.9.1' }))
+    const second = await service.execute(secondRequest)
+    const protectionCalls = controlled.protectionCalls
+    const request = { requestId: randomUUID(), sourceRequestId: secondRequest.requestId,
+      expectedRevision: second.resultingRevision }
+    await expect(service.previewRollback(request)).resolves.toMatchObject({
+      dryRun: true, component: 'nebula', targetVersion: '0.9.1', restoreFileCount: 1,
+      materialSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      currentConfigurationRevision: '1'.repeat(64),
+      planSha256: expect.stringMatching(/^[0-9a-f]{64}$/)
+    })
+    expect(controlled.protectionCalls).toBe(protectionCalls)
+    await expect(service.previewRollback({ ...request, sourceRequestId: firstRequest.requestId }))
+      .rejects.toMatchObject({ code: 'UPDATE_ROLLBACK_SOURCE_NOT_CURRENT' })
+    await expect(service.previewRollback({ ...request, expectedRevision: first.resultingRevision }))
+      .rejects.toMatchObject({ code: 'UPDATE_REVISION_CONFLICT' })
+    const plan = await service.previewRollback(request)
+    const store = new FileOperatorRollbackStore(path.join(fixture.projectRoot, '.dyson-control-updates', 'operator-rollbacks'))
+    await store.begin({ request: { ...request, expectedPlanSha256: plan.planSha256 }, plan,
+      phase: 'prepared', protection: null, resultingRevision: null }, {
+      signal: new AbortController().signal, assertActive() {}, toPowerShellBorrowArguments: () => []
+    })
+    await expect(service.getState()).resolves.toMatchObject({ recoveryRequired: true })
+    await expect(service.execute(secondRequest)).rejects.toMatchObject({ code: 'UPDATE_OPERATOR_ROLLBACK_RECOVERY_REQUIRED' })
+    await expect(service.reconcile()).rejects.toMatchObject({ code: 'UPDATE_OPERATOR_ROLLBACK_RECOVERY_REQUIRED' })
+    await expect(service.previewCleanup()).rejects.toMatchObject({ code: 'UPDATE_OPERATOR_ROLLBACK_RECOVERY_REQUIRED' })
+    await expect(service.recoverInterrupted(secondRequest.requestId))
+      .rejects.toMatchObject({ code: 'UPDATE_OPERATOR_ROLLBACK_RECOVERY_REQUIRED' })
+  })
+
   it.each([
     ['nebula', '0.9.1', 'github:NebulaModTeam/nebula', 'nebula', 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll'],
     ['bridge', '0.2.0', 'thunderstore:DysonControl/Bridge', 'plugin', 'plugins/dyson-control-bridge/DysonControlBridge.dll'],
@@ -1381,8 +1487,58 @@ describe('component update activation transaction', () => {
     ))).rejects.toMatchObject({ code: 'UPDATE_HISTORY_LIMIT_REACHED' })
     const cleanup = await service.previewCleanup()
     expect(cleanup).toMatchObject({ dryRun: true, executeSupported: false })
-    expect(cleanup.candidates).toContainEqual(expect.objectContaining({ kind: 'history', recoverable: true }))
+    expect(cleanup.candidates.filter(candidate => candidate.kind === 'history')).toEqual([])
     expect((await service.getState()).historyEntries).toBe(1)
+  })
+
+  it('blocks update and rollback entry points while cleanup requires recovery', async () => {
+    const fixture = await createFixture()
+    const controlled = createAdapters()
+    const service = createService(fixture, controlled.adapters, { hasPendingCleanup: async () => true })
+    const staged = await stageComponent(fixture.stagingRoot, defaultStage())
+    const request = makeRequest('nebula', '0.9.1', staged, initialComponentUpdateRevision)
+    await expect(service.getState()).resolves.toMatchObject({ recoveryRequired: true })
+    await expect(service.preview(request)).rejects.toMatchObject({ code: 'UPDATE_CLEANUP_RECOVERY_REQUIRED' })
+    await expect(service.execute(request)).rejects.toMatchObject({ code: 'UPDATE_CLEANUP_RECOVERY_REQUIRED' })
+    await expect(service.executeRollback({})).rejects.toMatchObject({ code: 'UPDATE_CLEANUP_RECOVERY_REQUIRED' })
+    await expect(service.previewCleanup()).rejects.toMatchObject({ code: 'UPDATE_CLEANUP_RECOVERY_REQUIRED' })
+    expect(controlled.protectionCalls).toBe(0)
+  })
+
+  it('offers older history while retaining the current successful update predecessor', async () => {
+    const fixture = await createFixture()
+    const service = createService(fixture, createAdapters().adapters, { maximumHistoryEntries: 2, hostMutationRecoveryCoordinator: new TestHostMutationRecoveryCoordinator() })
+    const first = await stageComponent(fixture.stagingRoot, defaultStage({ artifactId: 'nebula-retention-first', targetVersion: '0.9.1' }))
+    const firstRequest = makeRequest('nebula', '0.9.1', first, initialComponentUpdateRevision)
+    const installed = await service.execute(firstRequest)
+    const second = await stageComponent(fixture.stagingRoot, defaultStage({ artifactId: 'nebula-retention-second', targetVersion: '0.9.2' }))
+    const secondRequest = makeRequest('nebula', '0.9.2', second, installed.resultingRevision, baseInventory({ nebula: '0.9.1' }))
+    await service.execute(secondRequest)
+    const plan = await service.previewCleanup()
+    expect(plan.candidates.filter(candidate => candidate.kind === 'history')).toEqual([
+      { kind: 'history', opaqueId: firstRequest.requestId, recoverable: true, reason: 'history-retention-exceeded' }
+    ])
+    expect((await service.getState()).historyEntries).toBe(2)
+    const cleanupRequestId = randomUUID()
+    const bound = await service.previewRecoverableCleanup(cleanupRequestId)
+    expect(bound).toMatchObject({ requestId: cleanupRequestId,
+      candidates: [expect.objectContaining({ kind: 'history', opaqueId: firstRequest.requestId,
+        sha256: expect.stringMatching(/^[0-9a-f]{64}$/), sizeBytes: expect.any(Number) })] })
+    expect(bound.candidates[0]!.sizeBytes).toBeGreaterThan(0)
+    expect(await service.previewRecoverableCleanup(cleanupRequestId)).toEqual(bound)
+    const database = new ControlDatabase(path.join(fixture.root, 'cleanup-data'))
+    try {
+      const journal = { format: 'dyson-recoverable-cleanup-journal', schemaVersion: 1, requestId: cleanupRequestId,
+        direction: 'quarantine', actor: 'Administrator', startedAt: '2026-01-01T00:00:00.000Z', finishedAt: null,
+        state: 'running', completedCount: 0, plan: bound }
+      expect((await service.runRecoverableCleanup(journal, database)).state).toBe('completed')
+      expect((await service.getState()).historyEntries).toBe(1)
+      const restore = { ...journal, requestId: randomUUID(), direction: 'restore' }
+      expect((await service.runRecoverableCleanup(restore, database)).state).toBe('completed')
+      expect((await service.getState()).historyEntries).toBe(2)
+    } finally { database.close() }
+
+
   })
 
   it('streams a large compressed late-game-adjacent component without whole-artifact API buffering', async () => {
@@ -1586,6 +1742,8 @@ function createAdapters(options: {
         durable: true
       }
     },
+    inspectRollbackMaterial: async () => ({ configurationSnapshotVerified: true, protectionVerified: true,
+      serverModLockVerified: true, currentConfigurationRevision: '1'.repeat(64) }),
     captureRollbackBaseline: async (request, hostMutation) => options.baseline === undefined ? ({
       configurationSnapshotId: 'config-snapshot-fixture',
       configurationRevision: '1'.repeat(64),
@@ -1708,6 +1866,7 @@ function createService(
     maximumExpandedBytes: number
     maximumFiles: number
     maximumHistoryEntries: number
+    hasPendingCleanup: () => Promise<boolean>
     hostMutationCoordinator: HostMutationOperationCoordinator
     hostMutationRecoveryCoordinator: HostMutationRecoveryOperationCoordinator
   }> = {}

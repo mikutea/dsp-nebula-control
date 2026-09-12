@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto'
+import { parseCleanupJournal, assertCleanupTransition, type CleanupJournal } from '../update-pipeline/recoverable-cleanup-records.js'
+import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -196,6 +197,13 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
           CHECK(role IN ('viewer', 'operator', 'administrator')),
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS component_cleanup_checkpoints (
+        request_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0 AND sequence <= 65),
+        previous_sha256 TEXT,
+        payload TEXT NOT NULL,
+        PRIMARY KEY(request_id, sequence)
       );
       CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY,
@@ -670,6 +678,61 @@ export class ControlDatabase implements PlayerPresenceHistoryPersistence, Observ
       WHERE id = ?
     `).run(next.state, next.startedAt, next.finishedAt, next.durationMs, next.summary, next.errorCode, id)
     return next
+  }
+
+  loadCleanupJournal(requestId: string): CleanupJournal | null {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(requestId)) throw new Error('UPDATE_CLEANUP_REQUEST_INVALID')
+    const rows = this.#database.prepare('SELECT sequence, previous_sha256, payload FROM component_cleanup_checkpoints WHERE request_id = ? ORDER BY sequence').all(requestId) as unknown as Array<{ sequence: number; previous_sha256: string | null; payload: string }>
+    let previous: CleanupJournal | null = null, digest: string | null = null
+    if (rows.length > 66) throw new Error('UPDATE_CLEANUP_JOURNAL_INVALID')
+    for (const [index, row] of rows.entries()) {
+      if (row.sequence !== index || row.previous_sha256 !== digest || Buffer.byteLength(row.payload) > 128 * 1024) throw new Error('UPDATE_CLEANUP_JOURNAL_INVALID')
+      const journal = parseCleanupJournal(JSON.parse(row.payload))
+      if (journal.requestId !== requestId || JSON.stringify(journal) !== row.payload) throw new Error('UPDATE_CLEANUP_JOURNAL_INVALID')
+      if (previous) assertCleanupTransition(previous, journal)
+      else if (journal.completedCount !== 0 || journal.state !== 'running') throw new Error('UPDATE_CLEANUP_JOURNAL_INVALID')
+      previous = journal
+      digest = createHash('sha256').update(row.payload).digest('hex')
+    }
+    return previous
+  }
+
+  listCleanupJournals(): CleanupJournal[] {
+    const rows = this.#database.prepare('SELECT DISTINCT request_id FROM component_cleanup_checkpoints ORDER BY request_id LIMIT 1025').all() as unknown as Array<{ request_id: string }>
+    if (rows.length > 1024) throw new Error('UPDATE_CLEANUP_JOURNAL_CAPACITY')
+    return rows.map(row => {
+      const journal = this.loadCleanupJournal(row.request_id)
+      if (!journal) throw new Error('UPDATE_CLEANUP_JOURNAL_INVALID')
+      return journal
+    })
+  }
+
+  appendCleanupJournal(input: unknown): CleanupJournal {
+    const journal = parseCleanupJournal(input)
+    return this.#transaction(() => {
+      const previous = this.loadCleanupJournal(journal.requestId)
+      const payload = JSON.stringify(journal)
+      if (Buffer.byteLength(payload) > 128 * 1024) throw new Error('UPDATE_CLEANUP_JOURNAL_INVALID')
+      if (previous) {
+        assertCleanupTransition(previous, journal)
+        if (JSON.stringify(previous) === payload) return previous
+      } else if (journal.completedCount !== 0 || journal.state !== 'running') throw new Error('UPDATE_CLEANUP_JOURNAL_INVALID')
+      const row = this.#database.prepare('SELECT COUNT(*) AS count FROM component_cleanup_checkpoints WHERE request_id = ?').get(journal.requestId) as unknown as { count: number }
+      this.#database.prepare('INSERT INTO component_cleanup_checkpoints(request_id, sequence, previous_sha256, payload) VALUES (?, ?, ?, ?)')
+        .run(journal.requestId, row.count, previous ? createHash('sha256').update(JSON.stringify(previous)).digest('hex') : null, payload)
+      return journal
+    })
+  }
+
+  reconcileInterruptedRollbackAudits(): void {
+    // This closes the HTTP attempt, not the underlying rollback transaction.
+    // Durable rollback receipts remain the authority for the game outcome.
+    this.#database.prepare(`
+      UPDATE jobs SET state = 'failed', finished_at = ?, duration_ms = NULL,
+        error_code = CASE WHEN kind LIKE 'component.cleanup%' THEN 'UPDATE_CLEANUP_AUDIT_INTERRUPTED' ELSE 'UPDATE_ROLLBACK_AUDIT_INTERRUPTED' END
+      WHERE kind IN ('component.rollback', 'component.rollback.recovery', 'component.cleanup', 'component.cleanup.recovery', 'component.cleanup.restore')
+        AND state IN ('queued', 'running')
+    `).run(new Date().toISOString())
   }
 
   getJob(id: string): JobRecord | null {

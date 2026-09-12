@@ -266,8 +266,9 @@ function Sidebar({ active, onSelect, mobileOpen, provider, status }: {
         {navGroups.map((group) => <div className="nav-group" key={group.label}>
           <p>{group.label}</p>
           {group.items.map(({ key, label, icon: Icon }) =>
-            <button key={key} className={active === key ? 'active' : ''} onClick={() => onSelect(key)}>
-              <Icon size={19} /><span>{label}</span>
+            <button key={key} type="button" aria-label={label} aria-current={active === key ? 'page' : undefined}
+              className={active === key ? 'active' : ''} onClick={() => onSelect(key)}>
+              <Icon size={19} aria-hidden="true" /><span>{label}</span>
             </button>)}
         </div>)}
       </nav>

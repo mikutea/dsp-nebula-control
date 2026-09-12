@@ -492,6 +492,8 @@ export const jobKinds = [
   'game.start', 'game.save', 'game.stop', 'game.restart',
   'save.backup', 'save.restore',
   'player.notice.preview', 'player.notice',
+  'component.rollback', 'component.rollback.recovery',
+  'component.cleanup', 'component.cleanup.recovery', 'component.cleanup.restore',
   'audit.export'
 ] as const
 export type JobKind = (typeof jobKinds)[number]

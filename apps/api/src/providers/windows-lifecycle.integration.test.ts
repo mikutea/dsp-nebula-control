@@ -145,7 +145,7 @@ async function createFixture(): Promise<Fixture> {
   ])
   const now = Date.now()
   const heartbeat = buildBridgeHeartbeat({
-    pluginVersion: '0.1.0-rc.26', processId: 4242,
+    pluginVersion: '0.1.0-rc.27', processId: 4242,
     startedAtUnixMs: now - 60_000, writtenAtUnixMs: now
   }, secret)
   await writeFile(path.join(controlRoot, 'heartbeat'), heartbeat.payload, 'utf8')

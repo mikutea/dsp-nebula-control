@@ -117,21 +117,40 @@ try {
     if ([string]$expectedExit.value.state -cne 'completed') {
         throw 'managed game exited without a completed stop intent'
     }
+    $finalSaveProof = $null
+    try {
+        . (Join-Path $PSScriptRoot 'DysonStoppedSaveCapture.ps1')
+        $finalPair = Get-DysonStoppedSavePair -ProjectRoot $project.projectRoot
+        $finalSaveProof = [ordered]@{
+            protocol = 'DYSON_CONTROL_STOPPED_SAVE_PROOF_V1'
+            stopIntentSha256 = [string]$expectedExit.sha256
+            capturedAt = [System.DateTimeOffset]::UtcNow.ToString('o')
+            saveName = $finalPair.saveName
+            dsvBytes = $finalPair.dsvBytes
+            dsvSha256 = $finalPair.dsvSha256
+            serverBytes = $finalPair.serverBytes
+            serverSha256 = $finalPair.serverSha256
+        }
+    }
+    catch {
+        # Evidence failure must not restart an intentionally stopped game.
+        # The receipt remains auditable but cannot authorize an update baseline.
+        $finalSaveProof = $null
+    }
     [void](Remove-DysonGameBootstrapExpectedExit -Context $context `
         -BindingId $bindingId -RequireCompleted)
     $releaseCompleted = $true
 
     $errorCode = 'BOOTSTRAP_BINDING_FINALIZE_FAILED'
     Remove-DysonGameBootstrapBinding -Context $context -BindingId $bindingId
-    $stateLease.Dispose()
-    $stateLease = $null
     $receiptSha256 = $null
     $receiptErrorCode = $null
     try {
         $runtimeReceipt = Write-DysonGameBootstrapRuntimeReceipt -Context $context `
             -AttemptId $attemptId -BindingId $bindingId -Version $version -Outcome 'clean-exit' `
             -ErrorCode $null -RestartExpected $false -StartedAt $startedAt -PublishedAt $publishedAt `
-            -CompletedAt ([System.DateTimeOffset]::UtcNow.ToString('o')) -ProjectRootSha256 ([string]$project.sha256)
+            -CompletedAt ([System.DateTimeOffset]::UtcNow.ToString('o')) -ProjectRootSha256 ([string]$project.sha256) `
+            -FinalSaveProof $finalSaveProof
         $receiptSha256 = [string]$runtimeReceipt.receiptSha256
     }
     catch {
@@ -143,6 +162,8 @@ try {
         }
         else { 'BOOTSTRAP_RUNTIME_RECEIPT_WRITE_FAILED' }
     }
+    $stateLease.Dispose()
+    $stateLease = $null
     [ordered]@{
         protocol = $protocol
         operation = 'start'

@@ -38,6 +38,7 @@ describe('public release hygiene gate', () => {
       ['SECRET_LITERAL_ASSIGNMENT', 'scripts/public-release/scanner.mjs'],
       ['UNC_PATH', 'scripts/public-release/scanner.mjs'],
       ['UNC_PATH', 'apps/api/src/providers/windows-update-runtime-evidence.test.ts'],
+      ['UNC_PATH', 'scripts/windows/bootstrap/DysonStoppedSaveCapture.ps1'],
       ['SECRET_LITERAL_ASSIGNMENT', 'scripts/public-release/scanner.test.mjs'],
       ['UNC_PATH', 'scripts/windows/configuration/DysonConfiguration.Common.ps1'],
       ['UNC_PATH', 'scripts/windows/deployment/DysonDeployment.Common.ps1'],

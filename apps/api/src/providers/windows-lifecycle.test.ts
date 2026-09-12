@@ -235,7 +235,7 @@ describe('Windows lifecycle adapter', () => {
 })
 
 class FakeBridgeClient implements LifecycleBridgeClient {
-  pluginVersion = '0.1.0-rc.26'
+  pluginVersion = '0.1.0-rc.27'
   probeFailure = false
   probeCalls = 0
   failedSaveCode: string | null = null
@@ -489,8 +489,9 @@ describe('lifecycle verification transitions', () => {
     const context = operationContext(expected === 'running' ? 'start' : 'graceful-stop')
     await (expected === 'running' ? adapter.verifyRunning(context) : adapter.verifyStopped(context))
     expect(verify).toHaveBeenCalledTimes(2)
-    expect(verify.mock.calls[0]![0].outerRequestId).toBe(requestId)
-    expect(verify.mock.calls[1]![0].outerRequestId).not.toBe(requestId)
+    const observationIds = verify.mock.calls.map(([input]) => input.outerRequestId)
+    expect(observationIds.every(id => id !== requestId)).toBe(true)
+    expect(new Set(observationIds).size).toBe(2)
     expect(broker.dispatches).toHaveLength(0)
   })
 

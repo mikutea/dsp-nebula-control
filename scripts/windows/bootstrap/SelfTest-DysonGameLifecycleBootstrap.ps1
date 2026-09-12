@@ -671,10 +671,12 @@ function Get-BootstrapSelfTestRuntimeReceipt {
     $path = Join-Path $runtimeReceiptRoot ($AttemptId + '.json')
     $record = Read-DysonGameBootstrapJsonFile -Path $path -MaximumBytes 8192
     $value = $record.value
-    Assert-DysonGameBootstrapExactProperties -Value $value -Names @(
+    $expectedNames = @(
         'protocol', 'schemaVersion', 'attemptId', 'bindingId', 'version', 'outcome', 'errorCode',
         'restartExpected', 'startedAt', 'publishedAt', 'completedAt', 'projectRootSha256', 'dataRootIdentity'
     )
+    if ($null -ne $value.PSObject.Properties['finalSaveProof']) { $expectedNames += 'finalSaveProof' }
+    Assert-DysonGameBootstrapExactProperties -Value $value -Names $expectedNames
     return [pscustomobject][ordered]@{ value = $value; sha256 = [string]$record.sha256; path = $path }
 }
 
@@ -927,6 +929,10 @@ try {
     [System.IO.Directory]::CreateDirectory($poisonProgramData) | Out-Null
     [System.IO.Directory]::CreateDirectory($serverRoot) | Out-Null
     [System.IO.Directory]::CreateDirectory($runRoot) | Out-Null
+    $fixtureSaveRoot = Join-Path $projectRoot 'userdata\Save'
+    [void][System.IO.Directory]::CreateDirectory($fixtureSaveRoot)
+    [IO.File]::WriteAllText((Join-Path $fixtureSaveRoot '_lastexit_.dsv'), 'fictional final dsv')
+    [IO.File]::WriteAllText((Join-Path $fixtureSaveRoot '_lastexit_.server'), 'fictional final server')
     $eventProbeStream = $null
     try {
         $eventProbeStream = [System.IO.FileStream]::new(
@@ -970,6 +976,7 @@ try {
     finally { [IO.File]::Delete($bindingPath) }
     foreach ($name in @(
         'DysonGameLifecycleBootstrap.Common.ps1',
+        'DysonStoppedSaveCapture.ps1',
         'Resolve-DysonGameLifecycleRelease.ps1',
         'Start-DysonServer.ps1',
         'Stop-DysonServer.ps1'
@@ -1638,6 +1645,12 @@ public static class DysonBootstrapFixtureNativeAcl {
         $null -eq $postCrashReceipt.value.errorCode -and
         [string]$postCrashReceipt.sha256 -ceq [string]$postCrashRestartB.receiptSha256
     ) -Message 'the recovered clean-exit receipt is invalid'
+    Assert-BootstrapSelfTest -Condition (
+        $null -ne $postCrashReceipt.value.PSObject.Properties['finalSaveProof'] -and
+        [string]$postCrashReceipt.value.finalSaveProof.protocol -ceq 'DYSON_CONTROL_STOPPED_SAVE_PROOF_V1' -and
+        [string]$postCrashReceipt.value.finalSaveProof.dsvSha256 -ceq (Get-DysonGameBootstrapFileSha256 (Join-Path $fixtureSaveRoot '_lastexit_.dsv')) -and
+        [string]$postCrashReceipt.value.finalSaveProof.serverSha256 -ceq (Get-DysonGameBootstrapFileSha256 (Join-Path $fixtureSaveRoot '_lastexit_.server'))
+    ) -Message 'clean stop did not bind the final paired save'
     Assert-BootstrapSelfTest -Condition (-not [System.IO.File]::Exists($expectedExitPath)) `
         -Message 'a verified graceful stop left its completed expected-exit intent unconsumed'
 

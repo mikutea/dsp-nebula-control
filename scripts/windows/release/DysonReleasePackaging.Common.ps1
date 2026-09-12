@@ -237,6 +237,7 @@ if ($script:DysonArtifactRequiredHostMutationLeaseScripts.Count -ne 3 -or
     throw 'The bounded host-mutation runtime selection package is inconsistent.'
 }
 $script:DysonArtifactRequiredGameBootstrapScripts = @(
+    'scripts/windows/bootstrap/DysonStoppedSaveCapture.ps1',
     'scripts/windows/bootstrap/DysonGameLifecycleBootstrap.Common.ps1',
     'scripts/windows/bootstrap/Resolve-DysonGameLifecycleRelease.ps1',
     'scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1',

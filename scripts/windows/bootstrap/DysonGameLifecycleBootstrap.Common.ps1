@@ -424,7 +424,8 @@ function Write-DysonGameBootstrapRuntimeReceipt {
         [Parameter(Mandatory)][string]$StartedAt,
         [AllowNull()][string]$PublishedAt,
         [Parameter(Mandatory)][string]$CompletedAt,
-        [AllowNull()][string]$ProjectRootSha256
+        [AllowNull()][string]$ProjectRootSha256,
+        [AllowNull()]$FinalSaveProof
     )
 
     # Windows PowerShell 5.1 coerces an explicitly bound `$null` string
@@ -467,6 +468,31 @@ function Write-DysonGameBootstrapRuntimeReceipt {
         completedAt = $CompletedAt
         projectRootSha256 = $normalizedProjectRootSha256
         dataRootIdentity = $dataRootIdentity
+    }
+    if ($null -ne $FinalSaveProof) {
+        $proofKeys = @('protocol', 'stopIntentSha256', 'capturedAt', 'saveName', 'dsvBytes', 'dsvSha256', 'serverBytes', 'serverSha256')
+        $actualKeys = if ($FinalSaveProof -is [System.Collections.IDictionary]) { @($FinalSaveProof.Keys) }
+            else { @($FinalSaveProof.PSObject.Properties.Name) }
+        if (($actualKeys -join ',') -cne ($proofKeys -join ',') -or $Outcome -cne 'clean-exit' -or
+            $null -eq $normalizedBindingId -or $null -eq $normalizedPublishedAt -or
+            [string]$FinalSaveProof.protocol -cne 'DYSON_CONTROL_STOPPED_SAVE_PROOF_V1' -or
+            [string]$FinalSaveProof.saveName -cne '_lastexit_') { throw 'BOOTSTRAP_FINAL_SAVE_PROOF_INVALID' }
+        foreach ($field in @('stopIntentSha256', 'dsvSha256', 'serverSha256')) {
+            Assert-DysonGameBootstrapHash -Value ([string]$FinalSaveProof.$field)
+        }
+        Assert-DysonGameBootstrapTimestamp -Value ([string]$FinalSaveProof.capturedAt)
+        $captured = [datetimeoffset]::Parse([string]$FinalSaveProof.capturedAt)
+        if ($captured -lt [datetimeoffset]::Parse($normalizedPublishedAt) -or
+            $captured -gt [datetimeoffset]::Parse($CompletedAt)) { throw 'BOOTSTRAP_FINAL_SAVE_PROOF_INVALID' }
+        foreach ($field in @('dsvBytes', 'serverBytes')) {
+            if ($FinalSaveProof.$field -isnot [long] -and $FinalSaveProof.$field -isnot [int]) {
+                throw 'BOOTSTRAP_FINAL_SAVE_PROOF_INVALID'
+            }
+            if ($FinalSaveProof.$field -lt 1 -or $FinalSaveProof.$field -gt 9007199254740991) {
+                throw 'BOOTSTRAP_FINAL_SAVE_PROOF_INVALID'
+            }
+        }
+        $receipt.finalSaveProof = $FinalSaveProof
     }
     $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes(
         ($receipt | Microsoft.PowerShell.Utility\ConvertTo-Json -Depth 6 -Compress)

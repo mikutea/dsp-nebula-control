@@ -1,3 +1,8 @@
+import { RecoverableCleanupCoordinator } from './recoverable-cleanup-coordinator.js'
+import { parseCleanupJournal, type CleanupJournal } from './recoverable-cleanup-records.js'
+import type { CleanupJournalStore } from './recoverable-cleanup-execution.js'
+import { createRecoverableCleanupPlan } from './recoverable-cleanup-plan.js'
+import { FileCleanupMovePorts } from './recoverable-cleanup-files.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { constants } from 'node:fs'
@@ -20,6 +25,8 @@ import type { FileHandle } from 'node:fs/promises'
 import { hostname, uptime } from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
+import { FileOperatorRollbackStore } from './operator-rollback-store.js'
+import { OperatorRollbackCoordinator, type OperatorRollbackJournal } from './operator-rollback.js'
 import { HostMutationLeaseError } from '../host-mutation/lease.js'
 import {
   HostMutationOperationCoordinatorError,
@@ -74,6 +81,10 @@ const releaseIdSchema = z.string().regex(/^(?:nebula|bepinex|bridge|control)-[0-
 const isoDateSchema = z.string().datetime({ offset: true })
 const backupIdSchema = z.string().min(8).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/)
 const requestIdSchema = z.string().uuid()
+
+export const componentUpdateRollbackRequestSchema = z.strictObject({
+  requestId: z.string().uuid(), sourceRequestId: z.string().uuid(), expectedRevision: sha256Schema
+})
 
 export const componentUpdateActivationRequestSchema = z.strictObject({
   requestId: requestIdSchema,
@@ -407,12 +418,15 @@ export class ComponentUpdateActivationService {
   readonly #restoreRollbackServerModLock: NonNullable<ComponentUpdateActivationOptions['restoreRollbackServerModLock']> | null
   readonly #restoreRollbackPairedSave: NonNullable<ComponentUpdateActivationOptions['restoreRollbackPairedSave']> | null
   readonly #inspectRollbackReadback: NonNullable<ComponentUpdateActivationOptions['inspectRollbackReadback']> | null
+  readonly #inspectRollbackMaterial: ComponentUpdateActivationOptions['inspectRollbackMaterial']
   readonly #smoke: ComponentUpdateActivationOptions['smoke']
   readonly #compatibilityVerifier: ComponentUpdateActivationOptions['compatibilityVerifier']
   readonly #hostMutationCoordinator: HostMutationOperationCoordinator | null
   readonly #hostMutationRecoveryCoordinator: HostMutationRecoveryOperationCoordinator | null
   readonly #liveDeployment: FixedLiveComponentDeployment
   #activeHostMutationContext: ActivationHostMutationContext | null = null
+  readonly #hasPendingCleanup: () => Promise<boolean>
+  readonly #operatorRollbackStore: FileOperatorRollbackStore
   #tail: Promise<void> = Promise.resolve()
 
   constructor(options: ComponentUpdateActivationOptions) {
@@ -425,6 +439,8 @@ export class ComponentUpdateActivationService {
       throw new ComponentUpdateActivationError('UPDATE_ROOT_COLLISION')
     }
     this.#controlRoot = path.join(this.#projectRoot, '.dyson-control-updates')
+    this.#hasPendingCleanup = options.hasPendingCleanup ?? (async () => false)
+    this.#operatorRollbackStore = new FileOperatorRollbackStore(path.join(this.#controlRoot, 'operator-rollbacks'))
     this.#limits = {
       maximumArchiveBytes: options.maximumArchiveBytes ?? 512 * 1_024 * 1_024,
       maximumFileBytes: options.maximumFileBytes ?? 256 * 1_024 * 1_024,
@@ -448,6 +464,7 @@ export class ComponentUpdateActivationService {
     this.#restoreRollbackServerModLock = options.restoreRollbackServerModLock ?? null
     this.#restoreRollbackPairedSave = options.restoreRollbackPairedSave ?? null
     this.#inspectRollbackReadback = options.inspectRollbackReadback ?? null
+    this.#inspectRollbackMaterial = options.inspectRollbackMaterial
     this.#smoke = options.smoke
     if (typeof options.compatibilityVerifier?.assertCurrent !== 'function') {
       throw new ComponentUpdateActivationError('UPDATE_COMPATIBILITY_VERIFIER_INVALID')
@@ -471,6 +488,7 @@ export class ComponentUpdateActivationService {
   }
 
   async preview(input: unknown): Promise<ComponentUpdateActivationPlan> {
+    await this.#assertOperatorRollbackIdle()
     const request = normalizeActivationRequest(input)
     await this.#assertRoots(false)
     const state = await this.#loadState(false)
@@ -491,7 +509,202 @@ export class ComponentUpdateActivationService {
     return createActivationPlan(request, state, decision, inspected.summary.fileCount, inspected.summary.expandedBytes)
   }
 
+  async previewRollback(input: unknown): Promise<{
+    format: 'dyson-control-component-rollback-plan'; schemaVersion: 1; dryRun: true;
+    requestId: string; sourceRequestId: string; expectedRevision: string;
+    component: ManagedUpdateComponent; targetVersion: string; materialSha256: string;
+    rollbackBindingSha256: string; sourceProtectionBackupId: string;
+    restoreFileCount: number; removeFileCount: number; planSha256: string
+    currentConfigurationRevision: string
+  }> {
+    await this.#assertCleanupIdle()
+    const request = componentUpdateRollbackRequestSchema.parse(input)
+    request.requestId = request.requestId.toLowerCase()
+    request.sourceRequestId = request.sourceRequestId.toLowerCase()
+    if (request.requestId === request.sourceRequestId) throw new ComponentUpdateActivationError('UPDATE_IDEMPOTENCY_CONFLICT')
+    await this.#assertRoots(false)
+    const state = await this.#loadState(false)
+    if (state.recoveryRequired) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_REQUIRED')
+    if (state.revision !== request.expectedRevision) throw new ComponentUpdateActivationError('UPDATE_REVISION_CONFLICT')
+    const source = await this.#readReceipt(request.sourceRequestId)
+    const transaction = state.lastTransaction
+    if (!source || source.receipt.status !== 'succeeded' || source.receipt.recoveryRequired ||
+        !transaction || transaction.requestId !== request.sourceRequestId ||
+        transaction.requestFingerprint !== source.requestFingerprint ||
+        source.receipt.resultingRevision !== state.revision) {
+      throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_SOURCE_NOT_CURRENT')
+    }
+    const binding = requireRollbackBinding(transaction)
+    if (source.receipt.rollbackBindingSha256 !== binding.bindingSha256) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+    }
+    if (!this.#inspectRollbackMaterial) throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CAPABILITY_UNAVAILABLE')
+    const environment = z.strictObject({ configurationSnapshotVerified: z.literal(true), protectionVerified: z.literal(true),
+      serverModLockVerified: z.literal(true), currentConfigurationRevision: sha256Schema }).parse(
+      await this.#inspectRollbackMaterial({ requestId: request.sourceRequestId, component: transaction.component, binding }))
+    const previous = await this.#loadHistory(request.sourceRequestId)
+    if (previous.revision !== transaction.previousRevision) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+    const version = previousRollbackVersion(transaction, previous.components.find(entry => entry.component === transaction.component))
+    if (version === null) throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_VERSION_UNAVAILABLE')
+    const material = await this.#liveDeployment.inspectCommittedRollback(transactionToLiveRequest(transaction),
+      { assertActive: () => undefined })
+    if (canonicalJson(await this.#loadState(false)) !== canonicalJson(state)) throw new ComponentUpdateActivationError('UPDATE_REVISION_CONFLICT')
+    const plan = { format: 'dyson-control-component-rollback-plan' as const, schemaVersion: 1 as const,
+      dryRun: true as const, ...request, component: transaction.component, targetVersion: version,
+      materialSha256: material.materialSha256, rollbackBindingSha256: binding.bindingSha256,
+      sourceProtectionBackupId: transaction.protectionBackupId,
+      currentConfigurationRevision: environment.currentConfigurationRevision,
+      restoreFileCount: material.restoreFileCount, removeFileCount: material.removeFileCount }
+    return { ...plan, planSha256: createHash('sha256').update(canonicalJson(plan)).digest('hex') }
+  }
+
+  executeRollback(input: unknown) {
+    return this.#serialize(async () => { await this.#assertCleanupIdle(); return this.#operatorCoordinator().execute(input) })
+  }
+  async getRollbackReceipt(requestId: string) {
+    const record = await this.#operatorRollbackStore.load(z.string().uuid().parse(requestId).toLowerCase())
+    return record?.receipt ?? null
+  }
+  async getRollbackPending() {
+    const pending = await this.#operatorRollbackStore.pending()
+    const result = []
+    for (const entry of pending) {
+      const record = await this.#operatorRollbackStore.load(entry.requestId)
+      if (record && !record.receipt) result.push({ request: record.journal.request, phase: record.journal.phase })
+    }
+    return result
+  }
+
+  recoverRollback(input: unknown) {
+    return this.#serialize(async () => { await this.#assertCleanupIdle(); return this.#operatorCoordinator().recover(input) })
+  }
+
+  #operatorCoordinator(): OperatorRollbackCoordinator {
+    if (!this.#hostMutationCoordinator || !this.#hostMutationRecoveryCoordinator) {
+      throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE')
+    }
+    return new OperatorRollbackCoordinator({ store: this.#operatorRollbackStore,
+      coordinator: this.#hostMutationCoordinator, recovery: this.#hostMutationRecoveryCoordinator,
+      ports: {
+        preview: request => this.previewRollback(request),
+        validateResume: async (journal, scope) => {
+          scope.assertActive()
+          const pending = await this.#operatorRollbackStore.pending()
+          if (pending.length !== 1 || pending[0]!.requestId !== journal.request.requestId) {
+            throw new ComponentUpdateActivationError('UPDATE_OPERATOR_ROLLBACK_RECOVERY_REQUIRED')
+          }
+          const { transaction } = await this.#operatorSource(journal)
+          if (!this.#inspectRollbackMaterial) throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CAPABILITY_UNAVAILABLE')
+          const material = await this.#inspectRollbackMaterial({ requestId: journal.request.requestId,
+            component: transaction.component, binding: requireRollbackBinding(transaction) })
+          const allowedRevisions = [journal.plan.currentConfigurationRevision, requireRollbackBinding(transaction).configurationRevision]
+          if (!material.configurationSnapshotVerified || !material.protectionVerified || !material.serverModLockVerified ||
+              !allowedRevisions.includes(material.currentConfigurationRevision)) {
+            throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CONFIGURATION_CHANGED')
+          }
+          if (journal.phase !== 'prepared' && journal.phase !== 'protected') {
+            await this.#liveDeployment.verifyCommittedRollback({ requestId: journal.request.requestId,
+              source: transactionToLiveRequest(transaction), materialSha256: journal.plan.materialSha256 }, scope)
+          }
+          scope.assertActive()
+        },
+        protectCurrent: async (journal, scope) => {
+          const { transaction } = await this.#operatorSource(journal)
+          scope.assertActive()
+          const stopped = stoppedProofSchema.parse(await this.#verifyStoppedState({ requestId: journal.request.requestId,
+            component: transaction.component, phase: 'before-protection' }, scope))
+          if (!stopped.processStopped || !stopped.portClosed) throw new ComponentUpdateActivationError('UPDATE_SERVICE_STILL_RUNNING')
+          if (!this.#captureRollbackBaseline) throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CAPABILITY_UNAVAILABLE')
+          const request = { requestId: journal.request.requestId, component: transaction.component,
+            targetVersion: journal.plan.targetVersion, expectedRevision: journal.request.expectedRevision }
+          const baseline = rollbackBaselineSchema.parse(await this.#captureRollbackBaseline(request, scope))
+          scope.assertActive()
+          if (baseline.configurationRevision !== journal.plan.currentConfigurationRevision) {
+            throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CONFIGURATION_CHANGED')
+          }
+          const protection = saveProtectionReceiptSchema.parse(await this.#createSaveProtectionPoint({
+            ...request, purpose: 'component-update' }, scope))
+          scope.assertActive()
+          if (protection.requestId !== request.requestId || protection.saveIdentity !== baseline.previousLoadedSaveIdentity) {
+            throw new ComponentUpdateActivationError('UPDATE_SAVE_PROTECTION_IDENTITY_MISMATCH')
+          }
+          return createRollbackBinding(baseline, protection)
+        },
+        restoreFiles: async (journal, scope) => {
+          const { transaction } = await this.#operatorSource(journal)
+          const receipt = await this.#liveDeployment.rollbackCommitted({ requestId: journal.request.requestId,
+            source: transactionToLiveRequest(transaction), materialSha256: journal.plan.materialSha256 }, scope)
+          if (receipt.status !== 'rolled-back' || receipt.requestId !== journal.request.requestId) {
+            throw new ComponentUpdateActivationError('UPDATE_LIVE_ROLLBACK_FAILED')
+          }
+        },
+        restoreEnvironment: async (journal, scope) => {
+          const { transaction } = await this.#operatorSource(journal)
+          const binding = requireRollbackBinding(transaction)
+          const request = { requestId: journal.request.requestId, component: transaction.component, binding }
+          for (const restore of [this.#restoreRollbackConfiguration, this.#restoreRollbackServerModLock, this.#restoreRollbackPairedSave]) {
+            if (!restore) throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CAPABILITY_UNAVAILABLE')
+            scope.assertActive()
+            const result = rollbackStepReceiptSchema.parse(await restore(request, scope))
+            if (!result.restored || !result.rereadVerified) throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_READBACK_FAILED')
+          }
+          if (!this.#inspectRollbackReadback) throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_CAPABILITY_UNAVAILABLE')
+          const readback = rollbackReadbackSchema.parse(await this.#inspectRollbackReadback(request, scope))
+          if (!rollbackReadbackMatches(binding, readback)) throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_READBACK_MISMATCH')
+          scope.assertActive()
+        },
+        verify: async (journal, scope) => {
+          const { transaction, previous } = await this.#operatorSource(journal)
+          const binding = requireRollbackBinding(transaction)
+          scope.assertActive()
+          const result = smokeResultSchema.parse(await this.#smoke({ requestId: journal.request.requestId,
+            component: transaction.component, phase: 'rollback', expectedVersion: journal.plan.targetVersion,
+            expectedReleaseId: previous.components.find(entry => entry.component === transaction.component)?.releaseId ?? null,
+            expectedLoadedSaveIdentity: binding.previousLoadedSaveIdentity }, scope))
+          scope.assertActive()
+          if (!smokeIsHealthy(result, transaction.component, journal.plan.targetVersion, binding.previousLoadedSaveIdentity)) {
+            throw new ComponentUpdateActivationError('UPDATE_ROLLBACK_SMOKE_FAILED')
+          }
+        },
+        commitState: async (journal, scope) => {
+          const { previous, current, transaction } = await this.#operatorSource(journal)
+          await this.#liveDeployment.verifyCommittedRollback({ requestId: journal.request.requestId,
+            source: transactionToLiveRequest(transaction), materialSha256: journal.plan.materialSha256 }, scope)
+          if (canonicalJson(current) !== canonicalJson(previous)) await this.#writeActiveState(previous, { scope })
+          return previous.revision
+        }
+      }
+    })
+  }
+
+  async #operatorSource(journal: OperatorRollbackJournal) {
+    await this.#assertRoots(true)
+    const raw = await readJsonIfPresent(managedChild(this.#controlRoot, 'transactions', `${journal.request.sourceRequestId}.json`))
+    const transaction = journalSchema.parse(raw).transaction
+    const source = await this.#readReceipt(journal.request.sourceRequestId)
+    const binding = requireRollbackBinding(transaction)
+    if (source) assertReceiptBoundToTransaction(source, transaction)
+    if (!source || source.receipt.status !== 'succeeded' || transaction.requestId !== journal.request.sourceRequestId ||
+        transaction.requestFingerprint !== source.requestFingerprint || binding.bindingSha256 !== journal.plan.rollbackBindingSha256 ||
+        transaction.protectionBackupId !== journal.plan.sourceProtectionBackupId ||
+        source.receipt.resultingRevision !== journal.request.expectedRevision) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+    }
+    const previous = await this.#loadHistory(transaction.requestId)
+    if (previous.revision !== transaction.previousRevision || previousRollbackVersion(transaction,
+      previous.components.find(entry => entry.component === transaction.component)) !== journal.plan.targetVersion) {
+      throw new ComponentUpdateActivationError('UPDATE_RECOVERY_EVIDENCE_INVALID')
+    }
+    const current = await this.#loadState(true)
+    const committed = (journal.phase === 'verified' || journal.phase === 'state-committed') && canonicalJson(current) === canonicalJson(previous)
+    if (current.recoveryRequired || (!committed && current.revision !== journal.request.expectedRevision)) {
+      throw new ComponentUpdateActivationError('UPDATE_REVISION_CONFLICT')
+    }
+    return { transaction, previous, current }
+  }
+
   async execute(input: unknown): Promise<ComponentUpdateActivationReceipt> {
+    await this.#assertOperatorRollbackIdle()
     const request = normalizeActivationRequest(input)
     return await this.#serialize(async () => {
       await this.#initialize()
@@ -634,6 +847,7 @@ export class ComponentUpdateActivationService {
   }
 
   async reconcile(): Promise<ComponentUpdateActivationReceipt | null> {
+    await this.#assertOperatorRollbackIdle()
     return await this.#serialize(async () => {
       await this.#initialize()
       return await this.#withCrossInstanceLock(async () => await this.#runHostMutation(
@@ -649,6 +863,7 @@ export class ComponentUpdateActivationService {
    * this service and low-level lease bindings never cross the domain boundary.
    */
   async recoverInterrupted(requestIdInput: unknown): Promise<ComponentUpdateActivationReceipt> {
+    await this.#assertOperatorRollbackIdle()
     const requestId = requestIdSchema.parse(requestIdInput)
     return await this.#serialize(async () => {
       await this.#initialize()
@@ -659,6 +874,7 @@ export class ComponentUpdateActivationService {
       try {
         return await this.#runRecoveryHostMutation(requestId, async (context) => {
           return await this.#withCrossInstanceLock(async () => {
+            await this.#assertOperatorRollbackIdle()
             await this.#convergeRecoveryTemporaryEvidence(requestId, context)
             // Re-read after the broker has consumed the exact recovery binding.
             // Recovery temporary evidence is converged only while both the
@@ -713,20 +929,102 @@ export class ComponentUpdateActivationService {
     const historyEntries = await this.#countHistory(false)
     return {
       revision: state.revision,
-      recoveryRequired: state.recoveryRequired,
+      recoveryRequired: state.recoveryRequired || (await this.#operatorRollbackStore.pending()).length > 0 || await this.#hasPendingCleanup(),
       components: state.components.map(toActiveSummary),
       historyEntries
     }
   }
 
-  async previewCleanup(): Promise<ComponentUpdateCleanupPlan> {
+  async #assertCleanupIdle(): Promise<void> {
+    if (await this.#hasPendingCleanup()) throw new ComponentUpdateActivationError('UPDATE_CLEANUP_RECOVERY_REQUIRED')
+  }
+
+  async #assertOperatorRollbackIdle(): Promise<void> {
+    await this.#assertCleanupIdle()
+    try {
+      if ((await this.#operatorRollbackStore.pending()).length > 0) {
+        throw new ComponentUpdateActivationError('UPDATE_OPERATOR_ROLLBACK_RECOVERY_REQUIRED')
+      }
+    } catch (error) {
+      if (error instanceof ComponentUpdateActivationError) throw error
+      throw new ComponentUpdateActivationError('UPDATE_OPERATOR_ROLLBACK_RECOVERY_REQUIRED', { cause: error })
+    }
+  }
+
+  /** Internal assembly entry: journal identity/audit fields must be server-derived. */
+  runRecoverableCleanup(input: unknown, store: CleanupJournalStore & { listCleanupJournals(): CleanupJournal[] }, recovery = false) {
+    return this.#serialize(async () => {
+      const journal = parseCleanupJournal(input)
+      if (!this.#hostMutationCoordinator || !this.#hostMutationRecoveryCoordinator) throw new ComponentUpdateActivationError('UPDATE_HOST_LEASE_UNAVAILABLE')
+      const coordinator = new RecoverableCleanupCoordinator({ store,
+        coordinator: this.#hostMutationCoordinator, recovery: this.#hostMutationRecoveryCoordinator,
+        files: new FileCleanupMovePorts(this.#controlRoot, journal.plan.requestId),
+        withActivationLock: async (scope, work) => {
+          scope.assertActive()
+          await this.#initialize()
+          scope.assertActive()
+          return this.#withCrossInstanceLock(work)
+        },
+        validateEligibility: async (current, scope) => {
+          scope.assertActive()
+          const pending = store.listCleanupJournals().filter(entry => entry.state !== 'completed')
+          if (pending.some(entry => entry.requestId !== current.requestId) || (await this.#operatorRollbackStore.pending()).length > 0) throw new ComponentUpdateActivationError('UPDATE_CLEANUP_RECOVERY_REQUIRED')
+          const state = await this.#loadState(false)
+          if (state.recoveryRequired) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_REQUIRED')
+          if (current.direction === 'restore') {
+            const original = await store.loadCleanupJournal(current.plan.requestId)
+            if (!original || original.direction !== 'quarantine' || original.state !== 'completed' || original.plan.planSha256 !== current.plan.planSha256) throw new ComponentUpdateActivationError('UPDATE_CLEANUP_RESTORE_UNPROVEN')
+          } else {
+            if (state.revision !== current.plan.expectedRevision) throw new ComponentUpdateActivationError('UPDATE_REVISION_CONFLICT')
+            const stored = await store.loadCleanupJournal(current.requestId)
+            if (!stored) {
+              if ((await this.previewRecoverableCleanup(current.requestId)).planSha256 !== current.plan.planSha256) throw new ComponentUpdateActivationError('UPDATE_CLEANUP_PLAN_CHANGED')
+            }
+            const references = new Set(state.components.map(component => component.releaseId))
+            for (const entry of await this.#readHistoryEntries(false)) for (const component of entry.state.components) references.add(component.releaseId)
+            for (const candidate of current.plan.candidates) {
+              if (candidate.kind === 'history' ? candidate.opaqueId === state.lastTransaction?.requestId : references.has(candidate.opaqueId)) throw new ComponentUpdateActivationError('UPDATE_CLEANUP_SOURCE_REFERENCED')
+            }
+          }
+          scope.assertActive()
+        }
+      })
+      return recovery ? coordinator.recover(journal) : coordinator.execute(journal)
+    })
+  }
+
+  async previewRecoverableCleanup(requestIdInput: unknown) {
+    const requestId = requestIdSchema.parse(requestIdInput).toLowerCase()
     await this.#assertRoots(false)
     const state = await this.#loadState(false)
+    const preview = await this.previewCleanup()
+    if (preview.candidates.length === 0) throw new ComponentUpdateActivationError('UPDATE_CLEANUP_NOTHING_ELIGIBLE')
+    const files = new FileCleanupMovePorts(this.#controlRoot, requestId)
+    const candidates = []
+    for (const candidate of preview.candidates) {
+      const evidence = await files.inspect({ kind: candidate.kind, opaqueId: candidate.opaqueId,
+        sha256: '0'.repeat(64), sizeBytes: 0 }, 'source')
+      if (!evidence) throw new ComponentUpdateActivationError('UPDATE_CLEANUP_SOURCE_CHANGED')
+      candidates.push({ kind: candidate.kind, opaqueId: candidate.opaqueId, ...evidence })
+    }
+    if (canonicalJson(await this.#loadState(false)) !== canonicalJson(state) ||
+        canonicalJson(await this.previewCleanup()) !== canonicalJson(preview)) {
+      throw new ComponentUpdateActivationError('UPDATE_CLEANUP_PLAN_CHANGED')
+    }
+    return createRecoverableCleanupPlan({ format: 'dyson-recoverable-component-cleanup-plan', schemaVersion: 1,
+      requestId, expectedRevision: state.revision, candidates })
+  }
+
+  async previewCleanup(): Promise<ComponentUpdateCleanupPlan> {
+    await this.#assertOperatorRollbackIdle()
+    await this.#assertRoots(false)
+    const state = await this.#loadState(false)
+    if (state.recoveryRequired) throw new ComponentUpdateActivationError('UPDATE_RECOVERY_REQUIRED')
     const candidates: ComponentUpdateCleanupCandidate[] = []
     const history = await this.#readHistoryEntries(false)
     if (history.length >= this.#maximumHistoryEntries) {
       const countToFreeOneSlot = history.length - this.#maximumHistoryEntries + 1
-      for (const entry of history.slice(0, countToFreeOneSlot)) {
+      for (const entry of history.filter(entry => entry.requestId !== state.lastTransaction?.requestId).slice(0, countToFreeOneSlot)) {
         candidates.push({ kind: 'history', opaqueId: entry.requestId, recoverable: true, reason: 'history-retention-exceeded' })
       }
     }
@@ -1893,13 +2191,13 @@ export class ComponentUpdateActivationService {
 
   async #writeActiveState(
     state: StoredActiveState,
-    context: ActivationHostMutationContext
+    context: Pick<ActivationHostMutationContext, 'scope'> & Partial<Pick<ActivationHostMutationContext, 'markPossibleWrite'>>
   ): Promise<void> {
     validateStoredStateRevision(state)
     const activePath = managedChild(this.#controlRoot, 'active.json')
     const temporary = managedChild(this.#controlRoot, `.active-${randomUUID()}.tmp`)
     context.scope.assertActive()
-    context.markPossibleWrite()
+    context.markPossibleWrite?.()
     try {
       await writeDurableExclusive(temporary, `${canonicalJson(state)}\n`)
       context.scope.assertActive()

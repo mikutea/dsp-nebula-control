@@ -48,6 +48,17 @@ const nullableVersionSchema = z.union([z.string().regex(versionPattern), z.null(
 const nullableErrorCodeSchema = z.union([z.string().regex(errorCodePattern), z.null()])
 const nullableTimestampSchema = z.union([z.string().max(64), z.null()])
 const nullableHashSchema = z.union([z.string().regex(hashPattern), z.null()])
+export const finalSaveProofSchema = z.strictObject({
+  protocol: z.literal('DYSON_CONTROL_STOPPED_SAVE_PROOF_V1'),
+  stopIntentSha256: z.string().regex(hashPattern),
+  capturedAt: z.string().max(64),
+  saveName: z.literal('_lastexit_'),
+  dsvBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  dsvSha256: z.string().regex(hashPattern),
+  serverBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  serverSha256: z.string().regex(hashPattern)
+})
+export type FinalStoppedSaveProof = z.infer<typeof finalSaveProofSchema>
 const receiptSchema = z.strictObject({
   protocol: z.literal(GAME_RUNTIME_RECEIPT_PROTOCOL),
   schemaVersion: z.literal(1),
@@ -61,7 +72,8 @@ const receiptSchema = z.strictObject({
   publishedAt: nullableTimestampSchema,
   completedAt: z.string().max(64),
   projectRootSha256: nullableHashSchema,
-  dataRootIdentity: z.string().regex(hashPattern)
+  dataRootIdentity: z.string().regex(hashPattern),
+  finalSaveProof: finalSaveProofSchema.optional()
 })
 const cursorPayloadSchema = z.strictObject({
   v: z.literal(1),
@@ -94,6 +106,7 @@ export interface PublicGameRuntimeReceipt {
   projectRootIdentityVerified: boolean
   dataRootIdentityVerified: true
   receiptSha256: string
+  finalSaveProof?: FinalStoppedSaveProof
 }
 
 type PublicGameRuntimeReceiptCore = Omit<PublicGameRuntimeReceipt, 'receiptSha256'>
@@ -312,7 +325,8 @@ function validateReceipt(
   }
   const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
   const value = JSON.parse(text) as unknown
-  if (!isRecord(value) || !sameOrderedKeys(Object.keys(value), receiptPropertyNames)) {
+  if (!isRecord(value) || !sameOrderedKeys(Object.keys(value),
+    'finalSaveProof' in value ? [...receiptPropertyNames, 'finalSaveProof'] : receiptPropertyNames)) {
     throw new Error('invalid properties')
   }
   const parsed = receiptSchema.safeParse(value)
@@ -332,6 +346,11 @@ function validateReceipt(
     throw new Error('invalid timestamp order')
   }
   assertOutcomeConsistency(parsed.data)
+  if (parsed.data.finalSaveProof) {
+    const captured = parseTimestamp(parsed.data.finalSaveProof.capturedAt)
+    if (parsed.data.outcome !== 'clean-exit' || publishedAtTicks === null ||
+        captured < publishedAtTicks || captured > completedAtTicks) throw new Error('invalid final save binding')
+  }
 
   const canonicalPersistedReceipt: PersistedGameRuntimeReceipt = {
     protocol: parsed.data.protocol,
@@ -346,7 +365,8 @@ function validateReceipt(
     publishedAt: parsed.data.publishedAt,
     completedAt: parsed.data.completedAt,
     projectRootSha256: parsed.data.projectRootSha256,
-    dataRootIdentity: parsed.data.dataRootIdentity
+    dataRootIdentity: parsed.data.dataRootIdentity,
+    ...(parsed.data.finalSaveProof ? { finalSaveProof: parsed.data.finalSaveProof } : {})
   }
   if (JSON.stringify(canonicalPersistedReceipt) !== text) throw new Error('non-canonical receipt')
 
@@ -363,7 +383,8 @@ function validateReceipt(
     publishedAt: parsed.data.publishedAt,
     completedAt: parsed.data.completedAt,
     projectRootIdentityVerified: parsed.data.projectRootSha256 !== null,
-    dataRootIdentityVerified: true
+    dataRootIdentityVerified: true,
+    ...(parsed.data.finalSaveProof ? { finalSaveProof: parsed.data.finalSaveProof } : {})
   }
   const receipt: PublicGameRuntimeReceipt = {
     ...publicCore,

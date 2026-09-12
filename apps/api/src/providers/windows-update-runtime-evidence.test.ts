@@ -51,6 +51,19 @@ afterEach(async () => {
 })
 
 describe('WindowsUpdateRuntimeEvidenceReader', () => {
+  it('distinguishes an unpublished evidence file from corrupt evidence', async () => {
+    const f = await createFixture(observedAtUnixMs + 1_000)
+    const file = path.join(f.controlRoot, WINDOWS_UPDATE_RUNTIME_EVIDENCE_FILE)
+    await rm(file)
+    await expect(f.reader.readCurrentRuntimeEvidence()).rejects.toMatchObject({
+      code: 'WINDOWS_UPDATE_RUNTIME_EVIDENCE_NOT_READY'
+    })
+    await writeFile(file, 'not valid signed evidence')
+    await expect(f.reader.readCurrentRuntimeEvidence()).rejects.not.toMatchObject({
+      code: 'WINDOWS_UPDATE_RUNTIME_EVIDENCE_NOT_READY'
+    })
+  })
+
   it('shares the exact loaded-save HMAC vector with the C# Bridge', async () => {
     // Read the producer's public vector directly: a second handwritten fixture
     // previously drifted to a different field and signing input under the same V1.

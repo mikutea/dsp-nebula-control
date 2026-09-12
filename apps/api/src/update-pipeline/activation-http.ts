@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { normalizeVersion, type VersionComponent } from '../updates/version.js'
-import { componentUpdateActivationRequestSchema } from './activation.js'
+import { componentUpdateActivationRequestSchema, componentUpdateRollbackRequestSchema,
+  type ComponentUpdateActivationService } from './activation.js'
 import {
   ComponentUpdateActivationError,
   type ComponentUpdateActivationPlan,
@@ -51,6 +52,7 @@ const recoveryEnvelopeSchema = z.strictObject({
 const emptyInputSchema = z.strictObject({})
 
 export interface ComponentUpdateActivationHttpService {
+  previewRollback?(input: unknown): ReturnType<ComponentUpdateActivationService['previewRollback']>
   preview(input: unknown): Promise<ComponentUpdateActivationPlan>
   execute(input: unknown): Promise<ComponentUpdateActivationReceipt>
   reconcile(): Promise<ComponentUpdateActivationReceipt | null>
@@ -159,6 +161,16 @@ export class ComponentUpdateActivationHttpController {
     } catch (error) {
       return failureFrom(error)
     }
+  }
+
+  async previewRollback(input: unknown): Promise<ComponentUpdateActivationHttpResult<
+    Awaited<ReturnType<ComponentUpdateActivationService['previewRollback']>>>> {
+    try {
+      const parsed = componentUpdateRollbackRequestSchema.safeParse(input)
+      if (!parsed.success) throw new ActivationHttpFault(400, 'UPDATE_ROLLBACK_HTTP_REQUEST_INVALID')
+      if (!this.#service.previewRollback) throw new ActivationHttpFault(503, 'UPDATE_ROLLBACK_HTTP_UNAVAILABLE')
+      return success(200, await this.#service.previewRollback(parsed.data))
+    } catch (error) { return failureFrom(error) }
   }
 
   async execute(input: unknown): Promise<ComponentUpdateActivationHttpResult<ComponentUpdateActivationReceipt>> {
@@ -385,6 +397,7 @@ function safeRecoveryFailureCode(error: unknown): string {
 function recoveryFailureRequiresOperator(error: unknown, code: string): boolean {
   if (error instanceof ComponentUpdateActivationError && error.receipt?.recoveryRequired === true) return true
   return code === 'UPDATE_RECOVERY_REQUIRED' ||
+    code === 'UPDATE_OPERATOR_ROLLBACK_RECOVERY_REQUIRED' ||
     code === 'UPDATE_HOST_LEASE_DIRTY' ||
     code === 'UPDATE_HOST_LEASE_LOST' ||
     code === 'UPDATE_HOST_LEASE_RECOVERY_REQUIRED' ||
@@ -512,6 +525,9 @@ function stateProvesRecoveryTerminal(
 }
 
 const conflictCodes = new Set([
+  'UPDATE_ROLLBACK_SOURCE_NOT_CURRENT',
+  'UPDATE_LIVE_STATE_CONFLICT',
+  'UPDATE_LIVE_ROLLBACK_MATERIAL_INVALID',
   'UPDATE_PREVIOUS_COMPONENT_VERSION_MISMATCH',
   'UPDATE_ARCHIVE_CHANGED',
   'UPDATE_COMPATIBILITY_CONFLICT',
@@ -597,6 +613,7 @@ const unprocessableCodes = new Set([
 ])
 
 const unavailableCodes = new Set([
+  'UPDATE_OPERATOR_ROLLBACK_RECOVERY_REQUIRED',
   'UPDATE_ACTIVATION_FAILED',
   'UPDATE_ACTIVATION_LOCK_FAILED',
   'UPDATE_ACTIVATION_LOCK_INVALID',

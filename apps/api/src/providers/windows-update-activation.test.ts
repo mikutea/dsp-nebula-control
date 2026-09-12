@@ -33,6 +33,21 @@ const hostMutationScope: HostMutationOperationScope = {
 }
 
 describe('Windows component update activation adapters', () => {
+  it('uses explicit warning approval only for rollback without relaxing candidate health', async () => {
+    const status = healthyStatus()
+    status.versions.compatible = false
+    status.versions.warnings = ['mod-bepinex-target-mismatch']
+    const accepted = createFixture({ status, approveWarnings: true })
+    await expect(accepted.adapter.smoke(smokeRequest('bepinex', 'rollback', '5.4.22'), hostMutationScope))
+      .resolves.toMatchObject({ bepInExLoaded: true, nebulaLoaded: true, versionMatches: true })
+    const candidate = createFixture({ status, approveWarnings: true })
+    await expect(candidate.adapter.smoke(smokeRequest('bepinex', 'candidate', '5.4.22'), hostMutationScope))
+      .resolves.toMatchObject({ bepInExLoaded: false, nebulaLoaded: false })
+    const rejected = createFixture({ status })
+    await expect(rejected.adapter.smoke(smokeRequest('bepinex', 'rollback', '5.4.22'), hostMutationScope))
+      .resolves.toMatchObject({ bepInExLoaded: false, nebulaLoaded: false })
+  })
+
   it('strictly maps stopped proof and a verified save protection point', async () => {
     const fixture = createFixture()
 
@@ -64,7 +79,7 @@ describe('Windows component update activation adapters', () => {
     expect(fixture.lifecycle.contexts.every((entry) => entry.context.action === 'restart')).toBe(true)
     expect(fixture.lifecycle.contexts.every((entry) => entry.context.protectionPointId === null)).toBe(true)
     expect(fixture.lifecycle.contexts.every(
-      (entry) => entry.context.signal === hostMutationScope.signal
+      (entry) => entry.context.hostMutation === hostMutationScope && !entry.context.signal.aborted
     )).toBe(true)
   })
 
@@ -72,7 +87,7 @@ describe('Windows component update activation adapters', () => {
     const stopped = createFixture()
     stopped.lifecycle.stoppedResult = {
       summary: 'fixture stopped proof',
-      evidence: { processVerified: true, gamePortListening: true }
+      evidence: { processVerified: true, gamePortListening: true, lifecycleState: 'running_verified' }
     }
     await expect(stopped.adapter.verifyStoppedState({
       requestId, component: 'nebula', phase: 'before-publish'
@@ -377,6 +392,7 @@ describe('Windows component update activation adapters', () => {
 })
 
 interface FixtureOptions {
+  approveWarnings?: boolean
   status?: ServerStatus
   statusFailure?: boolean
   probedVersion?: string | null
@@ -434,6 +450,7 @@ function fakeTransactionProvider(
     loadedSaveIdentity: saveIdentity
   }
   return {
+    approveRollbackWarnings: async () => options.approveWarnings === true,
     captureRollbackBaseline: async () => ({
       configurationSnapshotId: readback.configurationSnapshotId,
       configurationRevision: readback.configurationRevision,
@@ -488,12 +505,12 @@ class FakeLifecycleAdapter implements LifecycleMutationAdapter {
   verifyStoppedFailures = 0
   stoppedResult: LifecyclePhaseResult = {
     summary: 'fixture stopped proof',
-    evidence: { processVerified: true, gamePortListening: false }
+    evidence: { processVerified: true, gamePortListening: false, lifecycleState: 'stopped_verified' }
   }
   protectionResult: LifecyclePhaseResult = {
     summary: 'fixture protection point',
     protectionPointId: `save:${requestId}`,
-    evidence: { dsvBytes: 1024, serverBytes: 256, manifestVerified: true, reused: false }
+    evidence: { dsvBytes: 1024, serverBytes: 256, manifestVerified: true, sourcePairVerified: true, mutationPerformed: true, reused: false }
   }
 
   constructor(events: string[]) {
@@ -520,7 +537,7 @@ class FakeLifecycleAdapter implements LifecycleMutationAdapter {
       this.stopFailures--
       throw new Error('fixture stop failure')
     }
-    return { summary: 'fixture stopped', evidence: { outcome: 'stopped', processVerified: true } }
+    return { summary: 'fixture stopped', evidence: { dispatched: true, recovered: false, taskName: 'Dyson-Nebula-Stop', readyVerified: true } }
   }
 
   async verifyStopped(context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
@@ -540,13 +557,13 @@ class FakeLifecycleAdapter implements LifecycleMutationAdapter {
       this.startFailures--
       throw new Error('fixture start failure')
     }
-    return { summary: 'fixture started', evidence: { outcome: 'started', processVerified: true } }
+    return { summary: 'fixture started', evidence: { dispatched: true, recovered: false, taskName: 'Dyson-Nebula-Server', readyVerified: true } }
   }
 
   async verifyRunning(context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {
     this.#events.push('verify-running')
     this.#record('verifyRunning', context)
-    return { summary: 'fixture running', evidence: { processVerified: true, gamePortListening: true } }
+    return { summary: 'fixture running', evidence: { processVerified: true, gamePortListening: true, lifecycleState: 'running_verified' } }
   }
 
   requestRollbackStart(_context: LifecycleOperationContext): Promise<LifecyclePhaseResult> {

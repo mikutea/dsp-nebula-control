@@ -32,6 +32,149 @@ afterEach(async () => {
 })
 
 describe('fixed live component deployment', () => {
+  it('explicitly rolls back a committed update without rewriting the original receipt', async () => {
+    const fixture = await createFixture()
+    const relative = 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll'
+    const live = path.join(fixture.liveRoot, relative)
+    await mkdir(path.dirname(live), { recursive: true })
+    await writeFile(live, 'original')
+    const source = await createImmutableRelease(fixture, 'nebula', '0.9.1', 'nebula-artifact-operator-1', [
+      [relative, Buffer.from('candidate')]
+    ])
+    const service = createService(fixture)
+    await service.publishCandidate(source, activeHostMutation)
+    await service.commitCandidate(source, activeHostMutation)
+    const originalReceiptPath = path.join(fixture.controlRoot, 'receipts', `${source.requestId}.json`)
+    const originalReceipt = await readFile(originalReceiptPath, 'utf8')
+    const inspected = await service.inspectCommittedRollback(source, activeHostMutation)
+    const request = { requestId: randomUUID(), source, materialSha256: inspected.materialSha256 }
+    await expect(service.rollbackCommitted(request, activeHostMutation)).resolves.toMatchObject({
+      requestId: request.requestId, status: 'rolled-back', rollbackOrigin: {
+        sourceRequestId: source.requestId, materialSha256: inspected.materialSha256
+      }
+    })
+    expect(await readFile(live, 'utf8')).toBe('original')
+    expect(await readFile(originalReceiptPath, 'utf8')).toBe(originalReceipt)
+    await expect(service.verifyCommittedRollback(request, activeHostMutation)).resolves.toBeUndefined()
+    await writeFile(live, 'later-edit')
+    await expect(service.verifyCommittedRollback(request, activeHostMutation)).rejects.toMatchObject({
+      code: 'UPDATE_LIVE_TARGET_CHANGED'
+    })
+    await expect(service.rollbackCommitted(request, activeHostMutation)).resolves.toMatchObject({ reused: true })
+    expect(await readFile(live, 'utf8')).toBe('later-edit')
+    await expect(service.rollbackCommitted({ ...request, materialSha256: 'f'.repeat(64) }, activeHostMutation))
+      .rejects.toMatchObject({ code: 'UPDATE_LIVE_IDEMPOTENCY_CONFLICT' })
+  })
+
+  it('resumes an explicit rollback after lease loss at a live restore boundary', async () => {
+    const fixture = await createFixture()
+    const relative = 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll'
+    const live = path.join(fixture.liveRoot, relative)
+    await mkdir(path.dirname(live), { recursive: true })
+    await writeFile(live, 'original')
+    const source = await createImmutableRelease(fixture, 'nebula', '0.9.1', 'nebula-artifact-operator-2', [
+      [relative, Buffer.from('candidate')]
+    ])
+    const service = createService(fixture)
+    await service.publishCandidate(source, activeHostMutation)
+    await service.commitCandidate(source, activeHostMutation)
+    const inspected = await service.inspectCommittedRollback(source, activeHostMutation)
+    const request = { requestId: randomUUID(), source, materialSha256: inspected.materialSha256 }
+    const lost = new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+    const scope = faultingHostMutation(() => {
+      if (existsSync(live) && readFileSync(live, 'utf8') === 'original') throw lost
+    })
+    await expect(service.rollbackCommitted(request, scope)).rejects.toBe(lost)
+    await expect(createService(fixture).rollbackCommitted(request, activeHostMutation))
+      .resolves.toMatchObject({ status: 'rolled-back' })
+    expect(await readFile(live, 'utf8')).toBe('original')
+  })
+
+  it.each([0, 1048576, 2097152])('resumes a rollback snapshot copy interrupted at %i bytes', async (boundary) => {
+    const fixture = await createFixture()
+    const relative = 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll'
+    const live = path.join(fixture.liveRoot, relative)
+    await mkdir(path.dirname(live), { recursive: true })
+    const original = Buffer.alloc(2097152, 7)
+    await writeFile(live, original)
+    const source = await createImmutableRelease(fixture, 'nebula', '0.9.1', 'nebula-artifact-operator-2', [
+      [relative, Buffer.from('candidate')]
+    ])
+    const service = createService(fixture)
+    await service.publishCandidate(source, activeHostMutation)
+    await service.commitCandidate(source, activeHostMutation)
+    const inspected = await service.inspectCommittedRollback(source, activeHostMutation)
+    const request = { requestId: randomUUID(), source, materialSha256: inspected.materialSha256 }
+    const lost = new HostMutationLeaseError('DYSON_HOST_MUTATION_LEASE_LOST')
+    const scope = faultingHostMutation(() => {
+      const copying = path.join(fixture.controlRoot, 'transactions', request.requestId, 'backup', 'previous-0.bin.copying')
+      if (existsSync(copying) && readFileSync(copying).length === boundary) throw lost
+    })
+    await expect(service.rollbackCommitted(request, scope)).rejects.toBe(lost)
+    await expect(createService(fixture).rollbackCommitted(request, activeHostMutation))
+      .resolves.toMatchObject({ status: 'rolled-back' })
+    expect(await readFile(live)).toEqual(original)
+  })
+
+  it('never resumes an explicit rollback journal as an ordinary candidate transaction', async () => {
+    const fixture = await createFixture()
+    const relative = 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll'
+    const request = await createImmutableRelease(fixture, 'nebula', '0.9.1', 'nebula-artifact-explicit-1', [
+      [relative, Buffer.from('candidate')]
+    ])
+    const service = createService(fixture)
+    await service.publishCandidate(request, activeHostMutation)
+    const journalPath = path.join(fixture.controlRoot, 'journals', `${request.requestId}.json`)
+    const journal = JSON.parse(await readFile(journalPath, 'utf8'))
+    journal.rollbackOrigin = { sourceRequestId: randomUUID(), materialSha256: 'a'.repeat(64) }
+    await writeFile(journalPath, JSON.stringify(journal))
+    await expect(service.reconcileCandidate(request, 'candidate', activeHostMutation)).rejects.toMatchObject({
+      code: 'UPDATE_LIVE_EXPLICIT_ROLLBACK_REQUIRED'
+    })
+    await expect(service.rollbackCandidate(request, activeHostMutation)).rejects.toMatchObject({
+      code: 'UPDATE_LIVE_EXPLICIT_ROLLBACK_REQUIRED'
+    })
+    expect(await readFile(path.join(fixture.liveRoot, relative), 'utf8')).toBe('candidate')
+  })
+
+  it('retains an unmanaged predecessor after commit and permits subsequent updates', async () => {
+    const fixture = await createFixture()
+    const relative = 'plugins/nebula-NebulaMultiplayerMod/Nebula.dll'
+    await mkdir(path.dirname(path.join(fixture.liveRoot, relative)), { recursive: true })
+    await writeFile(path.join(fixture.liveRoot, relative), 'unmanaged-original')
+    const first = await createImmutableRelease(fixture, 'nebula', '0.9.1', 'nebula-artifact-retain-1', [
+      [relative, Buffer.from('first-candidate')]
+    ])
+    const service = createService(fixture)
+    await service.publishCandidate(first, activeHostMutation)
+    await service.commitCandidate(first, activeHostMutation)
+    const journal = JSON.parse(await readFile(path.join(fixture.controlRoot, 'journals', `${first.requestId}.json`), 'utf8'))
+    const backup = path.join(fixture.controlRoot, 'transactions', first.requestId, 'backup', journal.entries[0].previous.snapshotName)
+    expect(await readFile(backup, 'utf8')).toBe('unmanaged-original')
+    const inspection = await service.inspectCommittedRollback(first, activeHostMutation)
+    expect(inspection).toMatchObject({ sourceRequestId: first.requestId, restoreFileCount: 1,
+      removeFileCount: 0, materialSha256: expect.stringMatching(/^[0-9a-f]{64}$/) })
+    await writeFile(backup, 'tampered-predecessor')
+    await expect(service.inspectCommittedRollback(first, activeHostMutation)).rejects.toMatchObject({
+      code: 'UPDATE_LIVE_ROLLBACK_MATERIAL_INVALID'
+    })
+    await writeFile(backup, 'unmanaged-original')
+    await createService(fixture).commitCandidate(first, activeHostMutation)
+    expect(await readFile(backup, 'utf8')).toBe('unmanaged-original')
+    const second = await createImmutableRelease(fixture, 'nebula', '0.9.2', 'nebula-artifact-retain-2', [
+      [relative, Buffer.from('second-candidate')]
+    ])
+    await service.publishCandidate(second, activeHostMutation)
+    await service.commitCandidate(second, activeHostMutation)
+    expect(await readFile(backup, 'utf8')).toBe('unmanaged-original')
+    await expect(service.inspectCommittedRollback(first, activeHostMutation)).rejects.toMatchObject({
+      code: 'UPDATE_LIVE_STATE_CONFLICT'
+    })
+    await expect(service.inspectCommittedRollback(second, activeHostMutation)).resolves.toMatchObject({
+      sourceRequestId: second.requestId, restoreFileCount: 1
+    })
+  })
+
   it('publishes real live files, commits durable state, and reuses the exact UUID only', async () => {
     const fixture = await createFixture()
     const request = await createImmutableRelease(fixture, 'nebula', '0.9.1', 'nebula-artifact-0001', [

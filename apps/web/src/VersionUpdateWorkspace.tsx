@@ -1,3 +1,4 @@
+import { RecoverableCleanupPanel } from './RecoverableCleanupPanel'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Check, CloudDownload, Database, History, LockKeyhole, PackageCheck,
@@ -7,6 +8,7 @@ import { api, ApiError } from './api'
 import { relativeTime } from './format'
 import { NebulaPluginTransactionWorkspace } from './NebulaPluginTransactionWorkspace'
 import { createUiRequestId } from './request-id'
+import { OperatorRollbackPanel } from './OperatorRollbackPanel'
 import type {
   ArtifactAcquisitionCandidate, ArtifactAcquisitionDiscoveryMeta, ArtifactAcquisitionPlan,
   ArtifactAcquisitionReceipt, ArtifactAcquisitionRegistration,
@@ -1205,6 +1207,9 @@ export function VersionUpdateWorkspace({ status, demo, user }: {
   const rollbackProjection = componentRollbackReceiptProjection(receipt)
 
   return <div className="version-workspace update-activation-workspace">
+    {!demo && canReadUpdates && <RecoverableCleanupPanel revision={activationState?.revision ?? null} canExecute={canActivate} />}
+    {!demo && canReadUpdates && <OperatorRollbackPanel revision={activationState?.revision ?? null}
+      sourceRequestId={receiptVerified && receipt?.status === 'succeeded' ? receipt.requestId : undefined} canExecute={canActivate} />}
     <div className="workspace-toolbar update-toolbar"><div><strong>确定性组件更新事务</strong><span>官方发现 · 持久获取 · 严格准备 · revision CAS · smoke · rollback</span></div><div><button type="button" onClick={() => void load()}><RefreshCw size={15} />刷新事务状态</button><button type="button" onClick={() => void discover('nebula')} disabled={discovering || !canReadUpdates}><CloudDownload className={discovering && discoveryComponent === 'nebula' ? 'spin' : ''} size={15} />{discovering && discoveryComponent === 'nebula' ? 'Nebula 发现中…' : '发现 Nebula'}</button><button type="button" onClick={() => void discover('bepinex')} disabled={discovering || !canReadUpdates}><CloudDownload className={discovering && discoveryComponent === 'bepinex' ? 'spin' : ''} size={15} />{discovering && discoveryComponent === 'bepinex' ? 'BepInEx 发现中…' : '发现 BepInEx'}</button></div></div>
 
     {!canActivate && <div className="permission-lock-note"><LockKeyhole size={15} /><span><strong>{user.role === 'viewer' ? 'Viewer 全局只读' : 'Operator 可获取 / 激活只读'}</strong><small>{user.role === 'viewer' ? '可以发现、预演和精确读取持久回执，但不会提交获取、候选准备、兼容性或激活写请求。' : '可以获取并准备候选、签发兼容性回执和生成激活 dry-run；只有 Administrator 可执行激活。'}</small></span></div>}

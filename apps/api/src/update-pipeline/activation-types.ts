@@ -163,6 +163,10 @@ export interface ComponentUpdateActivationAdapters {
     request: ComponentUpdateRollbackRestoreRequest,
     hostMutation: HostMutationOperationScope
   ): Promise<ComponentUpdateRollbackReadback>
+  inspectRollbackMaterial?(request: ComponentUpdateRollbackRestoreRequest): Promise<{
+    configurationSnapshotVerified: true; protectionVerified: true; serverModLockVerified: true;
+    currentConfigurationRevision: string
+  }>
   smoke(
     request: FixedUpdateSmokeRequest,
     hostMutation: HostMutationOperationScope
@@ -181,6 +185,7 @@ export interface ComponentUpdateActivationOptions extends ComponentUpdateActivat
    * Shared host-wide mutation coordinator. Execute/reconcile fail closed when
    * it is absent; read-only preview and inspection remain available.
    */
+  hasPendingCleanup?: () => Promise<boolean>
   hostMutationCoordinator?: HostMutationOperationCoordinator
   /**
    * Explicit administrator-triggered recovery capability. It is deliberately

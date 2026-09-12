@@ -32,6 +32,8 @@ const environmentSchema = z.object({
   DYSON_UPDATE_PREPARATION_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_UPDATE_ACTIVATION_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED: z.enum(['true', 'false']).default('false'),
+  DYSON_UPDATE_CLEANUP_ENABLED: z.enum(['true', 'false']).default('false'),
+  DYSON_UPDATE_CLEANUP_RECOVERY_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_STEAM_MANUAL_HANDOFF_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_NEBULA_PLUGIN_TRANSACTION_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_NEBULA_PLUGIN_TRANSACTION_RECOVERY_ENABLED: z.enum(['true', 'false']).default('false'),
@@ -71,7 +73,7 @@ const environmentSchema = z.object({
   DYSON_RUNTIME_SERVICE_USER: z.string().min(3).max(128).regex(/^[^"\r\n]+$/).optional(),
   DYSON_BRIDGE_CONTROL_ROOT: z.string().optional(),
   DYSON_BRIDGE_SECRET_FILE: z.string().optional(),
-  DYSON_BRIDGE_PLUGIN_VERSION: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,32})?$/).default('0.1.0-rc.26'),
+  DYSON_BRIDGE_PLUGIN_VERSION: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,32})?$/).default('0.1.0-rc.27'),
   DYSON_PLAYER_SNAPSHOT_MAX_AGE_MS: z.coerce.number().int().min(2_000).max(120_000).default(10_000),
   DYSON_PLAYER_NOTICE_MUTATIONS_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_PLAYER_HISTORY_CAPACITY: z.coerce.number().int().min(1).max(2_048).default(512),
@@ -122,6 +124,8 @@ export interface AppConfig {
   updatePreparationEnabled: boolean
   updateActivationEnabled: boolean
   updateActivationRecoveryEnabled: boolean
+  updateCleanupEnabled: boolean
+  updateCleanupRecoveryEnabled: boolean
   steamManualHandoffEnabled: boolean
   nebulaPluginTransactionEnabled: boolean
   nebulaPluginTransactionRecoveryEnabled: boolean
@@ -296,6 +300,13 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     if (!value.DYSON_UPDATE_COMPATIBILITY_POLICY_FILE) {
       throw new Error('DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED requires a trusted compatibility policy file')
     }
+  }
+  for (const flag of ['DYSON_UPDATE_CLEANUP_ENABLED', 'DYSON_UPDATE_CLEANUP_RECOVERY_ENABLED'] as const) {
+    if (value[flag] !== 'true') continue
+    if (value.DYSON_PROVIDER !== 'windows') throw new Error(flag + ' requires the Windows provider')
+    if (value.DYSON_LIFECYCLE_ENABLED !== 'true') throw new Error(flag + ' requires lifecycle execution')
+    if (value.DYSON_UPDATE_STAGING_ENABLED !== 'true' || !value.DYSON_UPDATE_STAGING_ROOT) throw new Error(flag + ' requires offline update staging')
+    if (!value.DYSON_UPDATE_COMPATIBILITY_POLICY_FILE) throw new Error(flag + ' requires a trusted compatibility policy file')
   }
   if (value.DYSON_STEAM_MANUAL_HANDOFF_ENABLED === 'true') {
     if (value.DYSON_PROVIDER !== 'windows') {
@@ -512,6 +523,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     updatePreparationEnabled: value.DYSON_UPDATE_PREPARATION_ENABLED === 'true',
     updateActivationEnabled: value.DYSON_UPDATE_ACTIVATION_ENABLED === 'true',
     updateActivationRecoveryEnabled: value.DYSON_UPDATE_ACTIVATION_RECOVERY_ENABLED === 'true',
+    updateCleanupEnabled: value.DYSON_UPDATE_CLEANUP_ENABLED === 'true',
+    updateCleanupRecoveryEnabled: value.DYSON_UPDATE_CLEANUP_RECOVERY_ENABLED === 'true',
     steamManualHandoffEnabled: value.DYSON_STEAM_MANUAL_HANDOFF_ENABLED === 'true',
     nebulaPluginTransactionEnabled: value.DYSON_NEBULA_PLUGIN_TRANSACTION_ENABLED === 'true',
     nebulaPluginTransactionRecoveryEnabled:

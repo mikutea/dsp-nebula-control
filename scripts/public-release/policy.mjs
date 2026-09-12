@@ -71,6 +71,11 @@ export const RULE_IDS = Object.freeze([
  * be reviewed independently; prefixes and glob expressions are not accepted.
  */
 export const EXACT_ALLOWLIST = Object.freeze([
+  // Reviewed Win32 extended-path prefix normalization, not a network endpoint.
+  { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/windows/bootstrap/DysonStoppedSaveCapture.ps1' },
+  { scope: 'artifact', ruleId: 'UNC_PATH', path: 'scripts/windows/bootstrap/DysonStoppedSaveCapture.ps1' },
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/bootstrap/DysonStoppedSaveCapture.ps1', blobId: 'f46dcc63ad79223702099f4cab26c208c60b002e' },
+  { scope: 'history', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'scripts/public-release/scanner.test.mjs', blobId: '643e07066dd38d982a90a0a8e54e8135b1a76311' },
   { scope: 'worktree', ruleId: 'FORBIDDEN_ENV_FILE', path: '.env.example' },
   { scope: 'history', ruleId: 'FORBIDDEN_ENV_FILE', path: '.env.example' },
   { scope: 'worktree', ruleId: 'IMAGE_REVIEW_REQUIRED', path: 'design/dashboard-concept-dsp-inspired-v2.png' },
@@ -109,6 +114,7 @@ export const EXACT_ALLOWLIST = Object.freeze([
   // The public CSharp vector reader contains an escaped-string regex, not a network share.
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'apps/api/src/providers/windows-update-runtime-evidence.test.ts' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'apps/api/src/providers/windows-update-runtime-evidence.test.ts', blobId: '0c43c5bb19a97a6d207c16e589c0c56911b694c6' },
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'apps/api/src/providers/windows-update-runtime-evidence.test.ts', blobId: '55de500c58d217167b167a3a38fe0683b332f7ff' },
   // These sources contain protocol/extended-path syntax, not a deployment endpoint.
   // Reviewed runtime-approval/ACL rollback changes retain only generic extended-path syntax.
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1', blobId: 'b61ea568d290d89a3e6e1b322b38d31f12453564' },
@@ -116,6 +122,7 @@ export const EXACT_ALLOWLIST = Object.freeze([
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: 'fbc9442ed303e6bde58f534513a4a9c98c25a3f0' },
   // This reviewed historical test blob also contains only generic extended-path prefix conversion.
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: '48002a94ba7cab80cc46b4a49ff649b7ca4a8c09' },
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: '7838bc779031045b2788aded1f67c31543278313' },
   // The added Bridge configuration test uses fictional paths; authentication fixtures remain fictional.
   { scope: 'history', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'apps/api/src/config.test.ts', blobId: 'd4aad480b97f2369497db3aec19773be0d962015' },
   // The builder uses generic Windows extended paths to clean its checked temporary directory.

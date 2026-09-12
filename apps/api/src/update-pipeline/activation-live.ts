@@ -79,6 +79,7 @@ export interface FixedLiveComponentDeploymentOptions {
 }
 
 export interface FixedLiveComponentDeploymentReceipt {
+  rollbackOrigin?: { sourceRequestId: string; materialSha256: string }
   format: 'dyson-control-fixed-live-component-receipt'
   schemaVersion: 1
   requestId: string
@@ -190,6 +191,7 @@ const liveCreatedDirectorySchema = z.enum([
 ])
 
 interface LiveDeploymentJournal {
+  rollbackOrigin?: { sourceRequestId: string; materialSha256: string }
   format: 'dyson-control-fixed-live-component-journal'
   schemaVersion: 1
   requestFingerprint: string
@@ -223,6 +225,7 @@ const journalEntrySchema: z.ZodType<LiveJournalEntry> = z.strictObject({
 })
 
 const journalSchema: z.ZodType<LiveDeploymentJournal> = z.strictObject({
+  rollbackOrigin: z.strictObject({ sourceRequestId: requestIdSchema, materialSha256: sha256Schema }).optional(),
   format: z.literal('dyson-control-fixed-live-component-journal'),
   schemaVersion: z.literal(1),
   requestFingerprint: sha256Schema,
@@ -235,6 +238,7 @@ const journalSchema: z.ZodType<LiveDeploymentJournal> = z.strictObject({
 })
 
 const receiptSchema: z.ZodType<FixedLiveComponentDeploymentReceipt> = z.strictObject({
+  rollbackOrigin: z.strictObject({ sourceRequestId: requestIdSchema, materialSha256: sha256Schema }).optional(),
   format: z.literal('dyson-control-fixed-live-component-receipt'),
   schemaVersion: z.literal(1),
   requestId: requestIdSchema,
@@ -432,6 +436,164 @@ export class FixedLiveComponentDeployment {
     })
     hostMutation.assertActive()
     return result
+  }
+
+  /** Read-only material inspection for a future explicit rollback transaction.
+   * Execution must revalidate this binding under its own fresh stopped proof. */
+  async inspectCommittedRollback(input: unknown, hostMutation: Pick<HostMutationOperationScope, 'assertActive'>): Promise<{
+    sourceRequestId: string; component: ManagedUpdateComponent; releaseId: string;
+    materialSha256: string; restoreFileCount: number; removeFileCount: number
+  }> {
+    hostMutation.assertActive()
+    const request = parseSupportedCandidateRequest(input)
+    const roots: PreparedRoots = {
+      immutableReleaseRoot: this.#immutableReleaseRoot, controlRoot: this.#controlRoot,
+      stateRoot: fixedChild(this.#controlRoot, 'state'), journalRoot: fixedChild(this.#controlRoot, 'journals'),
+      transactionRoot: fixedChild(this.#controlRoot, 'transactions'), receiptRoot: fixedChild(this.#controlRoot, 'receipts'),
+      lockRoot: fixedChild(this.#controlRoot, 'locks')
+    }
+    for (const root of Object.values(roots)) await assertNormalDirectory(root)
+    const receipt = await this.#readReceipt(roots, request.requestId)
+    if (receipt?.status !== 'committed') throw new ComponentUpdateActivationError('UPDATE_LIVE_NOT_COMMITTED')
+    assertReceiptIdentity(receipt, request)
+    const journal = await this.#requireJournal(roots, request)
+    if (journal.phase !== 'published') throw new ComponentUpdateActivationError('UPDATE_LIVE_STATE_CONFLICT')
+    const state = await this.#loadState(roots, request.component)
+    if (canonicalJson(state) !== canonicalJson(journal.candidateState)) {
+      throw new ComponentUpdateActivationError('UPDATE_LIVE_STATE_CONFLICT')
+    }
+    await this.#verifyCandidateLive(journal, hostMutation)
+    const transaction = transactionPaths(roots, request.requestId)
+    await assertNormalDirectory(transaction.root)
+    await assertNormalDirectory(transaction.backupRoot)
+    for (const entry of journal.entries) {
+      if (!entry.previous.exists) continue
+      const evidence = await fileEvidenceIfPresent(path.join(transaction.backupRoot, entry.previous.snapshotName!),
+        this.#limits.maximumFileBytes)
+      if (!evidence || evidence.sizeBytes !== entry.previous.sizeBytes || evidence.sha256 !== entry.previous.sha256) {
+        throw new ComponentUpdateActivationError('UPDATE_LIVE_ROLLBACK_MATERIAL_INVALID')
+      }
+      hostMutation.assertActive()
+    }
+    const after = await this.#loadState(roots, request.component)
+    const afterJournal = await this.#requireJournal(roots, request)
+    if (canonicalJson(after) !== canonicalJson(state) || canonicalJson(afterJournal) !== canonicalJson(journal)) {
+      throw new ComponentUpdateActivationError('UPDATE_LIVE_STATE_CONFLICT')
+    }
+    hostMutation.assertActive()
+    return { sourceRequestId: request.requestId, component: request.component, releaseId: request.releaseId,
+      materialSha256: createHash('sha256').update('dyson-committed-rollback-material-v1\0').update(canonicalJson(journal)).digest('hex'),
+      restoreFileCount: journal.entries.filter(entry => entry.previous.exists).length,
+      removeFileCount: journal.entries.filter(entry => !entry.previous.exists).length }
+  }
+
+  async rollbackCommitted(input: unknown, hostMutation: HostMutationOperationScope): Promise<FixedLiveComponentDeploymentReceipt> {
+    hostMutation.assertActive()
+    const parsed = z.strictObject({ requestId: requestIdSchema, source: candidateRequestSchema,
+      materialSha256: sha256Schema }).parse(input)
+    const source = parseSupportedCandidateRequest(parsed.source)
+    const request = { ...source, requestId: parsed.requestId.toLowerCase() }
+    if (request.requestId === source.requestId) throw new ComponentUpdateActivationError('UPDATE_LIVE_IDEMPOTENCY_CONFLICT')
+    const origin = { sourceRequestId: source.requestId, materialSha256: parsed.materialSha256 }
+    return await this.#serialize(async () => {
+      const roots = await this.#prepareRoots(hostMutation)
+      return await this.#withLock(roots, hostMutation, async () => {
+        const receipt = await this.#readReceipt(roots, request.requestId)
+        if (receipt) {
+          assertReceiptIdentity(receipt, request)
+          if (receipt.status !== 'rolled-back' || canonicalJson(receipt.rollbackOrigin) !== canonicalJson(origin)) {
+            throw new ComponentUpdateActivationError('UPDATE_LIVE_IDEMPOTENCY_CONFLICT')
+          }
+          return { ...receipt, reused: true }
+        }
+        await this.#assertNoOtherJournal(roots, request.requestId)
+        let journal = await this.#readJournal(roots, request.requestId, true)
+        if (!journal) {
+          const inspected = await this.inspectCommittedRollback(source, hostMutation)
+          if (inspected.materialSha256 !== parsed.materialSha256) {
+            throw new ComponentUpdateActivationError('UPDATE_LIVE_ROLLBACK_MATERIAL_INVALID')
+          }
+          const original = await this.#requireJournal(roots, source)
+          await this.#requireStopped(request, 'before-rollback', hostMutation)
+          journal = { ...original, request, requestFingerprint: fingerprintRequest(request),
+            rollbackOrigin: origin, phase: 'prepared' }
+          await this.#writeJournal(roots, journal, hostMutation)
+        }
+        if (canonicalJson(journal.rollbackOrigin) !== canonicalJson(origin) ||
+            canonicalJson(journal.request) !== canonicalJson(request) || journal.requestFingerprint !== fingerprintRequest(request)) {
+          throw new ComponentUpdateActivationError('UPDATE_LIVE_IDEMPOTENCY_CONFLICT')
+        }
+        const original = await this.#requireJournal(roots, source)
+        const digest = createHash('sha256').update('dyson-committed-rollback-material-v1\0')
+          .update(canonicalJson(original)).digest('hex')
+        if (digest !== origin.materialSha256) throw new ComponentUpdateActivationError('UPDATE_LIVE_ROLLBACK_MATERIAL_INVALID')
+        const sourcePaths = transactionPaths(roots, source.requestId)
+        const destination = transactionPaths(roots, request.requestId)
+        for (const directory of [destination.root, destination.backupRoot, destination.candidateRoot]) {
+          await activeMutation(hostMutation, async () => await mkdir(directory).catch(error => {
+            if (!isNodeError(error, 'EEXIST')) throw error
+          }))
+          await assertNormalDirectory(directory)
+        }
+        for (const entry of journal.entries) {
+          if (!entry.previous.exists) continue
+          const target = path.join(destination.backupRoot, entry.previous.snapshotName!)
+          const existing = await fileEvidenceIfPresent(target, this.#limits.maximumFileBytes)
+          const expected = { sizeBytes: entry.previous.sizeBytes!, sha256: entry.previous.sha256! }
+          if (existing) {
+            if (!evidenceMatches(existing, expected)) throw new ComponentUpdateActivationError('UPDATE_LIVE_ROLLBACK_MATERIAL_INVALID')
+          } else {
+            // Only this transaction's unpublished copy is disposable on retry.
+            // Published snapshots above remain immutable and digest checked.
+            const temporary = target + '.copying'
+            const leftover = await lstat(temporary).catch(error => {
+              if (isNodeError(error, 'ENOENT')) return null
+              throw error
+            })
+            if (leftover !== null) {
+              await assertNormalFile(temporary)
+              if (leftover.nlink !== 1) throw new ComponentUpdateActivationError('UPDATE_LIVE_FILE_INVALID')
+              await activeMutation(hostMutation, async () => await unlink(temporary))
+            }
+            await copyStableFile(path.join(sourcePaths.backupRoot, entry.previous.snapshotName!), temporary,
+              expected, this.#limits.maximumFileBytes, hostMutation)
+            await activeMutation(hostMutation, async () => await rename(temporary, target))
+          }
+        }
+        return await this.#rollbackJournal(roots, journal, hostMutation)
+      })
+    })
+  }
+
+  async verifyCommittedRollback(input: unknown, guard: Pick<HostMutationOperationScope, 'assertActive'>): Promise<void> {
+    guard.assertActive()
+    const parsed = z.strictObject({ requestId: requestIdSchema, source: candidateRequestSchema,
+      materialSha256: sha256Schema }).parse(input)
+    const source = parseSupportedCandidateRequest(parsed.source)
+    const request = { ...source, requestId: parsed.requestId.toLowerCase() }
+    const roots: PreparedRoots = { immutableReleaseRoot: this.#immutableReleaseRoot, controlRoot: this.#controlRoot,
+      stateRoot: fixedChild(this.#controlRoot, 'state'), journalRoot: fixedChild(this.#controlRoot, 'journals'),
+      transactionRoot: fixedChild(this.#controlRoot, 'transactions'), receiptRoot: fixedChild(this.#controlRoot, 'receipts'),
+      lockRoot: fixedChild(this.#controlRoot, 'locks') }
+    for (const root of Object.values(roots)) await assertNormalDirectory(root)
+    const receipt = await this.#readReceipt(roots, request.requestId)
+    if (receipt?.status !== 'rolled-back' || receipt.rollbackOrigin?.sourceRequestId !== source.requestId ||
+        receipt.rollbackOrigin.materialSha256 !== parsed.materialSha256) {
+      throw new ComponentUpdateActivationError('UPDATE_LIVE_ROLLBACK_NOT_COMPLETED')
+    }
+    assertReceiptIdentity(receipt, request)
+    const original = await this.#requireJournal(roots, source)
+    const digest = createHash('sha256').update('dyson-committed-rollback-material-v1\0').update(canonicalJson(original)).digest('hex')
+    if (digest !== parsed.materialSha256 ||
+        canonicalJson(await this.#loadState(roots, source.component)) !== canonicalJson(original.previousState)) {
+      throw new ComponentUpdateActivationError('UPDATE_LIVE_STATE_CONFLICT')
+    }
+    for (const entry of original.entries) {
+      guard.assertActive()
+      const target = await this.#resolveLiveTarget(source.component, entry.relativePath)
+      await assertTargetMatchesSnapshot(target, entry.previous, this.#limits.maximumFileBytes)
+    }
+    guard.assertActive()
   }
 
   async reconcileCandidate(
@@ -678,7 +840,7 @@ export class FixedLiveComponentDeployment {
 
   async #verifyCandidateLive(
     journal: LiveDeploymentJournal,
-    hostMutation: HostMutationOperationScope
+    hostMutation: Pick<HostMutationOperationScope, 'assertActive'>
   ): Promise<void> {
     for (const entry of journal.entries) {
       hostMutation.assertActive()
@@ -919,14 +1081,18 @@ export class FixedLiveComponentDeployment {
     )
   }
 
-  async #readJournal(roots: PreparedRoots, requestId: string): Promise<LiveDeploymentJournal | null> {
+  async #readJournal(roots: PreparedRoots, requestId: string, allowExplicitRollback = false): Promise<LiveDeploymentJournal | null> {
     const value = await readJsonIfPresent(fixedChild(roots.journalRoot, `${requestId}.json`))
     if (value === null) return null
     try {
       const journal = journalSchema.parse(value)
       if (journal.request.requestId !== requestId) throw new Error('request mismatch')
+      if (journal.rollbackOrigin && !allowExplicitRollback) {
+        throw new ComponentUpdateActivationError('UPDATE_LIVE_EXPLICIT_ROLLBACK_REQUIRED')
+      }
       return journal
     } catch (error) {
+      if (error instanceof ComponentUpdateActivationError) throw error
       throw new ComponentUpdateActivationError('UPDATE_LIVE_JOURNAL_INVALID', { cause: error })
     }
   }
@@ -962,6 +1128,13 @@ export class FixedLiveComponentDeployment {
         throw new ComponentUpdateActivationError('UPDATE_LIVE_JOURNAL_DIRECTORY_INVALID')
       }
       if (entry.name.toLowerCase() !== `${requestId.toLowerCase()}.json`) {
+        const previousId = entry.name.slice(0, -5).toLowerCase()
+        const receipt = await this.#readReceipt(roots, previousId)
+        const journal = await this.#readJournal(roots, previousId)
+        if (receipt?.status === 'committed' && journal?.phase === 'published') {
+          assertReceiptIdentity(receipt, journal.request)
+          continue
+        }
         throw new ComponentUpdateActivationError('UPDATE_LIVE_RECOVERY_REQUIRED')
       }
     }
@@ -1002,14 +1175,17 @@ export class FixedLiveComponentDeployment {
     journal: LiveDeploymentJournal,
     hostMutation: HostMutationOperationScope
   ): Promise<void> {
+    hostMutation.assertActive()
+    const terminalReceipt = await this.#readReceipt(roots, journal.request.requestId)
+    const retainRollbackMaterial = terminalReceipt?.status === 'committed'
     const transaction = transactionPaths(roots, journal.request.requestId)
     for (const [index, entry] of journal.entries.entries()) {
-      if (entry.previous.snapshotName !== null) {
+      if (!retainRollbackMaterial && entry.previous.snapshotName !== null) {
         await activeMutation(hostMutation, async () => {
           await unlinkIfPresent(path.join(transaction.backupRoot, entry.previous.snapshotName!))
         })
       }
-      if (entry.candidateSnapshotName !== null) {
+      if (!retainRollbackMaterial && entry.candidateSnapshotName !== null) {
         await activeMutation(hostMutation, async () => {
           await unlinkIfPresent(path.join(transaction.candidateRoot, entry.candidateSnapshotName!))
         })
@@ -1020,6 +1196,10 @@ export class FixedLiveComponentDeployment {
         await activeMutation(hostMutation, async () => await unlinkIfPresent(candidate))
       }
     }
+    // A successful first update may have no managed predecessor release.
+    // Preserve its immutable journal and verified snapshots for explicit rollback.
+    // Transient live siblings above are still removed to avoid polluting the game tree.
+    if (retainRollbackMaterial) return
     await activeMutation(hostMutation, async () => await rmdirIfPresent(transaction.backupRoot))
     await activeMutation(hostMutation, async () => await rmdirIfPresent(transaction.candidateRoot))
     await activeMutation(hostMutation, async () => await rmdirIfPresent(transaction.root))
@@ -1120,11 +1300,14 @@ async function copyStableFile(
 ): Promise<void> {
   await assertNormalFile(sourcePath)
   const source = await open(sourcePath, 'r')
-  const destination = hostMutation === undefined
-    ? await open(destinationPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
-    : await openActiveFile(hostMutation, destinationPath,
+  const destination = await (hostMutation === undefined
+    ? open(destinationPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+    : openActiveFile(hostMutation, destinationPath,
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-        0o600)
+        0o600)).catch(async error => {
+          await source.close()
+          throw error
+        })
   try {
     const before = await source.stat({ bigint: true })
     if (!before.isFile() || before.size !== BigInt(expected.sizeBytes) || before.size > BigInt(maximumBytes)) {
@@ -1294,7 +1477,8 @@ function makeReceipt(
     requestFingerprint: journal.requestFingerprint,
     releaseId: journal.request.releaseId, artifactId: journal.request.artifactId,
     targetVersion: journal.request.targetVersion, status,
-    fileCount: journal.candidateState.files.length, completedAt, reused
+    fileCount: journal.candidateState.files.length, completedAt, reused,
+    ...(journal.rollbackOrigin ? { rollbackOrigin: journal.rollbackOrigin } : {})
   })
 }
 

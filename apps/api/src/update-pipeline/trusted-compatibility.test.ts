@@ -15,6 +15,35 @@ afterEach(async () => {
 })
 
 describe('server-owned compatibility evidence', () => {
+  it('binds explicit rollback warning approvals into the policy revision and rejects unknown entries', async () => {
+    const policy = fictionalPolicy()
+    const plain = await createService({ policy })
+    const approved = await createService({ policy: { ...policy,
+      rollbackWarningApprovals: [{ entryId: policy.matrix.entries[0]!.id, warnings: ['mod-bepinex-target-mismatch'] }] } })
+    expect((await approved.service.status()).policyRevision).not.toBe((await plain.service.status()).policyRevision)
+    await expect(createService({ policy: { ...policy,
+      rollbackWarningApprovals: [{ entryId: 'missing', warnings: ['mod-bepinex-target-mismatch'] }] } }))
+      .rejects.toMatchObject({ code: 'UPDATE_COMPATIBILITY_POLICY_INVALID' })
+  })
+
+  it('rejects a receipt that expires while the authoritative inventory is being read', async () => {
+    let now = new Date('2026-08-30T12:00:00.000Z')
+    let expireDuringRead = false
+    const { service } = await createService({
+      now: () => now,
+      receiptLifetimeMs: 30_000,
+      readRuntimeInventory: async () => {
+        if (expireDuringRead) now = new Date(now.getTime() + 30_001)
+        return baseInventory()
+      }
+    })
+    const request = makeRequest(await service.status())
+    const receipt = await service.prepare(request)
+    expireDuringRead = true
+    await expect(service.assertCurrent(receipt.receiptId, candidateFrom(request)))
+      .rejects.toMatchObject({ code: 'UPDATE_COMPATIBILITY_RECEIPT_EXPIRED' })
+  })
+
   it('reports normalized runtime inventory but fails closed when no reviewed policy is installed', async () => {
     const { service } = await createService({ policy: null })
 

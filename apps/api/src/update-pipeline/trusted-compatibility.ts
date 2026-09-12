@@ -3,6 +3,7 @@ import { constants } from 'node:fs'
 import { lstat, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
+import { rollbackWarningApprovalsSchema } from './rollback-health-policy.js'
 import { TrustedModArtifactPolicy, trustedModArtifactPolicySchema } from './trusted-mod-artifacts.js'
 import {
   compatibilityMatrixInputSchema,
@@ -34,7 +35,14 @@ export const trustedCompatibilityPolicyInputSchema = z.strictObject({
   policyId: z.string().min(3).max(96).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/),
   reviewedAt: timestampSchema,
   matrix: compatibilityMatrixInputSchema,
-  trustedModArtifacts: trustedModArtifactPolicySchema.optional()
+  trustedModArtifacts: trustedModArtifactPolicySchema.optional(),
+  rollbackWarningApprovals: rollbackWarningApprovalsSchema.optional()
+}).superRefine((policy, context) => {
+  for (const approval of policy.rollbackWarningApprovals ?? []) {
+    if (!policy.matrix.entries.some(entry => entry.id === approval.entryId)) {
+      context.addIssue({ code: 'custom', message: 'Unknown rollback compatibility entry' })
+    }
+  }
 })
 
 export const trustedCompatibilityPreparationRequestSchema = z.strictObject({
@@ -48,6 +56,7 @@ export const trustedCompatibilityPreparationRequestSchema = z.strictObject({
 })
 
 interface NormalizedPolicy {
+  rollbackWarningApprovals?: z.infer<typeof rollbackWarningApprovalsSchema>
   trustedModArtifactsRevision?: string
   format: 'dyson-control-trusted-compatibility-policy'
   schemaVersion: 1
@@ -277,6 +286,7 @@ export class TrustedCompatibilityService {
       throw new TrustedCompatibilityError('UPDATE_COMPATIBILITY_RECEIPT_INVALID')
     }
     if (!decision.compatible) throw new TrustedCompatibilityError('UPDATE_COMPATIBILITY_CONFLICT')
+    if (this.#isExpired(receipt)) throw new TrustedCompatibilityError('UPDATE_COMPATIBILITY_RECEIPT_EXPIRED')
     return { receipt: { ...receipt, reused: false }, decision, runtimeInventory: inventory }
   }
 
@@ -488,6 +498,9 @@ function normalizePolicy(input: unknown): NormalizedPolicy {
       policyId: parsed.policyId,
       reviewedAt: new Date(parsed.reviewedAt).toISOString(),
       matrix,
+      ...(parsed.rollbackWarningApprovals === undefined ? {} : {
+        rollbackWarningApprovals: [...parsed.rollbackWarningApprovals].sort((a, b) => a.entryId.localeCompare(b.entryId))
+      }),
       ...(parsed.trustedModArtifacts === undefined ? {} : {
         trustedModArtifactsRevision: new TrustedModArtifactPolicy(parsed.trustedModArtifacts).revision
       })

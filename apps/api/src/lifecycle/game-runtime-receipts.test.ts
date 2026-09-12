@@ -57,6 +57,27 @@ afterEach(async () => {
 })
 
 describe('file game runtime receipt source', () => {
+  it('binds final stopped-save evidence into the public digest and rejects invalid bindings', async () => {
+    const proof = { protocol: 'DYSON_CONTROL_STOPPED_SAVE_PROOF_V1', stopIntentSha256: 'a'.repeat(64),
+      capturedAt: '2026-09-01T00:00:01.5000000+00:00', saveName: '_lastexit_',
+      dsvBytes: 100, dsvSha256: 'b'.repeat(64), serverBytes: 20, serverSha256: 'c'.repeat(64) }
+    const source = new FileGameRuntimeReceiptSource({ dataRoot, projectRoot })
+    const value = receipt(attemptIds[0])
+    await persist({ ...value, finalSaveProof: proof })
+    const first = (await source.list()).items[0]!
+    expect(first.finalSaveProof).toEqual(proof)
+    await persist({ ...value, finalSaveProof: { ...proof, dsvSha256: 'd'.repeat(64) } })
+    expect((await source.list()).items[0]!.receiptSha256).not.toBe(first.receiptSha256)
+    for (const invalid of [
+      { ...proof, capturedAt: '2026-09-01T00:00:03.0000000+00:00' },
+      { ...proof, saveName: '_autosave_' }, { ...proof, dsvBytes: 0 },
+      { ...proof, stopIntentSha256: 'invalid' }, { ...proof, extra: true }
+    ]) {
+      await persist({ ...value, finalSaveProof: invalid })
+      await expect(source.list()).rejects.toMatchObject({ code: 'GAME_RUNTIME_RECEIPTS_UNAVAILABLE' })
+    }
+  })
+
   it('returns an empty page when the receipt directory does not exist', async () => {
     await rm(receiptRoot, { recursive: true })
     const source = new FileGameRuntimeReceiptSource({ dataRoot, projectRoot })
@@ -292,6 +313,7 @@ describe('file game runtime receipt source', () => {
 })
 
 interface RuntimeReceipt {
+  finalSaveProof?: unknown
   protocol: typeof GAME_RUNTIME_RECEIPT_PROTOCOL
   schemaVersion: 1
   attemptId: string

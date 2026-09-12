@@ -1,3 +1,4 @@
+import { createRecoverableCleanupPlan } from './update-pipeline/recoverable-cleanup-plan.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { buildApplication, type ApplicationDependencies, type BuiltApplication } from './app.js'
 import { loadConfig } from './config.js'
@@ -31,6 +32,7 @@ function fixtureController() {
       }
     })),
     preview: vi.fn(async (input: unknown) => ({ statusCode: 200, body: { ok: true, data: { kind: 'preview', input } } })),
+    previewRollback: vi.fn(async (input: unknown) => ({ statusCode: 200, body: { ok: true, data: { kind: 'rollback-preview', input } } })),
     execute: vi.fn(async (input: unknown) => ({ statusCode: 202, body: { ok: true, data: { kind: 'receipt', input } } })),
     recover: vi.fn(async (input: unknown) => ({ statusCode: 202, body: { ok: true, data: { kind: 'recovery-receipt', input } } })),
     getReceipt: vi.fn(async (input: unknown) => ({ statusCode: 200, body: { ok: true, data: { kind: 'receipt', input } } })),
@@ -51,6 +53,80 @@ async function login(role: 'viewer' | 'administrator', password: string) {
 }
 
 describe('component update activation routes', () => {
+  it('authorizes operator rollback routes and keeps execution and recovery gates separate', async () => {
+    const request = { requestId: '11111111-1111-4111-8111-111111111111', sourceRequestId: '22222222-2222-4222-8222-222222222222',
+      expectedRevision: 'a'.repeat(64), expectedPlanSha256: 'b'.repeat(64) }
+    const receipt = { format: 'dyson-control-operator-rollback-receipt' as const, schemaVersion: 1 as const,
+      requestId: request.requestId, sourceRequestId: request.sourceRequestId, planSha256: request.expectedPlanSha256,
+      resultingRevision: 'c'.repeat(64), protectionBackupId: 'forward-backup', status: 'succeeded' as const, recoveryRequired: false as const }
+    const unused = async (): Promise<never> => { throw new Error('unexpected call') }
+    const service = { preview: unused, execute: unused, reconcile: async () => null, recoverInterrupted: unused,
+      getReceipt: async () => null, getState: async () => ({ revision: 'a'.repeat(64), recoveryRequired: false, components: [], historyEntries: 0 }),
+      previewRecoverableCleanup: async (id: unknown) => createRecoverableCleanupPlan({ format: 'dyson-recoverable-component-cleanup-plan', schemaVersion: 1,
+        requestId: id, expectedRevision: 'a'.repeat(64), candidates: [{ kind: 'history', opaqueId: request.sourceRequestId, sha256: 'b'.repeat(64), sizeBytes: 1 }] }),
+      runRecoverableCleanup: vi.fn(unused), previewCleanup: unused, executeRollback: vi.fn(async () => receipt), recoverRollback: vi.fn(async () => receipt),
+      getRollbackReceipt: vi.fn(async () => receipt), getRollbackPending: vi.fn(async () => [{ request, phase: 'files-restored' as const }]) }
+    const config = loadConfig({ NODE_ENV: 'test', DYSON_PROVIDER: 'demo', DYSON_PUBLIC_ORIGIN: origin,
+      DYSON_DEV_ADMIN_PASSWORD: 'fictional-administrator-password', DYSON_VIEWER_PASSWORD_HASH: await hashPassword('fictional-viewer-password') })
+    application = await buildApplication({ ...config, updateActivationEnabled: false, updateActivationRecoveryEnabled: true },
+      { componentUpdateActivationService: service })
+    const url = '/api/v1/updates/rollback/execute'
+    const payload = { request, confirmation: 'ROLLBACK_COMPONENT_UPDATE' }
+    expect((await application.app.inject({ method: 'POST', url, headers: { origin }, payload })).statusCode).toBe(401)
+    const viewer = await login('viewer', 'fictional-viewer-password')
+    expect((await application.app.inject({ method: 'POST', url, headers: { origin }, payload,
+      cookies: { dyson_session: viewer } })).statusCode).toBe(403)
+    const admin = await login('administrator', 'fictional-administrator-password')
+    expect((await application.app.inject({ method: 'POST', url, headers: { origin }, payload,
+      cookies: { dyson_session: admin } })).statusCode).toBe(423)
+    expect(service.executeRollback).not.toHaveBeenCalled()
+    expect((await application.app.inject({ method: 'POST', url: '/api/v1/updates/rollback/recovery', headers: { origin },
+      cookies: { dyson_session: admin }, payload: { request, confirmation: 'RECOVER_COMPONENT_ROLLBACK' } })).statusCode).toBe(200)
+    expect(service.recoverRollback).toHaveBeenCalledOnce()
+    const cleanupUrl = '/api/v1/updates/cleanup/recoverable/execute'
+    const cleanupPayload = { requestId: request.requestId, expectedRevision: request.expectedRevision,
+      expectedPlanSha256: request.expectedPlanSha256, confirmation: 'QUARANTINE_COMPONENT_MATERIAL' }
+    expect((await application.app.inject({ method: 'POST', url: cleanupUrl, headers: { origin }, payload: cleanupPayload })).statusCode).toBe(401)
+    expect((await application.app.inject({ method: 'POST', url: cleanupUrl, headers: { origin }, payload: cleanupPayload, cookies: { dyson_session: viewer } })).statusCode).toBe(403)
+    expect((await application.app.inject({ method: 'POST', url: cleanupUrl, headers: { origin }, payload: cleanupPayload, cookies: { dyson_session: admin } })).statusCode).toBe(423)
+    expect(service.runRecoverableCleanup).not.toHaveBeenCalled()
+    expect((await application.app.inject({ method: 'POST', url: '/api/v1/updates/cleanup/recoverable/preview', headers: { origin },
+      payload: { requestId: request.requestId }, cookies: { dyson_session: viewer } })).statusCode).toBe(200)
+    const cleanupState = await application.app.inject({ method: 'GET', url: '/api/v1/updates/cleanup/recoverable/state', cookies: { dyson_session: viewer } })
+    expect(cleanupState.json()).toMatchObject({ ok: true, data: { executionEnabled: false, recoveryEnabled: false, transactions: [] } })
+
+    const audit = await application.app.inject({ method: 'GET', url: '/api/v1/jobs', cookies: { dyson_session: admin } })
+    expect(audit.statusCode).toBe(200)
+    const rollbackJobs = audit.json().data.filter((job: { kind: string }) => job.kind.startsWith('component.rollback'))
+    expect(rollbackJobs).toHaveLength(2)
+    expect(rollbackJobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'component.rollback', actor: 'Administrator', state: 'failed', errorCode: 'UPDATE_ROLLBACK_NOT_COMPLETED' }),
+      expect.objectContaining({ kind: 'component.rollback.recovery', actor: 'Administrator', state: 'succeeded', errorCode: null })
+    ]))
+    for (const job of rollbackJobs) {
+      expect(job.summary).toContain(request.requestId)
+      expect(Number.isFinite(Date.parse(job.startedAt))).toBe(true)
+      expect(Date.parse(job.finishedAt)).toBeGreaterThanOrEqual(Date.parse(job.startedAt))
+      expect(job.durationMs).toBeGreaterThanOrEqual(0)
+    }
+    expect((await application.app.inject({ method: 'POST', url: '/api/v1/updates/rollback/recovery', headers: { origin },
+      cookies: { dyson_session: admin }, payload: { request, confirmation: 'RECOVER_COMPONENT_ROLLBACK', actor: 'forged-actor' } })).statusCode).toBe(400)
+    expect(service.recoverRollback).toHaveBeenCalledOnce()
+    const afterSpoof = await application.app.inject({ method: 'GET', url: '/api/v1/jobs?kind=component.rollback.recovery',
+      cookies: { dyson_session: admin } })
+    expect(afterSpoof.statusCode).toBe(200)
+    expect(afterSpoof.json().data).toHaveLength(2)
+    expect(afterSpoof.json().data.every((job: { actor: string }) => job.actor === 'Administrator')).toBe(true)
+
+    const state = await application.app.inject({ method: 'GET', url: '/api/v1/updates/rollback/state',
+      cookies: { dyson_session: viewer } })
+    expect(state.statusCode).toBe(200)
+    expect(state.json()).toMatchObject({ ok: true, data: { executionEnabled: false, recoveryEnabled: true,
+      pending: [{ request, phase: 'files-restored' }] } })
+    expect((await application.app.inject({ method: 'GET', url: `/api/v1/updates/rollback/receipts/${request.requestId}`,
+      cookies: { dyson_session: viewer } })).statusCode).toBe(200)
+  })
+
   it('projects the controller contract through bounded authenticated routes', async () => {
     const controller = fixtureController()
     application = await buildApplication(loadConfig({
@@ -69,6 +145,13 @@ describe('component update activation routes', () => {
     })
     expect(preview.statusCode).toBe(200)
     expect(controller.preview).toHaveBeenCalledWith(request)
+    const rollbackUrl = '/api/v1/updates/rollback/preview'
+    const anonymous = await application.app.inject({ method: 'POST', url: rollbackUrl, headers: { origin }, payload: request })
+    expect(anonymous.statusCode).toBe(401)
+    const rollback = await application.app.inject({ method: 'POST', url: rollbackUrl, headers: { origin },
+      cookies: { dyson_session: cookie }, payload: request })
+    expect(rollback.statusCode).toBe(200)
+    expect(controller.previewRollback).toHaveBeenCalledWith(request)
 
     const execute = await application.app.inject({
       method: 'POST', url: '/api/v1/updates/activation/execute', headers: { origin },
@@ -359,4 +442,37 @@ describe('component update activation routes', () => {
     })
     expect(readiness.body).not.toContain('journal-location')
   })
+})
+it('enables cleanup only explicitly and persists the authenticated request audit', async () => {
+  const requestId = '44444444-4444-4444-8444-444444444444'
+  const plan = createRecoverableCleanupPlan({ format: 'dyson-recoverable-component-cleanup-plan', schemaVersion: 1,
+    requestId, expectedRevision: 'a'.repeat(64), candidates: [{ kind: 'history', opaqueId: '55555555-5555-4555-8555-555555555555', sha256: 'b'.repeat(64), sizeBytes: 1 }] })
+  const unused = async (): Promise<never> => { throw new Error('unexpected call') }
+  const service = { preview: unused, execute: unused, reconcile: async () => null, recoverInterrupted: unused,
+    getReceipt: async () => null, getState: async () => ({ revision: plan.expectedRevision, recoveryRequired: false, components: [], historyEntries: 0 }),
+    previewCleanup: unused, previewRecoverableCleanup: async () => plan,
+    runRecoverableCleanup: async (input: unknown, store: import('./update-pipeline/recoverable-cleanup-execution.js').CleanupJournalStore) => {
+      const initial = await store.appendCleanupJournal(input)
+      const moved = await store.appendCleanupJournal({ ...initial, completedCount: 1 })
+      return await store.appendCleanupJournal({ ...moved, state: 'completed', finishedAt: new Date().toISOString() })
+    } }
+  application = await buildApplication({ ...loadConfig({ NODE_ENV: 'test', DYSON_PROVIDER: 'demo', DYSON_PUBLIC_ORIGIN: origin,
+    DYSON_DEV_ADMIN_PASSWORD: 'fictional-administrator-password' }), updateCleanupEnabled: true }, { componentUpdateActivationService: service })
+  const cookie = await login('administrator', 'fictional-administrator-password')
+  const response = await application.app.inject({ method: 'POST', url: '/api/v1/updates/cleanup/recoverable/execute', headers: { origin },
+    cookies: { dyson_session: cookie }, payload: { requestId, expectedRevision: plan.expectedRevision, expectedPlanSha256: plan.planSha256, confirmation: 'QUARANTINE_COMPONENT_MATERIAL' } })
+  expect(response.statusCode).toBe(200)
+  expect(response.json()).toMatchObject({ ok: true, data: { actor: 'Administrator', state: 'completed', requestId } })
+  const receiptUrl = '/api/v1/updates/cleanup/recoverable/receipts/' + requestId
+  expect((await application.app.inject({ method: 'GET', url: receiptUrl })).statusCode).toBe(401)
+  const readback = await application.app.inject({ method: 'GET', url: receiptUrl, cookies: { dyson_session: cookie } })
+  expect(readback.statusCode).toBe(200)
+  expect(readback.json()).toEqual(response.json())
+  const state = await application.app.inject({ method: 'GET', url: '/api/v1/updates/cleanup/recoverable/state', cookies: { dyson_session: cookie } })
+  expect(state.json()).toMatchObject({ data: { transactions: [expect.objectContaining({ requestId, expectedRevision: plan.expectedRevision, planSha256: plan.planSha256 })] } })
+  expect((await application.app.inject({ method: 'GET', url: '/api/v1/updates/cleanup/recoverable/receipts/66666666-6666-4666-8666-666666666666', cookies: { dyson_session: cookie } })).statusCode).toBe(404)
+
+  const audit = await application.app.inject({ method: 'GET', url: '/api/v1/jobs?kind=component.cleanup', cookies: { dyson_session: cookie } })
+  expect(audit.statusCode).toBe(200)
+  expect(audit.json().data).toEqual([expect.objectContaining({ actor: 'Administrator', state: 'succeeded', summary: expect.stringContaining(requestId), finishedAt: expect.any(String) })])
 })

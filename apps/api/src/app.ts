@@ -1,3 +1,4 @@
+import { RecoverableCleanupHttpController } from './update-pipeline/recoverable-cleanup-http.js'
 import path from 'node:path'
 import fs, { type Stats } from 'node:fs'
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
@@ -8,6 +9,7 @@ import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
 import { registerWebAssets } from './web-assets.js'
 import { z } from 'zod'
+import { OperatorRollbackHttpController } from './update-pipeline/operator-rollback-http.js'
 import { TrustedModArtifactPolicy, trustedModAcquisitionAuthority } from './update-pipeline/trusted-mod-artifacts.js'
 import { trustedCompatibilityPolicyInputSchema } from './update-pipeline/trusted-compatibility.js'
 import apiPackage from '../package.json' with { type: 'json' }
@@ -44,7 +46,8 @@ import {
 } from './providers/windows-update-transaction-provider.js'
 import { WindowsUpdateRuntimeEvidenceReader } from './providers/windows-update-runtime-evidence.js'
 import {
-  WindowsTrustedRuntimeCompatibilityInspector
+  WindowsTrustedRuntimeCompatibilityInspector,
+  type RollbackWarningCheck
 } from './providers/windows-runtime-compatibility.js'
 import {
   WindowsCutoverAdapter,
@@ -489,11 +492,11 @@ export interface ApplicationDependencies {
   componentUpdateActivationController?: Pick<
     ComponentUpdateActivationHttpController,
     'initialize' | 'recoveryStatus' | 'recover' | 'preview' | 'execute' | 'getReceipt' | 'history' | 'previewCleanup'
-  >
+  > & Partial<Pick<ComponentUpdateActivationHttpController, 'previewRollback'>>
   componentUpdateActivationService?: Pick<
     ComponentUpdateActivationService,
     'preview' | 'execute' | 'reconcile' | 'recoverInterrupted' | 'getReceipt' | 'getState' | 'previewCleanup'
-  >
+  > & Partial<Pick<ComponentUpdateActivationService, 'previewRollback' | 'executeRollback' | 'recoverRollback' | 'getRollbackReceipt' | 'getRollbackPending' | 'previewRecoverableCleanup' | 'runRecoverableCleanup'>>
   windowsUpdateActivationTransactionProvider?: WindowsUpdateActivationTransactionProvider &
     Partial<WindowsSteamManualHandoffTransactionProvider>
   steamManualHandoffService?: Pick<
@@ -605,6 +608,7 @@ export async function buildApplication(
     }
   }
   const database = new ControlDatabase(config.dataDir, config.nodeEnv === 'test')
+  database.reconcileInterruptedRollbackAudits()
   const events = new EventHub()
   const provider = dependencies.statusProvider ?? (
     config.provider === 'windows'
@@ -1201,6 +1205,12 @@ export async function buildApplication(
       }
     }
     const runtimeCompatibilitySource = {
+      approveRollbackWarnings: async (input: RollbackWarningCheck, signal?: AbortSignal) => {
+        await assertAuthorityRevision(signal)
+        const accepted = await runtimeCompatibilityInspector.approveRollbackWarnings(input, signal)
+        await assertAuthorityRevision(signal)
+        return accepted
+      },
       inspect: async (signal?: AbortSignal) => {
         await assertAuthorityRevision(signal)
         const compatibility = await runtimeCompatibilityInspector.inspect(signal)
@@ -1260,6 +1270,7 @@ export async function buildApplication(
               bridge: bepInExRoot,
               control: bepInExRoot
             },
+            hasPendingCleanup: async () => database.listCleanupJournals().some(journal => journal.state !== 'completed'),
             compatibilityVerifier: trustedCompatibilityService,
             hostMutationCoordinator,
             hostMutationRecoveryCoordinator,
@@ -1277,6 +1288,7 @@ export async function buildApplication(
               windowsUpdateActivationAdapters.restoreRollbackPairedSave(request, hostMutation),
             inspectRollbackReadback: (request, hostMutation) =>
               windowsUpdateActivationAdapters.inspectRollbackReadback(request, hostMutation),
+            inspectRollbackMaterial: request => windowsUpdateActivationAdapters.inspectRollbackMaterial(request),
             smoke: (request, hostMutation) => windowsUpdateActivationAdapters.smoke(request, hostMutation)
           })
         })()
@@ -1291,6 +1303,25 @@ export async function buildApplication(
         })
       : null
   )
+  const recoverableCleanup = componentUpdateActivationService?.previewRecoverableCleanup && componentUpdateActivationService.runRecoverableCleanup
+    ? new RecoverableCleanupHttpController({ store: database, service: {
+        previewRecoverableCleanup: id => componentUpdateActivationService.previewRecoverableCleanup!(id),
+        runRecoverableCleanup: (input, store, recovery) => componentUpdateActivationService.runRecoverableCleanup!(input, store, recovery)
+      }, mutationEnabled: () => config.updateCleanupEnabled, recoveryEnabled: () => config.updateCleanupRecoveryEnabled })
+    : null
+
+  const operatorRollback = componentUpdateActivationService?.executeRollback &&
+      componentUpdateActivationService.recoverRollback && componentUpdateActivationService.getRollbackReceipt
+    ? new OperatorRollbackHttpController({
+        service: {
+          executeRollback: request => componentUpdateActivationService.executeRollback!(request),
+          recoverRollback: request => componentUpdateActivationService.recoverRollback!(request),
+          getRollbackReceipt: requestId => componentUpdateActivationService.getRollbackReceipt!(requestId)
+        },
+        mutationEnabled: () => config.updateActivationEnabled,
+        recoveryEnabled: () => config.updateActivationRecoveryEnabled
+      })
+    : null
   if (componentUpdateActivation) {
     app.addHook('onReady', async () => {
       await componentUpdateActivation.initialize()
@@ -2870,6 +2901,104 @@ export async function buildApplication(
     if (!componentUpdateActivation) return updateActivationUnavailable(reply)
     const result = await componentUpdateActivation.execute(request.body)
     return reply.code(result.statusCode).send(result.body)
+  })
+
+  app.post('/api/v1/updates/cleanup/recoverable/preview', protectedRoute('updates.read'), async (request, reply) => {
+    if (!recoverableCleanup) return updateActivationUnavailable(reply)
+    const result = await recoverableCleanup.preview(request.body)
+    return reply.code(result.statusCode).send(result.body)
+  })
+  for (const [route, action] of [['execute', 'execute'], ['recovery', 'recover'], ['restore', 'restore']] as const) {
+    app.post('/api/v1/updates/cleanup/recoverable/' + route, protectedRoute('updates.activate'), async (request, reply) => {
+      if (!recoverableCleanup || !request.actor) return updateActivationUnavailable(reply)
+      const actor = request.actor
+      const result = await auditComponentOperation(actor, request.body, action === 'recover', () => recoverableCleanup[action](request.body, actor), action)
+      return reply.code(result.statusCode).send(result.body)
+    })
+  }
+  app.get('/api/v1/updates/cleanup/recoverable/receipts/:requestId', protectedRoute('updates.read'), async (request, reply) => {
+    const parsed = z.strictObject({ requestId: z.string().uuid() }).safeParse(request.params)
+    if (!parsed.success) return reply.code(400).send({ ok: false, error: { code: 'UPDATE_CLEANUP_REQUEST_INVALID' } })
+    if (!recoverableCleanup) return updateActivationUnavailable(reply)
+    try {
+      const journal = database.loadCleanupJournal(parsed.data.requestId.toLowerCase())
+      if (!journal) return reply.code(404).send({ ok: false, error: { code: 'UPDATE_CLEANUP_RECEIPT_NOT_FOUND' } })
+      if (journal.state !== 'completed') return reply.code(409).send({ ok: false, error: { code: 'UPDATE_CLEANUP_NOT_COMPLETED' } })
+      return { ok: true, data: journal }
+    } catch { return reply.code(503).send({ ok: false, error: { code: 'UPDATE_CLEANUP_UNAVAILABLE' } }) }
+  })
+
+  app.get('/api/v1/updates/cleanup/recoverable/state', protectedRoute('updates.read'), async (_request, reply) => {
+    if (!recoverableCleanup) return updateActivationUnavailable(reply)
+    try { return { ok: true, data: { executionEnabled: config.updateCleanupEnabled, recoveryEnabled: config.updateCleanupRecoveryEnabled,
+      transactions: database.listCleanupJournals().map(journal => ({ requestId: journal.requestId,
+        sourceRequestId: journal.plan.requestId, expectedRevision: journal.plan.expectedRevision, direction: journal.direction, state: journal.state,
+        completedCount: journal.completedCount, totalCount: journal.plan.candidates.length,
+        actor: journal.actor, startedAt: journal.startedAt, finishedAt: journal.finishedAt, planSha256: journal.plan.planSha256 })) } } }
+    catch { return reply.code(503).send({ ok: false, error: { code: 'UPDATE_CLEANUP_UNAVAILABLE' } }) }
+  })
+
+  app.post('/api/v1/updates/rollback/preview', protectedRoute('updates.read'), async (request, reply) => {
+    if (!componentUpdateActivation?.previewRollback) return updateActivationUnavailable(reply)
+    const result = await componentUpdateActivation.previewRollback(request.body)
+    return reply.code(result.statusCode).send(result.body)
+  })
+  async function auditComponentOperation<T extends { statusCode: number }>(
+    actor: string | null, input: unknown, recovery: boolean, action: () => Promise<T>, cleanupAction?: 'execute' | 'recover' | 'restore'
+  ): Promise<T> {
+    if (!actor) throw new Error('UPDATE_ROLLBACK_AUDIT_ACTOR_MISSING')
+    const binding = z.object({ request: z.object({ requestId: z.string().uuid() }) }).safeParse(cleanupAction ? { request: input } : input)
+    const requestId = binding.success ? binding.data.request.requestId.toLowerCase() : 'invalid-request'
+    const startedAt = new Date()
+    const kind = cleanupAction ? (cleanupAction === 'restore' ? 'component.cleanup.restore' : cleanupAction === 'recover' ? 'component.cleanup.recovery' : 'component.cleanup') : (recovery ? 'component.rollback.recovery' : 'component.rollback')
+    const failureCode = cleanupAction ? 'UPDATE_CLEANUP_NOT_COMPLETED' : 'UPDATE_ROLLBACK_NOT_COMPLETED'
+    let job = database.createJob(kind, actor, (cleanupAction ? '组件清理 ' + cleanupAction : '组件回退' + (recovery ? '恢复' : '')) + '请求：' + requestId)
+    job = database.updateJob(job.id, { state: 'running', startedAt: startedAt.toISOString() })
+    events.publish({ type: 'job.updated', data: job })
+    try {
+      const result = await action()
+      const finishedAt = new Date()
+      job = database.updateJob(job.id, { state: result.statusCode < 300 ? 'succeeded' : 'failed',
+        finishedAt: finishedAt.toISOString(), durationMs: Math.max(0, finishedAt.getTime() - startedAt.getTime()),
+        errorCode: result.statusCode < 300 ? null : failureCode })
+      events.publish({ type: 'job.updated', data: job })
+      return result
+    } catch (error) {
+      const finishedAt = new Date()
+      job = database.updateJob(job.id, { state: 'failed', finishedAt: finishedAt.toISOString(),
+        durationMs: Math.max(0, finishedAt.getTime() - startedAt.getTime()), errorCode: failureCode })
+      events.publish({ type: 'job.updated', data: job })
+      throw error
+    }
+  }
+
+  app.post('/api/v1/updates/rollback/execute', protectedRoute('updates.activate'), async (request, reply) => {
+    if (!operatorRollback) return updateActivationUnavailable(reply)
+    const result = await auditComponentOperation(request.actor, request.body, false, () => operatorRollback.execute(request.body))
+    return reply.code(result.statusCode).send(result.body)
+  })
+  app.get('/api/v1/updates/rollback/state', protectedRoute('updates.read'), async (_request, reply) => {
+    if (!operatorRollback || !componentUpdateActivationService?.getRollbackPending) return updateActivationUnavailable(reply)
+    try {
+      return { ok: true, data: { executionEnabled: config.updateActivationEnabled,
+        recoveryEnabled: config.updateActivationRecoveryEnabled,
+        pending: await componentUpdateActivationService.getRollbackPending() } }
+    } catch { return reply.code(503).send({ ok: false, error: { code: 'UPDATE_ROLLBACK_UNAVAILABLE' } }) }
+  })
+  app.post('/api/v1/updates/rollback/recovery', protectedRoute('updates.activate'), async (request, reply) => {
+    if (!operatorRollback) return updateActivationUnavailable(reply)
+    const result = await auditComponentOperation(request.actor, request.body, true, () => operatorRollback.recover(request.body))
+    return reply.code(result.statusCode).send(result.body)
+  })
+  app.get('/api/v1/updates/rollback/receipts/:requestId', protectedRoute('updates.read'), async (request, reply) => {
+    const parsed = z.strictObject({ requestId: z.string().uuid() }).safeParse(request.params)
+    if (!parsed.success) return reply.code(400).send({ ok: false, error: { code: 'UPDATE_ROLLBACK_REQUEST_INVALID' } })
+    if (!componentUpdateActivationService?.getRollbackReceipt) return updateActivationUnavailable(reply)
+    try {
+      const receipt = await componentUpdateActivationService.getRollbackReceipt(parsed.data.requestId)
+      return receipt ? { ok: true, data: receipt }
+        : reply.code(404).send({ ok: false, error: { code: 'UPDATE_ROLLBACK_RECEIPT_NOT_FOUND' } })
+    } catch { return reply.code(503).send({ ok: false, error: { code: 'UPDATE_ROLLBACK_UNAVAILABLE' } }) }
   })
 
   registerWindowsNebulaPluginTransactionRoutes(app, {

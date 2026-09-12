@@ -1,3 +1,4 @@
+import { createRecoverableCleanupPlan } from '../update-pipeline/recoverable-cleanup-plan.js'
 import { DatabaseSync } from 'node:sqlite'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -364,4 +365,51 @@ describe('durable save reconciliation storage', () => {
 
     expect(() => new ControlDatabase(directory)).toThrow('Save reconciliation schema is invalid')
   })
+})
+
+it('closes only interrupted rollback audit attempts across restart without inventing success', () => {
+  const directory = temporaryDirectory()
+  let database = new ControlDatabase(directory)
+  const original = database.createJob('component.rollback', 'Administrator', 'request: fictional-rollback')
+  database.updateJob(original.id, { state: 'running', startedAt: '2026-01-01T00:00:00.000Z' })
+  const other = database.createJob('status.refresh', 'Operator', 'unrelated')
+  const completed = database.createJob('component.rollback.recovery', 'Administrator', 'completed')
+  database.updateJob(completed.id, { state: 'succeeded', finishedAt: '2026-01-01T00:01:00.000Z' })
+  database.close()
+  database = new ControlDatabase(directory)
+  database.reconcileInterruptedRollbackAudits()
+  const interrupted = database.getJob(original.id)
+  expect(interrupted).toMatchObject({ actor: 'Administrator', summary: original.summary,
+    state: 'failed', errorCode: 'UPDATE_ROLLBACK_AUDIT_INTERRUPTED', durationMs: null })
+  expect(interrupted?.finishedAt).toBeTruthy()
+  expect(database.getJob(other.id)?.state).toBe('queued')
+  expect(database.getJob(completed.id)?.state).toBe('succeeded')
+  database.reconcileInterruptedRollbackAudits()
+  expect(database.getJob(original.id)).toEqual(interrupted)
+  database.close()
+})
+
+it('persists append-only cleanup progress and identity across reopen', () => {
+  const directory = temporaryDirectory()
+  const requestId = '11111111-1111-4111-8111-111111111111'
+  const plan = createRecoverableCleanupPlan({ format: 'dyson-recoverable-component-cleanup-plan', schemaVersion: 1, requestId,
+    expectedRevision: 'a'.repeat(64), candidates: [{ kind: 'history', opaqueId: '22222222-2222-4222-8222-222222222222', sha256: 'b'.repeat(64), sizeBytes: 1 }] })
+  const initial = { format: 'dyson-recoverable-cleanup-journal', schemaVersion: 1, requestId, plan,
+    actor: 'Administrator', direction: 'quarantine', startedAt: '2026-01-01T00:00:00.000Z', finishedAt: null, state: 'running', completedCount: 0 }
+  let db = new ControlDatabase(directory)
+  db.appendCleanupJournal(initial)
+  db.close()
+  db = new ControlDatabase(directory)
+  expect(db.loadCleanupJournal(requestId)).toEqual(initial)
+  expect(db.listCleanupJournals().filter(journal => journal.state === 'running')).toEqual([initial])
+  expect(() => db.appendCleanupJournal({ ...initial, completedCount: 1, actor: 'Operator' })).toThrow()
+  db.appendCleanupJournal({ ...initial, completedCount: 1 })
+  const terminal = { ...initial, completedCount: 1, state: 'completed', finishedAt: '2026-01-01T00:00:01.000Z' }
+  db.appendCleanupJournal(terminal)
+  db.appendCleanupJournal(terminal)
+  expect(db.loadCleanupJournal(requestId)).toEqual(terminal)
+  expect(db.listCleanupJournals()).toEqual([terminal])
+  expect(db.listCleanupJournals().filter(journal => journal.state === 'running')).toEqual([])
+  expect(() => db.appendCleanupJournal(initial)).toThrow()
+  db.close()
 })

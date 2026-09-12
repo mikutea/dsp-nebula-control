@@ -2201,6 +2201,7 @@ try {
         [ordered]@{ source = Join-Path $activeConfigurationSourceRoot 'Test-DysonControlConfiguration.ps1'; destination = 'configuration\Test-DysonControlConfiguration.ps1' },
         [ordered]@{ source = Join-Path $activeConfigurationSourceRoot 'dyson-control.environment-contract.json'; destination = 'configuration\dyson-control.environment-contract.json' },
         [ordered]@{ source = Join-Path $gameBootstrapSourceRoot 'DysonGameLifecycleBootstrap.Common.ps1'; destination = 'DysonGameLifecycleBootstrap.Common.ps1' },
+        [ordered]@{ source = Join-Path $gameBootstrapSourceRoot 'DysonStoppedSaveCapture.ps1'; destination = 'DysonStoppedSaveCapture.ps1' },
         [ordered]@{ source = Join-Path $gameBootstrapSourceRoot 'Resolve-DysonGameLifecycleRelease.ps1'; destination = 'Resolve-DysonGameLifecycleRelease.ps1' },
         [ordered]@{ source = Join-Path $gameBootstrapSourceRoot 'Start-DysonServer.ps1'; destination = 'Start-DysonServer.ps1' },
         [ordered]@{ source = Join-Path $gameBootstrapSourceRoot 'Stop-DysonServer.ps1'; destination = 'Stop-DysonServer.ps1' }

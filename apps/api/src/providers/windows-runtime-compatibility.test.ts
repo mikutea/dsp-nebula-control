@@ -16,6 +16,24 @@ afterEach(async () => {
 })
 
 describe('WindowsTrustedRuntimeCompatibilityInspector', () => {
+  it('approves only explicit rollback warnings for the independently verified target version', async () => {
+    const fixture = await createFixture()
+    const policy = { ...fixture.policy, rollbackWarningApprovals: [{
+      entryId: 'windows-runtime-exact-stack', warnings: ['mod-bepinex-target-mismatch']
+    }] }
+    const service = new TrustedCompatibilityService({ stateRoot: path.join(fixture.root, 'approved'),
+      policy, readRuntimeInventory: async () => runtimeInventory() })
+    const inspector = new WindowsTrustedRuntimeCompatibilityInspector({ projectRoot: fixture.root,
+      trustedCompatibilityService: service, policy })
+    const input = { component: 'bepinex' as const, expectedVersion: '5.4.23.3', warnings: ['mod-bepinex-target-mismatch'] }
+    await expect(inspector.approveRollbackWarnings(input)).resolves.toBe(true)
+    await expect(inspector.approveRollbackWarnings({ ...input, expectedVersion: '5.4.17.0' })).resolves.toBe(false)
+    await expect(inspector.approveRollbackWarnings({ ...input, warnings: [...input.warnings, 'game-load-incomplete'] })).resolves.toBe(false)
+    const mismatched = new WindowsTrustedRuntimeCompatibilityInspector({ projectRoot: fixture.root,
+      trustedCompatibilityService: fixture.service, policy })
+    await expect(mismatched.approveRollbackWarnings(input)).resolves.toBe(false)
+  })
+
   it('independently binds the reviewed policy, fixed inventory revision, and decision', async () => {
     const fixture = await createFixture()
     const inspector = new WindowsTrustedRuntimeCompatibilityInspector({

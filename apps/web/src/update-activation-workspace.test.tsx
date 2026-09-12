@@ -1,7 +1,11 @@
+vi.mock('./recoverable-cleanup-api', () => ({ recoverableCleanupApi: { state: vi.fn(async () => ({ executionEnabled: false, recoveryEnabled: false, transactions: [] })) } }))
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { VersionUpdateWorkspace, steamManualHandoffApi } from './VersionUpdateWorkspace'
+vi.mock('./operator-rollback-api', () => ({ operatorRollbackApi: {
+  state: vi.fn(async () => ({ executionEnabled: false, recoveryEnabled: false, pending: [] }))
+} }))
 import { api, ApiError } from './api'
 import type {
   ComponentCandidatePreparationReceipt,

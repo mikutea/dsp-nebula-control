@@ -80,15 +80,15 @@ describe('production configuration', () => {
 
   it('accepts only a bounded deployment release identifier', () => {
     expect(loadConfig({
-      NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: 'v0.1.0-rc.26+fixture'
-    }).deploymentVersion).toBe('v0.1.0-rc.26+fixture')
+      NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: 'v0.1.0-rc.27+fixture'
+    }).deploymentVersion).toBe('v0.1.0-rc.27+fixture')
     expect(() => loadConfig({
       NODE_ENV: 'test', DYSON_DEPLOYMENT_VERSION: '../untrusted release'
     })).toThrow()
   })
 
   it('defaults the expected Bridge heartbeat to the full repository release version', () => {
-    expect(loadConfig({ NODE_ENV: 'test' }).bridgePluginVersion).toBe('0.1.0-rc.26')
+    expect(loadConfig({ NODE_ENV: 'test' }).bridgePluginVersion).toBe('0.1.0-rc.27')
   })
 
   it('keeps player notices disabled and validates the closed mutation gate', () => {
@@ -682,4 +682,14 @@ it('configures startup verification separately from individual host calls', () =
   expect(loadConfig({NODE_ENV:'test',DYSON_STARTUP_TIMEOUT_MS:'900000'}).startupTimeoutMs).toBe(900_000)
   expect(()=>loadConfig({NODE_ENV:'test',DYSON_STARTUP_TIMEOUT_MS:'900001'})).toThrow()
   expect(()=>loadConfig({NODE_ENV:'test',DYSON_STARTUP_TIMEOUT_MS:'9999'})).toThrow()
+})
+
+it('defaults component cleanup gates off and rejects incomplete provider configuration', () => {
+  const defaults = loadConfig({ NODE_ENV: 'test' })
+  expect(defaults.updateCleanupEnabled).toBe(false)
+  expect(defaults.updateCleanupRecoveryEnabled).toBe(false)
+  for (const flag of ['DYSON_UPDATE_CLEANUP_ENABLED', 'DYSON_UPDATE_CLEANUP_RECOVERY_ENABLED']) {
+    expect(() => loadConfig({ NODE_ENV: 'test', [flag]: 'true' })).toThrow(/requires the Windows provider/)
+    expect(() => loadConfig({ NODE_ENV: 'test', [flag]: 'yes' })).toThrow()
+  }
 })

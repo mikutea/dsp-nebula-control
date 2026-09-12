@@ -2487,6 +2487,7 @@ try {
         'DysonDeployment.Configuration.ps1',
         'Start-DysonControl.ps1',
         'DysonGameLifecycleBootstrap.Common.ps1',
+        'DysonStoppedSaveCapture.ps1',
         'Resolve-DysonGameLifecycleRelease.ps1',
         'Start-DysonServer.ps1',
         'Stop-DysonServer.ps1'

@@ -347,7 +347,7 @@ async function readRuntimeEvidence(
   return parseWindowsUpdateRuntimeEvidence(await readStableUtf8File(
     path.join(root, WINDOWS_UPDATE_RUNTIME_EVIDENCE_FILE),
     maximumEvidenceBytes,
-    'WINDOWS_UPDATE_RUNTIME_EVIDENCE_FILE_INVALID'
+    'WINDOWS_UPDATE_RUNTIME_EVIDENCE_FILE_INVALID', 1, true
   ), secret)
 }
 
@@ -449,7 +449,8 @@ async function readStableUtf8File(
   filePath: string,
   maximumBytes: number,
   errorCode: string,
-  minimumBytes = 1
+  minimumBytes = 1,
+  missingIsNotReady = false
 ): Promise<string> {
   let handle: FileHandle | null = null
   try {
@@ -467,7 +468,11 @@ async function readStableUtf8File(
     if (bytes.length < minimumBytes || bytes.length > maximumBytes ||
         !sameFile(before, after) || !sameFile(after, afterPath)) throw new Error('changed')
     return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-  } catch {
+  } catch (error) {
+    if (missingIsNotReady && typeof error === 'object' && error !== null &&
+        'code' in error && error.code === 'ENOENT') {
+      throw new WindowsUpdateRuntimeEvidenceError('WINDOWS_UPDATE_RUNTIME_EVIDENCE_NOT_READY')
+    }
     throw new WindowsUpdateRuntimeEvidenceError(errorCode)
   } finally {
     await handle?.close().catch(() => undefined)

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { setTimeout as wait } from 'node:timers/promises'
 import type { Stats } from 'node:fs'
 import {
   lstat,
@@ -18,6 +19,7 @@ import type {
   GameRuntimeReceiptSource,
   PublicGameRuntimeReceipt
 } from '../lifecycle/game-runtime-receipts.js'
+import { finalSaveProofSchema } from '../lifecycle/game-runtime-receipts.js'
 import {
   HostMutationOperationCoordinatorError,
   type HostMutationOperationCoordinator,
@@ -140,7 +142,8 @@ const runtimeReceiptSchema: z.ZodType<PublicGameRuntimeReceipt> = z.strictObject
   completedAt: z.string().min(1).max(64),
   projectRootIdentityVerified: z.boolean(),
   dataRootIdentityVerified: z.literal(true),
-  receiptSha256: sha256Schema
+  receiptSha256: sha256Schema,
+  finalSaveProof: finalSaveProofSchema.optional()
 })
 const stoppedEvidenceSchema: z.ZodType<RuntimeStoppedEvidence> = z.strictObject({
   protocol: z.literal('DYSON_CONTROL_RUNTIME_V1'),
@@ -163,6 +166,7 @@ const modStateSchema: z.ZodType<ModDeploymentStateSummary> = z.strictObject({
 })
 
 export interface WindowsUpdateTransactionProviderOptions {
+  runtimeEvidenceTimeoutMs?: number
   readPreviousComponentVersion?: (component: FixedUpdateSmokeRequest['component'], signal: AbortSignal) => Promise<string | null>
   /** Only trusted construction selects this root; requests cannot override it. */
   projectRoot: string
@@ -202,6 +206,7 @@ export class WindowsUpdateActivationTransactionProvider implements
   WindowsUpdateActivationTransactionPort,
   WindowsSteamManualHandoffTransactionPort {
   readonly #projectRoot: string
+  readonly #runtimeEvidenceTimeoutMs: number
   readonly #configRoot: string
   readonly #backupRoot: string
   readonly #configStopProof: WindowsUpdateTransactionProviderOptions['configStopProof']
@@ -214,6 +219,11 @@ export class WindowsUpdateActivationTransactionProvider implements
   readonly #gameRuntimeReceiptSource: WindowsUpdateTransactionProviderOptions['gameRuntimeReceiptSource']
 
   constructor(options: WindowsUpdateTransactionProviderOptions) {
+    const evidenceTimeout = options?.runtimeEvidenceTimeoutMs ?? 120_000
+    if (!Number.isSafeInteger(evidenceTimeout) || evidenceTimeout < 1 || evidenceTimeout > 300_000) {
+      throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_EVIDENCE_TIMEOUT_INVALID')
+    }
+    this.#runtimeEvidenceTimeoutMs = evidenceTimeout
     if (!options || !isSafeAbsoluteRoot(options.projectRoot) ||
         typeof options.configStopProof?.issue !== 'function' ||
         typeof options.configStopProof?.validate !== 'function' ||
@@ -264,15 +274,11 @@ export class WindowsUpdateActivationTransactionProvider implements
       const modLock = await this.#inspectStableModLock()
       const save = await this.#inspectFixedSave()
       await this.#proveStopped(hostMutation.signal)
-      const loaded = await this.#readPersistedEvidence(hostMutation)
       const receipt = await this.#latestRuntimeReceipt()
-      assertStoppedRuntimeBinding(loaded, receipt)
+      assertStoppedRuntimeBinding(save.identity, receipt)
       const previousComponentVersion = this.#readPreviousComponentVersion === undefined
         ? undefined
         : versionSchema.nullable().parse(await this.#readPreviousComponentVersion(request.component, hostMutation.signal))
-      if (loaded.loadedSaveIdentity !== save.identity) {
-        throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_STOPPED_SAVE_BINDING_MISMATCH')
-      }
       await this.#proveStopped(hostMutation.signal)
       hostMutation.assertActive()
       return {
@@ -351,6 +357,36 @@ export class WindowsUpdateActivationTransactionProvider implements
       hostMutation.assertActive()
       throw providerError(error, 'WINDOWS_UPDATE_CONFIGURATION_RESTORE_FAILED')
     }
+  }
+
+  async inspectRollbackMaterial(input: Readonly<ComponentUpdateRollbackRestoreRequest>): Promise<{
+    configurationSnapshotVerified: true; protectionVerified: true; serverModLockVerified: true;
+    currentConfigurationRevision: string
+  }> {
+    const request = parse(rollbackRestoreSchema, input, 'WINDOWS_UPDATE_TRANSACTION_REQUEST_INVALID')
+    try {
+      const history = new GameConfigHistoryService({ configRoot: this.#configRoot,
+        validateStopProof: this.#configStopProof.validate })
+      const configuration = await history.diff(request.binding.configurationSnapshotId)
+      if (configuration.targetRevision !== request.binding.configurationRevision) {
+        throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_CONFIGURATION_SNAPSHOT_MISMATCH')
+      }
+      const protection = await inspectProtectionBinding(this.#backupRoot, request.binding.protectionBackupId)
+      if (protection.manifestSha256 !== request.binding.protectionManifestSha256 ||
+          protection.saveIdentity !== request.binding.previousLoadedSaveIdentity) {
+        throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_SAVE_BINDING_MISMATCH')
+      }
+      const modLock = await this.#inspectStableModLock()
+      if (modLock.sha256 !== request.binding.serverModLockSha256 || modLock.revision !== request.binding.serverModLockRevision) {
+        throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_MOD_LOCK_DRIFT_UNRESTORABLE')
+      }
+      const after = await history.diff(request.binding.configurationSnapshotId)
+      if (after.targetRevision !== configuration.targetRevision || after.currentRevision !== configuration.currentRevision) {
+        throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_CONFIGURATION_SNAPSHOT_DRIFT')
+      }
+      return { configurationSnapshotVerified: true, protectionVerified: true, serverModLockVerified: true,
+        currentConfigurationRevision: configuration.currentRevision }
+    } catch (error) { throw providerError(error, 'WINDOWS_UPDATE_ROLLBACK_MATERIAL_UNAVAILABLE') }
   }
 
   async restoreServerModLock(
@@ -456,7 +492,7 @@ export class WindowsUpdateActivationTransactionProvider implements
     hostMutation.assertActive()
     const request = parse(smokeRequestSchema, input, 'WINDOWS_UPDATE_TRANSACTION_REQUEST_INVALID')
     try {
-      const evidence = await this.#readCurrentEvidence(hostMutation)
+      const evidence = await this.#waitForCurrentEvidence(hostMutation)
       if (evidence.loadedSaveIdentity !== request.expectedLoadedSaveIdentity) {
         throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_EXACT_SAVE_LOAD_UNPROVEN')
       }
@@ -465,6 +501,18 @@ export class WindowsUpdateActivationTransactionProvider implements
       hostMutation.assertActive()
       throw providerError(error, 'WINDOWS_UPDATE_RUNTIME_EVIDENCE_UNAVAILABLE')
     }
+  }
+
+  async approveRollbackWarnings(request: Readonly<FixedUpdateSmokeRequest>, warnings: readonly string[],
+    hostMutation: HostMutationOperationScope): Promise<boolean> {
+    hostMutation.assertActive()
+    const parsed = parse(smokeRequestSchema, request, 'WINDOWS_UPDATE_TRANSACTION_REQUEST_INVALID')
+    if (parsed.phase !== 'rollback' || parsed.expectedVersion === null) return false
+    const accepted = await this.#runtimeCompatibilitySource.approveRollbackWarnings?.({
+      component: parsed.component, expectedVersion: parsed.expectedVersion, warnings
+    }, hostMutation.signal)
+    hostMutation.assertActive()
+    return accepted === true
   }
 
   async captureSteamManualBaseline(
@@ -535,7 +583,7 @@ export class WindowsUpdateActivationTransactionProvider implements
     const request = parse(steamLoadRequestSchema, input, 'WINDOWS_UPDATE_TRANSACTION_REQUEST_INVALID')
     const targetVersion = normalizeVersion(request.targetVersion, 'dsp')
     try {
-      const evidenceBefore = await this.#readCurrentEvidence(hostMutation)
+      const evidenceBefore = await this.#waitForCurrentEvidence(hostMutation)
       const compatibility = await this.#readCompatibility(hostMutation)
       const evidenceAfter = await this.#readCurrentEvidence(hostMutation)
       assertSameRuntimeGeneration(evidenceBefore, evidenceAfter)
@@ -580,6 +628,41 @@ export class WindowsUpdateActivationTransactionProvider implements
       throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_MOD_LOCK_CHANGED')
     }
     return { sha256: sha256(firstJson), revision: first.revision }
+  }
+
+  async #waitForCurrentEvidence(hostMutation: HostMutationOperationScope): Promise<AcceptedWindowsUpdateRuntimeEvidence> {
+    hostMutation.assertActive()
+    const deadline = new AbortController()
+    const signal = AbortSignal.any([hostMutation.signal, deadline.signal])
+    const timer = setTimeout(() => deadline.abort(), this.#runtimeEvidenceTimeoutMs)
+    let rejectCancelled!: (reason: unknown) => void
+    const cancelled = new Promise<never>((_, reject) => { rejectCancelled = reject })
+    const abort = () => rejectCancelled(new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_RUNTIME_EVIDENCE_TIMEOUT'))
+    signal.addEventListener('abort', abort, { once: true })
+    try {
+      signal.throwIfAborted()
+      while (true) {
+        hostMutation.assertActive()
+        try {
+          // These source operations are read-only; a timed-out read may not
+          // authorize anything when it eventually finishes.
+          return await Promise.race([this.#readCurrentEvidence({ ...hostMutation, signal }), cancelled])
+        } catch (error) {
+          hostMutation.assertActive()
+          if (signal.aborted) throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_RUNTIME_EVIDENCE_TIMEOUT')
+          if (!(typeof error === 'object' && error !== null && 'code' in error &&
+              error.code === 'WINDOWS_UPDATE_RUNTIME_EVIDENCE_NOT_READY')) throw error
+          await wait(100, undefined, { signal })
+        }
+      }
+    } catch (error) {
+      hostMutation.assertActive()
+      if (signal.aborted) throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_RUNTIME_EVIDENCE_TIMEOUT')
+      throw error
+    } finally {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', abort)
+    }
   }
 
   async #readCurrentEvidence(
@@ -894,25 +977,27 @@ function assertSameRuntimeGeneration(
 }
 
 function assertStoppedRuntimeBinding(
-  evidence: AcceptedWindowsUpdateRuntimeEvidence,
+  saveIdentity: string,
   receipt: PublicGameRuntimeReceipt
 ): void {
   if (!receipt.projectRootIdentityVerified || receipt.restartExpected ||
-      receipt.publishedAt === null || receipt.outcome !== 'clean-exit') {
+      receipt.publishedAt === null || receipt.outcome !== 'clean-exit' ||
+      receipt.errorCode !== null || receipt.bindingId === null || receipt.version === null) {
     throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_RUNTIME_RECEIPT_MISMATCH')
   }
   const startedAt = parseRuntimeTimestamp(receipt.startedAt)
   const publishedAt = parseRuntimeTimestamp(receipt.publishedAt)
   const completedAt = parseRuntimeTimestamp(receipt.completedAt)
+  const proof = receipt.finalSaveProof
+  if (!proof) throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_FINAL_SAVE_PROOF_UNAVAILABLE')
+  const capturedAt = parseRuntimeTimestamp(proof.capturedAt)
   if (startedAt > publishedAt || publishedAt > completedAt ||
-      evidence.processStartedAtUnixMs < startedAt ||
-      evidence.processStartedAtUnixMs > completedAt ||
-      evidence.bridgeStartedAtUnixMs < publishedAt ||
-      evidence.bridgeStartedAtUnixMs > completedAt ||
-      evidence.loadedSaveObservedAtUnixMs > completedAt ||
-      evidence.writtenAtUnixMs > completedAt ||
-      Date.parse(evidence.startedAt) !== evidence.processStartedAtUnixMs) {
+      capturedAt < publishedAt || capturedAt > completedAt) {
     throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_RUNTIME_RECEIPT_MISMATCH')
+  }
+  if (pairIdentity(proof.saveName, { bytes: proof.dsvBytes, sha256: proof.dsvSha256 },
+    { bytes: proof.serverBytes, sha256: proof.serverSha256 }) !== saveIdentity) {
+    throw new WindowsUpdateTransactionProviderError('WINDOWS_UPDATE_STOPPED_SAVE_BINDING_MISMATCH')
   }
 }
 

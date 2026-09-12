@@ -47,6 +47,26 @@ afterEach(async () => {
 })
 
 describe('WindowsUpdateActivationTransactionProvider', () => {
+  it('waits only for unpublished load evidence and bounds a stalled read', async () => {
+    const f = await createFixture(undefined, 500)
+    const request = { requestId, component: 'bepinex' as const, phase: 'candidate' as const,
+      expectedVersion: '5.4.23.5', expectedReleaseId: `bepinex-${'a'.repeat(32)}`,
+      expectedLoadedSaveIdentity: f.originalSaveIdentity }
+    f.state.missingReads = 1
+    await expect(f.provider.probeRuntimeLoadEvidence(request, f.hostMutation))
+      .resolves.toMatchObject({ loadedSaveIdentity: f.originalSaveIdentity })
+    expect(f.state.currentEvidenceCalls).toBe(2)
+    f.state.evidenceError = 'WINDOWS_UPDATE_EVIDENCE_HMAC_INVALID'
+    await expect(f.provider.probeRuntimeLoadEvidence(request, f.hostMutation)).rejects.toBeDefined()
+    expect(f.state.currentEvidenceCalls).toBe(3)
+    const hung = await createFixture(undefined, 30)
+    hung.state.hangRead = true
+    await expect(hung.provider.probeRuntimeLoadEvidence({ ...request,
+      expectedLoadedSaveIdentity: hung.originalSaveIdentity }, hung.hostMutation))
+      .rejects.toMatchObject({ code: 'WINDOWS_UPDATE_RUNTIME_EVIDENCE_TIMEOUT' })
+    expect(hung.state.currentEvidenceCalls).toBe(1)
+  })
+
   it('captures the canonical predecessor version from the server source and rejects missing evidence', async () => {
     const valid = await createFixture(async component => {
       expect(component).toBe('bepinex')
@@ -78,7 +98,7 @@ describe('WindowsUpdateActivationTransactionProvider', () => {
       previousLoadedSaveIdentity: fixture.originalSaveIdentity
     }))
     expect(fixture.state.stoppedProofCalls).toBe(3)
-    expect(fixture.state.persistedEvidenceCalls).toBe(1)
+    expect(fixture.state.persistedEvidenceCalls).toBe(0)
     expect(fixture.state.receiptCalls).toBe(1)
 
     const backup = await fixture.saveService.backup({
@@ -92,6 +112,13 @@ describe('WindowsUpdateActivationTransactionProvider', () => {
     }, fixture.hostMutation) as { manifestSha256: string; saveIdentity: string }
     expect(protection.saveIdentity).toBe(fixture.originalSaveIdentity)
     const binding = rollbackBinding(baseline, backup.backupId, protection.manifestSha256)
+    await expect(fixture.provider.inspectRollbackMaterial({ requestId, component: 'nebula', binding }))
+      .resolves.toEqual({ configurationSnapshotVerified: true, protectionVerified: true,
+        serverModLockVerified: true, currentConfigurationRevision: baseline.configurationRevision })
+    await expect(fixture.provider.inspectRollbackMaterial({ requestId, component: 'nebula',
+      binding: { ...binding, protectionManifestSha256: 'f'.repeat(64) } }))
+      .rejects.toMatchObject({ code: 'WINDOWS_UPDATE_SAVE_BINDING_MISMATCH' })
+    expect(fixture.state.stopProofTokensIssued).toBe(0)
 
     await writeFile(
       path.join(fixture.configRoot, 'nebula.cfg'),
@@ -131,10 +158,7 @@ describe('WindowsUpdateActivationTransactionProvider', () => {
 
   it('fails stopped baseline closed unless the newest clean runtime receipt and exact fixed pair agree', async () => {
     const wrongPair = await createFixture()
-    wrongPair.state.persisted = {
-      ...wrongPair.state.persisted,
-      loadedSaveIdentity: 'e'.repeat(64)
-    }
+    wrongPair.state.receipt.finalSaveProof!.dsvSha256 = 'e'.repeat(64)
     await expect(wrongPair.provider.captureRollbackBaseline({
       requestId,
       component: 'bridge',
@@ -159,6 +183,18 @@ describe('WindowsUpdateActivationTransactionProvider', () => {
     }, wrongReceipt.hostMutation)).rejects.toMatchObject({
       code: 'WINDOWS_UPDATE_RUNTIME_RECEIPT_MISMATCH'
     })
+  })
+
+  it('requires final-save authority while allowing saved bytes to differ from the old loaded proof', async () => {
+    const fixture = await createFixture()
+    fixture.state.persisted.loadedSaveIdentity = 'e'.repeat(64)
+    const request = { requestId, component: 'bepinex' as const, targetVersion: '5.4.23.5', expectedRevision: shaA }
+    await expect(fixture.provider.captureRollbackBaseline(request, fixture.hostMutation))
+      .resolves.toMatchObject({ previousLoadedSaveIdentity: fixture.originalSaveIdentity })
+    expect(fixture.state.persistedEvidenceCalls).toBe(0)
+    delete fixture.state.receipt.finalSaveProof
+    await expect(fixture.provider.captureRollbackBaseline(request, fixture.hostMutation))
+      .rejects.toMatchObject({ code: 'WINDOWS_UPDATE_FINAL_SAVE_PROOF_UNAVAILABLE' })
   })
 
   it('never claims a mod rollback when the fixed managed lock drifted', async () => {
@@ -264,7 +300,7 @@ interface Baseline {
   previousLoadedSaveIdentity: string
 }
 
-async function createFixture(readPreviousComponentVersion?: WindowsUpdateTransactionProviderOptions['readPreviousComponentVersion']) {
+async function createFixture(readPreviousComponentVersion?: WindowsUpdateTransactionProviderOptions['readPreviousComponentVersion'], runtimeEvidenceTimeoutMs?: number) {
   const projectRoot = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-update-provider-')))
   temporaryRoots.push(projectRoot)
   const configRoot = path.join(projectRoot, 'server', 'BepInEx', 'config')
@@ -312,7 +348,13 @@ async function createFixture(readPreviousComponentVersion?: WindowsUpdateTransac
     completedAt: '2026-08-30T00:00:10.0000000+00:00',
     projectRootIdentityVerified: true,
     dataRootIdentityVerified: true,
-    receiptSha256: shaB
+    receiptSha256: shaB,
+    finalSaveProof: {
+      protocol: 'DYSON_CONTROL_STOPPED_SAVE_PROOF_V1', stopIntentSha256: shaA,
+      capturedAt: '2026-08-30T00:00:09.0000000+00:00', saveName: '_lastexit_',
+      dsvBytes: originalPair.dsv.length, dsvSha256: createHash('sha256').update(originalPair.dsv).digest('hex'),
+      serverBytes: originalPair.server.length, serverSha256: createHash('sha256').update(originalPair.server).digest('hex')
+    }
   }
   const mod: ModDeploymentStateSummary = {
     revision: shaA,
@@ -324,6 +366,9 @@ async function createFixture(readPreviousComponentVersion?: WindowsUpdateTransac
     current,
     persisted: current,
     currentSequence: [] as AcceptedWindowsUpdateRuntimeEvidence[],
+    missingReads: 0,
+    evidenceError: null as string | null,
+    hangRead: false,
     receipt,
     mod,
     compatibility: {
@@ -344,6 +389,7 @@ async function createFixture(readPreviousComponentVersion?: WindowsUpdateTransac
     return stoppedEvidence
   }
   const provider = new WindowsUpdateActivationTransactionProvider({
+    runtimeEvidenceTimeoutMs,
     readPreviousComponentVersion,
     projectRoot,
     configStopProof: {
@@ -363,6 +409,9 @@ async function createFixture(readPreviousComponentVersion?: WindowsUpdateTransac
     runtimeEvidenceSource: {
       async readCurrentRuntimeEvidence() {
         state.currentEvidenceCalls += 1
+        if (state.hangRead) await new Promise(() => undefined)
+        if (state.missingReads-- > 0) throw Object.assign(new Error('not ready'), { code: 'WINDOWS_UPDATE_RUNTIME_EVIDENCE_NOT_READY' })
+        if (state.evidenceError) throw Object.assign(new Error('invalid'), { code: state.evidenceError })
         return state.currentSequence.shift() ?? state.current
       },
       async readPersistedRuntimeEvidence() {

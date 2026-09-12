@@ -78,7 +78,7 @@ export class WindowsLifecycleAdapter implements LifecycleMutationAdapter {
     }
     this.#options = {
       ...options,
-      bridgePluginVersion: options.bridgePluginVersion ?? '0.1.0-rc.26',
+      bridgePluginVersion: options.bridgePluginVersion ?? '0.1.0-rc.27',
       serverTaskName: options.serverTaskName ?? 'Dyson-Nebula-Server',
       stopTaskName: options.stopTaskName ?? 'Dyson-Nebula-Stop',
       gamePort: options.gamePort ?? 8469
@@ -284,16 +284,15 @@ export class WindowsLifecycleAdapter implements LifecycleMutationAdapter {
   ): Promise<LifecyclePhaseResult> {
     try {
       let evidence: Awaited<ReturnType<WindowsLifecycleBrokerClient['verify']>>
-      let attempt = 0
       while (true) {
         context.signal.throwIfAborted()
         context.hostMutation?.assertActive()
         try {
           evidence = await this.#options.brokerClient.verify({
             expected,
-            // A terminal blocked receipt is immutable; a new observation needs
-            // a new identity instead of replaying that cached result forever.
-            outerRequestId: attempt++ === 0 ? context.requestId : randomUUID(),
+            // Every observation must be fresh, including after a successful
+            // earlier proof. Dispatch keeps its separate stable request ID.
+            outerRequestId: randomUUID(),
             signal: context.signal
           })
           break
