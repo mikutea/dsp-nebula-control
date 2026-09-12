@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
+import { realpath, mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { expect, it } from 'vitest'
@@ -9,7 +9,7 @@ import { moveCleanupObject } from './recoverable-cleanup-move.js'
 const requestId = '11111111-1111-4111-8111-111111111111'
 const scope: HostMutationOperationScope = { signal: new AbortController().signal, assertActive() {}, toPowerShellBorrowArguments: () => [] }
 it.each(['history', 'release'] as const)('quarantines and restores real %s objects using only fixed roots', async kind => {
-  const root = await mkdtemp(path.join(tmpdir(), 'cleanup-files-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'cleanup-files-')))
   try {
     const opaqueId = kind === 'history' ? '22222222-2222-4222-8222-222222222222' : 'nebula-' + 'a'.repeat(32)
     const source = kind === 'history' ? path.join(root, 'history', opaqueId + '.json') : path.join(root, 'releases', 'nebula', opaqueId)
@@ -26,7 +26,7 @@ it.each(['history', 'release'] as const)('quarantines and restores real %s objec
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 it('preserves a newly occupied restore target and rejects path-shaped IDs', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'cleanup-conflict-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'cleanup-conflict-')))
   try {
     const opaqueId = '22222222-2222-4222-8222-222222222222'
     const source = path.join(root, 'history', opaqueId + '.json')

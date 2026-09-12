@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { realpath, mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { HostMutationLeaseError } from '../host-mutation/lease.js'
@@ -483,7 +483,7 @@ interface Fixture {
 }
 
 async function createFixture(): Promise<Fixture> {
-  const root = await mkdtemp(path.join(tmpdir(), 'dyson-live-deployment-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-live-deployment-')))
   temporaryRoots.push(root)
   const releaseRoot = path.join(root, 'releases')
   const controlRoot = path.join(root, 'control')

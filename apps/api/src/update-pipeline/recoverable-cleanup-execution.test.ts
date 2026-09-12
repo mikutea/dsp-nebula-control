@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { realpath, mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { expect, it } from 'vitest'
@@ -10,7 +10,7 @@ import { inspectCleanupObject } from './recoverable-cleanup-inventory.js'
 import { executeCleanupJournal } from './recoverable-cleanup-execution.js'
 const scope: HostMutationOperationScope = { signal: new AbortController().signal, assertActive() {}, toPowerShellBorrowArguments: () => [] }
 it('recovers after real rename before checkpoint using reopened SQLite and then restores', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'cleanup-execution-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'cleanup-execution-')))
   let db: ControlDatabase | undefined
   try {
     const control = path.join(root, 'control'), data = path.join(root, 'data')

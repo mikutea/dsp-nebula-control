@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { link, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { realpath, link, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { hostname, tmpdir, uptime } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import path from 'node:path'
@@ -217,7 +217,7 @@ interface FixtureOptions {
 }
 
 async function createFixture(options: FixtureOptions = {}) {
-  const root = await mkdtemp(path.join(tmpdir(), 'dyson-steam-handoff-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-steam-handoff-')))
   roots.push(root)
   const stateRoot = path.join(root, 'state')
   const events: string[] = []

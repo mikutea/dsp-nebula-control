@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { realpath, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -278,7 +278,7 @@ async function createFixture(
   now: number,
   alterHeartbeat: (index: number, heartbeat: BridgeHeartbeat) => BridgeHeartbeat = (_index, value) => value
 ) {
-  const root = await mkdtemp(path.join(tmpdir(), 'dyson-update-evidence-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'dyson-update-evidence-')))
   temporaryRoots.push(root)
   const controlRoot = path.join(root, 'control')
   const secretFile = path.join(root, 'secret')

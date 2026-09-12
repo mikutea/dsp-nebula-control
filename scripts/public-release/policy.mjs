@@ -71,6 +71,8 @@ export const RULE_IDS = Object.freeze([
  * be reviewed independently; prefixes and glob expressions are not accepted.
  */
 export const EXACT_ALLOWLIST = Object.freeze([
+  // Fixture root canonicalization retains the reviewed escaped-string regex.
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'apps/api/src/providers/windows-update-runtime-evidence.test.ts', blobId: '72410c340e0acd7e52d4c88fe9e6bf7331c74b6f' },
   // Reviewed Win32 extended-path prefix normalization, not a network endpoint.
   { scope: 'worktree', ruleId: 'UNC_PATH', path: 'scripts/windows/bootstrap/DysonStoppedSaveCapture.ps1' },
   { scope: 'artifact', ruleId: 'UNC_PATH', path: 'scripts/windows/bootstrap/DysonStoppedSaveCapture.ps1' },

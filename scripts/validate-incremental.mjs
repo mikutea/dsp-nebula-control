@@ -289,6 +289,7 @@ const reviewedPredecessorSources = new Map([
 ]);
 
 const reviewedOperatorBatchSources = new Map([
+  ["apps/api/src/update-pipeline/steam-manual-handoff.test.ts", "1169cda955e9146239491183bde46179fc1991dd3a3aa354d645f82e303af30e"],
   ["apps/web/src/recoverable-cleanup-panel.test.tsx", "0e63eec7996a82ee63164c43899c0dc6b16d3df5681328e43962e7cb75f2a69a"],
   ["apps/web/src/RecoverableCleanupPanel.tsx", "d1cb2ab6bed980200aef9397148f1079a314f2db48a8404dcac1ad6507ec7dd2"],
   ["apps/web/src/recoverable-cleanup-api.test.ts", "6edecef10d5d9f72a24f8f8615fa518adcc4b40e7cb1195fb5bc6a722570ece5"],
@@ -301,13 +302,13 @@ const reviewedOperatorBatchSources = new Map([
   ["apps/api/src/update-pipeline/recoverable-cleanup-http.ts", "9cfe0784758d785b642c6914fab86ca5e468df7f0e5f4487a2d9ed196bf26f33"],
   ["apps/api/src/update-pipeline/recoverable-cleanup-coordinator.test.ts", "e402bac0b9e05bd7e42ec24063806a0233c304eb918a6b751ebf99d5108de617"],
   ["apps/api/src/update-pipeline/recoverable-cleanup-coordinator.ts", "5ab64a97f2867705c778ab104f38d118d11f1fab5138bba1b19507023ca1c329"],
-  ["apps/api/src/update-pipeline/recoverable-cleanup-execution.test.ts", "a741e821c8c172e672bd08b17a56071ac689360250701ed485fab9c173640cb8"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-execution.test.ts", "23de652dc53cc338ad17a610edcfb9fa403fe28c3434c1565b8496933c7a0500"],
   ["apps/api/src/update-pipeline/recoverable-cleanup-execution.ts", "eb58ceebff8a04a171173e0700511f72e5faf475db83fe22ad7e41f9dbe8fef7"],
   ["apps/api/src/update-pipeline/recoverable-cleanup-records.test.ts", "a10111e8e1da42a365d9ac1864c5f107631587dc23d5bf85c2aa2fc1e9a757e3"],
   ["apps/api/src/update-pipeline/recoverable-cleanup-records.ts", "70c47ecf201c62cd2a7be50d28c44267f1ce2896d84a6746de8d59cbc46ecc22"],
-  ["apps/api/src/update-pipeline/recoverable-cleanup-files.test.ts", "cb9ac329410bf855e1a77f8f7d222426fe79f288db3ceefdd4d096c6fc16140a"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-files.test.ts", "d92cbcb8288f8dc0416236a0cc543460885014adb10536d248483c09d9a1525b"],
   ["apps/api/src/update-pipeline/recoverable-cleanup-files.ts", "b0f854635757653107da2f27b26b7a318db19c4b9d92f603999cbd97700c1189"],
-  ["apps/api/src/update-pipeline/recoverable-cleanup-inventory.test.ts", "db301dcd2e7414eed38afb99e030688cc44c1c91a1b51f524d127027e40a492b"],
+  ["apps/api/src/update-pipeline/recoverable-cleanup-inventory.test.ts", "aeff61a99c5339229594ef8ff65234114702eac7f8cfe65c6fa7c143e390d963"],
   ["apps/api/src/update-pipeline/recoverable-cleanup-inventory.ts", "6f7df8653f5fa8feb036d99deba4013a4cd61170882e28b270c4cce0771725e6"],
   ["apps/api/src/update-pipeline/recoverable-cleanup-move.test.ts", "a8fbca240d4d2adb1f0bf8d69218bb0c64f172210b0a4857eefdef7c512b3f14"],
   ["apps/api/src/update-pipeline/recoverable-cleanup-move.ts", "3f64867d39610c09e7fe0aa9b503a51e5106ade8c3234d51d8ee9992ac7056b5"],
@@ -361,7 +362,7 @@ const reviewedOperatorBatchSources = new Map([
   ],
   [
     "apps/api/src/providers/windows-update-runtime-evidence.test.ts",
-    "245a32de860d4c080b66aad9936f77f89ce87554a0d9698a5577ab3b4abc92a6"
+    "9aeecd5dc99eee306ff53e36d5f1f7ea3b84389ae5b811ab97c9f3a6c4870504"
   ],
   [
     "apps/api/src/providers/windows-update-runtime-evidence.ts",
@@ -389,7 +390,7 @@ const reviewedOperatorBatchSources = new Map([
   ],
   [
     "apps/api/src/update-pipeline/activation-live.test.ts",
-    "40e0c59d053a20d5099aa937855bcf513edd9ceb31833180fde8a2e60e8abfce"
+    "6ae65b53f330875f5ca49c382e9bc7f274ac197a9fd83aad325266d45617cfe8"
   ],
   [
     "apps/api/src/update-pipeline/activation-live.ts",
@@ -538,7 +539,7 @@ export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
   if (file === 'scripts/public-release/scanner.test.mjs' && aclSourceHash(after) === 'e04dc3b368859772a29127de141af4c618d93850efb2c84f968e7fb731a1d581') return 'reviewed-hygiene-policy'
   if (file === 'scripts/public-release/policy.mjs' &&
-      aclSourceHash(after) === '33d3ab536f308e2c73c95117cd39ad1f134833ff9c253336b3dd998cb5fec636') return 'reviewed-hygiene-policy'
+      aclSourceHash(after) === 'dba22642fdd16d9b11f2ba4cd7fa485a3e03ce2dae3b12c21eadf9673098886a') return 'reviewed-hygiene-policy'
   if (file === 'scripts/windows/deployment/Test-DysonControlDeployment.ps1' &&
       aclSourceHash(after) === '248758ae47a5edf9678f0c515eb564c31e3cb127538347556319ba10ae44766a') return 'verified-native-status'
   for (const releaseVersion of ['0.1.0-rc.24', '0.1.0-rc.25', '0.1.0-rc.26', '0.1.0-rc.27']) {
