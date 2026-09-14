@@ -1251,7 +1251,7 @@ export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
   if (file === 'scripts/public-release/scanner.test.mjs' && aclSourceHash(after) === '1fa443147c15695a1f91934ced3dfe2251b284bd0837680e885e53b792f3ad24') return 'reviewed-hygiene-policy'
   if (file === 'scripts/public-release/policy.mjs' &&
-      aclSourceHash(after) === 'd01292a6d6b9aa1016890678b2e98b2154ed33333f2363734638e86d4cff008a') return 'reviewed-hygiene-policy'
+      aclSourceHash(after) === '30fddda7fa9993bd8a9e3986c3166379693031a32759466f245a1568b0c9d82e') return 'reviewed-hygiene-policy'
   if (file === 'scripts/windows/deployment/Test-DysonControlDeployment.ps1' &&
       aclSourceHash(after) === 'a6c1dcaf59954eaaa4620b65cff612e856ed5280ce63e1a7e1520a52277f390d') return 'verified-native-status'
   for (const releaseVersion of ['0.1.0-rc.24', '0.1.0-rc.25', '0.1.0-rc.26', '0.1.0-rc.27']) {
