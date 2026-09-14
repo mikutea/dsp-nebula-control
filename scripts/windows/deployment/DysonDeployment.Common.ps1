@@ -2455,7 +2455,104 @@ function Read-DysonDeploymentStatusEnvironmentFile {
     return $configured
 }
 
+function Get-DysonLifecycleBrokerStaticHistoryFingerprint {
+    param([Parameter(Mandatory)]$Storage)
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in @(
+            [pscustomobject]@{ name='intents'; path=$Storage.intents },
+            [pscustomobject]@{ name='requests'; path=$Storage.requests },
+            [pscustomobject]@{ name='receipts'; path=$Storage.receipts })) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $entry.path -Force -ErrorAction Stop |
+                Sort-Object -Property Name -CaseSensitive)) {
+            $length = if ($item.PSIsContainer) { -1L } else { [int64]$item.Length }
+            $lines.Add(([string]$entry.name + '|' + [string]$item.Name + '|' +
+                [string][bool]$item.PSIsContainer + '|' + [string]$length + '|' +
+                [string][int64]$item.LastWriteTimeUtc.Ticks))
+        }
+    }
+    return Get-DysonTextSha256 ([string]::Join("`n", $lines))
+}
+
 function Assert-DysonLifecycleBrokerStaticNoPendingWork {
+    param([Parameter(Mandatory)]$Storage, [switch]$AllowPendingStatusRequests)
+
+    if (-not $AllowPendingStatusRequests) {
+        return Assert-DysonLifecycleBrokerStaticNoPendingWorkCore -Storage $Storage
+    }
+    return Assert-DysonLifecycleBrokerStaticPreQuiescence -Storage $Storage
+}
+
+function Assert-DysonLifecycleBrokerStaticPreQuiescence {
+    param([Parameter(Mandatory)]$Storage)
+
+    # The running panel continuously appends and retains closed read-only status
+    # pairs. Before quiescence, inspect only unmatched records to prove that no
+    # mutating request is pending. The strict full-history pass runs again after
+    # the panel and workers are stopped, before any destructive deployment step.
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $before = Get-DysonLifecycleBrokerStaticHistoryFingerprint -Storage $Storage
+        $failure = $null
+        try {
+            if (@(Get-ChildItem -LiteralPath $Storage.intents -Force -ErrorAction Stop).Count -ne 0) {
+                throw 'The lifecycle broker has an unfinished intent.'
+            }
+            $requests = @{}
+            foreach ($file in @(Get-ChildItem -LiteralPath $Storage.requests -Force -ErrorAction Stop)) {
+                if ($file.PSIsContainer -or $file.Extension -cne '.json') {
+                    throw 'The lifecycle broker request directory contains an unsupported entry.'
+                }
+                $id = ConvertTo-DysonLifecycleBrokerGuid ([string]$file.BaseName) `
+                    'DYSON_CONTROL_LIFECYCLE_BROKER_RECOVERY_REQUIRED'
+                $requests[$id] = [string]$file.FullName
+            }
+            $receipts = @{}
+            foreach ($file in @(Get-ChildItem -LiteralPath $Storage.receipts -Force -ErrorAction Stop)) {
+                if ($file.PSIsContainer -or $file.Extension -cne '.json') {
+                    throw 'The lifecycle broker receipt directory contains an unsupported entry.'
+                }
+                $id = ConvertTo-DysonLifecycleBrokerGuid ([string]$file.BaseName) `
+                    'DYSON_CONTROL_LIFECYCLE_BROKER_RECOVERY_REQUIRED'
+                $receipts[$id] = [string]$file.FullName
+            }
+            foreach ($id in @($requests.Keys)) {
+                if ($receipts.ContainsKey($id)) { continue }
+                $paths = Get-DysonLifecycleBrokerRecordPaths -Storage $Storage -BrokerRequestId $id
+                if (-not (Test-DysonLifecycleBrokerSamePath $requests[$id] $paths.request)) {
+                    throw 'The lifecycle broker has an unfinished request.'
+                }
+                $request = ConvertTo-DysonLifecycleBrokerValidatedRequest (
+                    Read-DysonLifecycleBrokerJson -Path $paths.request `
+                        -MaximumBytes $script:DysonLifecycleBrokerMaximumRequestBytes `
+                        -InvalidCode 'DYSON_CONTROL_LIFECYCLE_BROKER_REQUEST_INVALID'
+                )
+                if ([string]$request.brokerRequestId -cne $id -or
+                    [string]$request.capability -cne 'LifecycleStatus') {
+                    throw 'The lifecycle broker has an unfinished mutating request.'
+                }
+            }
+            foreach ($id in @($receipts.Keys)) {
+                if (-not $requests.ContainsKey($id)) {
+                    throw 'The lifecycle broker has an orphaned receipt.'
+                }
+            }
+        }
+        catch { $failure = $_ }
+        $after = Get-DysonLifecycleBrokerStaticHistoryFingerprint -Storage $Storage
+        if ([string]$before -ceq [string]$after) {
+            if ($null -ne $failure) { throw $failure }
+            return
+        }
+        if ($timer.Elapsed.TotalSeconds -ge 15) {
+            if ($null -ne $failure) { throw $failure }
+            throw 'The lifecycle broker pending-state view did not stabilize during preflight.'
+        }
+        Start-Sleep -Milliseconds 100
+    } while ($true)
+}
+
+function Assert-DysonLifecycleBrokerStaticNoPendingWorkCore {
     param([Parameter(Mandatory)]$Storage, [switch]$AllowPendingStatusRequests)
 
     if (@(Get-ChildItem -LiteralPath $Storage.intents -Force -ErrorAction Stop).Count -ne 0) {

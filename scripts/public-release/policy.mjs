@@ -86,6 +86,7 @@ export const EXACT_ALLOWLIST = Object.freeze([
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1', blobId: '8242ffca5b89d30b77c017ae40d419685bfaa294' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1', blobId: '21c7c1ba1c90eeda159e13646d3ec0f10a329587' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1', blobId: 'df963cfa6a64f59130118f1ffe98ad92f48d899d' },
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1', blobId: '10673ed04e776b0c49c52d22363504326dc9a625' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: 'bf04aa3fb5e6237043879bd6902cb37091a1d817' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: '42cd62c26ff3dbb545e1a6398dfed2f91f4e014d' },
   { scope: 'worktree', ruleId: 'FORBIDDEN_ENV_FILE', path: '.env.example' },
