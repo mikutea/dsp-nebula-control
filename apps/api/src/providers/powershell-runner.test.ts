@@ -149,5 +149,5 @@ $allowed = $PSCmdlet.ShouldProcess('disposable fixture', 'observe only')
       if (path.dirname(fixtureRoot) !== temporaryRoot) throw new Error('Unsafe fixture cleanup path')
       await fs.rm(fixtureRoot, { recursive: true, force: true })
     }
-  })
+  }, 15_000)
 })

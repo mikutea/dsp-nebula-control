@@ -607,7 +607,7 @@ const reviewedManagerRemovalSources = new Map([
   ],
   [
     "apps/api/src/providers/powershell-runner.test.ts",
-    "6935536e61ad03db04b287a79393350f0bc0b890b70533a4e4ae7106f2aced6d"
+    "31274cf064ab0cc6d00dc86df002161d5270674cb91af65ac8081ba660cab034"
   ],
   [
     "apps/api/src/providers/powershell-runner.ts",
