@@ -540,7 +540,7 @@ const reviewedContractMigrationSources = new Map([
   ],
   [
     "scripts/windows/configuration/New-DysonControlConfigurationSnapshot.ps1",
-    "5d28019782ceb80b26969b1d41e670cd5cad78d59925cac64c6265dbdfd06bb1"
+    "ddd4a375e79aeedc53b7aa45459c550ee26f2b0fcc0461c07627ac29da01b6c7"
   ],
   [
     "scripts/windows/configuration/Restore-DysonControlConfiguration.ps1",
@@ -548,7 +548,7 @@ const reviewedContractMigrationSources = new Map([
   ],
   [
     "scripts/windows/configuration/SelfTest-DysonControlConfiguration.ps1",
-    "8c5b2cb0b4491d5177b12e2e2a1033cd027dee8682a2594186c5f95be8690a32"
+    "505d2b23a881a0c4b91cb9ccc66ff9d621e8fe6b55fa833270bfc1c3776e300c"
   ],
   [
     "scripts/windows/configuration/Test-DysonControlConfiguration.ps1",

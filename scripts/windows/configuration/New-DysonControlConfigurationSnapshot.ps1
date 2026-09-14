@@ -40,13 +40,18 @@ foreach ($directory in @(
     )) {
     [void](Assert-DysonConfigurationPlainDirectoryChain $directory)
 }
-$configuration = Read-DysonControlEnvironmentFile -Path $storage.configurationPath `
-    -Contract $contract -ExpectedLauncherBindings $bindings -SkipSourceAcl
-[void](Assert-DysonConfigurationAcl -Path $storage.configurationPath `
-    -Kind ConfigFile -ServiceSid $serviceSid)
 $transactionState = Get-DysonConfigurationTransactionState -Storage $storage `
     -ServiceSid $serviceSid -Contract $contract -ExpectedLauncherBindings $bindings
 if (-not $transactionState.clean) { throw 'DYSON_CONFIGURATION_TRANSACTION_NOT_CLEAN' }
+$terminalContract = Resolve-DysonConfigurationRecordedContract -Contract $contract `
+    -RecordedSha256 ([string]$transactionState.terminalContractSha256)
+$configuration = Read-DysonControlEnvironmentFile -Path $storage.configurationPath `
+    -Contract $terminalContract -ExpectedLauncherBindings $bindings -SkipSourceAcl
+if ([string]$configuration.contractSha256 -cne [string]$terminalContract.sha256) {
+    throw 'DYSON_CONFIGURATION_TERMINAL_TARGET_INVALID'
+}
+[void](Assert-DysonConfigurationAcl -Path $storage.configurationPath `
+    -Kind ConfigFile -ServiceSid $serviceSid)
 $existingSnapshotCount = Assert-DysonConfigurationSnapshotInventory -Storage $storage `
     -Contract $contract -ServiceSid $serviceSid
 

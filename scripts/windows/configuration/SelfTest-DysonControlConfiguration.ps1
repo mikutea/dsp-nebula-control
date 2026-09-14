@@ -889,6 +889,30 @@ try {
         Assert-SelfTest ($legacyState.clean -and $legacyState.receipts.Count -eq 1) 'LEGACY_CONTRACT_HISTORY_READ'
         $snapshotCheck = Assert-DysonConfigurationSnapshot -SnapshotPath $legacySnapshot.path -Contract $script:Contract -ServiceSid $script:ServiceSid -ExpectedDataRoot $legacyFixture.dataRoot
         Assert-SelfTest $snapshotCheck.valid 'LEGACY_CONTRACT_SNAPSHOT_READ'
+        if ($script:AclIntegration) {
+            $crossVersionSnapshotId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
+            $crossVersionSnapshotOutput = @(& (Join-Path $PSScriptRoot 'New-DysonControlConfigurationSnapshot.ps1') `
+                -DataRoot $legacyFixture.dataRoot -ScriptRoot ([string]$legacyFixture.bindings['DYSON_SCRIPT_ROOT']) `
+                -RuntimeBootstrapRoot ([string]$legacyFixture.bindings['DYSON_RUNTIME_BOOTSTRAP_ROOT']) `
+                -DeploymentVersion ([string]$legacyFixture.bindings['DYSON_DEPLOYMENT_VERSION']) `
+                -ServiceAccount 'NT AUTHORITY\LOCAL SERVICE' -SnapshotId $crossVersionSnapshotId -Confirm:$false)
+            $crossVersionSnapshot = $crossVersionSnapshotOutput | Select-Object -Last 1
+            Assert-SelfTest ([string]$crossVersionSnapshot.state -ceq 'created' -and
+                [string]$crossVersionSnapshot.snapshotId -ceq $crossVersionSnapshotId -and
+                [string]$crossVersionSnapshot.contractSha256 -ceq '5386f42df066b3d5ce4fa26f3346baf4311b0ec8efb1eb4d83bdf488c14786dc' -and
+                [string]$crossVersionSnapshot.configurationSha256 -ceq [string]$legacyState.terminalTargetSha256) `
+                'LEGACY_CONTRACT_PUBLIC_SNAPSHOT_SCRIPT'
+        }
+        else {
+            $snapshotScriptSource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot `
+                'New-DysonControlConfigurationSnapshot.ps1'))
+            $stateIndex = $snapshotScriptSource.IndexOf('$transactionState = Get-DysonConfigurationTransactionState')
+            $resolverIndex = $snapshotScriptSource.IndexOf('$terminalContract = Resolve-DysonConfigurationRecordedContract')
+            $readerIndex = $snapshotScriptSource.IndexOf('$configuration = Read-DysonControlEnvironmentFile')
+            Assert-SelfTest ($stateIndex -ge 0 -and $resolverIndex -gt $stateIndex -and $readerIndex -gt $resolverIndex -and
+                $snapshotScriptSource.Contains('-Contract $terminalContract')) `
+                'LEGACY_CONTRACT_PUBLIC_SNAPSHOT_SCRIPT'
+        }
         $legacyParentAcl = Assert-DysonConfigurationParentAcl -Path $legacyFixture.dataRoot -ServiceSid $script:ServiceSid
         Assert-SelfTestRejected { Test-DysonConfigurationRuntimeApproval -Storage $legacyFixture.storage -Contract $script:Contract -ExpectedLauncherBindings $legacyFixture.bindings -ServiceSid $script:ServiceSid -ParentAcl $legacyParentAcl } 'LEGACY_APPROVAL_NOT_CURRENT' 'DYSON_CONFIGURATION_CONTENT_INVALID'
         Assert-SelfTestRejected { Get-DysonConfigurationTransactionState -Storage $legacyPendingFixture.storage -ServiceSid $script:ServiceSid -Contract $script:Contract -ExpectedLauncherBindings $legacyPendingFixture.bindings } 'LEGACY_PENDING_CONTRACT_REJECTED'
