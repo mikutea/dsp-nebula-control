@@ -987,6 +987,34 @@ try {
         [string]$candidateReplayEnvelope.profileCreatedAt -ceq [string]$upgradedProfile.createdAt -and
         (Test-SelfTestBytesEqual $upgradedBytes ([IO.File]::ReadAllBytes($script:profileFile)))) `
         'upgraded release replay preserves profile bytes and createdAt'
+
+    $replacementBootstrapRoot = Join-Path $script:root 'replacement-bootstrap'
+    [void][IO.Directory]::CreateDirectory($replacementBootstrapRoot)
+    foreach ($name in $replacementBootstrap.Keys) {
+        [IO.File]::WriteAllBytes((Join-Path $replacementBootstrapRoot $name), $replacementBootstrap[$name])
+        [IO.File]::WriteAllBytes((Join-Path $script:installed $name),
+            [IO.File]::ReadAllBytes((Join-Path $previousBootstrap $name)))
+    }
+    $reverseUpgrade = Invoke-SelfTestInstall -Script $script:install -InstalledRoot $script:installed `
+        -Broker $script:broker -Data $script:data -Shadow $script:shadow -UpgradeExisting `
+        -PreviousBootstrapRoot $replacementBootstrapRoot
+    $reverseEnvelope = ConvertFrom-SelfTestOutput $reverseUpgrade.stdout
+    $reverseProfile = Read-DysonLifecycleBrokerProfile $script:profileFile
+    Assert-SelfTest ($reverseUpgrade.exitCode -eq 0 -and $reverseEnvelope.operation -ceq 'upgraded' -and
+        (Test-DysonLifecycleBrokerSamePath $reverseProfile.brokerScriptRoot $script:brokerScripts)) `
+        'reverse upgrade restores the previous broker after replacement bootstrap bytes are no longer live'
+
+    foreach ($name in $replacementBootstrap.Keys) {
+        [IO.File]::WriteAllBytes((Join-Path $script:installed $name), $replacementBootstrap[$name])
+    }
+    $forwardAgain = Invoke-SelfTestInstall -Script $candidateInstall -InstalledRoot $candidateInstalled `
+        -Broker $script:broker -Data $script:data -Shadow $script:shadow -UpgradeExisting `
+        -PreviousBootstrapRoot $previousBootstrap
+    $forwardAgainEnvelope = ConvertFrom-SelfTestOutput $forwardAgain.stdout
+    $upgradedProfile = Read-DysonLifecycleBrokerProfile $script:profileFile
+    Assert-SelfTest ($forwardAgain.exitCode -eq 0 -and $forwardAgainEnvelope.operation -ceq 'upgraded' -and
+        (Test-DysonLifecycleBrokerSamePath $upgradedProfile.brokerScriptRoot $candidateBrokerScripts)) `
+        'broker remains usable after the reverse-upgrade rollback regression'
     $script:brokerScripts = $candidateBrokerScripts
     $script:install = $candidateInstall
     $script:submit = Join-Path $candidateBrokerScripts 'Submit-DysonLifecycleBrokerRequest.ps1'

@@ -482,6 +482,38 @@ function Invoke-DysonLifecycleBrokerDeploymentInstaller {
     return $receipt
 }
 
+function Get-DysonLifecycleBrokerRollbackInstallArguments {
+    param(
+        [Parameter(Mandatory)]$PreviousState,
+        [Parameter(Mandatory)][hashtable]$ReplacementInstallArguments
+    )
+
+    if ($null -eq $PreviousState.installArguments -or
+        -not $ReplacementInstallArguments.ContainsKey('InstalledWindowsRoot')) {
+        throw 'The lifecycle broker rollback bindings are incomplete.'
+    }
+    $replacementWindowsRoot = Assert-DysonPlainDirectory `
+        -Path ([string]$ReplacementInstallArguments['InstalledWindowsRoot'])
+    $replacementBootstrapRoot = Assert-DysonPlainDirectory `
+        -Path (Join-Path $replacementWindowsRoot 'bootstrap')
+    $arguments = @{}
+    foreach ($key in $PreviousState.installArguments.Keys) {
+        $arguments[$key] = $PreviousState.installArguments[$key]
+    }
+    $arguments['UpgradeExisting'] = $true
+    # Deployment rollback restores the previous stable bootstrap before it
+    # restores the previous broker. The still-published replacement profile
+    # therefore has to validate its Start/Stop hashes against the immutable
+    # replacement release, while the rollback candidate is hashed against the
+    # restored bootstrap. The broker installer uses this same argument for its
+    # own byte-exact compensation if the reverse upgrade fails.
+    $arguments['PreviousBootstrapRoot'] = $replacementBootstrapRoot
+    [void]$arguments.Remove('CompensateFirstInstall')
+    [void]$arguments.Remove('RemoveCurrent')
+    [void]$arguments.Remove('ExpectedProfileHash')
+    return $arguments
+}
+
 function Restore-DysonLifecycleBrokerDeploymentFirstInstall {
     param(
         [Parameter(Mandatory)][string]$Installer,
@@ -2038,14 +2070,9 @@ catch {
             $configurationRollbackFinalVerified -and
             $taskDataAclPreimageRestored) {
             try {
-                $restoreArguments = @{}
-                foreach ($key in $lifecycleBrokerPreviousState.installArguments.Keys) {
-                    $restoreArguments[$key] = $lifecycleBrokerPreviousState.installArguments[$key]
-                }
-                $restoreArguments['UpgradeExisting'] = $true
-                [void]$restoreArguments.Remove('CompensateFirstInstall')
-                [void]$restoreArguments.Remove('RemoveCurrent')
-                [void]$restoreArguments.Remove('ExpectedProfileHash')
+                $restoreArguments = Get-DysonLifecycleBrokerRollbackInstallArguments `
+                    -PreviousState $lifecycleBrokerPreviousState `
+                    -ReplacementInstallArguments $lifecycleBrokerInstallArguments
                 $restoreReceipt = Invoke-DysonLifecycleBrokerDeploymentInstaller `
                     -Installer ([string]$lifecycleBrokerPreviousState.installer) `
                     -Arguments $restoreArguments -ShadowRoot $lifecycleBrokerShadowFull

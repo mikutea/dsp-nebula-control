@@ -184,6 +184,40 @@ function Test-DysonDeploymentPendingStatusPreflight {
     Assert-SelfTest $rejected 'Preflight accepted an unfinished intent.'
 }
 
+function Test-DysonLifecycleBrokerRollbackInstallArguments {
+    $errors=$null; $tokens=$null
+    $ast=[Management.Automation.Language.Parser]::ParseFile($installScript,[ref]$tokens,[ref]$errors)
+    Assert-SelfTest -Condition ($errors.Count -eq 0) -Message 'installer parse failed'
+    $definition=@($ast.FindAll({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Get-DysonLifecycleBrokerRollbackInstallArguments'
+    },$false))
+    Assert-SelfTest -Condition ($definition.Count -eq 1) -Message 'broker rollback argument helper was not unique'
+    . ([scriptblock]::Create($definition[0].Extent.Text))
+    $replacementWindowsRoot=Join-Path $testRoot 'replacement-release\scripts\windows'
+    $replacementBootstrapRoot=Join-Path $replacementWindowsRoot 'bootstrap'
+    [void][IO.Directory]::CreateDirectory($replacementBootstrapRoot)
+    $previous=[pscustomobject]@{installArguments=@{
+        BrokerRoot=(Join-Path $testRoot 'broker')
+        InstalledWindowsRoot=(Join-Path $testRoot 'previous-release\scripts\windows')
+        PreviousBootstrapRoot='stale-bootstrap'
+        CompensateFirstInstall=$true
+        RemoveCurrent=$true
+        ExpectedProfileHash=('a' * 64)
+    }}
+    $actual=Get-DysonLifecycleBrokerRollbackInstallArguments -PreviousState $previous `
+        -ReplacementInstallArguments @{InstalledWindowsRoot=$replacementWindowsRoot}
+    Assert-SelfTest -Condition (
+        [bool]$actual.UpgradeExisting -and
+        [string]::Equals([string]$actual.PreviousBootstrapRoot,
+            [IO.Path]::GetFullPath($replacementBootstrapRoot),
+            [StringComparison]::OrdinalIgnoreCase) -and
+        -not $actual.ContainsKey('CompensateFirstInstall') -and
+        -not $actual.ContainsKey('RemoveCurrent') -and
+        -not $actual.ContainsKey('ExpectedProfileHash')
+    ) -Message 'broker rollback did not bind replacement bootstrap bytes for reverse upgrade validation'
+}
+
 
 
 function ConvertTo-DysonDeploymentSelfTestExtendedPath {
@@ -1716,6 +1750,7 @@ try {
     $taskFixtureEnabled = $true
     Test-DysonDeploymentBrokerQuiescence
     Test-DysonDeploymentPendingStatusPreflight
+    Test-DysonLifecycleBrokerRollbackInstallArguments
     foreach ($brokerTaskName in @('Dyson-Control-Lifecycle-Broker')) {
         Assert-SelfTest -Condition (@(Get-DysonScheduledTasksByExactName -TaskName $brokerTaskName).Count -eq 0) `
             -Message 'the initial deployment fixture did not isolate a fixed broker task query'
