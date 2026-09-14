@@ -536,7 +536,7 @@ const reviewedRuntimeLayoutSources = new Map([
 const reviewedContractMigrationSources = new Map([
   [
     "scripts/windows/configuration/DysonConfiguration.Common.ps1",
-    "58caa53bd90c5c48287526f280f096a40fd39dcd92600066999904ca6d454006"
+    "67e8e282d514164cbc0f2de8fd0413bc99b00f1a70c2a231b26a23581bcef214"
   ],
   [
     "scripts/windows/configuration/New-DysonControlConfigurationSnapshot.ps1",
@@ -695,7 +695,7 @@ const reviewedManagerRemovalSources = new Map([
   ],
   [
     "scripts/validate-incremental.test.mjs",
-    "bce68cb96934ee692837fdb9c67d0759985da8006d75d630d6fb258c5d606882"
+    "f138355a971359452ff9214685157c331a5af65d499643052bb1f10f4a0180c3"
   ],
   [
     "scripts/windows/bootstrap/SelfTest-DysonGameLifecycleBootstrap.ps1",
@@ -1247,7 +1247,7 @@ export function classifyChange(file, before, after) {
   if (after === null) throw new Error(`Deletion requires an updated validation plan: ${file}`)
   if (file === 'scripts/public-release/scanner.test.mjs' && aclSourceHash(after) === '1fa443147c15695a1f91934ced3dfe2251b284bd0837680e885e53b792f3ad24') return 'reviewed-hygiene-policy'
   if (file === 'scripts/public-release/policy.mjs' &&
-      aclSourceHash(after) === 'c2835a4d765ae9810016e19b1dd1d3109317b16d1f0349069a50e4ad67c36bd5') return 'reviewed-hygiene-policy'
+      aclSourceHash(after) === '0c380ff1755fdd38ec93c0df8343fe9192b90083c2ca4a9cd523eae1138a0651') return 'reviewed-hygiene-policy'
   if (file === 'scripts/windows/deployment/Test-DysonControlDeployment.ps1' &&
       aclSourceHash(after) === 'a6c1dcaf59954eaaa4620b65cff612e856ed5280ce63e1a7e1520a52277f390d') return 'verified-native-status'
   for (const releaseVersion of ['0.1.0-rc.24', '0.1.0-rc.25', '0.1.0-rc.26', '0.1.0-rc.27']) {

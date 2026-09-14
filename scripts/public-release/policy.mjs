@@ -83,6 +83,7 @@ export const EXACT_ALLOWLIST = Object.freeze([
   { scope: 'history', ruleId: 'SECRET_LITERAL_ASSIGNMENT', path: 'scripts/public-release/scanner.test.mjs', blobId: 'ee2bbae69c5a37747b50c1dd167751b3179866e8' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1', blobId: '5eb41a2ecd58d1cbfad5cdb8872d5248da2d3471' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1', blobId: '0b0f52d40453897749cc4e171a880ab376078f32' },
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/configuration/DysonConfiguration.Common.ps1', blobId: '8242ffca5b89d30b77c017ae40d419685bfaa294' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1', blobId: '21c7c1ba1c90eeda159e13646d3ec0f10a329587' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1', blobId: 'df963cfa6a64f59130118f1ffe98ad92f48d899d' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: 'bf04aa3fb5e6237043879bd6902cb37091a1d817' },

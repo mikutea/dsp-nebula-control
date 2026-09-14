@@ -1,3 +1,25 @@
+$script:DysonConfigurationSecurityModulePath = Join-Path $PSHOME `
+    'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+try {
+    if (-not [IO.File]::Exists($script:DysonConfigurationSecurityModulePath)) {
+        throw 'missing security module'
+    }
+    $script:DysonConfigurationSecurityModules = @(
+        Import-Module -Name $script:DysonConfigurationSecurityModulePath -PassThru -ErrorAction Stop
+    )
+    if ($script:DysonConfigurationSecurityModules.Count -ne 1 -or
+        -not [string]::Equals(
+            [IO.Path]::GetFullPath([string]$script:DysonConfigurationSecurityModules[0].Path),
+            [IO.Path]::GetFullPath($script:DysonConfigurationSecurityModulePath),
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not $script:DysonConfigurationSecurityModules[0].ExportedCommands.ContainsKey('Get-Acl') -or
+        -not $script:DysonConfigurationSecurityModules[0].ExportedCommands.ContainsKey('Set-Acl')) {
+        throw 'invalid security module'
+    }
+}
+catch { throw 'DYSON_CONFIGURATION_ACL_INVALID' }
+
 $script:DysonConfigurationContractProtocol = 'DYSON_CONTROL_ENVIRONMENT_CONTRACT_V1'
 $script:DysonConfigurationIntentProtocol = 'DYSON_CONTROL_CONFIGURATION_INTENT_V2'
 $script:DysonConfigurationReceiptProtocol = 'DYSON_CONTROL_CONFIGURATION_RECEIPT_V2'
@@ -735,7 +757,7 @@ function Set-DysonConfigurationAcl {
         ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         throw 'DYSON_CONFIGURATION_ACL_INVALID'
     }
-    $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+    $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($rule in @($acl.GetAccessRules(
                 $true, $false, [System.Security.Principal.SecurityIdentifier]
@@ -750,7 +772,7 @@ function Set-DysonConfigurationAcl {
             [System.Security.AccessControl.AccessControlType]([int]$rule.type)
         ))
     }
-    Set-Acl -LiteralPath $item.FullName -AclObject $acl -ErrorAction Stop
+    Microsoft.PowerShell.Security\Set-Acl -LiteralPath $item.FullName -AclObject $acl -ErrorAction Stop
     return Assert-DysonConfigurationAcl -Path $item.FullName -Kind $Kind -ServiceSid $ServiceSid `
         -SourceOwnerSid $SourceOwnerSid
 }
@@ -773,7 +795,7 @@ function Assert-DysonConfigurationAcl {
         ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         throw 'DYSON_CONFIGURATION_ACL_INVALID'
     }
-    $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+    $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
     if (-not $acl.AreAccessRulesProtected) { throw 'DYSON_CONFIGURATION_ACL_INVALID' }
     try { $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value }
     catch { throw 'DYSON_CONFIGURATION_ACL_INVALID' }
@@ -809,7 +831,7 @@ function Assert-DysonConfigurationPrivateSourceAcl {
     if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         throw 'DYSON_CONFIGURATION_SOURCE_ACL_INVALID'
     }
-    $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+    $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
     if (-not $acl.AreAccessRulesProtected) { throw 'DYSON_CONFIGURATION_SOURCE_ACL_INVALID' }
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     try { $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value }
@@ -834,7 +856,7 @@ function Assert-DysonConfigurationParentAcl {
     )
 
     $fullPath = Assert-DysonConfigurationPlainDirectoryChain $Path
-    $acl = Get-Acl -LiteralPath $fullPath -ErrorAction Stop
+    $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $fullPath -ErrorAction Stop
     if (-not $acl.AreAccessRulesProtected) {
         throw 'DYSON_CONFIGURATION_PARENT_ACL_INVALID'
     }
