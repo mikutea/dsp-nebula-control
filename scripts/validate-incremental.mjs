@@ -1341,8 +1341,9 @@ export function selectCommands(changes, { componentChanges } = {}) {
 
 const deploymentCommand = ['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
   '-File', 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1']]
-const apiBuildCommand = [process.platform === 'win32' ? 'npm.cmd' : 'npm',
-  ['--prefix', 'apps/api', 'run', 'build']]
+const npmCliPath = path.resolve(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+const apiBuildCommand = [process.execPath,
+  [npmCliPath, '--prefix', 'apps/api', 'run', 'build']]
 const isDeploymentCommand = ([, args]) => args.includes('apps/api/tsconfig.json') ||
   args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')
 const commandGroup = command => {
