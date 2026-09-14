@@ -178,6 +178,9 @@ export const EXACT_ALLOWLIST = Object.freeze([
   // fictional deployment fixtures; bind their new contents explicitly.
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/DysonDeployment.Common.ps1', blobId: 'e41dad64ed934c92c51f90cf060fc4c9a86d9853' },
   { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: 'a103af151998d1a9f7d3411e3bd31baa783a1148' },
+  // Reverse-upgrade rollback tests retain only the same fictional UNC and
+  // generic extended-path fixtures; pin the reviewed committed blob.
+  { scope: 'history', ruleId: 'UNC_PATH', path: 'scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1', blobId: 'ecf59997b5fccf2283e4707fdb24532f861d24b3' },
   {
     scope: 'history',
     ruleId: 'PRIVATE_IP_ADDRESS',
