@@ -348,6 +348,33 @@ function Assert-DysonConfigurationModuleFilePath {
     return $item.FullName
 }
 
+function Resolve-DysonConfigurationRecordedContract {
+    param([Parameter(Mandatory)]$Contract, [Parameter(Mandatory)][string]$RecordedSha256)
+
+    if ($RecordedSha256 -ceq [string]$Contract.sha256) { return $Contract }
+    if ($RecordedSha256 -cne '5386f42df066b3d5ce4fa26f3346baf4311b0ec8efb1eb4d83bdf488c14786dc') {
+        throw 'DYSON_CONFIGURATION_CONTRACT_HISTORY_UNSUPPORTED'
+    }
+    $legacy = Get-DysonConfigurationContract -ContractPath (Join-Path $PSScriptRoot 'dyson-control.environment-contract.rc26.json')
+    if ([string]$legacy.sha256 -cne $RecordedSha256) { throw 'DYSON_CONFIGURATION_CONTRACT_HISTORY_INVALID' }
+    foreach ($property in @('requiredProductionNames', 'launcherOwnedNames', 'secretNames')) {
+        if ([string]::Join('|', @($Contract.$property)) -cne [string]::Join('|', @($legacy.$property))) {
+            throw 'DYSON_CONFIGURATION_CONTRACT_HISTORY_UNSUPPORTED'
+        }
+    }
+    $added = @('DYSON_UPDATE_CLEANUP_ENABLED', 'DYSON_UPDATE_CLEANUP_RECOVERY_ENABLED', 'DYSON_STARTUP_TIMEOUT_MS')
+    $removed = @('DYSON_CUTOVER_ENABLED', 'DYSON_CUTOVER_RECOVERY_ENABLED', 'DYSON_CUTOVER_PROFILE_FILE', 'DYSON_CUTOVER_SERVICE_USER', 'DYSON_CUTOVER_TASK_TRANSACTION_ROOT')
+    $retained = @($legacy.dysonNames | Where-Object { $_ -cnotin $removed })
+    if ([int]$Contract.maximumBytes -ne [int]$legacy.maximumBytes -or
+        @($Contract.dysonNames).Count -ne ($retained.Count + $added.Count)) {
+        throw 'DYSON_CONFIGURATION_CONTRACT_HISTORY_UNSUPPORTED'
+    }
+    foreach ($name in $retained + $added) {
+        if (@($Contract.dysonNames) -cnotcontains [string]$name) { throw 'DYSON_CONFIGURATION_CONTRACT_HISTORY_UNSUPPORTED' }
+    }
+    return $legacy
+}
+
 function Get-DysonConfigurationContract {
     param([string]$ContractPath = (Join-Path $PSScriptRoot $script:DysonConfigurationContractName))
 
@@ -1665,8 +1692,10 @@ function Get-DysonConfigurationTransactionState {
             throw 'DYSON_CONFIGURATION_CHAIN_INVALID'
         }
         $transactionId = [string]$intent.record.transactionId
+        try { $intentContract = Resolve-DysonConfigurationRecordedContract -Contract $Contract -RecordedSha256 ([string]$intent.record.contractSha256) }
+        catch { throw 'DYSON_CONFIGURATION_INTENT_BINDING_INVALID' }
         if ([string]$intent.record.targetPathSha256 -cne $expectedTargetPathSha256 -or
-            [string]$intent.record.contractSha256 -cne [string]$Contract.sha256 -or
+            [string]$intent.record.contractSha256 -cne [string]$intentContract.sha256 -or
             [string]$intent.record.expectedAclFingerprint -cne
                 [string]$expectedTargetAcl.fingerprint -or
             [string]$intent.record.parentAclFingerprint -cne [string]$parentAcl.fingerprint -or
@@ -1726,6 +1755,7 @@ function Get-DysonConfigurationTransactionState {
             $lastCompletedReceipt = $receipt
         }
         else {
+            if ([string]$intent.record.contractSha256 -cne [string]$Contract.sha256) { throw 'DYSON_CONFIGURATION_PENDING_CONTRACT_MISMATCH' }
             $pending.Add($intent)
             if ($sequence -ne $intentCount) { throw 'DYSON_CONFIGURATION_CHAIN_INVALID' }
         }
@@ -1783,6 +1813,7 @@ function Get-DysonConfigurationTransactionState {
     $baseClean = $pending.Count -eq 0 -and $writerOrphans.Count -eq 0 -and
         $configurationTemps.Count -eq 0 -and $configurationBackups.Count -eq 0 -and
         $unknownTransactionEntries.Count -eq 0 -and $unknownConfigEntries.Count -eq 0
+    $terminalRecordedContractSha256 = if ($null -ne $lastCompletedIntent) { [string]$lastCompletedIntent.record.contractSha256 } else { $null }
     $terminalTargetPresent = $false
     $terminalTargetSha256 = $null
     $terminalTargetLength = $null
@@ -1805,6 +1836,7 @@ function Get-DysonConfigurationTransactionState {
                 $terminalReceiptState -ceq 'aborted' -and
                 -not [bool]$lastCompletedIntent.record.preimagePresent
             )
+            $terminalRecordedContractSha256 = [string]$lastCompletedIntent.record.contractSha256
             $terminalBindings = $null
             if ($terminalReceiptState -ceq 'aborted') {
                 if ([bool]$lastCompletedIntent.record.preimagePresent) {
@@ -1825,11 +1857,25 @@ function Get-DysonConfigurationTransactionState {
                             }) -Actual $terminalSnapshot)) {
                         throw 'DYSON_CONFIGURATION_TERMINAL_SNAPSHOT_INVALID'
                     }
+                    $terminalRecordedContractSha256 = [string]$terminalSnapshot.contractSha256
                     $terminalBindings = [hashtable]$terminalSnapshot.privateBindings
                     $terminalBindingsSha256 = [string]$lastCompletedIntent.record.preimageBindingsSha256
                 }
             }
             else {
+                if ([string]$lastCompletedIntent.record.operation -ceq 'restore') {
+                    $restoredSnapshot = Read-DysonConfigurationSnapshotInternal -SnapshotPath (Join-Path $Storage.snapshotRoot ([string]$lastCompletedIntent.record.sourceSnapshotId)) -Contract $Contract -ServiceSid $ServiceSid -ExpectedDataRoot $Storage.dataRoot
+                    if (-not (Test-DysonConfigurationSnapshotBindingMatch -Expected ([pscustomobject]@{
+                        snapshotId = $lastCompletedIntent.record.sourceSnapshotId
+                        manifestSha256 = $lastCompletedIntent.record.sourceSnapshotManifestSha256
+                        snapshotPathSha256 = $lastCompletedIntent.record.sourceSnapshotPathSha256
+                        configurationSha256 = $lastCompletedIntent.record.sourceSha256
+                        configurationLength = $lastCompletedIntent.record.sourceLength
+                        configurationAclFingerprint = $lastCompletedIntent.record.expectedAclFingerprint
+                        bindingsSha256 = $lastCompletedIntent.record.bindingsSha256
+                    }) -Actual $restoredSnapshot -IgnoreConfigurationAcl)) { throw 'DYSON_CONFIGURATION_TERMINAL_SNAPSHOT_INVALID' }
+                    $terminalRecordedContractSha256 = [string]$restoredSnapshot.contractSha256
+                }
                 $terminalBindings = [hashtable]$lastCompletedIntent.bindings
                 $terminalBindingsSha256 = [string]$lastCompletedIntent.record.bindingsSha256
             }
@@ -1843,8 +1889,9 @@ function Get-DysonConfigurationTransactionState {
                 try {
                     $terminalEvidence = Get-DysonConfigurationFileEvidence `
                         -Path $Storage.configurationPath -ServiceSid $ServiceSid -IncludePrivateBytes
+                    $terminalContract = Resolve-DysonConfigurationRecordedContract -Contract $Contract -RecordedSha256 $terminalRecordedContractSha256
                     $terminalEnvironment = Read-DysonControlEnvironmentBytes `
-                        -Bytes ([byte[]]$terminalEvidence.privateBytes) -Contract $Contract `
+                        -Bytes ([byte[]]$terminalEvidence.privateBytes) -Contract $terminalContract `
                         -ExpectedLauncherBindings $terminalBindings
                     if ([string]$terminalEvidence.pathSha256 -cne $expectedTargetPathSha256 -or
                         [string]$terminalEvidence.sha256 -cne $terminalTargetSha256 -or
@@ -1853,7 +1900,7 @@ function Get-DysonConfigurationTransactionState {
                         [string]$terminalEnvironment.sha256 -cne $terminalTargetSha256 -or
                         [int64]$terminalEnvironment.length -ne $terminalTargetLength -or
                         [string]$terminalEnvironment.bindingsSha256 -cne $terminalBindingsSha256 -or
-                        [string]$terminalEnvironment.contractSha256 -cne [string]$Contract.sha256) {
+                        [string]$terminalEnvironment.contractSha256 -cne [string]$terminalContract.sha256) {
                         throw 'DYSON_CONFIGURATION_TERMINAL_TARGET_INVALID'
                     }
                 }
@@ -1894,7 +1941,7 @@ function Get-DysonConfigurationTransactionState {
         terminalTargetAclFingerprint = $terminalTargetAclFingerprint
         terminalBindingsSha256 = $terminalBindingsSha256
         terminalContractSha256 = if ($null -ne $lastCompletedReceipt) {
-            [string]$lastCompletedIntent.record.contractSha256
+            $terminalRecordedContractSha256
         } else { $null }
         terminalTargetPathSha256 = if ($null -ne $lastCompletedReceipt) {
             [string]$lastCompletedIntent.record.targetPathSha256
@@ -2086,22 +2133,24 @@ function Read-DysonConfigurationSnapshotInternal {
         $manifest.bindingsSha256, $manifest.parentAclFingerprint,
         $manifest.directoryAclFingerprint, $manifest.sourceConfigurationAclFingerprint
     )) { [void](Assert-DysonConfigurationCanonicalSha256 ([string]$hash)) }
+    try { $recordContract = Resolve-DysonConfigurationRecordedContract -Contract $Contract -RecordedSha256 ([string]$manifest.contractSha256) }
+    catch { throw 'DYSON_CONFIGURATION_SNAPSHOT_INVALID' }
     $expectedName = [string]$manifest.snapshotId
     if ($AllowStagingName) { $expectedName = '.snapshot-' + $expectedName + '.partial' }
     if ((-not ($manifest.schemaVersion -is [int] -or $manifest.schemaVersion -is [long])) -or
         [string]$manifest.protocol -cne $script:DysonConfigurationSnapshotProtocol -or
         [int]$manifest.schemaVersion -ne $script:DysonConfigurationSchemaVersion -or
-        [string]$manifest.contractSha256 -cne [string]$Contract.sha256 -or
+        [string]$manifest.contractSha256 -cne [string]$recordContract.sha256 -or
         [string]$manifest.serviceSid -cne $ServiceSid -or
         [string]$manifest.parentAclFingerprint -cne [string]$parentAcl.fingerprint -or
         [string]$manifest.directoryAclFingerprint -cne [string]$snapshotAcl.fingerprint -or
         [System.IO.Path]::GetFileName($snapshotFull) -cne $expectedName) {
         throw 'DYSON_CONFIGURATION_SNAPSHOT_INVALID'
     }
-    $bindings = ConvertFrom-DysonConfigurationBindingRecord -Contract $Contract `
+    $bindings = ConvertFrom-DysonConfigurationBindingRecord -Contract $recordContract `
         -Record $manifest.launcherBindings
     $bindingsSha256 = Get-DysonConfigurationExpectedBindingsHash `
-        -ExpectedLauncherBindings $bindings -Contract $Contract
+        -ExpectedLauncherBindings $bindings -Contract $recordContract
     if ([string]$manifest.bindingsSha256 -cne $bindingsSha256) {
         throw 'DYSON_CONFIGURATION_SNAPSHOT_INVALID'
     }
@@ -2126,7 +2175,7 @@ function Read-DysonConfigurationSnapshotInternal {
     }
     if ($null -ne $ExpectedLauncherBindings -and
         $bindingsSha256 -cne (Get-DysonConfigurationExpectedBindingsHash `
-            -ExpectedLauncherBindings $ExpectedLauncherBindings -Contract $Contract)) {
+            -ExpectedLauncherBindings $ExpectedLauncherBindings -Contract $recordContract)) {
         throw 'DYSON_CONFIGURATION_SNAPSHOT_INVALID'
     }
     $inventory = @($manifest.files)
@@ -2162,9 +2211,10 @@ function Read-DysonConfigurationSnapshotInternal {
         (Get-DysonConfigurationSha256Bytes $bytes) -cne [string]$fileRecord.sha256) {
         throw 'DYSON_CONFIGURATION_SNAPSHOT_INVALID'
     }
-    $environment = Read-DysonControlEnvironmentBytes -Bytes $bytes -Contract $Contract `
+    $environment = Read-DysonControlEnvironmentBytes -Bytes $bytes -Contract $recordContract `
         -ExpectedLauncherBindings $bindings
     $result = [ordered]@{
+        contractSha256 = [string]$recordContract.sha256
         valid = $true
         snapshotId = [string]$manifest.snapshotId
         snapshotPath = $snapshotFull
@@ -2237,14 +2287,16 @@ function New-DysonConfigurationProtectedSnapshot {
         [Parameter(Mandatory)]$Contract,
         [Parameter(Mandatory)][hashtable]$ExpectedLauncherBindings,
         [Parameter(Mandatory)][string]$ServiceSid,
+        [string]$RecordedContractSha256,
         [string]$SnapshotId = ([guid]::NewGuid().ToString('D').ToLowerInvariant())
     )
 
+    $snapshotContract = if ([string]::IsNullOrWhiteSpace($RecordedContractSha256)) { $Contract } else { Resolve-DysonConfigurationRecordedContract -Contract $Contract -RecordedSha256 $RecordedContractSha256 }
     [void](Assert-DysonConfigurationCanonicalGuid $SnapshotId)
     [void](Assert-DysonConfigurationSnapshotInventory -Storage $Storage `
         -Contract $Contract -ServiceSid $ServiceSid)
     $configuration = Read-DysonControlEnvironmentFile -Path $Storage.configurationPath `
-        -Contract $Contract -ExpectedLauncherBindings $ExpectedLauncherBindings -SkipSourceAcl
+        -Contract $snapshotContract -ExpectedLauncherBindings $ExpectedLauncherBindings -SkipSourceAcl
     $configurationAcl = Assert-DysonConfigurationAcl -Path $Storage.configurationPath `
         -Kind ConfigFile -ServiceSid $ServiceSid
     $partialPath = Join-Path $Storage.snapshotRoot ('.snapshot-' + $SnapshotId + '.partial')
@@ -2265,7 +2317,7 @@ function New-DysonConfigurationProtectedSnapshot {
         schemaVersion = $script:DysonConfigurationSchemaVersion
         snapshotId = $SnapshotId
         createdAt = (Get-Date).ToUniversalTime().ToString('o')
-        contractSha256 = [string]$Contract.sha256
+        contractSha256 = [string]$snapshotContract.sha256
         serviceSid = $ServiceSid
         dataRootPathSha256 = Get-DysonConfigurationPathBindingSha256 $Storage.dataRoot
         targetPathSha256 = Get-DysonConfigurationPathBindingSha256 $Storage.configurationPath
@@ -2413,12 +2465,18 @@ function Invoke-DysonConfigurationMutationTransaction {
             (-not ($Source.length -is [int] -or $Source.length -is [long]))) {
             throw 'invalid source types'
         }
+        $sourceContract = if ($null -ne $SourceSnapshot) {
+            Resolve-DysonConfigurationRecordedContract -Contract $Contract `
+                -RecordedSha256 ([string]$SourceSnapshot.contractSha256)
+        }
+        else { $Contract }
         $validatedSource = Read-DysonControlEnvironmentBytes `
-            -Bytes ([byte[]]$Source.privateBytes) -Contract $Contract `
+            -Bytes ([byte[]]$Source.privateBytes) -Contract $sourceContract `
             -ExpectedLauncherBindings $ExpectedLauncherBindings
         if ([string]$validatedSource.sha256 -cne [string]$Source.sha256 -or
             [int64]$validatedSource.length -ne [int64]$Source.length -or
-            [string]$validatedSource.bindingsSha256 -cne [string]$Source.bindingsSha256) {
+            [string]$validatedSource.bindingsSha256 -cne [string]$Source.bindingsSha256 -or
+            [string]$validatedSource.contractSha256 -cne [string]$sourceContract.sha256) {
             throw 'source evidence mismatch'
         }
     }
@@ -2671,10 +2729,13 @@ function Invoke-DysonConfigurationMutationTransaction {
             if ($null -eq $targetEvidence) {
                 throw 'DYSON_CONFIGURATION_TARGET_VERIFICATION_FAILED'
             }
+            $installedContract = Resolve-DysonConfigurationRecordedContract -Contract $Contract `
+                -RecordedSha256 ([string]$finalState.terminalContractSha256)
             $installed = Read-DysonControlEnvironmentFile -Path $Storage.configurationPath `
-                -Contract $Contract -ExpectedLauncherBindings $ExpectedLauncherBindings -SkipSourceAcl
+                -Contract $installedContract -ExpectedLauncherBindings $ExpectedLauncherBindings -SkipSourceAcl
             if ([string]$installed.sha256 -cne [string]$Source.sha256 -or
-                [int64]$installed.length -ne [int64]$Source.length) {
+                [int64]$installed.length -ne [int64]$Source.length -or
+                [string]$installed.contractSha256 -cne [string]$installedContract.sha256) {
                 throw 'DYSON_CONFIGURATION_TARGET_VERIFICATION_FAILED'
             }
         }
@@ -2723,8 +2784,9 @@ function Publish-DysonConfigurationRuntimeApproval {
     if (-not $TransactionState.clean -or $TransactionState.receipts.Count -lt 1) {
         throw 'DYSON_CONFIGURATION_TRANSACTION_NOT_CLEAN'
     }
+    $approvalContract = Resolve-DysonConfigurationRecordedContract -Contract $Contract -RecordedSha256 ([string]$TransactionState.terminalContractSha256)
     $configuration = Read-DysonControlEnvironmentFile -Path $Storage.configurationPath `
-        -Contract $Contract -ExpectedLauncherBindings $ExpectedLauncherBindings -SkipSourceAcl
+        -Contract $approvalContract -ExpectedLauncherBindings $ExpectedLauncherBindings -SkipSourceAcl
     try {
         $acl = Assert-DysonConfigurationAcl -Path $Storage.configurationPath -Kind ConfigFile -ServiceSid $ServiceSid
         $snapshotCount = Assert-DysonConfigurationSnapshotInventory -Storage $Storage -Contract $Contract -ServiceSid $ServiceSid
@@ -2734,7 +2796,7 @@ function Publish-DysonConfigurationRuntimeApproval {
             configurationLength = [int64]$configuration.length
             namesSha256 = [string]$configuration.namesSha256
             bindingsSha256 = [string]$configuration.bindingsSha256
-            contractSha256 = [string]$Contract.sha256
+            contractSha256 = [string]$approvalContract.sha256
             configurationAclFingerprint = [string]$acl.fingerprint
             configurationPathSha256 = Get-DysonConfigurationPathBindingSha256 $Storage.configurationPath
             serviceSid = $ServiceSid

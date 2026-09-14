@@ -20,14 +20,12 @@
     "adapters": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["pairedSaveRestore", "windowsRebootRecovery", "updateRollback", "sideBySideDeployment", "gsmanagerRecoverableSwitch", "gsmanagerRemoval", "sixHourSoak", "seventyTwoHourSoak", "authenticatedPanel", "gameProtocolPath", "externalClientE2e"],
+      "required": ["pairedSaveRestore", "windowsRebootRecovery", "updateRollback", "independentDeployment", "sixHourSoak", "seventyTwoHourSoak", "authenticatedPanel", "gameProtocolPath", "externalClientE2e"],
       "properties": {
         "pairedSaveRestore": { "$ref": "#/$defs/adapter" },
         "windowsRebootRecovery": { "$ref": "#/$defs/adapter" },
         "updateRollback": { "$ref": "#/$defs/adapter" },
-        "sideBySideDeployment": { "$ref": "#/$defs/adapter" },
-        "gsmanagerRecoverableSwitch": { "$ref": "#/$defs/adapter" },
-        "gsmanagerRemoval": { "$ref": "#/$defs/adapter" },
+        "independentDeployment": { "$ref": "#/$defs/adapter" },
         "sixHourSoak": { "$ref": "#/$defs/adapter" },
         "seventyTwoHourSoak": { "$ref": "#/$defs/adapter" },
         "authenticatedPanel": { "$ref": "#/$defs/adapter" },

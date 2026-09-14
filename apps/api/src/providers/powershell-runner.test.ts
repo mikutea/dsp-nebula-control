@@ -2,7 +2,6 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type { WindowsCutoverPowerShellRunner } from './windows-cutover-host.js'
 import type { WindowsHostnameWssQualificationPowerShellRunner } from './windows-hostname-wss-qualification.js'
 import type { WindowsNebulaPluginTransactionPowerShellRunner } from './windows-nebula-plugin-transaction.js'
 import {
@@ -15,13 +14,10 @@ import {
 const scriptRoot = path.resolve('fictional', 'windows-scripts')
 
 describe('PowerShellLifecycleRunner script allowlist', () => {
-  it('maps only the read-only evidence and fixed broker submission entrypoints', () => {
-    expect(resolvePowerShellScriptPath(scriptRoot, 'Get-DysonCutoverEvidence.ps1')).toBe(
-      path.resolve(scriptRoot, 'cutover', 'Get-DysonCutoverEvidence.ps1')
-    )
-    expect(resolvePowerShellScriptPath(scriptRoot, 'Submit-DysonCutoverBrokerRequest.ps1')).toBe(
-      path.resolve(scriptRoot, 'cutover-broker', 'Submit-DysonCutoverBrokerRequest.ps1')
-    )
+  it('rejects the removed manager switching entrypoints', () => {
+    for (const name of ['Get-DysonCutoverEvidence.ps1', 'Submit-DysonCutoverBrokerRequest.ps1']) {
+      expect(() => resolvePowerShellScriptPath(scriptRoot, name)).toThrow('HOST_SCRIPT_INVALID')
+    }
   })
 
   it.each([
@@ -79,15 +75,13 @@ describe('PowerShellLifecycleRunner script allowlist', () => {
     )
   })
 
-  it('is structurally usable by both lifecycle and cutover providers', () => {
+  it('is structurally usable by lifecycle and plugin providers', () => {
     const runner = new PowerShellLifecycleRunner(scriptRoot, 5_000)
     const lifecycleRunner: LifecycleScriptRunner = runner
-    const cutoverRunner: WindowsCutoverPowerShellRunner = runner
     const nebulaTransactionRunner: WindowsNebulaPluginTransactionPowerShellRunner = runner
     const hostnameQualificationRunner: WindowsHostnameWssQualificationPowerShellRunner = runner
 
     expect(lifecycleRunner).toBe(runner)
-    expect(cutoverRunner).toBe(runner)
     expect(nebulaTransactionRunner).toBe(runner)
     expect(hostnameQualificationRunner).toBe(runner)
   })
@@ -98,7 +92,7 @@ describe('PowerShellLifecycleRunner script allowlist', () => {
     controller.abort(new Error('untrusted-abort-reason'))
 
     await expect(runner.run(
-      'Get-DysonCutoverEvidence.ps1',
+      'Get-DysonManagedPluginVersion.ps1',
       [],
       controller.signal
     )).rejects.toMatchObject({
@@ -111,13 +105,13 @@ describe('PowerShellLifecycleRunner script allowlist', () => {
   it('normalizes an invalid argument to a code-only runner error before spawning', async () => {
     const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'dyson-powershell-runner-'))
     try {
-      const brokerDirectory = path.join(fixtureRoot, 'cutover-broker')
+      const brokerDirectory = path.join(fixtureRoot, 'lifecycle-broker')
       await fs.mkdir(brokerDirectory)
-      await fs.writeFile(path.join(brokerDirectory, 'Submit-DysonCutoverBrokerRequest.ps1'), '')
+      await fs.writeFile(path.join(brokerDirectory, 'Submit-DysonLifecycleBrokerRequest.ps1'), '')
       const runner = new PowerShellLifecycleRunner(fixtureRoot, 5_000)
 
       await expect(runner.run(
-        'Submit-DysonCutoverBrokerRequest.ps1',
+        'Submit-DysonLifecycleBrokerRequest.ps1',
         ['line-one\nline-two'],
         new AbortController().signal
       )).rejects.toMatchObject({

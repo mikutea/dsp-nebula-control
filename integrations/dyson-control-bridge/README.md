@@ -355,7 +355,7 @@ $receipt = (& $uninstaller -DysonServerRoot $server -Confirm:$false | ConvertFro
 ```
 
 Neither install nor uninstall removes or changes saves, the DSP game, Nebula,
-BepInEx, or GSManager/GSM, and neither operation restarts the game.
+BepInEx or unrelated host software, and neither operation restarts the game.
 
 ## Configuration
 

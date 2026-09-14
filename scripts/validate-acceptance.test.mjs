@@ -52,7 +52,7 @@ test('legacy repository paths cannot promote a production-scoped requirement to 
   requirement.state = 'verified'
   requirement.evidence = [{ kind: 'automated-test', ref: 'apps/api/src/app.test.ts' }]
   const result = validateAcceptanceManifest(fixture, { repositoryRoot })
-  assert.ok(result.errors.some((error) => error.includes('PRD-001: verified requirement needs versioned dyson-side-by-side proof evidence')))
+  assert.ok(result.errors.some((error) => error.includes('PRD-001: verified requirement needs versioned dyson-vm proof evidence')))
 })
 
 test('private target-host evidence requires opaque identity, digest, observation time, and exact commit', () => {
@@ -60,7 +60,7 @@ test('private target-host evidence requires opaque identity, digest, observation
   const requirement = fixture.requirements.find((entry) => entry.id === 'PRD-001')
   requirement.state = 'verified'
   requirement.evidence = [{
-    evidenceId: 'prd-001-run-0001', kind: 'operator-run', scope: 'dyson-side-by-side',
+    evidenceId: 'prd-001-run-0001', kind: 'operator-run', scope: 'dyson-vm',
     subjectCommit: commit,
     runtimePayloadSha256: payload
   }]
@@ -84,7 +84,7 @@ test('unimplemented evidence expiry metadata is rejected instead of being silent
     'PRD-001: expiresAt is unsupported by the versioned public evidence contract'
   ))
   assert.ok(result.errors.includes(
-    'PRD-001: verified requirement needs versioned dyson-side-by-side proof evidence'
+    'PRD-001: verified requirement needs versioned dyson-vm proof evidence'
   ))
 })
 
@@ -106,7 +106,7 @@ test('repository and versioned evidence declarations use exact field sets', asyn
   result = validateAcceptanceManifest(fixture, { repositoryRoot: root })
   assert.ok(result.errors.includes('PRD-001: evidence entry has unsupported or missing fields'))
   assert.ok(result.errors.includes(
-    'PRD-001: verified requirement needs versioned dyson-side-by-side proof evidence'
+    'PRD-001: verified requirement needs versioned dyson-vm proof evidence'
   ))
 })
 
@@ -132,7 +132,7 @@ test('valid indexed private proof qualifies only at or above the requirement min
     repositoryRoot: root, releaseCommit: 'e'.repeat(40), artifactPayloadSha256: payload
   })
   assert.equal(result.errors.filter((error) => error.startsWith('PRD-001:')).length, 0)
-  assert.equal(minimumEvidenceScope(requirement), 'dyson-side-by-side')
+  assert.equal(minimumEvidenceScope(requirement), 'dyson-vm')
 })
 
 test('public index IDs use the shared PowerShell-safe grammar', async (context) => {
@@ -383,19 +383,18 @@ test('public evidence indexes cannot be reached through a symlink or reparse-poi
   assert.match(result.errors.join('\n'), /evidence index path is redirected/)
 })
 
-test('network, soak, public release, and cutover requirements have stronger explicit scopes', () => {
+test('network, soak, and public release requirements have stronger explicit scopes', () => {
   const byId = Object.fromEntries(manifest.requirements.map((entry) => [entry.id, entry]))
   assert.equal(minimumEvidenceScope(byId['PRD-004']), 'external-client')
   assert.equal(minimumEvidenceScope(byId['PRD-005']), 'production')
   assert.equal(minimumEvidenceScope(byId['OSS-003']), 'release')
-  assert.equal(minimumEvidenceScope(byId['CUT-002']), 'cutover')
 })
 
 function privateProof(evidenceId, subjectCommit, runtimePayloadSha256) {
   return {
     evidenceId,
     kind: 'operator-run',
-    scope: 'dyson-side-by-side',
+    scope: 'dyson-vm',
     subjectCommit,
     runtimePayloadSha256,
     opaqueId: `private:${evidenceId}`,

@@ -1,9 +1,9 @@
 # Production qualification runbook
 
-This runbook defines the resumable qualification path for the nine current
+This runbook defines the resumable qualification path for the six current
 `not-started` requirements in `acceptance/manifest.json`. It is a procedure and
 protocol contract. It is not evidence that a Dyson host, route, save, player, or
-GSManager installation has been exercised.
+production deployment paths have been exercised.
 
 The repository qualification tools are Windows PowerShell 5.1 compatible and
 default to zero production writes. Protocol v1 and its executor remain
@@ -12,7 +12,7 @@ adapters for exactly four actions: control-plane restart, exact-PID DSP crash
 recovery, one named SMB global-mapping interruption, and bounded allocation in
 one marked disposable qualification directory. A separate orchestration v2
 layer can now consume protected receipts for restore, reboot, update,
-side-by-side deployment, switch/removal, six-hour/72-hour soak, panel, network,
+independent deployment, six-hour/72-hour soak, panel, network,
 and external-client evidence. It never invokes those lower transactions. No
 production adapter was invoked to build or test this delivery. Every real
 action still needs fresh authorization, a reviewed private profile, an approved
@@ -35,7 +35,7 @@ become qualifying evidence merely because its JSON is valid.
 The following hierarchy is mandatory:
 
 1. **Repository validation** proves that the tool and its isolated fixtures
-   behave as specified. It leaves all nine requirements `not-started`, including
+   behave as specified. It leaves all six requirements `not-started`, including
    when the v2 fake matrix passes.
 2. **Controlled target execution** proves one bounded step on the exact
    candidate, at the evidence scope required by `docs/ACCEPTANCE.md`. A preview,
@@ -50,7 +50,7 @@ advance proves timer and resume logic; it is never sustained-operation evidence.
 The production soak requires at least six real hours measured by a monotonic
 clock and supported by genuine timestamped telemetry.
 
-## The nine open requirements
+## The six open requirements
 
 The mapping below is exhaustive for the current `not-started` set. Several
 qualification steps intentionally support more than one requirement, but no
@@ -59,19 +59,11 @@ step silently promotes a wider requirement.
 | Requirement | Qualification steps | Minimum real-world conclusion |
 | --- | --- | --- |
 | `SAV-005` — Production restore drill | `paired-save-restore`, `external-client-e2e` | A real, verified paired backup is restored in a controlled drill, the pinned DSP/Nebula build loads it, an external client joins it, a new save acknowledgement and stable pair are observed, and rollback remains available. Copying bytes or verifying a manifest alone is insufficient. |
-| `PRD-001` — Side-by-side Dyson deployment | `side-by-side-deployment` | The exact candidate runs within its declared data boundary while GSManager stays recoverable and production authority remains unchanged. Candidate health must be independently observed; installation success alone is insufficient. |
+| `PRD-001` — Independent Dyson Control deployment | `independent-deployment` | The exact release runs within its declared data boundary, produces a verified deployment receipt, passes the strict authenticated panel observation, and retains a verified deployment rollback receipt. Installation success alone is insufficient. |
 | `PRD-002` — Authenticated TLS management endpoint | `authenticated-panel` | The approved TLS route reaches the loopback-bound Node service, valid authentication succeeds, unauthenticated and under-privileged requests fail, and the management route cannot consume the game route. No credential is captured in qualification output. |
 | `PRD-003` — Game DNS and PassWall-bypass path | `game-protocol-path`, `external-client-e2e` | DNS classification, TCP ownership, any TLS/WebSocket layer, Nebula handshake, and actual route classification all agree. The exact external client joins through the intended path, and private route evidence proves it did not traverse PassWall. |
 | `PRD-004` — External client end-to-end join | `external-client-e2e` | A genuinely external production-candidate client authenticates, loads the lobby/world, completes a server-observed interaction, requests a verified save, disconnects cleanly, and reconnects to a fresh session, all within the challenge windows. |
 | `PRD-005` — Production reboot, fault, and soak evidence | `windows-reboot-recovery`, `control-plane-restart-recovery`, `game-crash-recovery`, `storage-interruption-recovery`, `controlled-disk-pressure`, `update-rollback`, `paired-save-restore`, `six-hour-soak` | Each real drill ends in independently verified service, game, save, and recovery state with private evidence. The soak also satisfies the full real-time and representative-workload rules below. One combined summary cannot conceal a missing sub-drill. |
-| `CUT-001` — GSManager and production recovery package | `side-by-side-deployment`, `paired-save-restore`, `gsmanager-recoverable-switch` | The exact GSManager snapshot, DataRoot recovery bundle, scheduled-task/configuration preimages, candidate recovery state, and paired-save protection point verify independently before authority changes. |
-| `CUT-002` — Reversible production cutover | `gsmanager-recoverable-switch`, `authenticated-panel`, `game-protocol-path`, `external-client-e2e` | During a declared maintenance window, authority transfers once to Dyson Control, management/game/save/client health is proven, and the documented rollback restores the prior authority without save loss or concurrent owners. |
-| `CUT-003` — GSManager removal and post-cutover acceptance | `gsmanager-recoverable-switch`, `six-hour-soak` plus a later removal-specific operator record | The reversible switch, rollback drill, observation window, final recovery package, release baseline, and evidence index pass before removal is separately approved. The qualification switch step does not itself remove GSManager and cannot by itself verify `CUT-003`. |
-
-`CUT-003` is deliberately last. GSManager remains available until the external
-client, real reboot, restore, update rollback, recovery, and sustained-operation
-gates pass. A successful Shadow switch or a production preview does not satisfy
-this ordering rule.
 
 ## Qualification protocol and plan
 
@@ -83,7 +75,7 @@ stable step IDs:
 
 | Step ID | Purpose | Normal evidence scope | Production mutation class |
 | --- | --- | --- | --- |
-| `side-by-side-deployment` | Verify immutable candidate deployment beside the current authority and confirm isolated persistent roots. | `dyson-side-by-side` | Existing deployment transaction, separately authorized; not executed by the qualification Shadow adapter. |
+| `independent-deployment` | Verify the immutable release, protected configuration snapshot, authenticated loopback panel observation, and deployment rollback receipt. | `dyson-vm` | Existing deployment transaction, separately authorized; not executed by the qualification Shadow adapter. |
 | `authenticated-panel` | Verify TLS, loopback origin, authentication, authorization, session, and management/game route separation. | `production` | Read-only qualification observations. |
 | `game-protocol-path` | Verify DNS classification, exact listener ownership, protocol layers, route class, and PassWall bypass. | `external-client` | Read-only preflight; any DNS/router/firewall change is outside this run and separately authorized. |
 | `external-client-e2e` | Run the two-sided join/authentication/interaction/save/disconnect/reconnect challenge. | `external-client` | Real external client and save request; no player identity or network address is collected. |
@@ -94,7 +86,6 @@ stable step IDs:
 | `storage-interruption-recovery` | Interrupt the explicitly named storage dependency for a bounded interval and prove fail-closed behavior plus recovery. | `production` | Dangerous bounded adapter; no generic mount/share command is permitted. |
 | `controlled-disk-pressure` | Exercise a capped, disposable allocation on the approved qualification volume and prove thresholds, abort, cleanup, and recovery. | `production` | Dangerous bounded adapter; system, application, DataRoot, and save volumes are never implicit targets. |
 | `update-rollback` | Activate an exact staged candidate, force a bounded failed-smoke outcome, restore prior binaries/config/mod lock/save, and load the prior version. | `production` | Dangerous existing update transaction, separately authorized. |
-| `gsmanager-recoverable-switch` | Transfer authority once, prove the no-dual-owner invariant, verify health, and exercise explicit rollback. | `cutover` | Dangerous cutover transaction; it does not remove GSManager. |
 | `six-hour-soak` | Run the fixed late-game workload and retain at least six real hours of complete telemetry. | `production` | No fault injection during the qualifying window. |
 
 Every step declares its prerequisites, timeout, evidence expiry, rollback
@@ -177,7 +168,7 @@ accepted:
   reference is still valid;
 - a fresh, independently verified protection point covers every mutable object
   for that action, including the atomic save pair where applicable;
-- no lifecycle, deployment, update, restore, cutover, removal, recovery, or
+- no lifecycle, deployment, update, restore, recovery, or
   qualification request is pending or uncertain;
 - the adapter declares fixed duration, resource, free-space, process, retry, and
   cleanup bounds plus an abort path and rollback inspection; and
@@ -284,14 +275,20 @@ than 300 seconds.
 
 `Qualification.OrchestrationV2.ps1` is a receipt adapter, not a second action
 runner. Its fixed public contract and strict profile/request/evidence schemas
-cover exactly these 11 evidence actions: paired-save restore, Windows reboot
-checkpoint/resume, update rollback, side-by-side deployment, recoverable
-GSManager switch, GSManager removal plus restore proof, six-hour and 72-hour
+cover exactly these nine evidence actions: paired-save restore, Windows reboot
+checkpoint/resume, update rollback, independent deployment, six-hour and 72-hour
 soaks, authenticated panel, game protocol path, and external-client E2E. It
 reuses the existing lower transaction receipts; controlled observation
 adapters exist only where the observation is external to a repository
 transaction. No free-form command, executable, path outside the private root,
 or self-reported pass Boolean is accepted.
+
+The independent-deployment adapter accepts the exact installer and rollback
+result shapes emitted by the deployment scripts. It binds the installer payload
+to the qualification runtime payload, the installed version to the strict panel
+observation, and the rollback snapshot to the installer's protection snapshot.
+Both installation and restored-release readiness must be true; synthetic
+`operation` or `candidateHealthy`/`candidateRemoved` claims are rejected.
 
 The private profile is exact-property, unexpired, and disabled by default at
 both global and action levels. Every adapter ID, verifier ID, HMAC key ID,
@@ -338,16 +335,13 @@ tools, game clients, soak collectors, or permission to operate the Dyson VM.
 
 | Protocol | What the local validator requires | What it does not prove |
 | --- | --- | --- |
-| `DYSON_QUALIFICATION_SIDE_BY_SIDE_OBSERVATION_V2` | An independently frozen expectation, HMAC-protected capture, exact candidate release/runtime/root, independent health/runtime observations, verified GSManager snapshot, distinct ports, and unchanged GSManager authority with no dual owner. | It does not install or start the candidate, inspect the VM, or prove that the supplied capture came from the production target. |
 | `DYSON_QUALIFICATION_PAIRED_SAVE_LOAD_OBSERVATION_V2` | Exact recovery receipt/bundle, protected paired-save identity, loaded-world Bridge evidence, acknowledged new save, intact new pair, and rollback receipt, all bound to one run/release/runtime/data-root/save generation. | It does not stop the game, restore files, load a world, request a save, or execute rollback. Hash or copy success alone is not a load proof. |
 | `DYSON_CONTROL_PANEL_OBSERVATION_V2` | Public host, certificate identity and validity, SNI/Host agreement, authenticated session, viewer mutation rejection, administrator read, loopback-only Node listener, and separate management/game routes. | It does not contact the public endpoint, authenticate a real operator, change TLS/DNS, or turn an HTTP response into target evidence. |
 | `DYSON_EXTERNAL_JOIN_OBSERVATION_V2` | One ordered 12-event DNS/TLS/WSS/Nebula/auth/join/interaction/save/disconnect/reconnect/rejoin chain bound to one release, endpoint, pseudonymous external client, world, and stable paired save. | It does not create the external session, contact the game, request a save, or permit player identity/network-address collection. |
-| `DYSON_REVERSIBLE_CUTOVER_OBSERVATION_V2` | Approved window, exact release manifest, paired-save protection point, GSManager authority snapshot, forward and rollback switch receipts, management/Nebula health, restored pair, and ordered audit/no-loss proof. | It does not switch authority, activate either owner, contact a host, or authorize the cutover. One-way switch success cannot qualify. |
-| `DYSON_POST_GSMANAGER_REMOVAL_OBSERVATION_V2` | A passed cutover, independent observation window, removal receipt, zero installation/task/service/port/process residue, exact Dyson Control identity, management/game/reboot/save health, inactive verified recovery package, and final evidence/runbook/checksum set. | It does not remove GSManager or prove that a zero-residual inventory was collected from the VM. A deletion receipt alone cannot qualify. |
 | `DYSON_SOAK_OBSERVATION_V2` | Exact six-hour or 72-hour real-monotonic duration and inclusive sample floors, a chained compact segment proof with gaps at most 30 seconds, representative late-game workload/save, component health, external Nebula join/rejoin, periodic stable saves, zero crash/recovery/data-loss outcome, and a closed alert conclusion. | It does not wait, collect telemetry, fast-forward a production clock, or replace the private raw samples and actual elapsed target observation. |
 
 Passing any generator, validator, schema check, or fictional self-test in this
-repository proves only local validation infrastructure. `PRD-*`, `CUT-*`, and
+repository proves only local validation infrastructure. `PRD-*` and
 `SAV-*` entries must remain at their pre-production state; they may not be
 changed to `implemented` or `verified` until a separately authorized run on the
 actual Dyson VM produces independently reviewed private evidence for the exact
@@ -376,7 +370,7 @@ its tests still use only a fake backend:
   qualification adapter must not call a reboot command. Resume must prove a new
   boot, post-boot task instances, dedicated session, exact process/listener,
   loopback readiness, and independent Task Scheduler trigger evidence.
-- **Control-plane restart:** do not touch DSP or GSManager. Bound the stop/start
+- **Control-plane restart:** do not touch DSP. Bound the stop/start
   and readiness windows, reconcile an intentionally interrupted durable job,
   and prove that an already completed phase was not executed twice. V2 binds a
   captured process to exact PID, executable path, file SHA-256, and command-line
@@ -420,13 +414,6 @@ its tests still use only a fake backend:
   exact stopped-state proof and fresh protection backup, load the restored world,
   save again, and verify compensation. A hash-only or byte-copy result is not a
   load proof.
-- **GSManager switch:** snapshot and verify GSManager plus DataRoot and save
-  recovery first. At every observation exactly one authority may own the game
-  runtime/port. Rollback restores the old authority in its documented disabled
-  or activation-required state, after which the separate cutover coordinator
-  explicitly activates the chosen owner. The qualification adapter never
-  removes GSManager.
-
 ## External Join Observation V2
 
 `DYSON_EXTERNAL_JOIN_OBSERVATION_V2` is the strict read-only format for the
@@ -528,7 +515,7 @@ times.
 | Order | Work | Earliest safe checkpoint and resume rule | Human participation |
 | --- | --- | --- | --- |
 | 0 | Freeze the subject commit/runtime payload, import the fixed plan, allocate a run UUID, verify the private evidence sink, approvals, topology, rollback packages, and evidence clock. Preview every dangerous step. | **`plan-frozen`** — safe to pause before any execute. Resume rehashes the plan and all private recovery anchors. | Qualification lead, host operator, change approver. |
-| 1 | Verify or create the GSManager snapshot, DataRoot recovery bundle, paired-save protection point, and their independently retained digests. Deploy the candidate side-by-side without transferring authority. | **`side-by-side-observed`** — pause only after GSManager remains available, the candidate is either healthy or fully rolled back, and no transaction is pending. | Elevated host operator and rollback observer. |
+| 1 | Verify the DataRoot recovery bundle, configuration snapshot, paired-save protection point, and their independently retained digests. Deploy the exact release and retain its rollback receipt. | **`independent-deployment-observed`** — pause only after the release is healthy or fully rolled back and no transaction is pending. | Elevated host operator and rollback observer. |
 | 2 | Prove the authenticated management panel and the separate game DNS/TCP/TLS/WebSocket/PassWall-bypass classification. Do not change DNS, firewall, router, or PassWall under qualification authority. | **`routes-classified`** — safe because this phase is read-only. Any route change invalidates the checkpoint and requires a fresh observation. | Panel operator; network owner supplies previously approved route evidence. |
 | 3 | Run the external join/authentication/interaction/save/disconnect/reconnect challenge on a disposable acceptance world. | **`external-observation-sealed`** — safe after the complete 12-event observation and self digest validate. An incomplete or expired chain is abandoned, not resumed mid-session. | Real external witness, host observer, and independent-save observer at the required stages. |
 | 4 | Perform the controlled paired-save restore/load/new-save/rollback drill. Repeat the external join against the loaded result when required by `SAV-005`. | **`restore-terminal`** — pause only after the selected world is healthy or exact compensation has been verified. Uncertain restore state blocks every later mutation. | Elevated save operator, host observer, external witness for load proof. |
@@ -537,13 +524,11 @@ times.
 | 7 | Run staged update failure and exact rollback, load the prior world, and rejoin externally. | **`update-rollback-terminal`** — pause after the previous release/config/mod lock/save and runtime health are independently proven. | Release operator, host observer, external witness. |
 | 8 | Create the immutable reboot checkpoint, pause, obtain immediate reboot authorization, perform the real guest reboot outside the qualification runner, and resume the exact checkpoint. | **`reboot-resume-terminal`** — safe after new-boot task/process/listener evidence and independent trigger evidence are stored. If the checkpoint expires, start a new reboot drill. | Host console operator/change approver; no manual recovery login may be hidden. |
 | 9 | Start the representative late-game six-hour soak after all disruptive drills. Perform normal multiplayer activity, including an external join near the beginning and a rejoin near the end, without pausing simulation or changing the candidate. | **`soak-sealed`** — the observer may checkpoint and resume without counting unobserved time, but service/workload interruption, candidate change, clock anomaly, or inadequate coverage fails/restarts the qualifying six-hour window. | Soak lead at start/end; external witness at scheduled join points; on-call operator for alerts. |
-| 10 | Only after steps 0–9 pass, preview and run the recoverable GSManager authority switch. Prove one owner, management/game/save/client health, explicit rollback, and no save loss. Return to the authority declared by the maintenance plan. | **`cutover-drill-terminal`** — pause only after exactly one authority is healthy and all cutover receipts/guards verify. | Cutover owner, GSManager owner, host operator, external witness, change approver. |
-| 11 | Seal private bundles, verify their digests and subject/runtime binding, generate only bounded public indexes, and run the acceptance gate. Plan later GSManager removal/post-cutover observation separately. | **`run-sealed`** — immutable. Any candidate or payload change creates a new run. | Evidence custodian and release approver. |
+| 10 | Seal private bundles, verify their digests and subject/runtime binding, generate only bounded public indexes, and run the acceptance gate. | **`run-sealed`** — immutable. Any candidate or payload change creates a new run. | Evidence custodian and release approver. |
 
 This critical path takes more than six wall-clock hours even when every human is
-ready and every preview is clean. Do not schedule a cutover or removal at a time
-that assumes the soak can be fast-forwarded. `CUT-003` may require a later
-observation/removal window and should not be promised as same-day completion.
+ready and every preview is clean. Do not schedule final production acceptance at
+a time that assumes the soak can be fast-forwarded.
 
 ## Pause, interruption, and resume rules
 
@@ -695,7 +680,7 @@ process/volume/network/save counters. Its summary must state
 `productionBackendInvoked: false` and every production side-effect flag false.
 
 The same parent test invokes the orchestration v2 protected-receipt matrix in a
-separate marked temporary root. It covers all 11 evidence-action adapters, exact schemas and
+separate marked temporary root. It covers all nine evidence-action adapters, exact schemas and
 contract, duplicate JSON-key rejection, preview/`-WhatIf` zero-write, default-off consume,
 source-byte rehash, HMAC and subject-binding tampering, stale-completion
 relabeling, rollback binding, the 15-second six-hour/72-hour sample and gap
@@ -750,7 +735,7 @@ The bounded repository integration now:
   deployment guide;
 - records both protocol versions, the v1 plan/executor/Shadow adapter, the v2
   fixed production-capable/fake adapters and schemas, both self-tests, and this runbook as repository
-  implementation evidence in `acceptance/manifest.json`, while all nine
+  implementation evidence in `acceptance/manifest.json`, while all six
   production qualification requirements remain `not-started`;
   and
 - keeps the qualification harness repository-only and outside the runtime

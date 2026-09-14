@@ -356,7 +356,7 @@ describe('public release hygiene gate', () => {
     assert.equal(canonicalEvidenceJson(tampered).includes(repository), false)
   })
 
-  it('accepts only the exact Bridge and hostname-WSS sources plus reviewed migration, recovery, or network docs in the artifact protocol', async () => {
+  it('accepts only the exact Bridge and hostname-WSS sources plus reviewed deployment, recovery, or network docs in the artifact protocol', async () => {
     const repository = await newRepository()
     await write(repository, 'README.md', 'Fictional repository\n')
     await commitAll(repository, 'fixture')
@@ -369,8 +369,6 @@ describe('public release hygiene gate', () => {
     const protocolFiles = [
       { path: 'apps/api/dist/index.js', bytes: Buffer.from('export const fixture = true\n') },
       { path: 'docs/DATAROOT-RECOVERY.md', bytes: Buffer.from('# Fictional DataRoot recovery\n') },
-      { path: 'docs/GSM-EVALUATION.md', bytes: Buffer.from('# Fictional GSM evaluation\n') },
-      { path: 'docs/MIGRATION-GSMANAGER.md', bytes: Buffer.from('# Fictional GSManager removal\n') },
       { path: 'docs/NETWORK-CONNECTIVITY.md', bytes: Buffer.from('# Fictional network contract\n') },
       { path: 'docs/PRODUCTION-QUALIFICATION.md', bytes: Buffer.from('# Fictional production qualification\n') },
       { path: 'docs/WINDOWS-DEPLOYMENT-DRAFT.md', bytes: Buffer.from('# Fictional deployment draft\n') },
@@ -385,11 +383,6 @@ describe('public release hygiene gate', () => {
         bytes: Buffer.from(`$script:RejectedPrivateAddress = '${privateV2Address}'\n`)
       },
       { path: 'scripts/windows/network/Test-DysonNebulaNetwork.ps1', bytes: Buffer.from("Write-Output 'fictional network assessment'\n") },
-      { path: 'scripts/windows/migration/DysonGsManagerRemoval.Common.ps1', bytes: Buffer.from("$script:Fixture = 'fictional'\n") },
-      { path: 'scripts/windows/migration/Remove-DysonGsManagerInstallation.ps1', bytes: Buffer.from("Write-Output 'fictional removal'\n") },
-      { path: 'scripts/windows/migration/Restore-DysonGsManagerRemoval.ps1', bytes: Buffer.from("Write-Output 'fictional restore'\n") },
-      { path: 'scripts/windows/migration/SelfTest-DysonGsManagerRemoval.ps1', bytes: Buffer.from("Write-Output 'fictional self-test'\n") },
-      { path: 'scripts/windows/migration/Test-DysonGsManagerRemoval.ps1', bytes: Buffer.from("Write-Output 'fictional inspection'\n") },
       {
         path: 'scripts/windows/DysonHostMutationLease.Common.ps1',
         bytes: Buffer.from(`$script:ReviewedExtendedPath = '${reviewedExtendedPath}'\n`)

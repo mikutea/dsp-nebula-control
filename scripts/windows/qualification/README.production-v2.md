@@ -3,7 +3,7 @@
 Protocol v2 is the minimal production-capable framework for four bounded
 qualification actions. A separate receipt-only orchestration v2 adapter now
 ingests protected results from the existing restore, reboot, update,
-deployment, cutover/removal, soak, panel, network, and external-client
+deployment, soak, panel, network, and external-client
 transactions without reimplementing or invoking those transactions. Both are
 deliberately separate from protocol v1. V1
 remains Shadow-only forever; its environment values, confirmation phrase,
@@ -111,10 +111,9 @@ or evidence root. The production adapter has no recursive delete primitive.
 
 ## Protected orchestration receipts
 
-The separate orchestration adapter has a closed 11-action allowlist:
+The separate orchestration adapter has a closed nine-action allowlist:
 `paired-save-restore`, `windows-reboot-recovery`, `update-rollback`,
-`side-by-side-deployment`, `gsmanager-recoverable-switch`,
-`gsmanager-removal`, `six-hour-soak`, `seventy-two-hour-soak`,
+`independent-deployment`, `six-hour-soak`, `seventy-two-hour-soak`,
 `authenticated-panel`, `game-protocol-path`, and `external-client-e2e`.
 It consumes evidence; it is not another mutation engine. The fixed contract
 names every adapter, verifier, independent HMAC key, artifact role/protocol,
@@ -209,7 +208,7 @@ and after-rename failures for both intent and receipt publication. It also tests
 hard-exit resume without replay, timeout/failed compensation, the recovery latch,
 broad-target rejection, no arbitrary command surface, and unchanged unrelated
 process/volume/network/save counters. It never invokes the production backend.
-The combined test also runs the orchestration v2 fixture matrix across all 11
+The combined test also runs the orchestration v2 fixture matrix across all nine
 receipt adapters. That matrix covers exact schemas/contracts, duplicate JSON-key
 rejection, preview/`-WhatIf` zero-write, default-off consume, actual source-byte rehash,
 HMAC/subject-binding tamper, check-set and soak bounds, failed-event external
@@ -222,5 +221,5 @@ hashes and readiness behavior,
 real SMB restore timing, real disk and workload behavior, paired-save integrity,
 external client reconnect, update rollback, save restore, reboot recovery,
 authority switch/removal, and real six-hour/72-hour monotonic soaks. The four
-mutation adapters and 11 receipt adapters are implementation coverage only;
+mutation adapters and nine receipt adapters are implementation coverage only;
 neither silently stands in for target-host evidence.

@@ -366,7 +366,7 @@ try {
     $borrowedLease = $null
     try {
         $borrowedLease = Enter-DysonHostMutationLease -DataRoot $borrowed.Data -Owner 'runtime-task-selftest' `
-            -Operation 'fictional-cutover' -RequestId ([guid]::NewGuid().ToString('D')) `
+            -Operation 'fictional-task-rotation' -RequestId ([guid]::NewGuid().ToString('D')) `
             -OwnerPid $PID -TimeoutMilliseconds 0
         $borrowedBefore = Get-DysonHostMutationLeaseStatus -DataRoot $borrowed.Data
         $borrowedApply = Invoke-RuntimeTaskFixture -Fixture $borrowed -StableRoot $borrowed.StableA `
@@ -404,7 +404,7 @@ try {
     $invalidLease = $null
     try {
         $invalidLease = Enter-DysonHostMutationLease -DataRoot $invalidBorrow.Data -Owner 'runtime-task-selftest' `
-            -Operation 'fictional-cutover' -RequestId ([guid]::NewGuid().ToString('D')) `
+            -Operation 'fictional-task-rotation' -RequestId ([guid]::NewGuid().ToString('D')) `
             -OwnerPid $PID -TimeoutMilliseconds 0
         $invalidBefore = Get-DysonHostMutationLeaseStatus -DataRoot $invalidBorrow.Data
         $replacement = if ($invalidLease.Token[0] -ceq 'A') { 'B' } else { 'A' }
@@ -439,7 +439,7 @@ try {
     $borrowedCrashLease = $null
     try {
         $borrowedCrashLease = Enter-DysonHostMutationLease -DataRoot $borrowedCrash.Data `
-            -Owner 'runtime-task-selftest' -Operation 'fictional-cutover' `
+            -Owner 'runtime-task-selftest' -Operation 'fictional-task-rotation' `
             -RequestId ([guid]::NewGuid().ToString('D')) -OwnerPid $PID -TimeoutMilliseconds 0
         $borrowedCrashBefore = Get-DysonHostMutationLeaseStatus -DataRoot $borrowedCrash.Data
         $borrowedSeed = Invoke-RuntimeTaskFixture -Fixture $borrowedCrash -StableRoot $borrowedCrash.StableA `
@@ -479,7 +479,7 @@ try {
     $borrowedTerminalLease = $null
     try {
         $borrowedTerminalLease = Enter-DysonHostMutationLease -DataRoot $borrowedTerminal.Data `
-            -Owner 'runtime-task-selftest' -Operation 'fictional-cutover' `
+            -Owner 'runtime-task-selftest' -Operation 'fictional-task-rotation' `
             -RequestId ([guid]::NewGuid().ToString('D')) -OwnerPid $PID -TimeoutMilliseconds 0
         $borrowedTerminalBefore = Get-DysonHostMutationLeaseStatus -DataRoot $borrowedTerminal.Data
         $borrowedTerminalRequest = [guid]::NewGuid().ToString('D')

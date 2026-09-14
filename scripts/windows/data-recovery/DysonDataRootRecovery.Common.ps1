@@ -14,14 +14,12 @@ $script:DysonDataRootRecoveryAllowedTopLevel = @(
     '.dyson-control-deployment-locks',
     'acceptance',
     'audit',
-    'authority-inventory',
     'config',
     'configuration-snapshots',
     'configuration-transactions',
     'data',
     'game-access-snapshots',
     'logs',
-    'migration',
     'private',
     'runtime-task-transactions',
     'snapshots',
@@ -778,10 +776,7 @@ function Write-DysonDataRootRecoveryJsonNew {
 }
 
 function Assert-DysonDataRootRecoveryBrokerHistoryClosed {
-    param(
-        [Parameter(Mandatory)][string]$BrokerRoot,
-        [Parameter(Mandatory)][ValidateSet('lifecycle', 'cutover')][string]$Kind
-    )
+    param([Parameter(Mandatory)][string]$BrokerRoot)
 
     if (-not (Test-DysonDataRootRecoveryPathExists $BrokerRoot)) { return 0 }
     $root = Assert-DysonDataRootRecoveryPlainDirectory $BrokerRoot
@@ -791,10 +786,7 @@ function Assert-DysonDataRootRecoveryBrokerHistoryClosed {
     foreach ($required in @($requestsPath, $receiptsPath, $intentsPath)) {
         [void](Assert-DysonDataRootRecoveryPlainDirectory $required)
     }
-    $workPath = if ($Kind -ceq 'cutover') { Join-Path $root 'work' } else { $null }
-    if ($null -ne $workPath) { [void](Assert-DysonDataRootRecoveryPlainDirectory $workPath) }
-    if (@(Get-DysonDataRootRecoveryChildItems $intentsPath).Count -ne 0 -or
-        ($null -ne $workPath -and @(Get-DysonDataRootRecoveryChildItems $workPath).Count -ne 0)) {
+    if (@(Get-DysonDataRootRecoveryChildItems $intentsPath).Count -ne 0) {
         Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
     }
 
@@ -816,45 +808,24 @@ function Assert-DysonDataRootRecoveryBrokerHistoryClosed {
         }
         $receiptMap[$Matches.id] = $item.FullName
     }
-    if ($Kind -ceq 'cutover') {
-        # The worker removes requests after persisting terminal receipts. Validate
-        # the retained history using its authoritative protocol, not file counts.
-        $brokerCommon = Join-Path $script:DysonDataRootRecoveryCommonRoot 'cutover-broker\DysonCutoverBroker.Common.ps1'
-        try {
-            . $brokerCommon
-            foreach ($id in $receiptMap.Keys) {
-                $terminal = ConvertTo-DysonCutoverBrokerValidatedReceipt (Read-DysonDataRootRecoveryJson $receiptMap[$id])
-                if ([string]$terminal.brokerRequestId -cne $id) { throw 'receipt identity mismatch' }
-                # A failed read-only observation cannot leave a host mutation to
-                # recover. Failed mutating operations still require reconciliation.
-                if ($terminal.state -ceq 'failed' -and $terminal.capability -cne 'CutoverEvidence') {
-                    throw 'failed mutation requires reconciliation'
-                }
-            }
-        }
-        catch { Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION' }
-    }
-    if ($Kind -ceq 'lifecycle' -and $requestMap.Count -ne $receiptMap.Count) {
+    if ($requestMap.Count -ne $receiptMap.Count) {
         Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
     }
     foreach ($id in $requestMap.Keys) {
         if (-not $receiptMap.ContainsKey($id)) { Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION' }
         $request = Read-DysonDataRootRecoveryJson $requestMap[$id]
         $receipt = Read-DysonDataRootRecoveryJson $receiptMap[$id]
-        $requestProtocol = if ($Kind -ceq 'lifecycle') { 'DYSON_CONTROL_LIFECYCLE_BROKER_REQUEST_V1' } else { 'DYSON_CONTROL_CUTOVER_BROKER_REQUEST_V1' }
-        $receiptProtocol = if ($Kind -ceq 'lifecycle') { 'DYSON_CONTROL_LIFECYCLE_BROKER_RECEIPT_V1' } else { 'DYSON_CONTROL_CUTOVER_BROKER_RECEIPT_V1' }
-        if ($request.protocol -isnot [string] -or [string]$request.protocol -cne $requestProtocol -or
+        if ($request.protocol -isnot [string] -or [string]$request.protocol -cne 'DYSON_CONTROL_LIFECYCLE_BROKER_REQUEST_V1' -or
             [int64]$request.schemaVersion -ne 1 -or [string]$request.brokerRequestId -cne $id -or
             $request.requestFingerprint -isnot [string] -or [string]$request.requestFingerprint -cnotmatch '^[0-9a-f]{64}$' -or
             $request.capability -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$request.capability) -or
-            $receipt.protocol -isnot [string] -or [string]$receipt.protocol -cne $receiptProtocol -or
+            $receipt.protocol -isnot [string] -or [string]$receipt.protocol -cne 'DYSON_CONTROL_LIFECYCLE_BROKER_RECEIPT_V1' -or
             [int64]$receipt.schemaVersion -ne 1 -or [string]$receipt.brokerRequestId -cne $id -or
             [string]$receipt.requestFingerprint -cne [string]$request.requestFingerprint -or
             [string]$receipt.capability -cne [string]$request.capability) {
             Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
         }
-        if (($Kind -ceq 'lifecycle' -and [string]$receipt.status -cnotin @('succeeded', 'blocked', 'failed')) -or
-            ($Kind -ceq 'cutover' -and [string]$receipt.state -cnotin @('succeeded', 'failed'))) {
+        if ([string]$receipt.status -cnotin @('succeeded', 'blocked', 'failed')) {
             Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
         }
     }
@@ -865,12 +836,24 @@ function Assert-DysonDataRootRecoveryNoPendingMutations {
     param(
         [Parameter(Mandatory)][string]$DataRoot,
         [Parameter(Mandatory)][string]$RecoveryRoot,
+        [Parameter(Mandatory)][ValidateSet('Windows', 'Shadow')][string]$Backend,
         [string]$DataRootIdentity,
         [string]$AllowedTerminalOperationId
     )
 
-    $lifecycleCount = Assert-DysonDataRootRecoveryBrokerHistoryClosed (Join-Path $DataRoot 'data\lifecycle-broker') lifecycle
-    $cutoverCount = Assert-DysonDataRootRecoveryBrokerHistoryClosed (Join-Path $DataRoot 'data\cutover-broker') cutover
+    if ($Backend -ceq 'Windows') {
+        try {
+            $retiredTasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
+                [string]::Equals([string]$_.TaskName, 'Dyson-Control-Cutover-Broker',
+                    [System.StringComparison]::OrdinalIgnoreCase)
+            })
+        }
+        catch { Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION' }
+        if ($retiredTasks.Count -ne 0) {
+            Throw-DysonDataRootRecoveryError 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
+        }
+    }
+    $lifecycleCount = Assert-DysonDataRootRecoveryBrokerHistoryClosed (Join-Path $DataRoot 'data\lifecycle-broker')
     if (-not [string]::IsNullOrWhiteSpace($DataRootIdentity) -and
         (Test-DysonDataRootRecoveryDirectoryExists $RecoveryRoot)) {
         $stateRoot = Join-Path (Join-Path $RecoveryRoot 'state') (Get-DysonDataRootRecoveryIdentityStem $DataRootIdentity)
@@ -909,7 +892,6 @@ function Assert-DysonDataRootRecoveryNoPendingMutations {
     }
     return [pscustomobject][ordered]@{
         lifecycleTerminalCount = $lifecycleCount
-        cutoverTerminalCount = $cutoverCount
         pending = $false
     }
 }
@@ -1949,7 +1931,7 @@ function Assert-DysonDataRootRecoveryPreflight {
         [string](Get-DysonHostMutationLeasePathInfo $roots.dataRoot).DataRootIdentity
     }
     $task = Assert-DysonDataRootRecoveryTaskQuiesced $ControlTaskName $Backend $ShadowRoot
-    $pending = Assert-DysonDataRootRecoveryNoPendingMutations $roots.dataRoot $roots.recoveryRoot $identity `
+    $pending = Assert-DysonDataRootRecoveryNoPendingMutations $roots.dataRoot $roots.recoveryRoot $Backend $identity `
         $AllowedTerminalOperationId
     [void](Get-DysonDataRootRecoveryTreeInventory $roots.dataRoot)
     return [pscustomobject][ordered]@{

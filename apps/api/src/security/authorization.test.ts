@@ -32,7 +32,6 @@ describe('authorization policy', () => {
       'configuration.read',
       'updates.read',
       'mods.read',
-      'cutover.read'
     ])
     for (const permission of [
       'jobs.export',
@@ -50,7 +49,6 @@ describe('authorization policy', () => {
       'updates.activate',
       'mods.mutate',
       'players.moderate',
-      'cutover.execute',
       'client-profile.generate'
     ] as const) {
       expect(can('viewer', permission)).toBe(false)
@@ -79,7 +77,6 @@ describe('authorization policy', () => {
       'updates.activate',
       'mods.mutate',
       'players.moderate',
-      'cutover.execute'
     ] as const) {
       expect(can('operator', permission)).toBe(false)
     }

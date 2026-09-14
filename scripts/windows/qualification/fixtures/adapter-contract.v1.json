@@ -54,14 +54,6 @@
       "productionAdapterRequired": true
     },
     {
-      "action": "gsmanager-switch",
-      "adapterId": "bounded-gsmanager-switch-v1",
-      "preconditions": ["fresh-protection-point", "maintenance-window", "target-identity"],
-      "timeoutSeconds": 900,
-      "rollback": "restore-disabled-recoverable-gsmanager-state",
-      "productionAdapterRequired": true
-    },
-    {
       "action": "save-restore",
       "adapterId": "bounded-save-restore-v1",
       "preconditions": ["fresh-protection-point", "maintenance-window", "target-identity"],

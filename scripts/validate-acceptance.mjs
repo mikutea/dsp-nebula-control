@@ -8,10 +8,9 @@ export const evidenceScopes = [
   'repository-integration',
   'local-windows',
   'release',
-  'dyson-side-by-side',
+  'dyson-vm',
   'production',
-  'external-client',
-  'cutover'
+  'external-client'
 ]
 
 const allowedPriorities = new Set(['P0', 'P1', 'P2'])
@@ -28,10 +27,10 @@ const proofKinds = new Set([
   'clean-host-run', 'operator-run', 'external-client-run', 'soak-report',
   'backup-manifest', 'rollback-drill', 'private-proof'
 ])
-const privateScopes = new Set(['dyson-side-by-side', 'production', 'external-client', 'cutover'])
+const privateScopes = new Set(['dyson-vm', 'production', 'external-client'])
 const requiredAreas = new Set([
   'security', 'lifecycle', 'saves', 'updates', 'mods', 'players', 'console',
-  'configuration', 'server', 'client', 'opensource', 'production', 'cutover'
+  'configuration', 'server', 'client', 'opensource', 'production'
 ])
 const scopeRank = new Map(evidenceScopes.map((scope, index) => [scope, index]))
 const commitPattern = /^[0-9a-f]{40}$/
@@ -242,11 +241,10 @@ export function isAllowedEvidenceOnlyPath(candidate) {
 }
 
 export function minimumEvidenceScope(requirement) {
-  if (requirement.id?.startsWith('CUT-')) return 'cutover'
   if (requirement.id === 'PRD-003' || requirement.id === 'PRD-004') return 'external-client'
   if (requirement.id === 'PRD-005' || requirement.id === 'SAV-005') return 'production'
   if (requirement.id === 'OSS-003') return 'release'
-  if (requirement.priority === 'P0' || requirement.priority === 'P1') return 'dyson-side-by-side'
+  if (requirement.priority === 'P0' || requirement.priority === 'P1') return 'dyson-vm'
   return 'repository-integration'
 }
 

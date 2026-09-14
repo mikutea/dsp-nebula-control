@@ -27,7 +27,7 @@ client/server parity, and rollback-oriented operations.
 Product scope and production readiness are tracked by the machine-validated
 [`acceptance/manifest.json`](acceptance/manifest.json). See
 [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) for evidence levels and the release
-and cutover gates. A feature is not complete merely because its navigation,
+and production gates. A feature is not complete merely because its navigation,
 preview, or API shape exists.
 
 ![Dyson Control dashboard](design/dashboard-implementation-dsp-inspired-v2.png)
@@ -79,21 +79,13 @@ game/management planes, PassWall evidence requirements, and external-client
 checklist. Neither the tool nor its Shadow self-test proves a reachable endpoint,
 router policy, PassWall bypass, Nebula join, or production readiness.
 
-## Why a separate control plane?
+## Direct control plane
 
-The evaluated GSManager plugin surface is a static iframe backed by an
-administrator-only generic API. It has no stable extension point for
-game-specific backend routes, durable jobs, fine-grained roles, or atomic
-Nebula save/update workflows. See [docs/GSM-EVALUATION.md](docs/GSM-EVALUATION.md).
-
-GSManager may remain installed as an emergency terminal while Dyson Control is
-developed, but it is not a runtime dependency. The release also carries a
-bounded, recoverable GSManager parallel-migration toolkit: read-only inspection,
-`-WhatIf`, a private atomic file/task snapshot bound to an existing paired-save
-protection manifest, strict full re-verification, and an explicitly confirmed
-guarded restore. It never snapshots `.dsv`/`.server`, starts either application,
-or provides a silent remove/disable/switch operation. See the
-[GSManager evaluation and migration contract](docs/GSM-EVALUATION.md#parallel-migration-and-recovery-contract).
+Dyson Control provides game-specific lifecycle, paired-save and update workflows
+through authenticated roles, durable jobs and auditable recovery receipts. Deploy
+its own runtime and startup task using the [Windows deployment guide](docs/WINDOWS-DEPLOYMENT-DRAFT.md).
+Management HTTPS and the Nebula game connection require separate end-to-end
+validation; configuring a hostname alone does not establish production readiness.
 
 ## Safe local preview
 
@@ -197,7 +189,7 @@ fixtures, but remain narrower than their production acceptance criteria:
   acknowledged alert episodes; these remain separate from save, reboot, crash,
   and external-client drills.
 - [production qualification runbook](docs/PRODUCTION-QUALIFICATION.md): a
-  resumable 13-step protocol for the nine open acceptance requirements, strict
+  resumable 12-step protocol for the six open acceptance requirements, strict
   public receipt shapes, private-evidence digests, interruption recovery, and
   two deliberately separate implementations: v1 is permanently Shadow-only;
   v2 contains four fixed, default-off production-capable adapters plus an
@@ -265,24 +257,24 @@ lifecycle broker owns privileged task dispatch plus current process/port
 evidence. The API validates the broker profile, its dependency hashes, fixed
 task descriptors, game account, and port binding before opening its database or
 listener; it cannot invoke the legacy task dispatcher or privileged runtime
-probe directly. This keeps lifecycle validation bound across an immutable
+probe directly. Installation, direct deployment, uninstall, status and DataRoot
+recovery also fail closed while the retired privileged task is still registered.
+This keeps lifecycle validation bound across an immutable
 release upgrade. Leaving
 `DYSON_LIFECYCLE_ENABLED` unset or `false` keeps the execution endpoint
 available for audited testing but terminates every request before any host
 mutation method is called.
 
-The game task pair is installed separately and transactionally. During a
-side-by-side GSManager deployment, use only `PrepareDisabled`; both definitions
-are disabled from first registration and point at the stable bootstrap above.
-`Activate` is reserved for the explicit GSManager cutover coordinator after the
-old startup authority is disabled and the game is proved stopped. The offline
+The game task pair is installed separately and transactionally. `PrepareDisabled`
+publishes both disabled definitions against the stable bootstrap; `Activate`
+requires the game to be proved stopped before enabling the selected pair. The offline
 gates `npm run runtime-tasks:selftest` and `npm run game-bootstrap:selftest`
 exercise pair rollback, interrupted recovery, outer-lease borrowing, active
 release binding, upgrade/rollback, and concurrent-start serialization without
 touching the native scheduler or a real game process.
 
 Whole-tree Nebula plugin publication has its own production boundary. It does
-not reuse component-activation, ordinary-mod, cutover, or lifecycle feature
+not reuse component-activation, ordinary-mod, or lifecycle feature
 flags. Configure a reviewed private job root, while the application derives the
 Server game root only from `<DYSON_PROJECT_ROOT>\server` and binds the host
 mutation lease to `DYSON_DATA_DIR`:
@@ -339,7 +331,7 @@ one stable cross-process transaction lock, guarded upgrade/rollback, and a
 recoverable uninstall that preserves ProgramData by default. Task identity is
 globally checked and fixed to the root Task Scheduler path; query failures stop
 before mutation. They install Dyson Control only; they do not silently start,
-stop, or remove DSP, Nebula, or GSManager.
+stop, or remove DSP or Nebula.
 
 Node is an independent deployment boundary: keep its `RuntimeRoot` outside both
 the immutable control-plane `InstallRoot` and persistent `DataRoot`, with a
@@ -360,9 +352,7 @@ npm run host-mutation:selftest
 npm run runtime-tasks:selftest
 npm run game-bootstrap:selftest
 npm run lifecycle:broker-selftest
-npm run cutover:selftest
 npm run bridge:selftest
-npm run migration:selftest
 npm run node-runtime:selftest
 npm run deployment:selftest
 npm run deployment:status-selftest
@@ -379,21 +369,15 @@ reboot, health, rollback, uninstall, or production verification.
 
 The public release artifact ships the Bridge source, project file, disabled
 configuration template, bounded Windows build/verify/install tools, the exact
-cutover host evidence/action/authority script set with offline self-tests, the
-exact six-file fixed cutover-broker script set with its offline self-test, the
-exact six-file lifecycle-broker script set with its offline self-test, the exact
-seven-file read-only Nebula network assessment set with its Shadow self-test,
-the exact GSManager migration script set, private-acceptance bundle/index tooling,
-and the GSManager/Windows migration guides. The installer creates the dedicated
-`data\cutover` journal/audit directory before the control plane can enable the
-cutover gates. Lifecycle-broker installation is separately opt-in with
+six-file lifecycle-broker script set with its offline self-test, the exact
+read-only Nebula network assessment set with its Shadow self-test, private
+acceptance bundle/index tooling, and the Windows deployment guide.
+Lifecycle-broker installation is separately opt-in with
 `-InstallLifecycleBrokerTask`; a cross-release change also requires
-`-UpgradeLifecycleBrokerExisting`. Cutover-broker installation is never implicit
-and is rejected unless lifecycle installation is present in the same transaction.
-The fixed order is release/bootstrap/configuration/control task, lifecycle broker,
-cutover broker, then control-task start and version-bound loopback readiness.
-Readiness requires `lifecycleBroker` and, when cutover is requested,
-`cutoverRecovery`.
+`-UpgradeLifecycleBrokerExisting`. The fixed order is release, bootstrap,
+configuration, control task, lifecycle broker, then control-task start and
+version-bound loopback readiness. Readiness requires `lifecycleBroker` whenever
+that broker is installed.
 
 Install, Stage, and Upgrade require the artifact payload SHA-256 copied from
 independently authenticated release provenance. Trusted deployment code treats
@@ -416,13 +400,11 @@ release/bootstrap/configuration is retained with an explicit
 `protected-configuration-restore-executor-unavailable` failure. Normal uninstall
 uses `-RemoveCurrent` with the exact expected profile hash, removes only
 the fixed profile and worker task, and preserves request/receipt/audit history;
-pending, orphaned, unknown, or drifted state fails closed. After both brokers pass
-that read-only preflight, uninstall first stops and removes the control task to
-quiesce the request entry point, then removes cutover, removes lifecycle, and only
-then moves the release or handles explicitly approved data removal. This does not
-reverse broker dependencies: cutover is still removed before lifecycle; quiescing
-the control task only prevents new requests from entering during teardown. A
-failure restores release state, lifecycle, cutover, and finally the exact prior
+pending, orphaned, unknown, or drifted state fails closed. After the lifecycle
+broker passes that read-only preflight, uninstall first stops and removes the
+control task to quiesce the request entry point, then removes lifecycle, and only
+then moves the release or handles explicitly approved data removal. A
+failure restores release state, lifecycle, and finally the exact prior
 control task. Static deployment
 status requires either no disabled residual state or a clean, active-release-bound
 enabled broker. Reboot acceptance requires the enabled broker plus both deep
@@ -477,26 +459,24 @@ apps/api       Fastify control-plane API, authentication, jobs, audit storage
 apps/web       React/Vite operator interface
 integrations   Disabled-by-default, protocol-bounded game/client companions
 scripts/windows  Bounded Windows collectors and fixed lifecycle actions
-docs           Architecture, security model, and migration decisions
+docs           Architecture, security model, deployment, and recovery decisions
 design         Accepted UI concept used as an implementation specification
 ```
 
 ## Roadmap
 
 1. Close the remaining repository-level transaction gaps: one host-mutation
-   lease across lifecycle/save/update/migration operations, crash-recoverable
-   save and GSManager journals, digest-bound paired-save compensation, and
+   lease across lifecycle/save/update operations, crash-recoverable
+   save journals, digest-bound paired-save compensation, and
    fully verified task/root rollback; then pass the complete local gate.
 2. Run desktop/mobile browser acceptance against fictional local data and
    verify the release artifact with the public hygiene/provenance gate.
 3. Run the reusable Windows package through clean-host, reboot, ACL, upgrade,
    rollback, and uninstall matrices.
-4. With fresh production approval, deploy side by side on the target Windows host while
-   GSManager remains recoverable.
+4. Deploy the exact release on the target Windows host with a verified
+   configuration snapshot and deployment rollback receipt.
 5. Complete the external join, PassWall-bypass, paired-save restore,
    late-game performance, reboot/fault, and soak evidence.
-6. Remove GSManager only after every cutover gate passes and the rollback
-   package has been independently verified.
 
 Inspect the current evidence-backed roadmap without changing state:
 

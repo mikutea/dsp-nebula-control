@@ -49,7 +49,7 @@ from that ID and has no other valid form:
 paths, traversal, a different filename, and redirected filesystem entries are
 rejected.
 
-Target-host, production, external-client, and cutover evidence stays private.
+Target-host, production, and external-client evidence stays private.
 The public manifest records only an opaque private-store ID, its SHA-256,
 observation time, evidence kind/scope, and release commit. It never embeds the
 underlying log, save, player identity, endpoint, task export, or configuration.
@@ -58,7 +58,7 @@ underlying log, save, player identity, endpoint, task export, or configuration.
 {
   "evidenceId": "prd-001-run-0001",
   "kind": "operator-run",
-  "scope": "dyson-side-by-side",
+  "scope": "dyson-vm",
   "subjectCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "runtimePayloadSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "opaqueId": "private:prd-001-run-0001",
@@ -79,7 +79,7 @@ complete protocol is:
   "evidence": {
     "evidenceId": "prd-001-run-0001",
     "kind": "operator-run",
-    "scope": "dyson-side-by-side",
+    "scope": "dyson-vm",
     "subjectCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "runtimePayloadSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "opaqueId": "private:prd-001-run-0001",
@@ -156,7 +156,7 @@ calculation uses the fixed P0/P1 contract rather than trusting mutable manifest
 input.
 
 - `P0` protects saves, credentials, access, lifecycle integrity, recovery,
-  networking, and production cutover. A failed `P0` prohibits production use.
+  networking, and production deployment. A failed `P0` prohibits production use.
 - `P1` is required for the general-purpose stable release: complete management
   workflows, productized deployment, monitoring, documentation, and client
   parity.
@@ -181,13 +181,13 @@ the current distribution without changing state. `acceptance:gate` additionally
 requires the exact final tag commit and built artifact manifest. It exits
 non-zero until every `P0` and `P1` requirement is verified by qualifying
 evidence for that runtime payload and until the candidate-to-tag Git diff is
-evidence-only; it is the final release and cutover gate, not a progress
+evidence-only; it is the final release and production gate, not a progress
 indicator.
 
 `qualification:selftest` validates the repository-only Windows PowerShell 5.1
-qualification protocol, fixed 13-step plan, receipt chains, interruption and
+qualification protocol, fixed 12-step plan, receipt chains, interruption and
 rollback handling, execution gates, and marked temporary Shadow adapters. Its
-virtual six-hour soak and fictional dangerous actions leave all nine production
+virtual six-hour soak and fictional dangerous actions leave all six production
 requirements `not-started`; they create neither target-host evidence nor
 authority to run a real adapter. See
 [the production qualification runbook](PRODUCTION-QUALIFICATION.md).
@@ -200,15 +200,14 @@ Scopes are ordered from narrowest to strongest:
 2. `repository-integration`
 3. `local-windows`
 4. `release`
-5. `dyson-side-by-side`
+5. `dyson-vm`
 6. `production`
 7. `external-client`
-8. `cutover`
 
-Every P0/P1 requirement requires at least `dyson-side-by-side` proof unless a
+Every P0/P1 requirement requires at least `dyson-vm` proof unless a
 stronger policy applies. Public-release hygiene requires `release`; the real
 game network and join require `external-client`; soak and restore-drill gates
-require `production`; and removal/switching gates require `cutover` evidence.
+require `production`.
 An implementation file or contract is useful supporting evidence but is never
 qualifying proof by itself.
 
@@ -220,24 +219,21 @@ qualifying proof by itself.
 | API authorization or mutation | Authenticated integration tests for allowed, denied, duplicate, timeout, and interrupted requests. |
 | Windows adapter | Fixture tests plus a controlled Windows integration run against fixed allowlisted scripts. |
 | Save, update, mod, or configuration mutation | Transaction receipt, pre-change protection point, post-condition check, tamper/failure test, and successful rollback. |
-| Installer, upgrade, migration, or uninstall | Clean-host installation matrix and preservation/removal assertions. |
+| Installer, upgrade, or uninstall | Clean-host installation matrix and preservation/removal assertions. |
 | Network reachability | Protocol-correct probe and a real external Nebula client join; DNS or HTTP health alone is insufficient. |
 | Reboot or crash recovery | Observed service recovery after a real reboot or injected process interruption. |
-| Production cutover | Timestamped private evidence, exact release hash, backup hash, rollback drill, and post-cutover observation. |
+| Production deployment | Timestamped private evidence, exact release hash, backup hash, rollback drill, and post-deployment observation. |
 
-## Cutover invariants
+## Production invariants
 
-1. GSManager remains available during side-by-side deployment.
-2. No lifecycle capability is enabled merely because preflight is green; its
+1. No lifecycle capability is enabled merely because preflight is green; its
    action adapter, durable receipt protocol, rollback job, and integration tests
    must also be verified.
-3. `.dsv` and `.server` are always protected, moved, restored, and validated as
+2. `.dsv` and `.server` are always protected, moved, restored, and validated as
    one atomic unit.
-4. The Node listener remains loopback-only behind authenticated TLS routing.
-5. Management transport and Nebula game transport are verified separately.
-6. The final game path must be demonstrated to bypass PassWall.
-7. GSManager is backed up and removed only after external client, reboot,
-   restore, update rollback, and sustained-operation gates pass.
+3. The Node listener remains loopback-only behind authenticated TLS routing.
+4. Management transport and Nebula game transport are verified separately.
+5. The final game path must be demonstrated to bypass PassWall.
 
 ## Current foundation
 
@@ -245,7 +241,7 @@ The `0.1.x` foundation implements and tests authenticated fail-closed
 configuration, fixed provider commands, strict non-mutating lifecycle preview,
 paired-save inventory, bounded host status, and installed-version discovery at
 repository-test scope. Those entries remain `implemented` until exact-commit
-Dyson side-by-side evidence satisfies the stronger release policy.
+Dyson VM evidence satisfies the stronger release policy.
 
 The repository also implements narrower, tested foundations for durable
 lifecycle execution, signed save/player bridging, save backup/restore
@@ -268,8 +264,7 @@ In particular:
 | Windows deployment | immutable releases, startup task, upgrade rollback, recoverable uninstall, protected automatic interactive-session configuration, fail-closed pre-reboot checkpoint/read-only resume, path-free game-runtime exit receipts, a bounded authenticated receipt API, and a target-root Bridge candidate builder/verifier that requires the fixed DSP `netstandard.dll` reference set and rejects missing, conditional, or reparse-point dependencies | fixture/API testing cannot prove a real reboot, native Task Scheduler/ACL/LSA behavior, crash restart, a real target-root Bridge build/load, clean-host matrix, client rejoin, or target deployment |
 | DataRoot recovery | private full-tree bundle with relative-path/type/length/SHA-256 and ACL intent, independent tamper/missing/extra verification, quiescence and no-pending gates, automatic pre-overwrite protection point, atomic directory swap, exact rollback, idempotent receipts, and a temporary-root Shadow fault-injection self-test | no target-host bundle, offline copy, native scheduled-task/ACL matrix, production restore, post-restore application health, or private operator evidence exists |
 | Network assessment | versioned redacted local/read-only v1 and v2 assessment schemas; separate game and management planes; local single-owner `DSPGAME` listener identity; all-answer DNS and public first-address semantics; TCP, TLS, hostname-preserving SNI/Host, and HTTP/WebSocket classification; permanent mutation denial; injected Shadow fixtures with zero native network calls; and a v2 fixed same-tree verifier boundary that derives WSS `/socket` semantics only from an exact, consumed, protected six-field qualification projection whose PassWall result comes from the signed receipt chain | no repository test contacted a real remote target, proved a public route, observed live router/firewall/PassWall counters, completed the Nebula application handshake, or supplied an accepted external-client production record; a passing v2 self-test or preview cannot qualify production, so `PRD-003` and `PRD-004` remain `not-started` |
-| Production qualification harness | strict 13-step plan for the nine open requirements; immutable plan/checkpoint/receipt digests; exact public receipt projection; private-evidence references; prerequisite, challenge, timing, pause/resume, idempotency, hard-exit and rollback recovery; permanently Shadow-only v1 adapters; four fixed, default-off production-capable v2 adapters with an isolated fake backend; and a protected Orchestration V2 layer that accepts only fixed schemas/adapters and normalizes controlled evidence into bounded receipt chains, all covered by Windows PowerShell 5.1 self-tests | repository tests invoke only v1 Shadow, v2 fake, and the Orchestration V2 protected receipt fixture; no v2 adapter has passed a target-host run, reboot remains out of scope, and no real process fault, SMB interruption, disk-pressure drill, authority switch, save restore, external join, or qualifying private evidence has been accepted; all nine mapped requirements remain `not-started` |
-| GSManager recoverable removal | fixed-root, snapshot-bound and paired-save-protection-bound removal; exact tree/task/ACL guard; preflight authority and pending-mutation gates; durable receipts; failure compensation; independent inspection; and explicit restore to a disabled, activation-required state, covered by a fictional temporary-root Shadow self-test | no clean-host/native Task Scheduler matrix, target-host preimage, operator confirmation, observation window, rollback drill, production removal, or production restoration exists; `CUT-003` remains `not-started` |
+| Production qualification harness | strict 12-step plan for the six open production requirements; immutable plan/checkpoint/receipt digests; exact public receipt projection; private-evidence references; prerequisite, challenge, timing, pause/resume, idempotency, hard-exit and rollback recovery; permanently Shadow-only v1 adapters; four fixed, default-off production-capable v2 adapters with an isolated fake backend; and a protected Orchestration V2 layer that accepts only fixed schemas/adapters and normalizes controlled evidence into bounded receipt chains, all covered by Windows PowerShell 5.1 self-tests | repository tests invoke only v1 Shadow, v2 fake, and the Orchestration V2 protected receipt fixture; no v2 adapter has passed a target-host run, reboot remains out of scope, and no real process fault, SMB interruption, disk-pressure drill, save restore, external join, or qualifying private evidence has been accepted; all six mapped requirements remain `not-started` |
 | Open-source release | Windows CI pins Node.js 24 and runs the complete gate, including Windows PowerShell 5.1 self-tests and both builds; the tag-only release workflow binds a canonical tag/version/commit, rejects a dirty checkout, runs acceptance and public-history/artifact scans, then publishes only the deterministic ZIP, SHA-256, canonical provenance, and bounded scan evidence; exact required-file gates cover the compiled observability runtime, Orchestration V2 contracts, Bridge source/build contract and fixed `netstandard.dll` reference; release self-tests exercise removal, unexpected-file, conditional-reference, and re-manifesting failures; cross-runtime version checks pin the PowerShell, JSON Schema, and TypeScript protocol/schema literals | no final exact-commit release artifact, successful tag workflow, hosting-platform cache/fork review, or independently checked public tag exists yet |
 | Performance | persistent bounded raw telemetry plus a restart-persistent 72-hour slim hash chain; continuity qualification for sample coverage, monotonic order, maximum gap, SMB mapping/task health, and chain integrity; server-authoritative save/backup receipt latency with failures kept separate and missing or truncated evidence reported as unknown; read-only API/UI projection; a signed Bridge UPS/TPS sampler bound to the verified runtime process/session and current Bridge generation; durable acknowledged alert episodes; and a separate fixed six-hour late-game report | repository tests use fictional or temporary inputs, including the 17,281-sample restart/continuity matrix; there is no real-VM Bridge telemetry, representative production late-game save, trusted target-host latency drill, reboot/crash recovery evidence, external join, or completed 72-hour soak window |
 
@@ -279,8 +274,7 @@ default production-assembly regression path are repository implementation
 evidence only. They add no signed or hashed target-host evidence and cannot
 promote an update, rollback, or production requirement to `verified`.
 
-The manifest therefore still contains exactly 48 requirements: 39
-`implemented`, nine `not-started`, and zero `verified`. All nine
+The manifest therefore contains exactly 45 requirements: 39
+`implemented`, six `not-started`, and zero `verified`. All six
 production-only requirements remain `not-started`, and no real-VM evidence has
-been added. GSManager has not been removed or replaced, and no production
-endpoint is verified by this repository state.
+been added, and no production endpoint is verified by this repository state.

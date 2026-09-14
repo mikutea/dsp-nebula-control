@@ -13,7 +13,7 @@
     "runId": { "$ref": "#/$defs/uuid" },
     "profileId": { "$ref": "#/$defs/uuid" },
     "profileSha256": { "$ref": "#/$defs/digest" },
-    "action": { "enum": ["paired-save-restore", "windows-reboot-recovery", "update-rollback", "side-by-side-deployment", "gsmanager-recoverable-switch", "gsmanager-removal", "six-hour-soak", "seventy-two-hour-soak", "authenticated-panel", "game-protocol-path", "external-client-e2e"] },
+    "action": { "enum": ["paired-save-restore", "windows-reboot-recovery", "update-rollback", "independent-deployment", "six-hour-soak", "seventy-two-hour-soak", "authenticated-panel", "game-protocol-path", "external-client-e2e"] },
     "actionTargetId": { "$ref": "#/$defs/identifier" },
     "mode": { "enum": ["preview", "consume"] },
     "executionScope": { "enum": ["production", "fixture"] },

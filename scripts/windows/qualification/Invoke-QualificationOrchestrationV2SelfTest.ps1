@@ -333,210 +333,9 @@ function New-OrchestrationSelfTestPanelObservation {
     return New-DysonControlPanelObservationV2 -InputValue $inputValue
 }
 
-function New-OrchestrationSelfTestSideBySideObservation {
-    param(
-        [Parameter(Mandatory)][string]$ReceiptId,
-        [Parameter(Mandatory)][string]$RunId,
-        [Parameter(Mandatory)][string]$ActionTargetId,
-        [Parameter(Mandatory)][string]$KeyId,
-        [Parameter(Mandatory)][datetimeoffset]$ObservedAt
-    )
-    $digest = { param([char]$Character) 'sha256:' + [string]::new($Character, 64) }
-    $candidateRoot = [pscustomobject][ordered]@{
-        canonicalPath = 'D:\ExampleDyson\Candidate'
-        fileSystem = 'NTFS'
-        driveType = 'Fixed'
-        volumeIdentitySha256 = & $digest '1'
-        rootIdentitySha256 = $null
-        reparseFree = $true
-    }
-    $candidateRoot.rootIdentitySha256 = Get-DysonSideBySideV2RootIdentityDigest -Root $candidateRoot
-    $productionRoot = [pscustomobject][ordered]@{
-        canonicalPath = 'E:\ExampleDyson\Production'
-        fileSystem = 'NTFS'
-        driveType = 'Fixed'
-        volumeIdentitySha256 = & $digest '2'
-        rootIdentitySha256 = $null
-        reparseFree = $true
-    }
-    $productionRoot.rootIdentitySha256 = Get-DysonSideBySideV2RootIdentityDigest -Root $productionRoot
-    $gsManagerRoot = [pscustomobject][ordered]@{
-        canonicalPath = 'E:\ExampleGsManager'
-        fileSystem = 'NTFS'
-        driveType = 'Fixed'
-        volumeIdentitySha256 = & $digest '2'
-        rootIdentitySha256 = $null
-        reparseFree = $true
-    }
-    $gsManagerRoot.rootIdentitySha256 = Get-DysonSideBySideV2RootIdentityDigest -Root $gsManagerRoot
-    $artifactHashes = [pscustomobject][ordered]@{
-        releasePackageSha256 = & $digest '3'
-        artifactPayloadSha256 = & $digest '4'
-        runtimePayloadSha256 = [string]$profile.runtimePayloadSha256
-        manifestSha256 = & $digest '6'
-    }
-    $deployment = [pscustomobject][ordered]@{
-        protocol = 'DYSON_CONTROL_CANDIDATE_DEPLOYMENT_RECEIPT_V2'
-        schemaVersion = 2
-        receiptId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
-        state = 'installed'
-        releaseId = 'example-release-1.2.3'
-        subjectCommit = [string]$profile.subjectCommit
-        completedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddSeconds(-10)
-        artifactHashes = $artifactHashes
-        candidateRootIdentitySha256 = [string]$candidateRoot.rootIdentitySha256
-        receiptSha256 = $null
-    }
-    $deployment.receiptSha256 = Get-DysonQualificationV2ObjectDigest -Value `
-        (Get-DysonSideBySideV2UnsignedValue -Value $deployment -Excluded @('receiptSha256'))
-    $runtime = [pscustomobject][ordered]@{
-        protocol = 'DYSON_QUALIFICATION_SIDE_BY_SIDE_RUNTIME_IDENTITY_V2'
-        schemaVersion = 2
-        observerClass = 'independent-read-only-os-observer'
-        queryMode = 'read-only'
-        mutationAttempted = $false
-        pid = 4242
-        processStartTimeUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddMinutes(-1)
-        observedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt
-        candidateRootIdentitySha256 = [string]$candidateRoot.rootIdentitySha256
-        releaseId = [string]$deployment.releaseId
-        subjectCommit = [string]$profile.subjectCommit
-        runtimePayloadSha256 = [string]$profile.runtimePayloadSha256
-        executableSha256 = & $digest '7'
-        commandLineSha256 = & $digest '8'
-        runtimeAssemblySha256 = & $digest '9'
-        nebulaAssemblySha256 = & $digest 'a'
-        bridgeAssemblySha256 = & $digest 'b'
-        identitySha256 = $null
-    }
-    $runtime.identitySha256 = Get-DysonQualificationV2ObjectDigest -Value `
-        (Get-DysonSideBySideV2UnsignedValue -Value $runtime -Excluded @('identitySha256'))
-    $snapshot = [pscustomobject][ordered]@{
-        protocol = 'DYSON_QUALIFICATION_GSMANAGER_SNAPSHOT_VERIFICATION_V2'
-        schemaVersion = 2
-        snapshotProtocol = 'DYSON_GSMANAGER_SNAPSHOT_V2'
-        snapshotId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
-        snapshotManifestSha256 = & $digest 'c'
-        payloadSha256 = & $digest 'd'
-        taskXmlSha256 = & $digest 'e'
-        securityInventorySha256 = & $digest 'f'
-        pairedSaveProtectionSha256 = 'sha256:' + ('0' * 63) + '1'
-        verificationMode = 'full-byte-acl-task-read-only'
-        mutationAttempted = $false
-        recoverable = $true
-        verifiedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddMinutes(-10)
-        expiresAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddHours(4)
-        verificationSha256 = $null
-    }
-    $snapshot.verificationSha256 = Get-DysonQualificationV2ObjectDigest -Value `
-        (Get-DysonSideBySideV2UnsignedValue -Value $snapshot -Excluded @('verificationSha256'))
-    $authority = [pscustomobject][ordered]@{
-        protocol = 'DYSON_QUALIFICATION_SIDE_BY_SIDE_AUTHORITY_OBSERVATION_V2'
-        schemaVersion = 2
-        observerClass = 'independent-read-only-host-observer'
-        queryMode = 'read-only'
-        mutationAttempted = $false
-        observedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt
-        authority = 'GSManager'
-        authorityGeneration = 17
-        switchIntentPresent = $false
-        cutoverReceiptPresent = $false
-        gsManagerTaskAvailable = $true
-        gsManagerSnapshotId = [string]$snapshot.snapshotId
-        productionPort = 8469
-        productionPortOwner = 'GSManager'
-        candidatePort = 13010
-        candidateBindAddressClass = 'loopback'
-        candidateOwnsProductionPort = $false
-        candidateProductionListenerCount = 0
-        dualAuthorityDetected = $false
-        observationSha256 = $null
-    }
-    $authority.observationSha256 = Get-DysonQualificationV2ObjectDigest -Value `
-        (Get-DysonSideBySideV2UnsignedValue -Value $authority -Excluded @('observationSha256'))
-    $capture = [pscustomobject][ordered]@{
-        protocol = 'DYSON_QUALIFICATION_SIDE_BY_SIDE_CAPTURE_V2'
-        schemaVersion = 2
-        receiptId = $ReceiptId
-        runId = $RunId
-        actionTargetId = $ActionTargetId
-        targetIdentity = [string]$profile.targetIdentity
-        deploymentReceipt = $deployment
-        isolation = [pscustomobject][ordered]@{
-            candidateRoot = $candidateRoot
-            productionDataRoot = $productionRoot
-            gsManagerRoot = $gsManagerRoot
-            evaluatedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt
-        }
-        health = [pscustomobject][ordered]@{
-            protocol = 'DYSON_QUALIFICATION_SIDE_BY_SIDE_HEALTH_OBSERVATION_V2'
-            schemaVersion = 2
-            observerClass = 'independent-read-only-host-observer'
-            probeClass = 'loopback-readyz-read-only'
-            requestMethod = 'GET'
-            addressClass = 'loopback'
-            mutationAttempted = $false
-            status = 'healthy'
-            httpStatus = 200
-            responseSha256 = 'sha256:' + ('2a' * 32)
-            deploymentReceiptSha256 = [string]$deployment.receiptSha256
-            releaseId = [string]$deployment.releaseId
-            subjectCommit = [string]$profile.subjectCommit
-            runtimePayloadSha256 = [string]$profile.runtimePayloadSha256
-            observedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt
-        }
-        runtime = $runtime
-        gsManagerSnapshot = $snapshot
-        authority = $authority
-        observationWindow = [pscustomobject][ordered]@{
-            startedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddSeconds(-1)
-            observedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt
-            expiresAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddHours(4)
-            elapsedSeconds = 1
-            clockClass = 'bounded-monotonic'
-        }
-        keyId = $KeyId
-    }
-    $expectation = [pscustomobject][ordered]@{
-        protocol = 'DYSON_QUALIFICATION_SIDE_BY_SIDE_EXPECTATION_V2'
-        schemaVersion = 2
-        runId = $RunId
-        actionTargetId = $ActionTargetId
-        targetIdentity = [string]$profile.targetIdentity
-        releaseId = [string]$deployment.releaseId
-        subjectCommit = [string]$profile.subjectCommit
-        artifactHashes = $artifactHashes
-        deploymentReceiptSha256 = [string]$deployment.receiptSha256
-        candidateRootIdentitySha256 = [string]$candidateRoot.rootIdentitySha256
-        gsManagerSnapshotId = [string]$snapshot.snapshotId
-        gsManagerSnapshotManifestSha256 = [string]$snapshot.snapshotManifestSha256
-        productionPort = [int]$authority.productionPort
-        candidatePort = [int]$authority.candidatePort
-        keyId = $KeyId
-    }
-    $key = Get-OrchestrationSelfTestKey -KeyId $KeyId
-    try {
-        return New-DysonSideBySideV2Observation -Capture $capture -Expectation $expectation -Key $key -NowUtc $ObservedAt.AddSeconds(1)
-    }
-    finally { [Array]::Clear($key, 0, $key.Length) }
-}
 
-function Protect-OrchestrationSelfTestSideBySideObservation {
-    param([Parameter(Mandatory)]$Observation, [Parameter(Mandatory)][string]$KeyId)
-    $Observation.receiptSha256 = Get-DysonQualificationV2ObjectDigest -Value `
-        (Get-DysonSideBySideV2UnsignedValue -Value $Observation -Excluded @('receiptSha256','protection'))
-    $key = Get-OrchestrationSelfTestKey -KeyId $KeyId
-    try {
-        $payload = ConvertTo-DysonQualificationV2CanonicalJson -Value ([pscustomobject][ordered]@{
-            domain = 'DYSON_QUALIFICATION_SIDE_BY_SIDE_OBSERVATION_HMAC_V2'
-            receiptSha256 = [string]$Observation.receiptSha256
-            keyId = [string]$Observation.protection.keyId
-        })
-        $Observation.protection.hmacSha256 = Get-DysonSideBySideV2Hmac -Key $key -Text $payload
-    }
-    finally { [Array]::Clear($key, 0, $key.Length) }
-    return $Observation
-}
+
+
 
 function New-OrchestrationSelfTestPairedSaveLoadObservation {
     param(
@@ -620,94 +419,11 @@ function New-OrchestrationSelfTestPairedSaveLoadObservation {
     return $value
 }
 
-function New-OrchestrationSelfTestPostRemovalObservation {
-    param(
-        [Parameter(Mandatory)][string]$ObservationId,
-        [Parameter(Mandatory)][string]$RunId,
-        [Parameter(Mandatory)][datetimeoffset]$ObservedAt,
-        [Parameter(Mandatory)]$RemovalArtifact
-    )
-    $digest = { param([char]$Character) 'sha256:' + [string]::new($Character, 64) }
-    $start = $ObservedAt.AddMinutes(-119)
-    $savePair = & $digest 'c'
-    $world = & $digest 'a'
-    $inputValue = [pscustomobject][ordered]@{
-        protocol = 'DYSON_POST_GSMANAGER_REMOVAL_OBSERVATION_INPUT_V2'; schemaVersion = 2
-        observationId = $ObservationId; runId = $RunId; targetIdentity = [string]$profile.targetIdentity
-        releaseIdentity = [pscustomobject][ordered]@{
-            releaseVersion='0.1.0-rc.1'; subjectCommit=[string]$profile.subjectCommit
-            runtimePayloadSha256=[string]$profile.runtimePayloadSha256
-            releaseManifestSha256=(& $digest '2'); releaseChecksumsSha256=(& $digest '3')
-        }
-        cutoverObservation = [pscustomobject][ordered]@{
-            observationId=[guid]::NewGuid().ToString('D').ToLowerInvariant(); observationSha256=(& $digest '4')
-            qualified=$true; observedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $start.AddHours(-1)
-        }
-        removalReceipt = [pscustomobject][ordered]@{
-            receiptId=[string]$RemovalArtifact.receiptId; receiptSha256=[string]$RemovalArtifact.receiptSha256
-            outcome='removed'; completedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $start.AddMinutes(-10)
-        }
-        observationWindow = [pscustomobject][ordered]@{
-            windowId=[guid]::NewGuid().ToString('D').ToLowerInvariant(); observerClass='independent-operator'; independent=$true
-            startedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $start
-            completedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $ObservedAt
-            elapsedMonotonicSeconds=[int64](($ObservedAt-$start).TotalSeconds)
-        }
-        inventory = [pscustomobject][ordered]@{
-            installationCount=0; scheduledTaskCount=0; serviceCount=0; listeningPortCount=0; processCount=0
-            scannedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $start.AddMinutes(10)
-        }
-        management = [pscustomobject][ordered]@{
-            panelOriginAddress='127.0.0.1'; panelOriginPort=3001; loopbackOnly=$true; publicHost='panel.example.com'
-            externalTlsVerified=$true; authenticatedPanelVerified=$true; tlsReceiptSha256=(& $digest '6')
-            authenticatedPanelReceiptSha256=(& $digest '7'); observedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $start.AddMinutes(20)
-        }
-        game = [pscustomobject][ordered]@{
-            publicHost='join.example.com'; protocol='nebula'; serverAuthoritativeJoin=$true; serverAuthoritativeReconnect=$true
-            reachabilityOnly=$false; joinReceiptSha256=(& $digest '8'); reconnectReceiptSha256=(& $digest '9')
-            worldBindingSha256=$world; savePairSha256=$savePair; observedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $start.AddMinutes(40)
-        }
-        reboot = [pscustomobject][ordered]@{
-            checkpointSha256=(& $digest 'e'); resumeReceiptSha256=(& $digest 'f'); newBootObserved=$true
-            runtimeRecovered=$true; savePairSha256=$savePair; observedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $start.AddMinutes(60)
-        }
-        save = [pscustomobject][ordered]@{
-            saveReceiptSha256=(& $digest 'b'); savePairSha256=$savePair; saveManifestSha256=(& $digest 'd')
-            worldBindingSha256=$world; pairedFilesIntact=$true; observedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $start.AddMinutes(90)
-        }
-        recoveryPackage = [pscustomobject][ordered]@{
-            bundleManifestSha256=(& $digest '1'); verificationReceiptSha256=(& $digest '2'); verified=$true
-            activationRequired=$true; activated=$false; savePairSha256=$savePair
-            observedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $start.AddMinutes(100)
-        }
-        deliverables = [pscustomobject][ordered]@{
-            evidenceIndexSha256=(& $digest '3'); runbookSha256=(& $digest '4'); knownLimitationsSha256=(& $digest '5')
-            releaseChecksumsSha256=(& $digest '3'); checksumsVerified=$true
-            observedAtUtc=ConvertTo-DysonQualificationV2Utc -Value $ObservedAt
-        }
-        observedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt
-        expiresAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddHours(1)
-    }
-    return New-DysonPostGsManagerRemovalObservationV2 -InputValue $inputValue
-}
 
-function Update-OrchestrationSelfTestPostRemovalBindings {
-    param([Parameter(Mandatory)]$Observation)
-    $subjectBinding = Get-DysonPostRemovalV2SubjectBindingDigest -Value $Observation
-    $Observation.subjectBindingSha256 = $subjectBinding
-    foreach ($name in @('cutoverObservation','removalReceipt','observationWindow','inventory','management','game','reboot','save','recoveryPackage','deliverables')) {
-        $Observation.$name.subjectBindingSha256 = $subjectBinding
-    }
-    $Observation.inventory.inventorySha256 = Get-DysonPostRemovalV2InventoryDigest -Inventory $Observation.inventory
-    $Observation.observationSha256 = Get-DysonPostRemovalV2Digest -Observation $Observation
-    return $Observation
-}
 
-function Update-OrchestrationSelfTestPostRemovalDigest {
-    param([Parameter(Mandatory)]$Observation)
-    $Observation.observationSha256 = Get-DysonPostRemovalV2Digest -Observation $Observation
-    return $Observation
-}
+
+
+
 
 function New-OrchestrationSelfTestSoakObservation {
     param(
@@ -850,133 +566,9 @@ function Update-OrchestrationSelfTestSoakDigest {
     return $Observation
 }
 
-function New-OrchestrationSelfTestReversibleCutoverSwitchReceipt {
-    param(
-        [Parameter(Mandatory)][ValidateSet('to-dyson-control','back-to-gsmanager')][string]$Phase,
-        [Parameter(Mandatory)][string]$ReceiptId,
-        [Parameter(Mandatory)][string]$RunId,
-        [Parameter(Mandatory)][datetimeoffset]$ObservedAt
-    )
-    $toDyson = $Phase -ceq 'to-dyson-control'
-    $capabilities = if ($toDyson) {
-        @('DisablePreviousAuthority','StopPreviousRuntime','StartCandidateRuntime')
-    } else { @('StopCandidateRuntime','EnablePreviousAuthority','StartPreviousRuntime') }
-    $actions = for ($index = 0; $index -lt 3; $index++) {
-        $receiptCharacterCode = if ($toDyson) { 97 + $index } else { 100 + $index }
-        [pscustomobject][ordered]@{
-            sequence = $index + 1
-            capability = $capabilities[$index]
-            brokerReceiptProtocol = 'DYSON_CONTROL_CUTOVER_BROKER_RECEIPT_V1'
-            brokerReceiptSha256 = ([char]$receiptCharacterCode).ToString() * 64
-            hostReceiptProtocol = 'DYSON_CONTROL_CUTOVER_ACTION_RECEIPT_V1'
-            requestId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
-            requestFingerprint = if ($toDyson) { 'a' * 64 } else { 'b' * 64 }
-            status = 'succeeded'
-        }
-    }
-    return [pscustomobject][ordered]@{
-        protocol = 'DYSON_REVERSIBLE_CUTOVER_SWITCH_RECEIPT_V2'; schemaVersion = 2; receiptId = $ReceiptId
-        qualificationRunId = $RunId; targetIdentity = [string]$profile.targetIdentity
-        controlRelease = '0.1.0-rc.1'; subjectCommit = [string]$profile.subjectCommit
-        runtimePayloadSha256 = ConvertTo-ReversibleCutoverExpectedRawSha256 ([string]$profile.runtimePayloadSha256)
-        releaseManifestSha256 = '6' * 64; dataRootIdentity = 'sha256:' + ('2' * 64)
-        saveGenerationId = '22222222-2222-4222-8222-222222222222'; authorityInventoryRevision = '5' * 64
-        phase = $Phase; fromAuthority = if ($toDyson) { 'gsmanager' } else { 'dyson-control' }
-        toAuthority = if ($toDyson) { 'dyson-control' } else { 'gsmanager' }
-        state = 'succeeded'; persisted = $true; actions = @($actions)
-        startedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $(if ($toDyson) { $ObservedAt.AddMinutes(-7) } else { $ObservedAt.AddMinutes(-5) })
-        completedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $(if ($toDyson) { $ObservedAt.AddMinutes(-6) } else { $ObservedAt.AddMinutes(-4) })
-    }
-}
 
-function New-OrchestrationSelfTestReversibleCutoverObservation {
-    param(
-        [Parameter(Mandatory)][string]$WindowId,
-        [Parameter(Mandatory)][string]$ApprovalId,
-        [Parameter(Mandatory)][string]$RunId,
-        [Parameter(Mandatory)][datetimeoffset]$ObservedAt,
-        [Parameter(Mandatory)]$SwitchToReceipt,
-        [Parameter(Mandatory)][string]$SwitchToSourceSha256,
-        [Parameter(Mandatory)]$SwitchBackReceipt,
-        [Parameter(Mandatory)][string]$SwitchBackSourceSha256,
-        [Parameter(Mandatory)][datetimeoffset]$ExpiresAt
-    )
-    $raw = { param([string]$Value) ConvertTo-ReversibleCutoverExpectedRawSha256 $Value }
-    $dsvSha = '8' * 64
-    $serverSha = '9' * 64
-    $dsvLength = 4096L
-    $serverLength = 2048L
-    $pairSha = Get-ReversibleCutoverSha256Text ('DYSON_PAIRED_SAVE_V2|' + $dsvLength + '|' + $dsvSha + '|' + $serverLength + '|' + $serverSha)
-    $value = [pscustomobject][ordered]@{
-        protocol = 'DYSON_REVERSIBLE_CUTOVER_OBSERVATION_V2'; schemaVersion = 2
-        qualificationRunId = $RunId; targetIdentity = [string]$profile.targetIdentity
-        maintenanceWindow = [pscustomobject][ordered]@{
-            protocol = 'DYSON_APPROVED_MAINTENANCE_WINDOW_V2'; approvalId = $ApprovalId; windowId = $WindowId
-            startsAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddMinutes(-10)
-            endsAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ExpiresAt; sourceSha256 = '1' * 64
-        }
-        release = [pscustomobject][ordered]@{
-            controlRelease = [string]$SwitchToReceipt.controlRelease; subjectCommit = [string]$profile.subjectCommit
-            runtimePayloadSha256 = (& $raw ([string]$profile.runtimePayloadSha256))
-            releaseManifestSha256 = [string]$SwitchToReceipt.releaseManifestSha256
-        }
-        dataRootIdentity = [string]$SwitchToReceipt.dataRootIdentity
-        saveGenerationId = [string]$SwitchToReceipt.saveGenerationId
-        protectionPoint = [pscustomobject][ordered]@{
-            protocol = 'DYSON_CONTROL_PAIRED_SAVE_PROTECTION_POINT_V2'
-            protectionPointId = '55555555-5555-4555-8555-555555555555'; pairSha256 = $pairSha
-            createdAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddMinutes(-8)
-            expiresAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ExpiresAt; sourceSha256 = '2' * 64
-        }
-        gsManagerAuthority = [pscustomobject][ordered]@{
-            protocol = 'DYSON_GSMANAGER_AUTHORITY_PROFILE_V1'
-            snapshotId = '66666666-6666-4666-8666-666666666666'
-            inventoryRevision = [string]$SwitchToReceipt.authorityInventoryRevision; runtimeOwner = 'gsmanager'
-            capturedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddMinutes(-7); sourceSha256 = '3' * 64
-        }
-        switchToDysonControl = [pscustomobject][ordered]@{
-            protocol = [string]$SwitchToReceipt.protocol; receiptId = [string]$SwitchToReceipt.receiptId
-            state = 'succeeded'; persisted = $true; actionCount = 3
-            completedAtUtc = [string]$SwitchToReceipt.completedAtUtc; sourceSha256 = (& $raw $SwitchToSourceSha256)
-        }
-        dysonControlHealth = [pscustomobject][ordered]@{
-            protocol = 'DYSON_REVERSIBLE_CUTOVER_HEALTH_OBSERVATION_V2'
-            healthId = '88888888-8888-4888-8888-888888888888'; authority = 'dyson-control'
-            authenticatedManagement = $true; gameProtocolHandshake = $true; simulationProgressObserved = $true
-            observedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddMinutes(-5); sourceSha256 = '4' * 64
-        }
-        switchBackToGsManager = [pscustomobject][ordered]@{
-            protocol = [string]$SwitchBackReceipt.protocol; receiptId = [string]$SwitchBackReceipt.receiptId
-            state = 'succeeded'; persisted = $true; actionCount = 3
-            completedAtUtc = [string]$SwitchBackReceipt.completedAtUtc; sourceSha256 = (& $raw $SwitchBackSourceSha256)
-        }
-        restoredGsManagerHealth = [pscustomobject][ordered]@{
-            protocol = 'DYSON_REVERSIBLE_CUTOVER_HEALTH_OBSERVATION_V2'
-            healthId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'; authority = 'gsmanager'
-            authenticatedManagement = $true; gameProtocolHandshake = $true; simulationProgressObserved = $true
-            observedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt.AddMinutes(-3); sourceSha256 = '7' * 64
-        }
-        restoredSavePair = [pscustomobject][ordered]@{
-            dsvLength = $dsvLength; dsvSha256 = $dsvSha; serverLength = $serverLength
-            serverSha256 = $serverSha; pairSha256 = $pairSha
-        }
-        bidirectionalNoLoss = [pscustomobject][ordered]@{
-            protocol = 'DYSON_REVERSIBLE_CUTOVER_NO_LOSS_PROOF_V2'; forwardSwitchProved = $true
-            reverseSwitchProved = $true; generationPreserved = $true; pairPreserved = $true
-            beforePairSha256 = $pairSha; afterPairSha256 = $pairSha
-        }
-        audit = [pscustomobject][ordered]@{
-            protocol = 'DYSON_REVERSIBLE_CUTOVER_AUDIT_V2'; firstSequence = 1; lastSequence = 7; entryCount = 7
-            sourceSha256 = 'b' * 64; terminalEvidenceSha256 = $pairSha
-        }
-        collectorEffects = [pscustomobject][ordered]@{ networkTouched = $false; productionChanged = $false }
-        observedAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ObservedAt
-        expiresAtUtc = ConvertTo-DysonQualificationV2Utc -Value $ExpiresAt
-        observationSha256 = $null
-    }
-    $value.observationSha256 = Get-ReversibleCutoverObservationDigest $value
-    return $value
-}
+
+
 
 function New-OrchestrationSelfTestSourceValue {
     param(
@@ -992,11 +584,7 @@ function New-OrchestrationSelfTestSourceValue {
         return New-OrchestrationSelfTestPanelObservation -ReceiptId $ReceiptId -RunId $RunId `
             -ActionTargetId $ActionTargetId -ObservedAt $ObservedAt
     }
-    if ($role -ceq 'candidate-isolation-observation') {
-        $configuration = Get-DysonOrchestrationV2ActionConfiguration -Profile $profile -Action $Action
-        return New-OrchestrationSelfTestSideBySideObservation -ReceiptId $ReceiptId -RunId $RunId `
-            -ActionTargetId $ActionTargetId -KeyId ([string]$configuration.keyId) -ObservedAt $ObservedAt
-    }
+
     if ($role -ceq 'external-join-observation') {
         return New-OrchestrationSelfTestExternalJoinObservation -ObservationId $ReceiptId -RunId $RunId `
             -ObservedAt $ObservedAt
@@ -1005,8 +593,7 @@ function New-OrchestrationSelfTestSourceValue {
         return New-OrchestrationSelfTestSoakObservation -ObservationId $ReceiptId -RunId $RunId `
             -Action $Action -ObservedAt $ObservedAt
     }
-    if ($role -in @('restored-world-observation','reboot-resume-observation',
-            'post-removal-observation')) {
+    if ($role -in @('restored-world-observation','reboot-resume-observation')) {
         return New-OrchestrationSelfTestControlledObservation -ArtifactContract $ArtifactContract -ReceiptId $ReceiptId `
             -RunId $RunId -Action $Action -ActionTargetId $ActionTargetId -ObservedAt $ObservedAt
     }
@@ -1024,31 +611,42 @@ function New-OrchestrationSelfTestSourceValue {
             return [pscustomobject][ordered]@{ format=[string]$ArtifactContract.protocol; schemaVersion=1; requestId=$ReceiptId; status='rolled-back'; rollbackVerified=$true; recoveryRequired=$false }
         }
         'deployment-receipt' {
-            return [pscustomobject][ordered]@{ protocol=[string]$ArtifactContract.protocol; state='installed'; operation='install'; candidateHealthy=$true }
-        }
-        'deployment-rollback-receipt' {
-            return [pscustomobject][ordered]@{ protocol=[string]$ArtifactContract.protocol; state='rolled-back'; operation='rollback'; candidateRemoved=$true }
-        }
-        'cutover-receipt' {
-            return New-OrchestrationSelfTestReversibleCutoverSwitchReceipt -Phase 'to-dyson-control' `
-                -ReceiptId $ReceiptId -RunId $RunId -ObservedAt $ObservedAt
-        }
-        'cutover-rollback-receipt' {
-            return New-OrchestrationSelfTestReversibleCutoverSwitchReceipt -Phase 'back-to-gsmanager' `
-                -ReceiptId $ReceiptId -RunId $RunId -ObservedAt $ObservedAt
-        }
-        'reversible-cutover-observation' {
+            $deploymentSnapshotId = $ObservedAt.ToUniversalTime().ToString('yyyyMMdd-HHmmssfff') + '-' + $RunId.Substring(0,8)
             return [pscustomobject][ordered]@{
-                protocol = [string]$ArtifactContract.protocol; schemaVersion = 2
-                observationSha256 = '0' * 64
+                protocol=[string]$ArtifactContract.protocol; state='installed'; version='0.1.0-rc.1'
+                artifactPayloadSha256=([string]$profile.runtimePayloadSha256).Substring(7); artifactProvenanceBound=$true
+                sourceArtifactScriptsExecuted=$false; runtimeRootIdentity=('sha256:'+('1'*64)); nodeExecutableSha256=('2'*64)
+                nodeRuntimeProtected=$true; runtimeChanged=$false; deploymentSnapshotId=$deploymentSnapshotId
+                configurationCreated=$false; configurationReplaced=$true; configurationReady=$true
+                configurationSha256=('3'*64); configurationLength=2048; configurationNamesSha256=('4'*64)
+                configurationBindingsSha256=('5'*64); configurationContractSha256=('6'*64)
+                configurationAclFingerprint=('7'*64); configurationParentAclFingerprint=('8'*64)
+                configurationReplacementSupported=$true; qualifiedClientStorageConfigured=$true
+                qualifiedClientProfileEnabled=$true; qualifiedClientStorageReady=$true
+                qualifiedClientStorageLayoutSha256=('9'*64); qualifiedClientStorageDirectoryCount=2
+                startupTaskInstalled=$true; readinessVerified=$true; loopbackForcedByLauncher=$true
+                persistentDataReady=$true; lifecycleBrokerTaskRequested=$true; lifecycleBrokerOperation='installed'
+                lifecycleBrokerTaskInstalled=$true; lifecycleBrokerTaskName='Dyson-Control-Lifecycle-Broker'
+                lifecycleBrokerProfileHash=('a'*64); lifecycleBrokerReused=$false; lifecycleBrokerUpgraded=$false
+                lifecycleBrokerDataReady=$true; gameTasksChanged=$false
             }
         }
-        'removal-receipt' {
-            return [pscustomobject][ordered]@{ protocol=[string]$ArtifactContract.protocol; schemaVersion=1; requestId=$ReceiptId; status='removed' }
+        'deployment-rollback-receipt' {
+            $deploymentSnapshotId = $ObservedAt.ToUniversalTime().ToString('yyyyMMdd-HHmmssfff') + '-' + $RunId.Substring(0,8)
+            $guardSnapshotId = $ObservedAt.AddMilliseconds(1).ToUniversalTime().ToString('yyyyMMdd-HHmmssfff') + '-' + $ReceiptId.Substring(0,8)
+            return [pscustomobject][ordered]@{
+                protocol=[string]$ArtifactContract.protocol; state='rolled-back'; operation='rollback'
+                snapshotId=$deploymentSnapshotId; restoredVersion='0.1.0-rc.0'; configRestored=$true; guardSnapshotId=$guardSnapshotId
+                readinessVerified=$true; rollback=('Restore guard snapshot ' + $guardSnapshotId + '.')
+                runtimeRootIdentity=('sha256:'+('1'*64)); nodeExecutableSha256=('2'*64)
+                nodeRuntimeProtected=$true; runtimeChanged=$false
+            }
         }
-        'removal-restore-receipt' {
-            return [pscustomobject][ordered]@{ protocol=[string]$ArtifactContract.protocol; schemaVersion=1; restoreRequestId=$ReceiptId; removalRequestId=[guid]::NewGuid().ToString('D').ToLowerInvariant(); status='restored-disabled'; activationRequired=$true }
-        }
+
+
+
+
+
         'hostname-wss-qualification' {
             return [pscustomobject][ordered]@{ protocol=[string]$ArtifactContract.protocol; schemaVersion=1; qualificationId=$ReceiptId; documentSha256=('sha256:'+('9'*64)) }
         }
@@ -1073,13 +671,11 @@ function New-OrchestrationSelfTestCase {
     $elapsed = [int64]$contract.minimumElapsedSeconds
     if ($Action -ceq 'external-client-e2e') { $elapsed = 330 }
     if ($Action -ceq 'paired-save-restore') { $elapsed = 480 }
-    if ($Action -ceq 'gsmanager-recoverable-switch') { $elapsed = 480 }
-    if ($Action -ceq 'gsmanager-removal') { $elapsed = 7140 }
+
+
     $artifacts = @()
     $externalObservation = $null
     $pairedObservation = $null
-    $reversibleCutoverObservation = $null
-    $postRemovalObservation = $null
     $soakObservation = $null
     $artifactValues = @{}
     $artifactPaths = @{}
@@ -1140,44 +736,15 @@ function New-OrchestrationSelfTestCase {
         $pairedArtifact.fileSha256 = Get-DysonOrchestrationV2FileDigest -Path ([string]$artifactPaths['restored-world-observation'])
         $pairedArtifact.receiptSha256 = 'sha256:' + [string]$pairedObservation.observationSha256
     }
-    if ($Action -ceq 'gsmanager-recoverable-switch') {
-        $switchToValue = $artifactValues['cutover-receipt']
-        $switchBackValue = $artifactValues['cutover-rollback-receipt']
-        $switchToArtifact = @($artifacts | Where-Object { [string]$_.role -ceq 'cutover-receipt' })[0]
-        $switchBackArtifact = @($artifacts | Where-Object { [string]$_.role -ceq 'cutover-rollback-receipt' })[0]
-        $reversibleArtifact = @($artifacts | Where-Object { [string]$_.role -ceq 'reversible-cutover-observation' })[0]
-        $reversibleCutoverObservation = New-OrchestrationSelfTestReversibleCutoverObservation `
-            -WindowId ([string]$reversibleArtifact.receiptId) -ApprovalId $approvalId -RunId $runId `
-            -ObservedAt $observedAt -ExpiresAt $observedAt.AddSeconds([int]$contract.maximumEvidenceAgeSeconds) `
-            -SwitchToReceipt $switchToValue -SwitchToSourceSha256 ([string]$switchToArtifact.fileSha256) `
-            -SwitchBackReceipt $switchBackValue -SwitchBackSourceSha256 ([string]$switchBackArtifact.fileSha256)
-        $artifactValues['reversible-cutover-observation'] = $reversibleCutoverObservation
-        Write-OrchestrationSelfTestJson -Path ([string]$artifactPaths['reversible-cutover-observation']) `
-            -Value $reversibleCutoverObservation
-        $reversibleArtifact.fileSha256 = Get-DysonOrchestrationV2FileDigest `
-            -Path ([string]$artifactPaths['reversible-cutover-observation'])
-        $reversibleArtifact.receiptSha256 = 'sha256:' + [string]$reversibleCutoverObservation.observationSha256
-    }
-    if ($Action -ceq 'gsmanager-removal') {
-        $removalArtifact = @($artifacts | Where-Object { [string]$_.role -ceq 'removal-receipt' })[0]
-        $postArtifact = @($artifacts | Where-Object { [string]$_.role -ceq 'post-removal-observation' })[0]
-        $postRemovalObservation = New-OrchestrationSelfTestPostRemovalObservation `
-            -ObservationId ([string]$postArtifact.receiptId) -RunId $runId -ObservedAt $observedAt `
-            -RemovalArtifact $removalArtifact
-        $artifactValues['post-removal-observation'] = $postRemovalObservation
-        Write-OrchestrationSelfTestJson -Path ([string]$artifactPaths['post-removal-observation']) -Value $postRemovalObservation
-        $postArtifact.fileSha256 = Get-DysonOrchestrationV2FileDigest -Path ([string]$artifactPaths['post-removal-observation'])
-        $postArtifact.receiptSha256 = [string]$postRemovalObservation.observationSha256
-    }
+
+
     $rollback = $script:DysonOrchestrationV2ZeroDigest
     if ($null -ne $contract.rollbackRole) {
         $rollback = [string]@($artifacts | Where-Object { [string]$_.role -ceq [string]$contract.rollbackRole })[0].receiptSha256
     }
     $protection = if ($Action -ceq 'paired-save-restore') {
         'sha256:' + [string]$pairedObservation.protectionPoint.sourceSha256
-    } elseif ($Action -ceq 'gsmanager-recoverable-switch') {
-        'sha256:' + [string]$reversibleCutoverObservation.protectionPoint.sourceSha256
-    } elseif ([bool]$contract.requiresProtectionPoint) {
+    }  elseif ([bool]$contract.requiresProtectionPoint) {
         Get-DysonQualificationV2Sha256 -Value ('protection-' + $requestId)
     } else { $script:DysonOrchestrationV2ZeroDigest }
     $initialJoin = $script:DysonOrchestrationV2ZeroDigest
@@ -1195,16 +762,8 @@ function New-OrchestrationSelfTestCase {
     elseif ($Action -ceq 'paired-save-restore') {
         $terminal = 'sha256:' + [string]$pairedObservation.observationSha256
     }
-    elseif ($Action -ceq 'gsmanager-recoverable-switch') {
-        $terminal = 'sha256:' + [string]$reversibleCutoverObservation.observationSha256
-        $sampleCount = 7
-        $maximumSampleGapSeconds = 180
-    }
-    elseif ($Action -ceq 'gsmanager-removal') {
-        $initialJoin = [string]$postRemovalObservation.game.joinReceiptSha256
-        $reconnect = [string]$postRemovalObservation.game.reconnectReceiptSha256
-        $terminal = [string]$postRemovalObservation.observationSha256
-    }
+
+
     elseif ($Action -in @('six-hour-soak','seventy-two-hour-soak')) {
         $initialJoin = [string]$soakObservation.externalSession.initialJoinReceiptSha256
         $reconnect = [string]$soakObservation.externalSession.reconnectReceiptSha256
@@ -1290,7 +849,6 @@ function New-OrchestrationSelfTestCase {
         evidencePath = $evidencePath
         artifacts = $artifacts
         externalObservation = $externalObservation
-        postRemovalObservation = $postRemovalObservation
         soakObservation = $soakObservation
     }
 }
@@ -1347,18 +905,24 @@ function Get-OrchestrationSelfTestArtifactValue {
         -Code 'DYSON_QUALIFICATION_ORCHESTRATION_V2_SOURCE_INVALID'
 }
 
-function Assert-OrchestrationSelfTestSideBySideRejected {
-    param([Parameter(Mandatory)]$Case, [Parameter(Mandatory)][string]$Message)
+
+
+function Assert-OrchestrationSelfTestExternalJoinRejected {
+    param(
+        [Parameter(Mandatory)]$Case,
+        [Parameter(Mandatory)][string]$Message,
+        [string]$ExpectedCode = 'DYSON_QUALIFICATION_ORCHESTRATION_V2_SOURCE_INVALID'
+    )
     $actualCode = $null
     try {
         [void](Invoke-DysonQualificationOrchestrationV2 -Profile $profile -Request $Case.request `
             -KeyResolver $resolver -NowUtc $now)
     }
     catch { $actualCode = Get-DysonOrchestrationV2ErrorCode -Exception $_.Exception }
-    Assert-OrchestrationSelfTest ($actualCode -ceq 'DYSON_QUALIFICATION_ORCHESTRATION_V2_SOURCE_INVALID') $Message
+    Assert-OrchestrationSelfTest ($actualCode -ceq $ExpectedCode) ($Message + '; actual=' + [string]$actualCode)
 }
 
-function Assert-OrchestrationSelfTestExternalJoinRejected {
+function Assert-OrchestrationSelfTestDeploymentRejected {
     param(
         [Parameter(Mandatory)]$Case,
         [Parameter(Mandatory)][string]$Message,
@@ -1396,52 +960,13 @@ function Assert-OrchestrationSelfTestPairedSaveRejected {
         ($Message + '; actual=' + [string]$actualCode)
 }
 
-function Set-OrchestrationSelfTestReversibleCutoverObservation {
-    param([Parameter(Mandatory)]$Case, [Parameter(Mandatory)]$Value)
-    Set-OrchestrationSelfTestArtifactValue -Case $Case -Role 'reversible-cutover-observation' -Value $Value
-    $Case.evidence.assertions.protectionPointSha256 = 'sha256:' + [string]$Value.protectionPoint.sourceSha256
-    $Case.evidence.assertions.terminalReceiptSha256 = 'sha256:' + [string]$Value.observationSha256
-    $Case.evidence = Protect-OrchestrationSelfTestEvidence -Evidence $Case.evidence
-    Reset-OrchestrationSelfTestRequestForEvidence -Case $Case
-}
 
-function Assert-OrchestrationSelfTestReversibleCutoverRejected {
-    param([Parameter(Mandatory)]$Case, [Parameter(Mandatory)][string]$Message)
-    $actualCode = $null
-    try {
-        [void](Invoke-DysonQualificationOrchestrationV2 -Profile $profile -Request $Case.request `
-            -KeyResolver $resolver -NowUtc $now)
-    }
-    catch { $actualCode = Get-DysonOrchestrationV2ErrorCode -Exception $_.Exception }
-    Assert-OrchestrationSelfTest `
-        ($actualCode -ceq 'DYSON_QUALIFICATION_ORCHESTRATION_V2_REVERSIBLE_CUTOVER_INVALID') `
-        ($Message + '; actual=' + [string]$actualCode)
-}
 
-function Set-OrchestrationSelfTestPostRemovalObservation {
-    param([Parameter(Mandatory)]$Case, [Parameter(Mandatory)]$Value)
-    Set-OrchestrationSelfTestArtifactValue -Case $Case -Role 'post-removal-observation' -Value $Value
-    $Case.evidence.assertions.initialJoinReceiptSha256 = [string]$Value.game.joinReceiptSha256
-    $Case.evidence.assertions.reconnectReceiptSha256 = [string]$Value.game.reconnectReceiptSha256
-    $Case.evidence.assertions.terminalReceiptSha256 = [string]$Value.observationSha256
-    $Case.evidence = Protect-OrchestrationSelfTestEvidence -Evidence $Case.evidence
-    Reset-OrchestrationSelfTestRequestForEvidence -Case $Case
-}
 
-function Assert-OrchestrationSelfTestPostRemovalRejected {
-    param(
-        [Parameter(Mandatory)]$Case,
-        [Parameter(Mandatory)][string]$Message,
-        [string]$ExpectedCode = 'DYSON_QUALIFICATION_ORCHESTRATION_V2_SOURCE_INVALID'
-    )
-    $actualCode = $null
-    try {
-        [void](Invoke-DysonQualificationOrchestrationV2 -Profile $profile -Request $Case.request `
-            -KeyResolver $resolver -NowUtc $now)
-    }
-    catch { $actualCode = Get-DysonOrchestrationV2ErrorCode -Exception $_.Exception }
-    Assert-OrchestrationSelfTest ($actualCode -ceq $ExpectedCode) ($Message + '; actual=' + [string]$actualCode)
-}
+
+
+
+
 
 function Set-OrchestrationSelfTestSoakObservation {
     param([Parameter(Mandatory)]$Case, [Parameter(Mandatory)]$Value)
@@ -1515,10 +1040,10 @@ try {
 
     $stage = 'contract-and-schema-coverage'
     [void](Assert-DysonOrchestrationV2Profile -Profile $profile -NowUtc $now)
-    Assert-OrchestrationSelfTest (@($contract.actions).Count -eq 11 -and
+    Assert-OrchestrationSelfTest (@($contract.actions).Count -eq 9 -and
         @($contract.actions | Where-Object { [string]$_.action -eq 'six-hour-soak' -and [int64]$_.minimumElapsedSeconds -eq 21600 -and [int64]$_.maximumEvidenceAgeSeconds -eq 3600 -and [string]$_.artifacts[0].protocol -ceq 'DYSON_SOAK_OBSERVATION_V2' }).Count -eq 1 -and
         @($contract.actions | Where-Object { [string]$_.action -eq 'seventy-two-hour-soak' -and [int64]$_.minimumElapsedSeconds -eq 259200 -and [int64]$_.maximumEvidenceAgeSeconds -eq 3600 -and [string]$_.artifacts[0].protocol -ceq 'DYSON_SOAK_OBSERVATION_V2' }).Count -eq 1) `
-        'the fixed contract did not retain all 11 actions and real soak floors'
+        'the fixed contract did not retain all 9 actions and real soak floors'
     foreach ($schemaName in @('qualification-orchestration-profile.v2.schema.json',
             'qualification-orchestration-request.v2.schema.json','qualification-controlled-evidence.v2.schema.json')) {
         $schema = Get-Content -LiteralPath (Join-Path $PSScriptRoot $schemaName) -Raw | ConvertFrom-Json
@@ -1537,101 +1062,6 @@ try {
     catch { $duplicateCode = Get-DysonOrchestrationV2ErrorCode -Exception $_.Exception }
     Assert-OrchestrationSelfTest ($duplicateCode -ceq 'DYSON_QUALIFICATION_ORCHESTRATION_V2_DUPLICATE_JSON_KEY') `
         'escaped duplicate JSON object keys were accepted before exact-property validation'
-    Add-OrchestrationSelfTestResult $stage
-
-    $stage = 'side-by-side-strict-observation-binding'
-    $sideConfiguration = Get-DysonOrchestrationV2ActionConfiguration -Profile $profile -Action 'side-by-side-deployment'
-    $validSide = New-OrchestrationSelfTestCase -Action 'side-by-side-deployment' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'strict-valid'
-    $validSidePreview = Invoke-DysonQualificationOrchestrationV2 -Profile $profile -Request $validSide.request `
-        -KeyResolver $resolver -NowUtc $now
-    Assert-OrchestrationSelfTest ([string]$validSidePreview.decision -ceq 'preview-valid' -and
-        -not [bool]$validSidePreview.qualificationStateChanged -and -not [bool]$validSidePreview.productionChanged) `
-        'a valid strict side-by-side observation did not pass orchestration preview'
-
-    $genericSide = New-OrchestrationSelfTestCase -Action 'side-by-side-deployment' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'generic-resealed'
-    $genericArtifact = @($genericSide.contract.artifacts | Where-Object {
-        [string]$_.role -ceq 'candidate-isolation-observation'
-    })[0]
-    $genericValue = New-OrchestrationSelfTestControlledObservation -ArtifactContract $genericArtifact `
-        -ReceiptId ([string]@($genericSide.artifacts | Where-Object {
-            [string]$_.role -ceq 'candidate-isolation-observation'
-        })[0].receiptId) -RunId ([string]$genericSide.request.runId) -Action 'side-by-side-deployment' `
-        -ActionTargetId ([string]$sideConfiguration.actionTargetId) -ObservedAt $now.AddMinutes(-1)
-    Set-OrchestrationSelfTestArtifactValue -Case $genericSide -Role 'candidate-isolation-observation' -Value $genericValue
-    Assert-OrchestrationSelfTestSideBySideRejected -Case $genericSide `
-        -Message 'the old generic recomputed status=verified observation bypassed the strict side-by-side validator'
-
-    $crossRun = New-OrchestrationSelfTestCase -Action 'side-by-side-deployment' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'cross-run'
-    $crossRunValue = Get-OrchestrationSelfTestArtifactValue -Case $crossRun -Role 'candidate-isolation-observation'
-    $crossRunValue.runId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
-    $crossRunValue = Protect-OrchestrationSelfTestSideBySideObservation -Observation $crossRunValue `
-        -KeyId ([string]$sideConfiguration.keyId)
-    Set-OrchestrationSelfTestArtifactValue -Case $crossRun -Role 'candidate-isolation-observation' -Value $crossRunValue
-    Assert-OrchestrationSelfTestSideBySideRejected -Case $crossRun `
-        -Message 'a re-signed side-by-side observation from another run was accepted'
-
-    $crossTarget = New-OrchestrationSelfTestCase -Action 'side-by-side-deployment' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'cross-target'
-    $crossTargetValue = Get-OrchestrationSelfTestArtifactValue -Case $crossTarget -Role 'candidate-isolation-observation'
-    $crossTargetValue.actionTargetId = 'target-foreign-side-by-side'
-    $crossTargetValue.targetIdentity = 'sha256:' + ('d' * 64)
-    $crossTargetValue = Protect-OrchestrationSelfTestSideBySideObservation -Observation $crossTargetValue `
-        -KeyId ([string]$sideConfiguration.keyId)
-    Set-OrchestrationSelfTestArtifactValue -Case $crossTarget -Role 'candidate-isolation-observation' -Value $crossTargetValue
-    Assert-OrchestrationSelfTestSideBySideRejected -Case $crossTarget `
-        -Message 'a re-signed side-by-side observation from another target was accepted'
-
-    $crossCommit = New-OrchestrationSelfTestCase -Action 'side-by-side-deployment' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'cross-commit'
-    $crossCommitValue = Get-OrchestrationSelfTestArtifactValue -Case $crossCommit -Role 'candidate-isolation-observation'
-    $foreignCommit = 'd' * 40
-    $crossCommitValue.subjectCommit = $foreignCommit
-    $crossCommitValue.deploymentReceipt.subjectCommit = $foreignCommit
-    $crossCommitValue.deploymentReceipt.receiptSha256 = Get-DysonQualificationV2ObjectDigest -Value `
-        (Get-DysonSideBySideV2UnsignedValue -Value $crossCommitValue.deploymentReceipt -Excluded @('receiptSha256'))
-    $crossCommitValue.health.subjectCommit = $foreignCommit
-    $crossCommitValue.health.deploymentReceiptSha256 = [string]$crossCommitValue.deploymentReceipt.receiptSha256
-    $crossCommitValue.runtime.subjectCommit = $foreignCommit
-    $crossCommitValue.runtime.identitySha256 = Get-DysonQualificationV2ObjectDigest -Value `
-        (Get-DysonSideBySideV2UnsignedValue -Value $crossCommitValue.runtime -Excluded @('identitySha256'))
-    $crossCommitValue = Protect-OrchestrationSelfTestSideBySideObservation -Observation $crossCommitValue `
-        -KeyId ([string]$sideConfiguration.keyId)
-    Set-OrchestrationSelfTestArtifactValue -Case $crossCommit -Role 'candidate-isolation-observation' -Value $crossCommitValue
-    Assert-OrchestrationSelfTestSideBySideRejected -Case $crossCommit `
-        -Message 'a fully re-signed side-by-side observation from another commit was accepted'
-
-    $crossRuntime = New-OrchestrationSelfTestCase -Action 'side-by-side-deployment' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'cross-runtime'
-    $crossRuntimeValue = Get-OrchestrationSelfTestArtifactValue -Case $crossRuntime -Role 'candidate-isolation-observation'
-    $foreignRuntime = 'sha256:' + ('e' * 64)
-    $crossRuntimeValue.runtimePayloadSha256 = $foreignRuntime
-    $crossRuntimeValue.deploymentReceipt.artifactHashes.runtimePayloadSha256 = $foreignRuntime
-    $crossRuntimeValue.deploymentReceipt.receiptSha256 = Get-DysonQualificationV2ObjectDigest -Value `
-        (Get-DysonSideBySideV2UnsignedValue -Value $crossRuntimeValue.deploymentReceipt -Excluded @('receiptSha256'))
-    $crossRuntimeValue.health.runtimePayloadSha256 = $foreignRuntime
-    $crossRuntimeValue.health.deploymentReceiptSha256 = [string]$crossRuntimeValue.deploymentReceipt.receiptSha256
-    $crossRuntimeValue.runtime.runtimePayloadSha256 = $foreignRuntime
-    $crossRuntimeValue.runtime.identitySha256 = Get-DysonQualificationV2ObjectDigest -Value `
-        (Get-DysonSideBySideV2UnsignedValue -Value $crossRuntimeValue.runtime -Excluded @('identitySha256'))
-    $crossRuntimeValue = Protect-OrchestrationSelfTestSideBySideObservation -Observation $crossRuntimeValue `
-        -KeyId ([string]$sideConfiguration.keyId)
-    Set-OrchestrationSelfTestArtifactValue -Case $crossRuntime -Role 'candidate-isolation-observation' -Value $crossRuntimeValue
-    Assert-OrchestrationSelfTestSideBySideRejected -Case $crossRuntime `
-        -Message 'a fully re-signed side-by-side observation from another runtime payload was accepted'
-
-    $crossKey = New-OrchestrationSelfTestCase -Action 'side-by-side-deployment' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'cross-key'
-    $crossKeyValue = Get-OrchestrationSelfTestArtifactValue -Case $crossKey -Role 'candidate-isolation-observation'
-    $foreignKeyId = [string](Get-DysonOrchestrationV2ActionConfiguration `
-        -Profile $profile -Action 'authenticated-panel').keyId
-    $crossKeyValue.protection.keyId = $foreignKeyId
-    $crossKeyValue = Protect-OrchestrationSelfTestSideBySideObservation -Observation $crossKeyValue -KeyId $foreignKeyId
-    Set-OrchestrationSelfTestArtifactValue -Case $crossKey -Role 'candidate-isolation-observation' -Value $crossKeyValue
-    Assert-OrchestrationSelfTestSideBySideRejected -Case $crossKey `
-        -Message 'a fully re-signed side-by-side observation under another orchestration key was accepted'
     Add-OrchestrationSelfTestResult $stage
 
     $stage = 'preview-is-read-only'
@@ -1700,11 +1130,13 @@ Invoke-DysonQualificationOrchestrationV2 -Profile $whatIfProfile -Request $whatI
     [Environment]::SetEnvironmentVariable($script:DysonOrchestrationV2FixtureGateName,
         $script:DysonOrchestrationV2FixtureGateValue, [EnvironmentVariableTarget]::Process)
 
-    $stage = 'all-eleven-protected-adapters'
+    $stage = 'all-nine-protected-adapters'
+    $adapterStage = $stage
     $predecessor = $script:DysonOrchestrationV2ZeroDigest
     $cases = @{}
     $receipts = @()
     foreach ($action in $script:DysonOrchestrationV2Actions) {
+        $stage = $adapterStage + ':' + $action
         $case = if ($action -ceq 'paired-save-restore') { $first } else {
             New-OrchestrationSelfTestCase -Action $action -PredecessorReceiptSha256 $predecessor -NowUtc $now
         }
@@ -1720,8 +1152,9 @@ Invoke-DysonQualificationOrchestrationV2 -Profile $whatIfProfile -Request $whatI
         $receipts += ,$accepted.receipt
         $cases[$action] = $case
     }
-    Assert-OrchestrationSelfTest ($receipts.Count -eq 11 -and [int64]$receipts[10].sequence -eq 11) `
-        'the 11-action receipt chain was incomplete'
+    Assert-OrchestrationSelfTest ($receipts.Count -eq 9 -and [int64]$receipts[8].sequence -eq 9) `
+        'the 9-action receipt chain was incomplete'
+    $stage = $adapterStage
     Add-OrchestrationSelfTestResult $stage
 
     $stage = 'idempotent-replay'
@@ -1729,7 +1162,7 @@ Invoke-DysonQualificationOrchestrationV2 -Profile $whatIfProfile -Request $whatI
     $replay = Invoke-DysonQualificationOrchestrationV2 -Profile $profile -Request $last.request `
         -KeyResolver $resolver -NowUtc $now
     Assert-OrchestrationSelfTest ([bool]$replay.reused -and -not [bool]$replay.qualificationStateChanged -and
-        [string]$replay.receipt.receiptSha256 -ceq [string]$receipts[10].receiptSha256) `
+        [string]$replay.receipt.receiptSha256 -ceq [string]$receipts[-1].receiptSha256) `
         'an exact replay did not return the immutable receipt'
     Add-OrchestrationSelfTestResult $stage
 
@@ -1846,6 +1279,54 @@ Invoke-DysonQualificationOrchestrationV2 -Profile $whatIfProfile -Request $whatI
     }
     Add-OrchestrationSelfTestResult $stage
 
+    $stage = 'independent-deployment-real-receipt-binding'
+    $syntheticDeployment = New-OrchestrationSelfTestCase -Action 'independent-deployment' `
+        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'synthetic-install'
+    Set-OrchestrationSelfTestArtifactValue -Case $syntheticDeployment -Role 'deployment-receipt' -Value `
+        ([pscustomobject][ordered]@{ protocol='DYSON_CONTROL_DEPLOYMENT_V1'; state='installed'; operation='install'; candidateHealthy=$true })
+    Assert-OrchestrationSelfTestDeploymentRejected -Case $syntheticDeployment `
+        -Message 'a synthetic self-reported deployment object was accepted'
+
+    $payloadSplice = New-OrchestrationSelfTestCase -Action 'independent-deployment' `
+        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'payload-splice'
+    $payloadValue = Get-OrchestrationSelfTestArtifactValue -Case $payloadSplice -Role 'deployment-receipt'
+    $payloadValue.artifactPayloadSha256 = 'e' * 64
+    Set-OrchestrationSelfTestArtifactValue -Case $payloadSplice -Role 'deployment-receipt' -Value $payloadValue
+    Assert-OrchestrationSelfTestDeploymentRejected -Case $payloadSplice `
+        -ExpectedCode 'DYSON_QUALIFICATION_ORCHESTRATION_V2_DEPLOYMENT_BINDING_INVALID' `
+        -Message 'a deployment receipt for another runtime payload was accepted'
+
+    $versionSplice = New-OrchestrationSelfTestCase -Action 'independent-deployment' `
+        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'version-splice'
+    $versionValue = Get-OrchestrationSelfTestArtifactValue -Case $versionSplice -Role 'deployment-receipt'
+    $versionValue.version = '0.1.1-rc.1'
+    Set-OrchestrationSelfTestArtifactValue -Case $versionSplice -Role 'deployment-receipt' -Value $versionValue
+    Assert-OrchestrationSelfTestDeploymentRejected -Case $versionSplice `
+        -ExpectedCode 'DYSON_QUALIFICATION_ORCHESTRATION_V2_DEPLOYMENT_BINDING_INVALID' `
+        -Message 'a deployment receipt for another panel release was accepted'
+
+    $snapshotSplice = New-OrchestrationSelfTestCase -Action 'independent-deployment' `
+        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'snapshot-splice'
+    $snapshotValue = Get-OrchestrationSelfTestArtifactValue -Case $snapshotSplice -Role 'deployment-rollback-receipt'
+    $snapshotValue.snapshotId = $now.AddMilliseconds(-2).ToUniversalTime().ToString('yyyyMMdd-HHmmssfff') + '-eeeeeeee'
+    Set-OrchestrationSelfTestArtifactValue -Case $snapshotSplice -Role 'deployment-rollback-receipt' -Value $snapshotValue
+    $snapshotRollbackArtifact = @($snapshotSplice.evidence.artifacts | Where-Object { [string]$_.role -ceq 'deployment-rollback-receipt' })[0]
+    $snapshotSplice.evidence.assertions.rollbackReceiptSha256 = [string]$snapshotRollbackArtifact.receiptSha256
+    $snapshotSplice.evidence = Protect-OrchestrationSelfTestEvidence -Evidence $snapshotSplice.evidence
+    Reset-OrchestrationSelfTestRequestForEvidence -Case $snapshotSplice
+    Assert-OrchestrationSelfTestDeploymentRejected -Case $snapshotSplice `
+        -ExpectedCode 'DYSON_QUALIFICATION_ORCHESTRATION_V2_DEPLOYMENT_BINDING_INVALID' `
+        -Message 'a rollback receipt for another deployment snapshot was accepted'
+
+    $unverifiedRollback = New-OrchestrationSelfTestCase -Action 'independent-deployment' `
+        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'unverified-rollback'
+    $unverifiedRollbackValue = Get-OrchestrationSelfTestArtifactValue -Case $unverifiedRollback -Role 'deployment-rollback-receipt'
+    $unverifiedRollbackValue.readinessVerified = $false
+    Set-OrchestrationSelfTestArtifactValue -Case $unverifiedRollback -Role 'deployment-rollback-receipt' -Value $unverifiedRollbackValue
+    Assert-OrchestrationSelfTestDeploymentRejected -Case $unverifiedRollback `
+        -Message 'a rollback receipt without restored readiness was accepted'
+    Add-OrchestrationSelfTestResult $stage
+
     $stage = 'soak-v2-strict-observation-binding'
     foreach ($soakAction in @('six-hour-soak','seventy-two-hour-soak')) {
         $validSoak = New-OrchestrationSelfTestCase -Action $soakAction `
@@ -1947,96 +1428,6 @@ Invoke-DysonQualificationOrchestrationV2 -Profile $whatIfProfile -Request $whatI
         -Message 'a soak evidence envelope re-signed under another configured key was accepted'
     Add-OrchestrationSelfTestResult $stage
 
-    $stage = 'reversible-cutover-v2-strict-observation-binding'
-    $validCutover = New-OrchestrationSelfTestCase -Action 'gsmanager-recoverable-switch' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'strict-valid'
-    $validCutoverPreview = Invoke-DysonQualificationOrchestrationV2 -Profile $profile -Request $validCutover.request `
-        -KeyResolver $resolver -NowUtc $now
-    Assert-OrchestrationSelfTest ([string]$validCutoverPreview.decision -ceq 'preview-valid' -and
-        -not [bool]$validCutoverPreview.productionChanged) 'a valid reversible cutover observation did not pass preview'
-
-    $genericCutover = New-OrchestrationSelfTestCase -Action 'gsmanager-recoverable-switch' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'generic-status'
-    $genericArtifact = @($genericCutover.evidence.artifacts | Where-Object {
-        [string]$_.role -ceq 'reversible-cutover-observation'
-    })[0]
-    $genericValue = [pscustomobject][ordered]@{
-        protocol='DYSON_REVERSIBLE_CUTOVER_OBSERVATION_V2'; schemaVersion=2
-        qualificationRunId=[string]$genericCutover.request.runId; targetIdentity=[string]$profile.targetIdentity
-        maintenanceWindow=$null; release=$null; dataRootIdentity=$null; saveGenerationId=$null
-        protectionPoint=$null; gsManagerAuthority=$null; switchToDysonControl=$null; dysonControlHealth=$null
-        switchBackToGsManager=$null; restoredGsManagerHealth=$null; restoredSavePair=$null
-        bidirectionalNoLoss=$null; audit=$null; collectorEffects=$null
-        observedAtUtc=[string]$genericCutover.evidence.observedAtUtc; expiresAtUtc=[string]$genericCutover.evidence.expiresAtUtc
-        status='healthy'; httpStatus=200; tcpOpen=$true; observationSha256=$null
-    }
-    $genericValue.observationSha256 = Get-ReversibleCutoverObservationDigest $genericValue
-    Set-OrchestrationSelfTestArtifactValue -Case $genericCutover -Role 'reversible-cutover-observation' -Value $genericValue
-    $genericCutover.evidence.assertions.terminalReceiptSha256 = 'sha256:' + [string]$genericValue.observationSha256
-    $genericCutover.evidence = Protect-OrchestrationSelfTestEvidence -Evidence $genericCutover.evidence
-    Reset-OrchestrationSelfTestRequestForEvidence -Case $genericCutover
-    Assert-OrchestrationSelfTestReversibleCutoverRejected -Case $genericCutover `
-        -Message 'a re-digested generic HTTP/TCP status object bypassed the reversible cutover validator'
-
-    foreach ($mutation in @(
-        [pscustomobject]@{ suffix='cross-run'; kind='run'; message='another qualification run' },
-        [pscustomobject]@{ suffix='cross-commit'; kind='commit'; message='another commit' },
-        [pscustomobject]@{ suffix='cross-save'; kind='save'; message='another save generation' },
-        [pscustomobject]@{ suffix='rollback-source'; kind='rollback'; message='another rollback source' },
-        [pscustomobject]@{ suffix='one-way'; kind='one-way'; message='a non-persisted reverse switch' },
-        [pscustomobject]@{ suffix='health'; kind='health'; message='unauthenticated management health' },
-        [pscustomobject]@{ suffix='pair'; kind='pair'; message='a one-way no-loss proof' },
-        [pscustomobject]@{ suffix='audit'; kind='audit'; message='another audit terminal' }
-    )) {
-        $case = New-OrchestrationSelfTestCase -Action 'gsmanager-recoverable-switch' `
-            -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix $mutation.suffix
-        $value = Get-OrchestrationSelfTestArtifactValue -Case $case -Role 'reversible-cutover-observation'
-        switch ([string]$mutation.kind) {
-            'run' { $value.qualificationRunId = [guid]::NewGuid().ToString('D').ToLowerInvariant() }
-            'commit' { $value.release.subjectCommit = 'd' * 40 }
-            'save' { $value.saveGenerationId = [guid]::NewGuid().ToString('D').ToLowerInvariant() }
-            'rollback' { $value.switchBackToGsManager.sourceSha256 = 'e' * 64 }
-            'one-way' { $value.switchBackToGsManager.persisted = $false }
-            'health' { $value.dysonControlHealth.authenticatedManagement = $false }
-            'pair' { $value.bidirectionalNoLoss.reverseSwitchProved = $false }
-            'audit' { $value.audit.terminalEvidenceSha256 = 'e' * 64 }
-        }
-        $value.observationSha256 = Get-ReversibleCutoverObservationDigest $value
-        Set-OrchestrationSelfTestReversibleCutoverObservation -Case $case -Value $value
-        Assert-OrchestrationSelfTestReversibleCutoverRejected -Case $case `
-            -Message ('a fully re-digested reversible cutover record with ' + [string]$mutation.message + ' was accepted')
-    }
-
-    $rawSplice = New-OrchestrationSelfTestCase -Action 'gsmanager-recoverable-switch' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'raw-rollback-splice'
-    $rawBack = Get-OrchestrationSelfTestArtifactValue -Case $rawSplice -Role 'cutover-rollback-receipt'
-    $rawBack.authorityInventoryRevision = 'd' * 64
-    Set-OrchestrationSelfTestArtifactValue -Case $rawSplice -Role 'cutover-rollback-receipt' -Value $rawBack
-    $rawBackArtifact = @($rawSplice.evidence.artifacts | Where-Object {
-        [string]$_.role -ceq 'cutover-rollback-receipt'
-    })[0]
-    $rawSplice.evidence.assertions.rollbackReceiptSha256 = [string]$rawBackArtifact.receiptSha256
-    $rawObservation = Get-OrchestrationSelfTestArtifactValue -Case $rawSplice -Role 'reversible-cutover-observation'
-    $rawObservation.switchBackToGsManager.sourceSha256 = ConvertTo-ReversibleCutoverExpectedRawSha256 `
-        ([string]$rawBackArtifact.fileSha256)
-    $rawObservation.observationSha256 = Get-ReversibleCutoverObservationDigest $rawObservation
-    Set-OrchestrationSelfTestReversibleCutoverObservation -Case $rawSplice -Value $rawObservation
-    Assert-OrchestrationSelfTestReversibleCutoverRejected -Case $rawSplice `
-        -Message 'a fully re-bound rollback receipt from another authority inventory was accepted'
-
-    foreach ($topMutation in @('protection','terminal')) {
-        $case = New-OrchestrationSelfTestCase -Action 'gsmanager-recoverable-switch' `
-            -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix ('top-' + $topMutation)
-        if ($topMutation -ceq 'protection') {
-            $case.evidence.assertions.protectionPointSha256 = 'sha256:' + ('e' * 64)
-        } else { $case.evidence.assertions.terminalReceiptSha256 = 'sha256:' + ('e' * 64) }
-        $case.evidence = Protect-OrchestrationSelfTestEvidence -Evidence $case.evidence
-        Reset-OrchestrationSelfTestRequestForEvidence -Case $case
-        Assert-OrchestrationSelfTestReversibleCutoverRejected -Case $case `
-            -Message ('a re-signed top-level ' + $topMutation + ' splice was accepted')
-    }
-    Add-OrchestrationSelfTestResult $stage
-
     $stage = 'paired-save-v2-strict-observation-binding'
     $validPaired = New-OrchestrationSelfTestCase -Action 'paired-save-restore' `
         -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'strict-valid'
@@ -2106,127 +1497,6 @@ Invoke-DysonQualificationOrchestrationV2 -Profile $whatIfProfile -Request $whatI
         Assert-OrchestrationSelfTestPairedSaveRejected -Case $case `
             -Message ('a fully re-digested paired-save record from ' + [string]$mutation.message + ' was accepted')
     }
-    Add-OrchestrationSelfTestResult $stage
-
-    $stage = 'post-removal-v2-strict-observation-binding'
-    $validPostRemoval = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'strict-valid'
-    $validPostRemovalPreview = Invoke-DysonQualificationOrchestrationV2 -Profile $profile -Request $validPostRemoval.request `
-        -KeyResolver $resolver -NowUtc $now
-    Assert-OrchestrationSelfTest ([string]$validPostRemovalPreview.decision -ceq 'preview-valid' -and
-        -not [bool]$validPostRemovalPreview.productionChanged) 'a valid strict post-removal observation did not pass preview'
-
-    $genericPostRemoval = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'generic-status-only'
-    $genericPostContract = @($genericPostRemoval.contract.artifacts | Where-Object { [string]$_.role -ceq 'post-removal-observation' })[0]
-    $genericPostArtifact = @($genericPostRemoval.artifacts | Where-Object { [string]$_.role -ceq 'post-removal-observation' })[0]
-    $genericPostValue = New-OrchestrationSelfTestControlledObservation -ArtifactContract $genericPostContract `
-        -ReceiptId ([string]$genericPostArtifact.receiptId) -RunId ([string]$genericPostRemoval.request.runId) `
-        -Action 'gsmanager-removal' -ActionTargetId ([string]$genericPostRemoval.request.actionTargetId) `
-        -ObservedAt $now.AddMinutes(-1)
-    Set-OrchestrationSelfTestArtifactValue -Case $genericPostRemoval -Role 'post-removal-observation' -Value $genericPostValue
-    Assert-OrchestrationSelfTestPostRemovalRejected -Case $genericPostRemoval `
-        -Message 'a generic recomputed status=verified observation bypassed the strict post-removal validator'
-
-    $removalOnly = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'removal-only'
-    $removalOnlyValue = Get-OrchestrationSelfTestArtifactValue -Case $removalOnly -Role 'post-removal-observation'
-    foreach ($name in @('cutoverObservation','observationWindow','inventory','management','game','reboot','save','recoveryPackage','deliverables')) {
-        $removalOnlyValue.PSObject.Properties.Remove($name)
-    }
-    $removalOnlyValue = Update-OrchestrationSelfTestPostRemovalDigest -Observation $removalOnlyValue
-    Set-OrchestrationSelfTestArtifactValue -Case $removalOnly -Role 'post-removal-observation' -Value $removalOnlyValue
-    Assert-OrchestrationSelfTestPostRemovalRejected -Case $removalOnly `
-        -Message 'a removal-success receipt without complete post-removal evidence was accepted'
-
-    foreach ($bindingMutation in @(
-        [pscustomobject]@{ suffix='cross-run'; field='runId'; value=[guid]::NewGuid().ToString('D').ToLowerInvariant(); label='run' },
-        [pscustomobject]@{ suffix='cross-target'; field='targetIdentity'; value=('sha256:' + ('d' * 64)); label='target identity' }
-    )) {
-        $case = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-            -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix $bindingMutation.suffix
-        $value = Get-OrchestrationSelfTestArtifactValue -Case $case -Role 'post-removal-observation'
-        $value.PSObject.Properties[[string]$bindingMutation.field].Value = [string]$bindingMutation.value
-        $value = Update-OrchestrationSelfTestPostRemovalBindings -Observation $value
-        Set-OrchestrationSelfTestPostRemovalObservation -Case $case -Value $value
-        Assert-OrchestrationSelfTestPostRemovalRejected -Case $case `
-            -Message ('a fully rebound post-removal observation from another ' + $bindingMutation.label + ' was accepted')
-    }
-
-    foreach ($releaseMutation in @(
-        [pscustomobject]@{ suffix='cross-commit'; field='subjectCommit'; value=('d' * 40); label='commit' },
-        [pscustomobject]@{ suffix='cross-runtime'; field='runtimePayloadSha256'; value=('sha256:' + ('e' * 64)); label='runtime payload' }
-    )) {
-        $case = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-            -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix $releaseMutation.suffix
-        $value = Get-OrchestrationSelfTestArtifactValue -Case $case -Role 'post-removal-observation'
-        $value.releaseIdentity.PSObject.Properties[[string]$releaseMutation.field].Value = [string]$releaseMutation.value
-        $value = Update-OrchestrationSelfTestPostRemovalBindings -Observation $value
-        Set-OrchestrationSelfTestPostRemovalObservation -Case $case -Value $value
-        Assert-OrchestrationSelfTestPostRemovalRejected -Case $case `
-            -Message ('a fully rebound post-removal observation from another ' + $releaseMutation.label + ' was accepted')
-    }
-
-    foreach ($splice in @('release','save')) {
-        $case = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-            -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix ('cross-' + $splice)
-        $value = Get-OrchestrationSelfTestArtifactValue -Case $case -Role 'post-removal-observation'
-        if ($splice -ceq 'release') { $value.releaseIdentity.releaseVersion = '0.1.1-rc.1' }
-        else { $value.game.savePairSha256 = 'sha256:' + ('e' * 64) }
-        $value = Update-OrchestrationSelfTestPostRemovalDigest -Observation $value
-        Set-OrchestrationSelfTestPostRemovalObservation -Case $case -Value $value
-        Assert-OrchestrationSelfTestPostRemovalRejected -Case $case `
-            -Message ('a re-signed cross-' + $splice + ' splice was accepted')
-    }
-
-    $residualAuthority = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'residual-authority'
-    $residualValue = Get-OrchestrationSelfTestArtifactValue -Case $residualAuthority -Role 'post-removal-observation'
-    $residualValue.inventory.scheduledTaskCount = 1
-    $residualValue.inventory.inventorySha256 = Get-DysonPostRemovalV2InventoryDigest -Inventory $residualValue.inventory
-    $residualValue = Update-OrchestrationSelfTestPostRemovalDigest -Observation $residualValue
-    Set-OrchestrationSelfTestPostRemovalObservation -Case $residualAuthority -Value $residualValue
-    Assert-OrchestrationSelfTestPostRemovalRejected -Case $residualAuthority `
-        -Message 'a re-digested observation with residual GSManager authority was accepted'
-
-    $crossRemovalReceipt = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'cross-removal-receipt'
-    $crossRemovalValue = Get-OrchestrationSelfTestArtifactValue -Case $crossRemovalReceipt -Role 'post-removal-observation'
-    $crossRemovalValue.removalReceipt.receiptId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
-    $crossRemovalValue = Update-OrchestrationSelfTestPostRemovalDigest -Observation $crossRemovalValue
-    Set-OrchestrationSelfTestPostRemovalObservation -Case $crossRemovalReceipt -Value $crossRemovalValue
-    Assert-OrchestrationSelfTestPostRemovalRejected -Case $crossRemovalReceipt `
-        -Message 'a re-signed observation bound to another removal receipt was accepted'
-
-    $reSignedPostTamper = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 're-signed-failed-join'
-    $reSignedPostValue = Get-OrchestrationSelfTestArtifactValue -Case $reSignedPostTamper -Role 'post-removal-observation'
-    $reSignedPostValue.game.serverAuthoritativeJoin = $false
-    $reSignedPostValue = Update-OrchestrationSelfTestPostRemovalDigest -Observation $reSignedPostValue
-    Set-OrchestrationSelfTestPostRemovalObservation -Case $reSignedPostTamper -Value $reSignedPostValue
-    Assert-OrchestrationSelfTestPostRemovalRejected -Case $reSignedPostTamper `
-        -Message 'a re-digested and envelope-re-signed failed Nebula join was accepted'
-
-    $crossPostTarget = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'cross-action-target'
-    $crossPostTarget.request.actionTargetId = 'target-foreign-gsmanager-removal'
-    $crossPostTarget.evidence.actionTargetId = [string]$crossPostTarget.request.actionTargetId
-    $crossPostTarget.evidence.assertions.subjectBindingSha256 = Get-DysonOrchestrationV2SubjectBindingDigest -Evidence $crossPostTarget.evidence
-    $crossPostTarget.evidence = Protect-OrchestrationSelfTestEvidence -Evidence $crossPostTarget.evidence
-    Reset-OrchestrationSelfTestRequestForEvidence -Case $crossPostTarget
-    Assert-OrchestrationSelfTestPostRemovalRejected -Case $crossPostTarget `
-        -ExpectedCode 'DYSON_QUALIFICATION_ORCHESTRATION_V2_TARGET_MISMATCH' `
-        -Message 'a re-signed envelope for another removal action target was accepted'
-
-    $crossPostKey = New-OrchestrationSelfTestCase -Action 'gsmanager-removal' `
-        -PredecessorReceiptSha256 $script:DysonOrchestrationV2ZeroDigest -NowUtc $now -CaseSuffix 'cross-key'
-    $crossPostKey.evidence.protection.keyId = [string](Get-DysonOrchestrationV2ActionConfiguration `
-        -Profile $profile -Action 'authenticated-panel').keyId
-    $crossPostKey.evidence = Protect-OrchestrationSelfTestEvidence -Evidence $crossPostKey.evidence
-    Reset-OrchestrationSelfTestRequestForEvidence -Case $crossPostKey
-    Assert-OrchestrationSelfTestPostRemovalRejected -Case $crossPostKey `
-        -ExpectedCode 'DYSON_QUALIFICATION_ORCHESTRATION_V2_PROTECTION_INVALID' `
-        -Message 'a post-removal evidence envelope re-signed under another configured key was accepted'
     Add-OrchestrationSelfTestResult $stage
 
     $stage = 'external-join-v2-strict-observation-binding'
@@ -2346,7 +1616,7 @@ Invoke-DysonQualificationOrchestrationV2 -Profile $whatIfProfile -Request $whatI
     $resumed = Invoke-DysonQualificationOrchestrationV2 -Profile $profile -Request $resumeCase.request `
         -KeyResolver $resolver -NowUtc $now -Resume
     Assert-OrchestrationSelfTest ([string]$resumed.decision -ceq 'qualified' -and
-        [int64]$resumed.receipt.sequence -eq 12 -and -not [bool]$resumed.productionChanged) `
+        [int64]$resumed.receipt.sequence -eq ($receipts.Count + 1) -and -not [bool]$resumed.productionChanged) `
         'explicit resume did not finish the validated receipt without a production mutation'
     Add-OrchestrationSelfTestResult $stage
 

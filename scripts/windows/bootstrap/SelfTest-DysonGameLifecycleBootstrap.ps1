@@ -1421,6 +1421,8 @@ public static class DysonBootstrapFixtureNativeAcl {
         $legacyObserved = [Security.AccessControl.RawSecurityDescriptor]::new($finalRequested.aclSddl)
         Assert-BootstrapSelfTest (($legacyObserved.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited) -eq 0) `
             'the expected-exit fixture did not retain legacy inheritance flags'
+        # This hook runs synchronously in the self-test script scope. A dynamic
+        # closure module cannot resolve its private helper functions when packaged.
         $script:DysonGameBootstrapExpectedExitFaultHook = {
             param($Phase, $FaultContext)
             if ($Phase -cne 'after-replace') { return }
@@ -1439,7 +1441,7 @@ public static class DysonBootstrapFixtureNativeAcl {
                     securityMatches = (Test-DysonGameBootstrapExpectedExitSecurityEqual $record $finalRequested)
                 }
             }
-        }.GetNewClosure()
+        }
         try {
             $finalCompleted = Complete-DysonGameBootstrapExpectedExit `
                 -Context $expectedExitContext -BindingId ([string]$expectedExitBinding.bindingId)

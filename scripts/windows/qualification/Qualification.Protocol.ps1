@@ -7,7 +7,7 @@ $script:DysonQualificationProtocolExecuteEnvironmentName = 'DYSON_QUALIFICATION_
 $script:DysonQualificationProtocolExecuteEnvironmentValue = 'ALLOW_BOUNDED_PRODUCTION_QUALIFICATION_V1'
 $script:DysonQualificationProtocolActions = @(
     'windows-restart','control-plane-restart','dsp-crash-recovery','storage-interruption',
-    'disk-pressure','update-rollback','gsmanager-switch','save-restore'
+    'disk-pressure','update-rollback','save-restore'
 )
 
 function Throw-DysonQualificationProtocolError {

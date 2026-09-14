@@ -19,6 +19,10 @@ function Assert-RebootAcceptanceFixture {
     if (-not $Condition) { throw "REBOOT_ACCEPTANCE_SELFTEST_FAILED: $Message" }
 }
 
+Assert-RebootAcceptanceFixture -Condition ([IO.File]::ReadAllText($commonPath).Contains(
+    'Assert-DysonRetiredPrivilegedRuntimeAbsent')) `
+    -Message 'the native reboot observer omitted the retired privileged task gate'
+
 function New-FixtureIdentity {
     param([Parameter(Mandatory)][ValidatePattern('^[0-9a-f]$')][string]$Character)
     return 'sha256:' + [string]::new([char]$Character, 64)
@@ -379,10 +383,9 @@ try {
         $checks = [ordered]@{
             deploymentVersion = 'pass'
             statusProvider = 'pass'
-            lifecycleBroker = if ($script:rebootReadinessFixtureMode -ceq 'pass') { 'pass' } else { 'not-applicable' }
         }
         if ($script:rebootReadinessFixtureMode -cne 'missing') {
-            $checks['cutoverRecovery'] = 'pass'
+            $checks['lifecycleBroker'] = if ($script:rebootReadinessFixtureMode -ceq 'pass') { 'pass' } else { 'not-applicable' }
         }
         return [pscustomobject]@{
             StatusCode = 200
@@ -399,19 +402,19 @@ try {
         -ExpectedMessage 'The loopback control-plane readiness check did not prove the expected release before the deadline.' `
         -Operation {
             [void](Test-DysonLoopbackReadiness -ReadinessUri $fixtureReadinessUri -ExpectedVersion '1.0.0' `
-                -RequiredChecks @('lifecycleBroker', 'cutoverRecovery') -TimeoutSeconds 1)
+                -RequiredChecks @('lifecycleBroker') -TimeoutSeconds 1)
         }) -Message 'a required lifecycleBroker not-applicable state was accepted as ready'
     $script:rebootReadinessFixtureMode = 'missing'
     Assert-RebootAcceptanceFixture -Condition (Test-RebootAcceptanceRejected `
         -ExpectedMessage 'The loopback control-plane readiness check did not prove the expected release before the deadline.' `
         -Operation {
             [void](Test-DysonLoopbackReadiness -ReadinessUri $fixtureReadinessUri -ExpectedVersion '1.0.0' `
-                -RequiredChecks @('lifecycleBroker', 'cutoverRecovery') -TimeoutSeconds 1)
-        }) -Message 'a missing required cutoverRecovery check was accepted as ready'
+                -RequiredChecks @('lifecycleBroker') -TimeoutSeconds 1)
+        }) -Message 'a missing required lifecycleBroker check was accepted as ready'
     $script:rebootReadinessFixtureMode = 'pass'
     Assert-RebootAcceptanceFixture -Condition ([bool](Test-DysonLoopbackReadiness `
         -ReadinessUri $fixtureReadinessUri -ExpectedVersion '1.0.0' `
-        -RequiredChecks @('lifecycleBroker', 'cutoverRecovery') -TimeoutSeconds 1)) `
+        -RequiredChecks @('lifecycleBroker') -TimeoutSeconds 1)) `
         -Message 'literal pass values for required readiness checks were rejected'
 
     $tampered = $checkpointBeforeCollision | ConvertFrom-Json

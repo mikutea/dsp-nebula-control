@@ -13,7 +13,6 @@ $script:DysonQualificationActions = @(
     'storage-interruption',
     'disk-pressure',
     'update-rollback',
-    'gsmanager-switch',
     'save-restore'
 )
 
@@ -452,7 +451,6 @@ function Assert-DysonQualificationActionReceipt {
             if ([string]$Receipt.status -ceq 'failed') { @('code', 'manualRecoveryRequired') }
             else { @('previousReleaseActivated') }
         }
-        'gsmanager-switch' { @('recoverable', 'state') }
         'save-restore' { @('pairedSaveRestored', 'pairedSaveRevision') }
     })
     $outcomeNames = @($Receipt.outcome.PSObject.Properties | ForEach-Object { [string]$_.Name })

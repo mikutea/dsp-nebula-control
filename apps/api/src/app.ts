@@ -49,14 +49,6 @@ import {
   WindowsTrustedRuntimeCompatibilityInspector,
   type RollbackWarningCheck
 } from './providers/windows-runtime-compatibility.js'
-import {
-  WindowsCutoverAdapter,
-  type WindowsCutoverHostClient
-} from './providers/windows-cutover.js'
-import {
-  FixedWindowsCutoverHostClient,
-  windowsCutoverHostScriptNames
-} from './providers/windows-cutover-host.js'
 import { createWindowsManagedPluginVersionProbe } from './providers/windows-managed-plugin-version.js'
 import { FileBridgeClient } from './bridge/file-client.js'
 import { validateBridgeSecret } from './bridge/protocol.js'
@@ -264,14 +256,6 @@ import {
   type ServerObservabilitySnapshot
 } from './observability/index.js'
 import { collectWindowsBridgeObservability } from './observability/windows-bridge.js'
-import type { CutoverRoutesController } from './cutover/routes.js'
-import { registerCutoverRoutes } from './cutover/routes.js'
-import { CutoverService } from './cutover/service.js'
-import { CutoverHttpController } from './cutover/http.js'
-import { SqliteCutoverDurableStore } from './cutover/sqlite-store.js'
-import { SqliteCutoverAuditStore } from './cutover/audit.js'
-import { readCutoverAuthorityProfile } from './cutover/profile.js'
-import { readCutoverBrokerProfile } from './cutover/broker-profile.js'
 import {
   FileGameRuntimeReceiptSource,
   gameRuntimeReceiptListQuerySchema,
@@ -447,8 +431,6 @@ export interface ApplicationDependencies {
   gameConfigHistoryController?: GameConfigHistoryRoutesController
   saveTransactionService?: Pick<SaveTransactionService, 'inspect' | 'backup' | 'restore'>
   backupRetentionController?: BackupRetentionRoutesController
-  cutoverController?: CutoverRoutesController
-  cutoverHostClient?: WindowsCutoverHostClient
   savePairTransferService?: Pick<SavePairTransferService, 'exportBackup' | 'openExport' | 'importArchive'>
   savePairPromotionService?: Pick<SavePairTransferService, 'previewImportPromotion' | 'promoteImport'>
   thunderstoreReleaseClient?: {
@@ -894,92 +876,6 @@ export async function buildApplication(
     ? new SaveJobService(database, saveTransactions, events, { hostMutationCoordinator, hostMutationRecoveryCoordinator })
     : null
   if (saveJobs && config.saveMutationsEnabled) saveJobs.initialize()
-  let ownedCutoverStore: SqliteCutoverDurableStore | null = null
-  let ownedCutoverAudit: SqliteCutoverAuditStore | null = null
-  let cutoverController: CutoverRoutesController | null = dependencies.cutoverController ?? null
-  if (cutoverController === null && (config.cutoverEnabled || config.cutoverRecoveryEnabled)) {
-    try {
-      if (config.provider !== 'windows' || !config.projectRoot || !config.runtimeBootstrapRoot ||
-          !config.cutoverProfileFile || !config.cutoverServiceUser ||
-          !config.cutoverTaskTransactionRoot || !windowsScriptRunner || !saveTransactions ||
-          !hostMutationCoordinator || !hostMutationRecoveryCoordinator) {
-        throw new Error('CUTOVER_RUNTIME_UNAVAILABLE')
-      }
-      const profile = readCutoverAuthorityProfile({
-        profileFile: config.cutoverProfileFile,
-        projectRoot: config.projectRoot,
-        dataRoot: config.dataDir,
-        runtimeBootstrapRoot: config.runtimeBootstrapRoot,
-        runtimeTaskTransactionRoot: config.cutoverTaskTransactionRoot,
-        serviceUser: config.cutoverServiceUser,
-        gamePort: config.gamePort
-      })
-      if (dependencies.cutoverHostClient === undefined) {
-        assertCutoverHostScriptsAvailable(config.scriptRoot)
-        readCutoverBrokerProfile({
-          profileFile: path.join(config.dataDir, 'cutover-broker', 'broker-profile.json'),
-          scriptRoot: config.scriptRoot,
-          projectRoot: config.projectRoot,
-          dataRoot: config.dataDir,
-          authorityProfileFile: config.cutoverProfileFile,
-          runtimeBootstrapRoot: config.runtimeBootstrapRoot,
-          runtimeTaskTransactionRoot: config.cutoverTaskTransactionRoot,
-          serviceUser: config.cutoverServiceUser,
-          gamePort: config.gamePort
-        })
-      }
-      ownedCutoverStore = new SqliteCutoverDurableStore(
-        config.cutoverDataDirectory,
-        profile.inventoryRevision
-      )
-      ownedCutoverAudit = new SqliteCutoverAuditStore(config.cutoverDataDirectory)
-      const hostClient = dependencies.cutoverHostClient ?? new FixedWindowsCutoverHostClient({
-          projectRoot: config.projectRoot,
-          profileFile: config.cutoverProfileFile,
-          cutoverScriptRoot: config.scriptRoot,
-          runtimeBootstrapRoot: config.runtimeBootstrapRoot,
-          runtimeTaskTransactionRoot: config.cutoverTaskTransactionRoot,
-          serviceUser: config.cutoverServiceUser,
-          gamePort: config.gamePort,
-          authorityInventoryRevision: profile.inventoryRevision,
-          runner: windowsScriptRunner
-        })
-      const service = new CutoverService({
-        authorityInventoryRevision: profile.inventoryRevision,
-        adapter: new WindowsCutoverAdapter({
-          authorityInventoryRevision: profile.inventoryRevision,
-          hostClient,
-          saves: saveTransactions
-        }),
-        store: ownedCutoverStore,
-        hostMutationCoordinator,
-        hostMutationRecoveryCoordinator
-      })
-      const controller = new CutoverHttpController({
-        service,
-        ordinaryMutationGate: () => config.cutoverEnabled,
-        recoveryMutationGate: () => config.cutoverRecoveryEnabled,
-        audit: ownedCutoverAudit
-      })
-      cutoverController = controller
-      app.addHook('onReady', async () => controller.initialize())
-    } catch (error) {
-      try { ownedCutoverAudit?.close() } catch { /* Preserve the construction failure. */ }
-      try { ownedCutoverStore?.close() } catch { /* Preserve the construction failure. */ }
-      ownedCutoverAudit = null
-      ownedCutoverStore = null
-      await closeFailedCutoverConstruction({
-        app,
-        database,
-        lifecycle,
-        saveJobs,
-        observabilityTimer,
-        stopPlayerHistoryRetention,
-        unsubscribeObservability
-      })
-      throw error
-    }
-  }
   const defaultSaveTransferService = (
     workspacePaths && config.saveTransferRoot
       ? new SavePairTransferService({
@@ -1445,12 +1341,6 @@ export async function buildApplication(
       authenticate: auth.authenticate
     })
   }
-  if (cutoverController) {
-    registerCutoverRoutes(app, {
-      controller: cutoverController,
-      authenticate: auth.authenticate
-    })
-  }
 
   app.get('/healthz', async (_request, reply) => {
     if (config.deploymentVersion) {
@@ -1485,7 +1375,6 @@ export async function buildApplication(
       lifecycleBroker: config.lifecycleEnabled ? 'fail' : 'not-applicable',
       activationRecovery: activationRecoveryApplicable ? 'fail' : 'not-applicable',
       steamHandoffRecovery: config.steamManualHandoffEnabled ? 'fail' : 'not-applicable',
-      cutoverRecovery: cutoverController ? 'fail' : 'not-applicable'
     }
 
     const statusReadiness = collectObservabilityStatus().then(status => {
@@ -1545,18 +1434,6 @@ export async function buildApplication(
           : 'fail'
       } catch {
         checks.steamHandoffRecovery = 'fail'
-      }
-    }
-
-    if (cutoverController) {
-      try {
-        const recovery = await cutoverController.recoveryStatus({})
-        checks.cutoverRecovery = recovery.statusCode === 200 && recovery.body.ok &&
-          recovery.body.data.phase === 'ready'
-          ? 'pass'
-          : 'fail'
-      } catch {
-        checks.cutoverRecovery = 'fail'
       }
     }
 
@@ -3471,11 +3348,7 @@ export async function buildApplication(
       await app.close()
       await lifecycle.close()
       await saveJobs?.close()
-      try {
-        try { ownedCutoverAudit?.close() } finally { ownedCutoverStore?.close() }
-      } finally {
-        database.close()
-      }
+      database.close()
     }
   }
 }
@@ -3523,36 +3396,6 @@ function isTrustedStoppedLifecycleRuntime(
     runtime.process.pid === null && runtime.process.owner === null && runtime.process.sessionId === null &&
     runtime.port.port === gamePort && runtime.port.listenerCount === 0 &&
     !runtime.pidFile.present && !runtime.pidFile.valid
-}
-
-function assertCutoverHostScriptsAvailable(scriptRoot: string): void {
-  try {
-    for (const scriptName of windowsCutoverHostScriptNames) {
-      const scriptPath = resolvePowerShellScriptPath(scriptRoot, scriptName)
-      const information = fs.lstatSync(scriptPath)
-      if (!information.isFile() || information.isSymbolicLink()) throw new Error('invalid host script')
-    }
-  } catch {
-    throw new Error('CUTOVER_HOST_SCRIPTS_UNAVAILABLE')
-  }
-}
-
-async function closeFailedCutoverConstruction(resources: {
-  app: FastifyInstance
-  database: ControlDatabase
-  lifecycle: Pick<LifecycleService, 'close'>
-  saveJobs: Pick<SaveJobService, 'close'> | null
-  observabilityTimer: NodeJS.Timeout | null
-  stopPlayerHistoryRetention: () => void
-  unsubscribeObservability: () => void
-}): Promise<void> {
-  if (resources.observabilityTimer) clearInterval(resources.observabilityTimer)
-  try { resources.stopPlayerHistoryRetention() } catch { /* Preserve the construction failure. */ }
-  try { resources.unsubscribeObservability() } catch { /* Preserve the construction failure. */ }
-  try { await resources.app.close() } catch { /* Preserve the construction failure. */ }
-  try { await resources.lifecycle.close() } catch { /* Preserve the construction failure. */ }
-  try { await resources.saveJobs?.close() } catch { /* Preserve the construction failure. */ }
-  try { resources.database.close() } catch { /* Preserve the construction failure. */ }
 }
 
 async function sendQualifiedClientArtifact(

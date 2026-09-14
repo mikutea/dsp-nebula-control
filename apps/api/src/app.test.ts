@@ -38,6 +38,18 @@ afterEach(async () => {
 })
 
 describe('control API', () => {
+  it('does not expose the removed manager-switching endpoints', async () => {
+    application = await buildApplication(loadConfig({ NODE_ENV: 'test', DYSON_PROVIDER: 'demo',
+      DYSON_DEV_ADMIN_PASSWORD: 'test-password-long-enough', DYSON_PUBLIC_ORIGIN: 'http://127.0.0.1:13010' }))
+    const cookie = await loginAdministrator(application)
+    for (const [method, action] of [['GET', 'status'], ['POST', 'preview'], ['POST', 'prepare'],
+      ['POST', 'activate'], ['POST', 'rollback'], ['POST', 'recover']] as const) {
+      const response = await application.app.inject({ method, url: '/api/v1/cutover/' + action,
+        headers: { cookie, origin: 'http://127.0.0.1:13010' }, ...(method === 'POST' ? { payload: {} } : {}) })
+      expect(response.statusCode).toBe(404)
+    }
+  })
+
   it.each(['complete', 'empty', 'truncated', 'expired', 'unavailable'] as const)(
     'projects only a current complete authoritative roster into overview: %s', async (kind) => {
       const config = loadConfig({ NODE_ENV: 'test', DYSON_PROVIDER: 'demo',

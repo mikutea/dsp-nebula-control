@@ -520,7 +520,7 @@ try {
         -Evidence ([pscustomobject][ordered]@{ lifecycleState = 'stopped_verified' })
     [void](Write-DysonLifecycleBrokerJsonNew $terminalPaths.receipt $terminalReceipt $script:DysonLifecycleBrokerMaximumReceiptBytes)
     $auditSentinel = Join-Path $compensateBroker 'deployment-audit.keep'
-    $neighborSentinel = Join-Path $script:root 'game-steam-gsmanager.keep'
+    $neighborSentinel = Join-Path $script:root 'unrelated-neighbor.keep'
     [IO.File]::WriteAllText($auditSentinel, 'preserve', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($neighborSentinel, 'preserve', [Text.UTF8Encoding]::new($false))
     $compensation = Invoke-SelfTestInstall -Script $script:install -InstalledRoot $script:installed `

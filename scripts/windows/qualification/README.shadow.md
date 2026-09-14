@@ -49,7 +49,7 @@ environment value, receipt, or `SHADOW` phrase can authorize them; see
 
 The allowlist is `windows-restart`, `control-plane-restart`,
 `dsp-crash-recovery`, `storage-interruption`, `disk-pressure`,
-`update-rollback`, `gsmanager-switch`, and `save-restore`. Storage interruption
+`update-rollback` and `save-restore`. Storage interruption
 is limited to 300 virtual seconds. Disk pressure is limited to 85 percent and
 300 virtual seconds.
 

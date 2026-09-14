@@ -266,9 +266,9 @@ try {
         -not $protocolGate.productionChanged) -Message 'protocol and Shadow execution gates did not align'
     $plan = Import-DysonQualificationPlan -Path $planPath.Replace('Qualification.Plan.ps1', 'qualification-plan.v1.json')
     $planTest = Test-DysonQualificationPlan -Plan $plan
-    Assert-QualificationSelfTest -Condition ($planTest.valid -and $planTest.stepCount -eq 13 -and
-        @($planTest.acceptanceIds).Count -eq 9) `
-        -Message 'fixed qualification plan did not cover 13 steps and 9 acceptance IDs'
+    Assert-QualificationSelfTest -Condition ($planTest.valid -and $planTest.stepCount -eq 12 -and
+        @($planTest.acceptanceIds).Count -eq 6) `
+        -Message 'fixed qualification plan did not cover 12 steps and 6 acceptance IDs'
     $planNow = [datetimeoffset]'2026-09-01T01:00:00Z'
     $run = New-DysonQualificationRun -Plan $plan `
         -RunId '90000000-0000-4000-8000-000000000001' -NowUtc $planNow
@@ -385,7 +385,6 @@ try {
         @('storage-interruption', [pscustomobject][ordered]@{ durationSeconds = 2 }),
         @('disk-pressure', [pscustomobject][ordered]@{ durationSeconds = 2; targetPercent = 80 }),
         @('update-rollback', $null),
-        @('gsmanager-switch', $null),
         @('save-restore', $null)
     )
     $normalReceipts = @()
@@ -400,7 +399,7 @@ try {
             -Message ('normal action did not pass: ' + [string]$normalActions[$index][0])
         $normalReceipts += $receipt
     }
-    Assert-QualificationSelfTest -Condition ($normalReceipts.Count -eq 8) `
+    Assert-QualificationSelfTest -Condition ($normalReceipts.Count -eq 7) `
         -Message 'not every dangerous adapter ran in Shadow'
     Add-QualificationSelfTestResult $stage
 
@@ -736,7 +735,7 @@ try {
         [string]$orchestrationResult.result -ceq 'passed' -and
         [int]$orchestrationResult.testCount -ge 12 -and
         [int]$orchestrationResult.testCount -eq [int]$orchestrationResult.passedCount -and
-        @($orchestrationResult.actionsCovered).Count -eq 11 -and
+        @($orchestrationResult.actionsCovered).Count -eq 9 -and
         -not [bool]$orchestrationResult.productionBackendInvoked -and
         -not [bool]$orchestrationResult.productionMutationImplemented -and
         -not [bool]$orchestrationResult.serviceControlTouched -and
@@ -758,8 +757,8 @@ try {
         requestProtocol = $script:DysonQualificationActionRequestProtocol
         receiptProtocol = $script:DysonQualificationActionReceiptProtocol
         planProtocol = $script:DysonQualificationProtocol
-        planStepCount = 13
-        acceptanceIdCount = 9
+        planStepCount = 12
+        acceptanceIdCount = 6
         externalClientReceiptCount = 11
         testCount = $results.Count
         passedCount = $results.Count

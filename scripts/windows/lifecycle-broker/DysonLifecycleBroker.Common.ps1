@@ -811,8 +811,8 @@ function Get-DysonLifecycleBrokerTaskDescriptor {
 
 function Get-DysonLifecycleBrokerExpectedActiveDescriptorHash {
     param([Parameter(Mandatory)]$Descriptor)
-    # Installation pins the definition expected after cutover activation without
-    # changing the observed descriptor or enabling either scheduled task.
+    # Installation pins the prepared definition without changing the observed
+    # descriptor or enabling either scheduled task.
     $expected = [ordered]@{}
     foreach ($property in $Descriptor.PSObject.Properties) { $expected[$property.Name] = $property.Value }
     $expected.enabled = $true

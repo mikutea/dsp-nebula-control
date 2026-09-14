@@ -3,7 +3,7 @@
 . (Join-Path $PSScriptRoot 'Qualification.Protocol.ps1')
 
 $script:DysonQualificationRequiredAcceptanceIds = @(
-    'SAV-005','PRD-001','PRD-002','PRD-003','PRD-004','PRD-005','CUT-001','CUT-002','CUT-003'
+    'SAV-005','PRD-001','PRD-002','PRD-003','PRD-004','PRD-005'
 )
 $script:DysonQualificationStepStates = @(
     'pending','ready','previewed','awaiting-human','executing','verifying','passed','failed',

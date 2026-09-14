@@ -21,6 +21,10 @@ function Assert-SelfTest {
     if (-not $Condition) { throw ('data recovery self-test: ' + $Message) }
 }
 
+Assert-SelfTest -Condition ([IO.File]::ReadAllText((Join-Path $PSScriptRoot `
+    'DysonDataRootRecovery.Common.ps1')).Contains('Dyson-Control-Cutover-Broker')) `
+    -Message 'the recovery preflight omitted the retired privileged task rejection gate'
+
 function Write-SelfTestUtf8 {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][AllowEmptyString()][string]$Value)
     $parent = Get-DysonDataRootRecoveryParentPath $Path
@@ -135,7 +139,7 @@ try {
     )
     Write-SelfTestUtf8 (Join-Path $fixtureRoot '.dyson-data-root-recovery-shadow') 'shadow-only'
     Write-SelfTestTask Ready
-    foreach ($relative in @('config', 'data', 'logs', 'state', 'snapshots', 'migration', 'audit', 'runtime-task-transactions', 'acceptance')) {
+    foreach ($relative in @('config', 'data', 'logs', 'state', 'snapshots', 'audit', 'runtime-task-transactions', 'acceptance')) {
         [void][System.IO.Directory]::CreateDirectory((Join-Path $dataRoot $relative))
     }
     $secretSettingName = 'DYSON_' + 'SESSION_' + 'SECRET'
@@ -168,7 +172,6 @@ try {
     # They must survive the same byte/ACL restore and rollback checks as the database.
     $installerStatePaths = @(
         '.dyson-control-deployment-locks\fixture.lock',
-        'authority-inventory\fixture.json',
         'configuration-snapshots\fixture.json',
         'configuration-transactions\fixture.json',
         'game-access-snapshots\fixture.json',
@@ -237,45 +240,11 @@ try {
     Assert-SelfTestFailure { & $newScript @commonArgs -BundleId ([guid]::NewGuid().ToString('D')) -WhatIf } 'DYSON_CONTROL_DATA_RECOVERY_TREE_INVALID'
     [System.IO.Directory]::Delete($junction)
 
-    $brokerRoot = Join-Path $dataRoot 'data\cutover-broker'
-    foreach ($relative in @('requests', 'receipts', 'intents', 'work')) { [void][System.IO.Directory]::CreateDirectory((Join-Path $brokerRoot $relative)) }
+    $brokerRoot = Join-Path $dataRoot 'data\lifecycle-broker'
+    foreach ($relative in @('requests', 'receipts', 'intents')) { [void][System.IO.Directory]::CreateDirectory((Join-Path $brokerRoot $relative)) }
     Write-SelfTestUtf8 (Join-Path $brokerRoot ('requests\' + [guid]::NewGuid().ToString('D') + '.json')) '{}'
     Assert-SelfTestFailure { & $newScript @commonArgs -BundleId ([guid]::NewGuid().ToString('D')) -WhatIf } 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
     [System.IO.Directory]::Delete($brokerRoot, $true)
-
-    $cutoverRoot = Join-Path $dataRoot 'data\cutover-broker'
-    foreach ($relative in @('requests', 'receipts', 'intents', 'work')) {
-        [void][System.IO.Directory]::CreateDirectory((Join-Path $cutoverRoot $relative))
-    }
-    $terminalId = [guid]::NewGuid().ToString('D')
-    $terminalPath = Join-Path $cutoverRoot ('receipts\' + $terminalId + '.json')
-    $closedRead = [ordered]@{
-        protocol = 'DYSON_CONTROL_CUTOVER_BROKER_RECEIPT_V1'; schemaVersion = 1
-        brokerRequestId = $terminalId; requestFingerprint = ('a' * 64)
-        capability = 'CutoverEvidence'; requestId = [guid]::NewGuid().ToString('D')
-        authorityInventoryRevision = ('b' * 64); state = 'failed'
-        errorCode = 'DYSON_CONTROL_CUTOVER_BROKER_RECOVERY_REQUIRED'; childReceipt = $null
-        createdAt = '2026-01-01T00:00:00.0000000Z'; completedAt = '2026-01-01T00:00:01.0000000Z'
-    }
-    Write-SelfTestUtf8 $terminalPath ($closedRead | ConvertTo-Json -Depth 8 -Compress)
-    Assert-SelfTest ((Assert-DysonDataRootRecoveryBrokerHistoryClosed $cutoverRoot cutover) -eq 1) `
-        'a terminal read-only receipt with a consumed request was rejected'
-    $closedRead.capability = 'StartCandidateRuntime'
-    Write-SelfTestUtf8 $terminalPath ($closedRead | ConvertTo-Json -Depth 8 -Compress)
-    Assert-SelfTestFailure { Assert-DysonDataRootRecoveryBrokerHistoryClosed $cutoverRoot cutover } 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
-    $closedRead.capability = 'CutoverEvidence'; $closedRead.requestFingerprint = 'invalid'
-    Write-SelfTestUtf8 $terminalPath ($closedRead | ConvertTo-Json -Depth 8 -Compress)
-    Assert-SelfTestFailure { Assert-DysonDataRootRecoveryBrokerHistoryClosed $cutoverRoot cutover } 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
-    $closedRead.requestFingerprint = ('a' * 64)
-    Write-SelfTestUtf8 $terminalPath ($closedRead | ConvertTo-Json -Depth 8 -Compress)
-    $pendingPath = Join-Path $cutoverRoot ('intents\' + $terminalId + '.json')
-    Write-SelfTestUtf8 $pendingPath '{}'
-    Assert-SelfTestFailure { Assert-DysonDataRootRecoveryBrokerHistoryClosed $cutoverRoot cutover } 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
-    [System.IO.File]::Delete($pendingPath)
-    $pendingPath = Join-Path $cutoverRoot ('requests\' + [guid]::NewGuid().ToString('D') + '.json')
-    Write-SelfTestUtf8 $pendingPath '{}'
-    Assert-SelfTestFailure { Assert-DysonDataRootRecoveryBrokerHistoryClosed $cutoverRoot cutover } 'DYSON_CONTROL_DATA_RECOVERY_PENDING_MUTATION'
-    [System.IO.File]::Delete($pendingPath)
 
     Write-SelfTestTask Running
     Assert-SelfTestFailure { & $newScript @commonArgs -BundleId ([guid]::NewGuid().ToString('D')) -WhatIf } 'DYSON_CONTROL_DATA_RECOVERY_TASK_NOT_QUIESCED'

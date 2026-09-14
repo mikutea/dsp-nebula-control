@@ -1575,6 +1575,21 @@ function Get-DysonScheduledTasksByExactName {
     return @($matches)
 }
 
+function Assert-DysonRetiredPrivilegedRuntimeAbsent {
+    # This task name belonged to the removed privileged switching broker. The
+    # current release never invokes or removes that legacy runtime; it refuses
+    # to install, deploy, recover, or report ready while the SYSTEM task exists.
+    $retiredTaskName = 'Dyson-Control-Cutover-Broker'
+    $matches = @(Get-DysonScheduledTasksByExactName -TaskName $retiredTaskName)
+    if ($matches.Count -ne 0) {
+        throw 'A retired privileged control task is still registered. Remove it with the previously installed release before continuing.'
+    }
+    return [pscustomobject][ordered]@{
+        taskName = $retiredTaskName
+        absent = $true
+    }
+}
+
 function Get-DysonControlTaskActionArguments {
     param(
         [Parameter(Mandatory)][string]$LauncherPath,
@@ -2646,9 +2661,8 @@ function Get-DysonLifecycleBrokerStaticStatus {
         throw 'The lifecycle broker profile is not bound to the active release and production environment.'
     }
     Assert-DysonLifecycleBrokerDependencies -Profile $profile
-    # Deployment readiness validates the installed broker while cutover still
-    # owns activation of a prepared, disabled game-task pair. Worker dispatch
-    # retains the default active-task requirement.
+    # Deployment readiness accepts the transactionally prepared disabled task
+    # pair. Worker dispatch retains the default active-task requirement.
     [void](Assert-DysonLifecycleBrokerTaskPair -Profile $profile -AllowPreparedDisabled)
     Assert-DysonLifecycleBrokerStaticWorkerTask -Task $tasks[0] -Profile $profile -ProfileFile $expectedProfileFile
     return [pscustomobject][ordered]@{

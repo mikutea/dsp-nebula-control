@@ -26,8 +26,15 @@ function Add-Check {
 
 Add-Check -Code 'INSTALL_ROOT' -Passed (Test-Path -LiteralPath $installFull -PathType Container) -Summary 'Versioned install root exists.'
 Add-Check -Code 'DATA_ROOT' -Passed (Test-Path -LiteralPath $dataFull -PathType Container) -Summary 'Persistent data root exists.'
-Add-Check -Code 'CUTOVER_DATA' -Passed (Test-Path -LiteralPath (Join-Path $dataFull 'data\cutover') -PathType Container) `
-    -Summary 'The durable cutover journal and audit directory exists.'
+try {
+    [void](Assert-DysonRetiredPrivilegedRuntimeAbsent)
+    Add-Check -Code 'RETIRED_PRIVILEGED_RUNTIME' -Passed $true `
+        -Summary 'No retired privileged control task is registered.'
+}
+catch {
+    Add-Check -Code 'RETIRED_PRIVILEGED_RUNTIME' -Passed $false `
+        -Summary 'A retired privileged control task is still registered.'
+}
 $activeVersion = $null
 $active = $null
 try {
@@ -164,7 +171,7 @@ if ($ReadinessUri) {
             throw 'The Node.js runtime identity changed before readiness validation.'
         }
         [void](Test-DysonLoopbackReadiness -ReadinessUri $ReadinessUri -ExpectedVersion $activeVersion `
-            -RequiredChecks @('lifecycleBroker', 'cutoverRecovery') -TimeoutSeconds 2)
+            -RequiredChecks @('lifecycleBroker') -TimeoutSeconds 2)
         $readinessPassed = $true
         Add-Check -Code 'LOOPBACK_READINESS' -Passed $true -Summary 'The loopback /readyz endpoint proved deep application readiness.'
     }

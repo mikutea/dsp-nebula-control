@@ -38,11 +38,6 @@ const environmentSchema = z.object({
   DYSON_NEBULA_PLUGIN_TRANSACTION_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_NEBULA_PLUGIN_TRANSACTION_RECOVERY_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_NEBULA_PLUGIN_JOB_BASE: z.string().optional(),
-  DYSON_CUTOVER_ENABLED: z.enum(['true', 'false']).default('false'),
-  DYSON_CUTOVER_RECOVERY_ENABLED: z.enum(['true', 'false']).default('false'),
-  DYSON_CUTOVER_PROFILE_FILE: z.string().optional(),
-  DYSON_CUTOVER_SERVICE_USER: z.string().min(3).max(128).regex(/^[^"\r\n]+$/).optional(),
-  DYSON_CUTOVER_TASK_TRANSACTION_ROOT: z.string().optional(),
   DYSON_QUALIFIED_CLIENT_PROFILE_ENABLED: z.enum(['true', 'false']).default('false'),
   DYSON_CLIENT_QUALIFICATION_EVIDENCE_ROOT: z.string().optional(),
   DYSON_CLIENT_QUALIFICATION_BUILD_HARVEST_ROOT_A: z.string().optional(),
@@ -131,12 +126,6 @@ export interface AppConfig {
   nebulaPluginTransactionRecoveryEnabled: boolean
   nebulaPluginJobBase: string | null
   nebulaPluginGameRoot: string | null
-  cutoverEnabled: boolean
-  cutoverRecoveryEnabled: boolean
-  cutoverProfileFile: string | null
-  cutoverServiceUser: string | null
-  cutoverTaskTransactionRoot: string | null
-  cutoverDataDirectory: string
   qualifiedClientProfileEnabled: boolean
   clientQualificationEvidenceRoot: string | null
   clientQualificationBuildHarvestRootA: string | null
@@ -356,33 +345,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
       }
     }
   }
-  if (value.DYSON_CUTOVER_PROFILE_FILE && !path.isAbsolute(value.DYSON_CUTOVER_PROFILE_FILE)) {
-    throw new Error('DYSON_CUTOVER_PROFILE_FILE must be an absolute path')
-  }
-  if (value.DYSON_CUTOVER_TASK_TRANSACTION_ROOT &&
-      !path.isAbsolute(value.DYSON_CUTOVER_TASK_TRANSACTION_ROOT)) {
-    throw new Error('DYSON_CUTOVER_TASK_TRANSACTION_ROOT must be an absolute path')
-  }
-  if (value.DYSON_CUTOVER_ENABLED === 'true' || value.DYSON_CUTOVER_RECOVERY_ENABLED === 'true') {
-    if (value.DYSON_PROVIDER !== 'windows') {
-      throw new Error('Dyson cutover requires the Windows provider')
-    }
-    if (value.DYSON_LIFECYCLE_ENABLED !== 'true') {
-      throw new Error('Dyson cutover requires lifecycle execution')
-    }
-    if (!value.DYSON_CUTOVER_PROFILE_FILE) {
-      throw new Error('Dyson cutover requires DYSON_CUTOVER_PROFILE_FILE')
-    }
-    if (!value.DYSON_CUTOVER_SERVICE_USER) {
-      throw new Error('Dyson cutover requires DYSON_CUTOVER_SERVICE_USER')
-    }
-    if (!value.DYSON_CUTOVER_TASK_TRANSACTION_ROOT) {
-      throw new Error('Dyson cutover requires DYSON_CUTOVER_TASK_TRANSACTION_ROOT')
-    }
-    if (!value.DYSON_DATA_DIR || !path.isAbsolute(value.DYSON_DATA_DIR)) {
-      throw new Error('Dyson cutover requires an absolute DYSON_DATA_DIR')
-    }
-  }
   const qualifiedClientValues = [
     value.DYSON_CLIENT_QUALIFICATION_EVIDENCE_ROOT,
     value.DYSON_CLIENT_QUALIFICATION_BUILD_HARVEST_ROOT_A,
@@ -535,19 +497,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     nebulaPluginGameRoot: value.DYSON_PROJECT_ROOT
       ? path.resolve(value.DYSON_PROJECT_ROOT, 'server')
       : null,
-    cutoverEnabled: value.DYSON_CUTOVER_ENABLED === 'true',
-    cutoverRecoveryEnabled: value.DYSON_CUTOVER_RECOVERY_ENABLED === 'true',
-    cutoverProfileFile: value.DYSON_CUTOVER_PROFILE_FILE
-      ? path.resolve(value.DYSON_CUTOVER_PROFILE_FILE)
-      : null,
-    cutoverServiceUser: value.DYSON_CUTOVER_SERVICE_USER ?? null,
-    cutoverTaskTransactionRoot: value.DYSON_CUTOVER_TASK_TRANSACTION_ROOT
-      ? path.resolve(value.DYSON_CUTOVER_TASK_TRANSACTION_ROOT)
-      : null,
-    cutoverDataDirectory: path.resolve(
-      value.DYSON_DATA_DIR ?? path.join(repositoryRoot, 'data'),
-      'cutover'
-    ),
     qualifiedClientProfileEnabled: value.DYSON_QUALIFIED_CLIENT_PROFILE_ENABLED === 'true',
     clientQualificationEvidenceRoot: value.DYSON_CLIENT_QUALIFICATION_EVIDENCE_ROOT
       ? path.resolve(value.DYSON_CLIENT_QUALIFICATION_EVIDENCE_ROOT)

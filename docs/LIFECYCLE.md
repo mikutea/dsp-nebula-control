@@ -293,18 +293,7 @@ no trigger, `IgnoreNew`, a five-minute execution limit, and one profile-bound
 PowerShell action. The profile file/ACL and task/task DACL are part of the
 installation preimage and rollback contract.
 
-Cutover installation is rejected unless `-InstallCutoverBrokerTask` is combined
-with `-InstallLifecycleBrokerTask` in the same call. Its exact additional inputs
-are `-CutoverProjectRoot`, `-CutoverAuthorityProfileFile`,
-`-CutoverAuthorityInventoryRevision`, `-CutoverRuntimeTaskTransactionRoot`,
-`-CutoverServiceUser`, `-CutoverGamePort`, and
-`-CutoverRuntimeBootstrapRoot`; a cross-release change also needs
-`-UpgradeCutoverBrokerExisting`. Project, bootstrap, service-user, and game-port
-values must equal the lifecycle values. The environment must enable
-`DYSON_CUTOVER_ENABLED=true` and `DYSON_CUTOVER_RECOVERY_ENABLED=true` and bind
-the same authority profile, transaction root, account, and port.
-
-`-WhatIf` validates these complete bindings and reports the requested install,
+`-WhatIf` validates the complete lifecycle bindings and reports the requested install,
 upgrade, or reuse modes without running Node, registering tasks, publishing
 profiles, starting the control task, or polling readiness. A real operation has
 this strict order:
@@ -312,12 +301,10 @@ this strict order:
 ```text
 release + bootstrap + configuration + control task
   -> lifecycle broker
-  -> cutover broker (when requested)
   -> control-task start + exact-version readiness
 ```
 
-The final readiness check requires `lifecycleBroker`; a cutover transaction also
-requires `cutoverRecovery`. Same-release lifecycle reuse returns `reused`, proves
+The final readiness check requires `lifecycleBroker`. Same-release lifecycle reuse returns `reused`, proves
 the preimage stayed exact, and is never compensated. A cross-release lifecycle
 change must have `-UpgradeLifecycleBrokerExisting` or the transaction fails
 closed.
@@ -330,8 +317,7 @@ fails, the deployment first removes the replacement control task and restores
 the old active release, bootstrap, configuration, and data ACL. Only then does it
 invoke the **old release's** lifecycle installer with `-UpgradeExisting`, restore
 the old profile bytes/profile ACL and task XML/enabled state/task DACL, and prove
-the old preimage exact. Deferred cutover restoration follows lifecycle; the old
-control task is restored last.
+the old preimage exact. The old control task is restored last.
 
 Normal control-plane uninstall captures the lifecycle profile hash and calls the
 active release installer with `-RemoveCurrent -ExpectedProfileHash <sha256>`.
@@ -344,24 +330,22 @@ orphaned or unknown broker state. It removes only the fixed profile and worker
 task and returns a bounded
 `DYSON_CONTROL_LIFECYCLE_BROKER_REMOVAL_RECEIPT_V1`. Requests, receipts, empty
 intent storage, audits, recovery sentinels, and other DataRoot evidence remain.
-`-RemoveData` is rejected while retained lifecycle/cutover/authority evidence
+`-RemoveData` is rejected while retained lifecycle evidence
 exists.
 
-Control-plane uninstall validates both broker preimages before any mutation. It
+Control-plane uninstall validates the lifecycle-broker preimage before any mutation. It
 then stops and removes the control task first to quiesce the request entry point,
-removes the dependent cutover broker with `RemoveCurrent`, removes lifecycle with
-`-RemoveCurrent -ExpectedProfileHash`, and only then moves the release or performs
+removes lifecycle with `-RemoveCurrent -ExpectedProfileHash`, and only then moves the release or performs
 explicitly approved data removal. Quiescing the request entry point is not a
-reversal of broker dependency order: cutover is still removed before lifecycle;
-the early control-task step only prevents new work from arriving during teardown.
+substitute for broker idleness; it only prevents new work from arriving during teardown.
 If any later step fails, rollback restores release and active-pointer state first,
-then lifecycle, then cutover, and restores the exact prior control task last.
+then lifecycle, and restores the exact prior control task last.
 
 `Test-DysonControlDeployment.ps1` performs the read-only static lifecycle check:
 an enabled broker must be bound to the active release, environment, dependencies,
 runtime tasks, worker task, and clean channel; a disabled configuration must have
 no residual broker state. With `-ReadinessUri`, status additionally requires
-`lifecycleBroker` and `cutoverRecovery`. Reboot checkpoint creation and resume
+`lifecycleBroker`. Reboot checkpoint creation and resume
 are stricter: they require static lifecycle state `ready` and both deep readiness
 checks before accepting either side of the reboot. The repository-only gates are
 `npm run lifecycle:broker-selftest`, `npm run deployment:status-selftest`, and
@@ -415,7 +399,7 @@ installed nor enabled by default. A Windows save/stop/restart preflight reports
 start additionally requires one bound interactive game session and Steam in
 that same session.
 
-## Requirements before production cutover
+## Requirements before production deployment
 
 The repository implementation is not, by itself, production verification.
 Before enabling target-host lifecycle mutation, the release manifest still

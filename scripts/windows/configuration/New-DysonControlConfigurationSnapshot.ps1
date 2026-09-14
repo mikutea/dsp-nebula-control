@@ -56,7 +56,7 @@ if ($WhatIfPreference) {
         mode = 'what-if'
         configurationSha256 = [string]$configuration.sha256
         configurationLength = [int64]$configuration.length
-        contractSha256 = [string]$contract.sha256
+        contractSha256 = [string]$transactionState.terminalContractSha256
         bindingsSha256 = [string]$configuration.bindingsSha256
         completedTransactionCount = [int]$transactionState.receipts.Count
         existingSnapshotCount = [int]$existingSnapshotCount
@@ -85,6 +85,7 @@ try {
         throw 'DYSON_CONFIGURATION_TARGET_CHANGED'
     }
     $parameters = @{
+        RecordedContractSha256 = [string]$underLock.terminalContractSha256
         Storage = $storage
         Contract = $contract
         ExpectedLauncherBindings = $bindings
@@ -116,6 +117,6 @@ finally { $lock.Dispose() }
     configurationAclFingerprint = [string]$snapshot.configurationAclFingerprint
     manifestSha256 = [string]$snapshot.manifestSha256
     bindingsSha256 = [string]$snapshot.bindingsSha256
-    contractSha256 = [string]$contract.sha256
+    contractSha256 = [string]$snapshot.contractSha256
     mutationPerformed = $true
 }

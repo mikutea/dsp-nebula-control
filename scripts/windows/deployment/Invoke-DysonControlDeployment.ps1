@@ -67,10 +67,10 @@ if ([string]::Equals($installFull, $dataFull, [System.StringComparison]::Ordinal
     throw 'InstallRoot and DataRoot must be separate directory trees.'
 }
 Assert-DysonRelativePath -Path $EntryPointRelativePath -Name 'EntryPointRelativePath'
+[void](Assert-DysonRetiredPrivilegedRuntimeAbsent)
 
 $brokerProfileCandidates = @(
-    (Join-Path $dataFull 'data\lifecycle-broker\broker-profile.json'),
-    (Join-Path $dataFull 'data\cutover-broker\broker-profile.json')
+    (Join-Path $dataFull 'data\lifecycle-broker\broker-profile.json')
 )
 $brokerProfilePresent = @($brokerProfileCandidates | Where-Object {
     Test-Path -LiteralPath $_

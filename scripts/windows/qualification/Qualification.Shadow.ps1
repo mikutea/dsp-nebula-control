@@ -213,7 +213,6 @@ function Initialize-DysonQualificationShadowFixture {
         diskPressurePercent = 0
         activeRelease = 'candidate'
         previousRelease = 'stable'
-        gsManagerState = 'recoverable-disabled'
         savePairRevision = [int64]1
         manualRecoveryRequired = $false
         evidence = @()
@@ -378,15 +377,6 @@ function Invoke-DysonQualificationShadowEffect {
                 }
             }
             $summary['previousReleaseActivated'] = $true
-        }
-        'gsmanager-switch' {
-            if ([string]$State.gsManagerState -ceq 'recoverable-disabled') {
-                $State.gsManagerState = 'shadow-active'
-            }
-            else { $State.gsManagerState = 'recoverable-disabled' }
-            $durationSeconds = 30
-            $summary['recoverable'] = $true
-            $summary['state'] = [string]$State.gsManagerState
         }
         'save-restore' {
             $State.savePairRevision = [int64]$State.savePairRevision + 1

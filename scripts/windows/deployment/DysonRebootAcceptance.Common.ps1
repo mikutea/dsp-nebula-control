@@ -724,6 +724,7 @@ function Get-DysonRebootAcceptanceNativeControlObservation {
         [Parameter(Mandatory)][string]$TaskName
     )
 
+    [void](Assert-DysonRetiredPrivilegedRuntimeAbsent)
     $active = Get-DysonActiveRelease -InstallRoot $InstallRoot -DataRoot $DataRoot
     if (-not $active) { throw 'No Dyson Control release is active.' }
     $tasks = @(Get-DysonScheduledTasksByExactName -TaskName $TaskName)
@@ -775,7 +776,6 @@ function Get-DysonRebootAcceptanceNativeControlObservation {
     $requiredChecks = @('lifecycleBroker')
     $configured = Read-DysonDeploymentStatusEnvironmentFile -Path $environmentPath
     try {
-        if ($configured['DYSON_CUTOVER_RECOVERY_ENABLED'] -ceq 'true') { $requiredChecks += 'cutoverRecovery' }
     }
     finally { $configured.Clear() }
     [void](Test-DysonLoopbackReadiness -ReadinessUri $ReadinessUri `

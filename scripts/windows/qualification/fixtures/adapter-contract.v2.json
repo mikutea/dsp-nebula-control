@@ -15,7 +15,7 @@
       "timeoutMaximumSeconds": 900,
       "identityRule": "exact-pid-path-file-sha256-and-scheduled-task-xml-sha256",
       "compensation": "start-exact-profile-task-and-reinspect",
-      "forbiddenTargets": ["dsp-process", "gsmanager-process", "image-name-match"]
+      "forbiddenTargets": ["dsp-process", "unmanaged-process", "image-name-match"]
     },
     {
       "action": "dsp-crash-recovery",

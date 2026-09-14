@@ -344,3 +344,64 @@ Required affected checks:
 Do not classify this batch as verified merely because its source fingerprints are
 registered. Mapping selects checks; only their results and native acceptance can
 establish the associated claims. Do not automatically run npm run check.
+
+## Recorded configuration contract migration (in progress)
+
+RC27 reads completed RC26 configuration transactions and snapshots only through
+an immutable, hash-verified copy of the RC26 contract. The supported evolution
+adds the two cleanup gates and the startup timeout key, and removes the five
+obsolete manager-switching keys; secret, launcher-owned,
+required-name and size-limit policies must remain identical. Pending transactions
+under the older contract require recovery before migration. Runtime approval
+continues to bind the actual terminal environment contract, including when a
+restore returns to an RC26 snapshot.
+
+Run the configuration native self-test, deployment configuration integration,
+release packaging and full installer upgrade/failure/rollback fixtures, plus API
+configuration and apply/reconcile checks. Installer rollback must validate mixed
+history with the new reader and independently verify the restored launcher's
+runtime-only approval. These checks do not replace a cross-version target-host
+upgrade and rollback demonstration. Existing RC26 deployment evidence cannot
+prove this migration complete.
+
+## Direct management deployment cleanup (in progress)
+
+The manager-switching web workspace, API client, routes, controller construction,
+recovery readiness check, durable-store adapters and host script runner capabilities
+are removed. Their permissions and application settings are removed as well.
+The immutable RC26 environment contract remains only for historical receipt and
+snapshot verification; it does not restore an executable switching capability.
+Nebula plugin transaction capabilities are unrelated and remain supported.
+
+The Windows switching/migration tools, broker, package entries, examples and
+operator documents are removed. Production qualification now uses an
+`independent-deployment` action bound to the deployment receipt, strict panel
+observation and deployment rollback receipt. The public acceptance manifest has
+45 requirements: 39 implemented and six production requirements awaiting real
+evidence. V1 keeps 12 steps for those six requirements; orchestration V2 keeps
+nine protected actions. The shared project copy no longer carries the obsolete
+manager adapter or installer scripts.
+
+Validation completed so far: API/web builds, 77 focused API tests, authenticated
+404 checks for all six former switching endpoints, PowerShell syntax, 179 native
+configuration assertions with 69 current environment keys, 107 lifecycle-broker
+cases, 41 runtime-task cases, DataRoot recovery, deployment configuration/status/
+reboot checks, the 18-case orchestration matrix, the 28-case V1 qualification
+matrix, acceptance validation and release-package assembly. The full installer
+self-test passes on the Dyson VM, and the new validator reads all 47 completed
+RC26 configuration transactions with the legacy contract and zero mutation.
+The full release-artifact self-test also passes on the Dyson VM, including every
+packaged protocol self-test and the missing/extra/tampered-file matrices. Exact
+affected/deletion hashes, CI and target-host deployment still
+remain. Do not reuse the previous candidate artifact or its CI result for these
+bytes.
+
+Security review found and fixed three pre-deployment issues: the independent
+deployment adapter now validates and cross-binds the real installer, panel and
+rollback receipts; every deployment/recovery entry point rejects a registered
+retired privileged task; and a restore validates RC26 snapshot bytes under the
+snapshot's immutable contract before publishing them. Adversarial qualification
+fixtures now reject the former synthetic receipt shape and cross-payload,
+cross-version and cross-snapshot splices. A legacy restore fixture contains all
+five RC26-only fields so the compatibility path is exercised rather than merely
+the common subset.

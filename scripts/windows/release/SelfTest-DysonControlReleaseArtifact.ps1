@@ -164,15 +164,10 @@ export { allowedScriptPaths };
         'Configure-DysonInteractiveSession.ps1', 'Disable-DysonInteractiveSession.ps1',
         'DysonSession.Common.ps1', 'Test-DysonInteractiveSession.ps1'
     )
-    $migrationScripts = @(
-        'DysonGsManagerMigration.Common.ps1', 'Get-DysonGsManagerMigration.ps1',
-        'New-DysonGsManagerSnapshot.ps1', 'Restore-DysonGsManagerSnapshot.ps1',
-        'SelfTest-DysonGsManagerMigration.ps1', 'Test-DysonGsManagerSnapshot.ps1'
-    )
-    $gsManagerRemovalScriptPaths = @($script:DysonArtifactRequiredGsManagerRemovalScripts)
-    $gsManagerRemovalScripts = @($gsManagerRemovalScriptPaths | ForEach-Object { [System.IO.Path]::GetFileName($_) })
-    Assert-ReleaseSelfTest -Condition ($gsManagerRemovalScripts.Count -eq 5) `
-        -Message 'the exact GSManager recoverable-removal allowlist did not contain five entries'
+
+
+
+
     $evidenceScripts = @(
         'DysonPrivateEvidence.Common.ps1', 'New-DysonAcceptanceEvidenceIndex.ps1',
         'New-DysonPrivateEvidenceBundle.ps1', 'SelfTest-DysonPrivateEvidenceBundle.ps1',
@@ -199,16 +194,14 @@ export { allowedScriptPaths };
         -Message 'the bounded artifact-builder selection did not exactly combine host-mutation and Nebula transaction runtime files'
     $gameBootstrapScriptPaths = @($script:DysonArtifactRequiredGameBootstrapScripts)
     $gameBootstrapScripts = @($gameBootstrapScriptPaths | ForEach-Object { [System.IO.Path]::GetFileName($_) })
-    Assert-ReleaseSelfTest -Condition ($gameBootstrapScripts.Count -eq 5) `
-        -Message 'the exact stable game bootstrap allowlist did not contain five entries'
-    $cutoverScriptPaths = @($script:DysonArtifactRequiredCutoverScripts)
-    $cutoverScripts = @($cutoverScriptPaths | ForEach-Object { [System.IO.Path]::GetFileName($_) })
-    Assert-ReleaseSelfTest -Condition ($cutoverScripts.Count -eq 7) `
-        -Message 'the exact cutover host allowlist did not contain seven entries'
-    $cutoverBrokerScriptPaths = @($script:DysonArtifactRequiredCutoverBrokerScripts)
-    $cutoverBrokerScripts = @($cutoverBrokerScriptPaths | ForEach-Object { [System.IO.Path]::GetFileName($_) })
-    Assert-ReleaseSelfTest -Condition ($cutoverBrokerScripts.Count -eq 6) `
-        -Message 'the exact cutover broker allowlist did not contain six entries'
+    Assert-ReleaseSelfTest -Condition ($gameBootstrapScripts.Count -eq 7) `
+        -Message 'the exact stable game bootstrap allowlist did not contain seven entries'
+
+
+
+
+
+
     $lifecycleBrokerScriptPaths = @($script:DysonArtifactRequiredLifecycleBrokerScripts)
     $lifecycleBrokerScripts = @($lifecycleBrokerScriptPaths | ForEach-Object { [System.IO.Path]::GetFileName($_) })
     Assert-ReleaseSelfTest -Condition ($lifecycleBrokerScripts.Count -eq 6) `
@@ -218,14 +211,15 @@ export { allowedScriptPaths };
     Assert-ReleaseSelfTest -Condition ($dataRecoveryScripts.Count -eq 5) `
         -Message 'the exact DataRoot recovery allowlist did not contain five entries'
     $configurationFilePaths = @($script:DysonArtifactRequiredConfigurationFiles)
-    Assert-ReleaseSelfTest -Condition ($configurationFilePaths.Count -eq 8 -and
+    Assert-ReleaseSelfTest -Condition ($configurationFilePaths.Count -eq 9 -and
+        $configurationFilePaths -ccontains 'scripts/windows/configuration/dyson-control.environment-contract.rc26.json' -and
         $configurationFilePaths -ccontains `
             'scripts/windows/configuration/SelfTest-DysonControlConfiguration.ps1' -and
         $configurationFilePaths -ccontains `
             'scripts/windows/configuration/New-DysonControlConfigurationSnapshot.ps1' -and
         $configurationFilePaths -ccontains `
             'scripts/windows/configuration/Restore-DysonControlConfiguration.ps1') `
-        -Message 'the exact protected configuration allowlist did not contain its eight runtime, transaction, and self-test files'
+        -Message 'the exact protected configuration allowlist did not contain its nine runtime, transaction, legacy-contract and self-test files'
     $networkFilePaths = @($script:DysonArtifactRequiredNetworkFiles)
     Assert-ReleaseSelfTest -Condition ($networkFilePaths.Count -eq 17) `
         -Message 'the exact Nebula network and hostname-WSS qualification allowlist did not contain seventeen entries'
@@ -239,13 +233,13 @@ export { allowedScriptPaths };
     Assert-ReleaseSelfTest -Condition ($qualificationFrameworkPaths.Count -eq 16) `
         -Message 'the exact qualification V1/V2 framework allowlist did not contain its sixteen-file dependency closure'
     $strictQualificationV2Paths = @($script:DysonArtifactRequiredStrictQualificationV2Files)
-    Assert-ReleaseSelfTest -Condition ($strictQualificationV2Paths.Count -eq 39 -and
+    Assert-ReleaseSelfTest -Condition ($strictQualificationV2Paths.Count -eq 22 -and
         @($strictQualificationV2Paths | Where-Object {
             $_ -cnotmatch '^scripts/windows/qualification/'
         }).Count -eq 0) `
-        -Message 'the exact strict qualification V2 allowlist did not contain thirty-nine bounded entries'
+        -Message 'the exact strict qualification V2 allowlist did not contain twenty-two bounded entries'
     $qualificationRuntimePaths = @($script:DysonArtifactRequiredQualificationRuntimeFiles)
-    Assert-ReleaseSelfTest -Condition ($qualificationRuntimePaths.Count -eq 65 -and
+    Assert-ReleaseSelfTest -Condition ($qualificationRuntimePaths.Count -eq 48 -and
         @($qualificationOrchestrationV2Paths | Where-Object { $_ -cnotin $qualificationRuntimePaths }).Count -eq 0 -and
         @($qualificationFrameworkPaths | Where-Object { $_ -cnotin $qualificationRuntimePaths }).Count -eq 0 -and
         @($strictQualificationV2Paths | Where-Object { $_ -cnotin $qualificationRuntimePaths }).Count -eq 0) `
@@ -256,8 +250,8 @@ export { allowedScriptPaths };
     $hostnameWssSourcePaths = @($script:DysonArtifactRequiredNebulaHostnameWssSources)
     Assert-ReleaseSelfTest -Condition ($hostnameWssSourcePaths.Count -eq 2) `
         -Message 'the exact hostname-WSS public source contract allowlist did not contain two entries'
-    $migrationDocs = @($script:DysonArtifactRequiredMigrationDocs)
-    $gsManagerRemovalDocs = @($script:DysonArtifactRequiredGsManagerRemovalDocs)
+    $deploymentDocs = @($script:DysonArtifactRequiredDeploymentDocs)
+
     $recoveryDocs = @($script:DysonArtifactRequiredRecoveryDocs)
     $networkDocs = @($script:DysonArtifactRequiredNetworkDocs)
     $qualificationDocs = @($script:DysonArtifactRequiredQualificationDocs)
@@ -295,16 +289,8 @@ export { allowedScriptPaths };
         Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\bootstrap\$name") `
             -Destination (Join-Path $fixtureRoot $relative.Replace('/', '\'))
     }
-    foreach ($relative in $cutoverScriptPaths) {
-        $name = [System.IO.Path]::GetFileName($relative)
-        Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\cutover\$name") `
-            -Destination (Join-Path $fixtureRoot $relative.Replace('/', '\'))
-    }
-    foreach ($relative in $cutoverBrokerScriptPaths) {
-        $name = [System.IO.Path]::GetFileName($relative)
-        Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\cutover-broker\$name") `
-            -Destination (Join-Path $fixtureRoot $relative.Replace('/', '\'))
-    }
+
+
     foreach ($relative in $lifecycleBrokerScriptPaths) {
         $name = [System.IO.Path]::GetFileName($relative)
         Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\lifecycle-broker\$name") `
@@ -339,15 +325,8 @@ export { allowedScriptPaths };
         Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\session\$name") `
             -Destination (Join-Path $fixtureRoot "scripts\windows\session\$name")
     }
-    foreach ($name in $migrationScripts) {
-        Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\migration\$name") `
-            -Destination (Join-Path $fixtureRoot "scripts\windows\migration\$name")
-    }
-    foreach ($relative in $gsManagerRemovalScriptPaths) {
-        $name = [System.IO.Path]::GetFileName($relative)
-        Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\migration\$name") `
-            -Destination (Join-Path $fixtureRoot $relative.Replace('/', '\'))
-    }
+
+
     foreach ($name in $evidenceScripts) {
         Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\evidence\$name") `
             -Destination (Join-Path $fixtureRoot "scripts\windows\evidence\$name")
@@ -360,13 +339,12 @@ export { allowedScriptPaths };
         Copy-FixtureScript -Source (Join-Path $PSScriptRoot "..\..\..\integrations\dyson-control-bridge\$name") `
             -Destination (Join-Path $fixtureRoot "integrations\dyson-control-bridge\$name")
     }
-    foreach ($relative in @(
-        $migrationDocs + $gsManagerRemovalDocs + $recoveryDocs + $networkDocs + $qualificationDocs
-    )) {
+
+
+    foreach ($relative in @($deploymentDocs + $recoveryDocs + $networkDocs + $qualificationDocs)) {
         Copy-FixtureScript -Source (Join-Path $repositoryRoot $relative.Replace('/', '\')) `
             -Destination (Join-Path $fixtureRoot $relative.Replace('/', '\'))
     }
-
     $excludedNebulaPrivateSourcePaths = @(
         'scripts/windows/nebula-private-build/README.md',
         'scripts/windows/nebula-private-build/SelfTest-NebulaPrivateBuild.ps1',
@@ -429,8 +407,8 @@ export { allowedScriptPaths };
         [int]$preview.hostnameWssQualificationProtocolFiles -eq 2 -and
         [int]$preview.qualificationOrchestrationV2Files -eq 8 -and
         [int]$preview.qualificationFrameworkFiles -eq 16 -and
-        [int]$preview.strictQualificationV2Files -eq 39 -and
-        [int]$preview.qualificationRuntimeFiles -eq 65 -and
+        [int]$preview.strictQualificationV2Files -eq 22 -and
+        [int]$preview.qualificationRuntimeFiles -eq 48 -and
         [int]$preview.hostnameWssSourceContractFiles -eq 2 -and
         [int]$preview.networkDocuments -eq 1 -and
         [int]$preview.qualificationDocuments -eq 1) `
@@ -486,21 +464,16 @@ export { allowedScriptPaths };
         [int]$verifiedA.nebulaPluginTransactionRunnerMappingsRequired -eq 5 -and
         -not [bool]$verifiedA.privateNebulaCandidateBinariesPackaged) `
         -Message 'artifact verification did not attest the exact public Nebula V3 API/runtime and private-binary boundary'
-    Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.gsManagerParallelMigrationPackaged -and [bool]$verifiedA.migrationDocumentationPackaged) `
-        -Message 'artifact verification did not attest the GSManager parallel-migration tools and documentation'
-    Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.gsManagerRecoverableRemovalPackaged -and
-        [bool]$verifiedA.gsManagerRemovalDocumentationPackaged) `
-        -Message 'artifact verification did not attest the GSManager recoverable-removal tools and documentation'
+
+
     Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.privateAcceptanceEvidenceToolingPackaged) `
         -Message 'artifact verification did not attest the private acceptance evidence tooling'
     Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.hostMutationLeaseToolingPackaged) `
         -Message 'artifact verification did not attest the host-mutation lease tooling'
     Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.stableGameBootstrapPackaged) `
         -Message 'artifact verification did not attest the stable game bootstrap tooling'
-    Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.cutoverHostToolingPackaged) `
-        -Message 'artifact verification did not attest the cutover host tooling'
-    Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.cutoverBrokerToolingPackaged) `
-        -Message 'artifact verification did not attest the cutover broker tooling'
+
+
     Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.lifecycleBrokerToolingPackaged) `
         -Message 'artifact verification did not attest the lifecycle broker tooling'
     Assert-ReleaseSelfTest -Condition ([bool]$verifiedA.dataRootRecoveryToolingPackaged -and
@@ -724,13 +697,9 @@ export { allowedScriptPaths };
         $script:DysonArtifactRequiredConfigurationFiles +
         $script:DysonArtifactRequiredSessionScripts +
         $script:DysonArtifactRequiredBridgeScripts +
-        $script:DysonArtifactRequiredMigrationScripts +
-        $script:DysonArtifactRequiredGsManagerRemovalScripts +
         $script:DysonArtifactRequiredEvidenceScripts +
         $script:DysonArtifactRequiredHostMutationScripts +
         $script:DysonArtifactRequiredGameBootstrapScripts +
-        $script:DysonArtifactRequiredCutoverScripts +
-        $script:DysonArtifactRequiredCutoverBrokerScripts +
         $script:DysonArtifactRequiredLifecycleBrokerScripts +
         $script:DysonArtifactRequiredDataRecoveryScripts +
         $script:DysonArtifactRequiredNetworkFiles +
@@ -748,21 +717,15 @@ export { allowedScriptPaths };
         'scripts/windows/cutover/Get-DysonCutoverEvidence.ps1',
         'scripts/windows/cutover-broker/Submit-DysonCutoverBrokerRequest.ps1'
     )) {
-        Assert-ReleaseSelfTest -Condition ($runnerScriptPaths -ccontains $cutoverRunnerPath) `
-            -Message "the complete PowerShell runner drift check omitted a cutover mapping: $cutoverRunnerPath"
+        Assert-ReleaseSelfTest -Condition ($runnerScriptPaths -cnotcontains $cutoverRunnerPath) `
+            -Message "the PowerShell runner still exposes a removed manager mapping: $cutoverRunnerPath"
     }
     foreach ($name in $sessionScripts) {
         Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA "scripts\windows\session\$name") -PathType Leaf) `
             -Message "interactive-session runtime script was omitted: $name"
     }
-    foreach ($name in $migrationScripts) {
-        Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA "scripts\windows\migration\$name") -PathType Leaf) `
-            -Message "a GSManager migration script was omitted from the public artifact: $name"
-    }
-    foreach ($relative in $gsManagerRemovalScriptPaths) {
-        Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA $relative.Replace('/', '\')) -PathType Leaf) `
-            -Message "a GSManager recoverable-removal script was omitted from the public artifact: $relative"
-    }
+
+
     foreach ($name in $evidenceScripts) {
         Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA "scripts\windows\evidence\$name") -PathType Leaf) `
             -Message "a private acceptance evidence tool was omitted from the public artifact: $name"
@@ -784,14 +747,8 @@ export { allowedScriptPaths };
         Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA $relative.Replace('/', '\')) -PathType Leaf) `
             -Message "a required stable game bootstrap script was omitted from the artifact: $relative"
     }
-    foreach ($relative in $cutoverScriptPaths) {
-        Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA $relative.Replace('/', '\')) -PathType Leaf) `
-            -Message "a required cutover host script was omitted from the artifact: $relative"
-    }
-    foreach ($relative in $cutoverBrokerScriptPaths) {
-        Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA $relative.Replace('/', '\')) -PathType Leaf) `
-            -Message "a required cutover broker script was omitted from the artifact: $relative"
-    }
+
+
     foreach ($relative in $lifecycleBrokerScriptPaths) {
         Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA $relative.Replace('/', '\')) -PathType Leaf) `
             -Message "a required lifecycle broker script was omitted from the artifact: $relative"
@@ -824,22 +781,10 @@ export { allowedScriptPaths };
         [bool]$packagedGameBootstrapSelfTest.publicReceiptsWerePathFree -and
         [bool]$packagedGameBootstrapSelfTest.unrelatedProcessPreserved) `
         -Message 'the packaged stable game bootstrap did not pass its self-contained shadow-runtime test'
-    $packagedCutoverHostSelfTest = Convert-LastJsonResult -Output (Invoke-PackagedSelfTest `
-        -Script (Join-Path $artifactA 'scripts\windows\cutover\SelfTest-DysonCutoverHost.ps1'))
-    Assert-ReleaseSelfTest -Condition ($packagedCutoverHostSelfTest.protocol -ceq 'DYSON_CONTROL_CUTOVER_HOST_SELFTEST_V1' -and
-        $packagedCutoverHostSelfTest.status -ceq 'passed' -and
-        [int]$packagedCutoverHostSelfTest.testCount -ge 13 -and
-        @($packagedCutoverHostSelfTest.tests).Count -eq [int]$packagedCutoverHostSelfTest.testCount) `
-        -Message 'the packaged cutover host tools did not pass their self-contained shadow test'
-    $packagedCutoverBrokerSelfTest = Convert-LastJsonResult -Output (Invoke-PackagedSelfTest `
-        -Script (Join-Path $artifactA 'scripts\windows\cutover-broker\SelfTest-DysonCutoverBroker.ps1'))
-    Assert-ReleaseSelfTest -Condition ($packagedCutoverBrokerSelfTest.protocol -ceq 'DYSON_CONTROL_CUTOVER_BROKER_SELFTEST_V1' -and
-        [int]$packagedCutoverBrokerSelfTest.schemaVersion -eq 1 -and
-        $packagedCutoverBrokerSelfTest.status -ceq 'passed' -and
-        [int]$packagedCutoverBrokerSelfTest.count -ge 38 -and
-        @($packagedCutoverBrokerSelfTest.tests).Count -eq [int]$packagedCutoverBrokerSelfTest.count) `
-        -Message ('the packaged cutover broker did not pass its self-contained shadow test: ' +
-            ($packagedCutoverBrokerSelfTest | ConvertTo-Json -Depth 8 -Compress))
+
+
+
+
     $packagedLifecycleBrokerSelfTest = Convert-LastJsonResult -Output (Invoke-PackagedSelfTest `
         -Script (Join-Path $artifactA 'scripts\windows\lifecycle-broker\SelfTest-DysonLifecycleBroker.ps1'))
     Assert-ReleaseSelfTest -Condition ($packagedLifecycleBrokerSelfTest.protocol -ceq `
@@ -920,7 +865,7 @@ export { allowedScriptPaths };
         $packagedOrchestrationV2SelfTest.result -ceq 'passed' -and
         [int]$packagedOrchestrationV2SelfTest.testCount -eq
             [int]$packagedOrchestrationV2SelfTest.passedCount -and
-        @($packagedOrchestrationV2SelfTest.actionsCovered).Count -eq 11 -and
+        @($packagedOrchestrationV2SelfTest.actionsCovered).Count -eq 9 -and
         -not [bool]$packagedOrchestrationV2SelfTest.productionBackendInvoked -and
         -not [bool]$packagedOrchestrationV2SelfTest.productionMutationImplemented -and
         -not [bool]$packagedOrchestrationV2SelfTest.productionChanged) `
@@ -937,28 +882,18 @@ export { allowedScriptPaths };
                 ('scripts\windows\deployment\' + $runtimeDeliveryName)) -PathType Leaf) `
             -Message "the protected Node runtime delivery chain omitted $runtimeDeliveryName"
     }
-    $packagedGsManagerRemovalSelfTest = Convert-LastJsonResult -Output (Invoke-PackagedSelfTest `
-        -Script (Join-Path $artifactA 'scripts\windows\migration\SelfTest-DysonGsManagerRemoval.ps1') `
-        -SuppressInformation)
-    Assert-ReleaseSelfTest -Condition ($packagedGsManagerRemovalSelfTest.protocol -ceq `
-            'DYSON_GSMANAGER_REMOVAL_SELFTEST_V1' -and
-        $packagedGsManagerRemovalSelfTest.status -ceq 'passed' -and
-        [int]$packagedGsManagerRemovalSelfTest.testCount -ge 11 -and
-        @($packagedGsManagerRemovalSelfTest.tests).Count -eq [int]$packagedGsManagerRemovalSelfTest.testCount) `
-        -Message 'the packaged GSManager recoverable-removal tools did not pass their self-contained Shadow test'
+
+
     $packagedEvidenceSelfTest = Convert-LastJsonResult -Output (Invoke-PackagedSelfTest `
         -Script (Join-Path $artifactA 'scripts\windows\evidence\SelfTest-DysonPrivateEvidenceBundle.ps1'))
     Assert-ReleaseSelfTest -Condition ($packagedEvidenceSelfTest.protocol -eq 'DYSON_PRIVATE_ACCEPTANCE_EVIDENCE_SELFTEST_V1' -and
         $packagedEvidenceSelfTest.state -eq 'passed' -and -not [bool]$packagedEvidenceSelfTest.productionChanged) `
         -Message 'the packaged private acceptance evidence tools did not pass their self-contained self-test'
-    foreach ($relative in $migrationDocs) {
+    foreach ($relative in $deploymentDocs) {
         Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA $relative.Replace('/', '\')) -PathType Leaf) `
-            -Message "GSManager migration documentation was omitted from the public artifact: $relative"
+            -Message "deployment documentation was omitted from the public artifact: $relative"
     }
-    foreach ($relative in $gsManagerRemovalDocs) {
-        Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA $relative.Replace('/', '\')) -PathType Leaf) `
-            -Message "GSManager recoverable-removal documentation was omitted from the public artifact: $relative"
-    }
+
     foreach ($relative in $recoveryDocs) {
         Assert-ReleaseSelfTest -Condition (Test-Path -LiteralPath (Join-Path $artifactA $relative.Replace('/', '\')) -PathType Leaf) `
             -Message "DataRoot recovery documentation was omitted from the public artifact: $relative"
@@ -1156,22 +1091,6 @@ export { allowedScriptPaths };
     catch { $bridgeExtraRejected = $true }
     Assert-ReleaseSelfTest -Condition $bridgeExtraRejected -Message 'an extra public Bridge source file was accepted'
     Remove-Item -LiteralPath (Join-Path $artifactB 'integrations\dyson-control-bridge\unexpected.cs') -Force
-
-    $requiredMigrationScript = Join-Path $artifactB 'scripts\windows\migration\Test-DysonGsManagerSnapshot.ps1'
-    $requiredMigrationScriptBackup = Join-Path $testRoot 'required-migration-script.backup'
-    [System.IO.File]::Move($requiredMigrationScript, $requiredMigrationScriptBackup)
-    $migrationMissingRejected = $false
-    try { & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null }
-    catch { $migrationMissingRejected = $true }
-    Assert-ReleaseSelfTest -Condition $migrationMissingRejected -Message 'an artifact missing a required GSManager migration script was accepted'
-    [System.IO.File]::Move($requiredMigrationScriptBackup, $requiredMigrationScript)
-
-    Write-FixtureText -Path (Join-Path $artifactB 'scripts\windows\migration\Unexpected-Migration.ps1') -Value "throw 'unexpected migration tool'`n"
-    $migrationExtraRejected = $false
-    try { & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null }
-    catch { $migrationExtraRejected = $true }
-    Assert-ReleaseSelfTest -Condition $migrationExtraRejected -Message 'an extra GSManager migration script was accepted'
-    Remove-Item -LiteralPath (Join-Path $artifactB 'scripts\windows\migration\Unexpected-Migration.ps1') -Force
 
     $requiredRuntimeReceiptApi = Join-Path $artifactB 'apps\api\dist\lifecycle\game-runtime-receipts.js'
     $requiredRuntimeReceiptApiBackup = Join-Path $testRoot 'required-game-runtime-receipts.backup'
@@ -1477,72 +1396,6 @@ export { allowedScriptPaths };
     }
     finally { [System.IO.File]::WriteAllBytes($nebulaRuntimeTamperPath, $nebulaRuntimeTamperBytes) }
 
-    $cutoverMissingFileCases = 0
-    for ($cutoverIndex = 0; $cutoverIndex -lt $cutoverScriptPaths.Count; $cutoverIndex++) {
-        $requiredCutoverPath = Join-Path $artifactB $cutoverScriptPaths[$cutoverIndex].Replace('/', '\')
-        $requiredCutoverBackup = Join-Path $testRoot ("required-cutover-$cutoverIndex.backup")
-        [System.IO.File]::Move($requiredCutoverPath, $requiredCutoverBackup)
-        $cutoverMissingMessage = $null
-        try {
-            & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null
-        }
-        catch {
-            $cutoverMissingMessage = $_.Exception.Message
-        }
-        finally {
-            if (Test-Path -LiteralPath $requiredCutoverBackup -PathType Leaf) {
-                [System.IO.File]::Move($requiredCutoverBackup, $requiredCutoverPath)
-            }
-        }
-        Assert-ReleaseSelfTest -Condition ($cutoverMissingMessage -eq 'The cutover host delivery package is incomplete.') `
-            -Message "removing required cutover host script index $cutoverIndex did not fail through the exact required-file gate"
-        $cutoverMissingFileCases++
-    }
-    Assert-ReleaseSelfTest -Condition ($cutoverMissingFileCases -eq $cutoverScriptPaths.Count) `
-        -Message 'not every required cutover host script was covered by a removal test'
-
-    $unexpectedCutoverPath = Join-Path $artifactB 'scripts\windows\cutover\Unexpected-Cutover.ps1'
-    Write-FixtureText -Path $unexpectedCutoverPath -Value "throw 'unexpected cutover host tool'`n"
-    $cutoverExtraRejected = $false
-    try { & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null }
-    catch { $cutoverExtraRejected = $true }
-    Assert-ReleaseSelfTest -Condition $cutoverExtraRejected `
-        -Message 'an extra cutover host script outside the exact allowlist was accepted'
-    Remove-Item -LiteralPath $unexpectedCutoverPath -Force
-
-    $cutoverBrokerMissingFileCases = 0
-    for ($brokerIndex = 0; $brokerIndex -lt $cutoverBrokerScriptPaths.Count; $brokerIndex++) {
-        $requiredBrokerPath = Join-Path $artifactB $cutoverBrokerScriptPaths[$brokerIndex].Replace('/', '\')
-        $requiredBrokerBackup = Join-Path $testRoot ("required-cutover-broker-$brokerIndex.backup")
-        [System.IO.File]::Move($requiredBrokerPath, $requiredBrokerBackup)
-        $brokerMissingMessage = $null
-        try {
-            & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null
-        }
-        catch {
-            $brokerMissingMessage = $_.Exception.Message
-        }
-        finally {
-            if (Test-Path -LiteralPath $requiredBrokerBackup -PathType Leaf) {
-                [System.IO.File]::Move($requiredBrokerBackup, $requiredBrokerPath)
-            }
-        }
-        Assert-ReleaseSelfTest -Condition ($brokerMissingMessage -eq 'The cutover broker delivery package is incomplete.') `
-            -Message "removing required cutover broker script index $brokerIndex did not fail through the exact required-file gate"
-        $cutoverBrokerMissingFileCases++
-    }
-    Assert-ReleaseSelfTest -Condition ($cutoverBrokerMissingFileCases -eq $cutoverBrokerScriptPaths.Count) `
-        -Message 'not every required cutover broker script was covered by a removal test'
-
-    $unexpectedBrokerPath = Join-Path $artifactB 'scripts\windows\cutover-broker\Unexpected-CutoverBroker.ps1'
-    Write-FixtureText -Path $unexpectedBrokerPath -Value "throw 'unexpected cutover broker tool'`n"
-    $cutoverBrokerExtraRejected = $false
-    try { & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null }
-    catch { $cutoverBrokerExtraRejected = $true }
-    Assert-ReleaseSelfTest -Condition $cutoverBrokerExtraRejected `
-        -Message 'an extra cutover broker script outside the exact allowlist was accepted'
-    Remove-Item -LiteralPath $unexpectedBrokerPath -Force
-
     $lifecycleBrokerMissingFileCases = 0
     for ($brokerIndex = 0; $brokerIndex -lt $lifecycleBrokerScriptPaths.Count; $brokerIndex++) {
         $requiredBrokerPath = Join-Path $artifactB $lifecycleBrokerScriptPaths[$brokerIndex].Replace('/', '\')
@@ -1760,12 +1613,9 @@ export { allowedScriptPaths };
     }
 
     foreach ($requiredStrictQualificationRelative in @(
-        'scripts/windows/qualification/SelfTest-DysonSideBySideObservationV2.ps1',
         'scripts/windows/qualification/SelfTest-DysonQualificationPairedSaveLoadRecordV2.ps1',
         'scripts/windows/qualification/dyson-control-panel-observation-v2.schema.json',
         'scripts/windows/qualification/README.ExternalJoinObservationV2.md',
-        'scripts/windows/qualification/Qualification.ReversibleCutover.ps1',
-        'scripts/windows/qualification/dyson-post-gsmanager-removal-observation-v2.schema.json',
         'scripts/windows/qualification/SelfTest-DysonSoakObservationV2.ps1'
     )) {
         $requiredStrictQualificationPath = Join-Path $artifactB `
@@ -1854,40 +1704,6 @@ export { allowedScriptPaths };
     Assert-ReleaseSelfTest -Condition $networkExtraRejected `
         -Message 'an extra Nebula network assessment file outside the exact allowlist was accepted'
     Remove-Item -LiteralPath $unexpectedNetworkPath -Force
-
-    $gsManagerRemovalRequiredPaths = @($gsManagerRemovalScriptPaths + $gsManagerRemovalDocs)
-    $gsManagerRemovalMissingFileCases = 0
-    for ($removalIndex = 0; $removalIndex -lt $gsManagerRemovalRequiredPaths.Count; $removalIndex++) {
-        $requiredRemovalPath = Join-Path $artifactB $gsManagerRemovalRequiredPaths[$removalIndex].Replace('/', '\')
-        $requiredRemovalBackup = Join-Path $testRoot ("required-gsmanager-removal-$removalIndex.backup")
-        [System.IO.File]::Move($requiredRemovalPath, $requiredRemovalBackup)
-        $removalMissingMessage = $null
-        try {
-            & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null
-        }
-        catch { $removalMissingMessage = $_.Exception.Message }
-        finally {
-            if (Test-Path -LiteralPath $requiredRemovalBackup -PathType Leaf) {
-                [System.IO.File]::Move($requiredRemovalBackup, $requiredRemovalPath)
-            }
-        }
-        Assert-ReleaseSelfTest -Condition ($removalMissingMessage -eq `
-                'The GSManager recoverable-removal delivery package is incomplete.') `
-            -Message "removing required GSManager recoverable-removal file index $removalIndex did not fail through the exact required-file gate"
-        $gsManagerRemovalMissingFileCases++
-    }
-    Assert-ReleaseSelfTest -Condition ($gsManagerRemovalMissingFileCases -eq $gsManagerRemovalRequiredPaths.Count) `
-        -Message 'not every required GSManager recoverable-removal file was covered by a removal test'
-
-    $unexpectedGsManagerRemovalPath = Join-Path $artifactB `
-        'scripts\windows\migration\Unexpected-GsManagerRemoval.ps1'
-    Write-FixtureText -Path $unexpectedGsManagerRemovalPath -Value "throw 'unexpected GSManager removal tool'`n"
-    $gsManagerRemovalExtraRejected = $false
-    try { & $testArtifactScript -ArtifactPath $artifactB -ExpectedVersion '1.2.3-fixture' | Out-Null }
-    catch { $gsManagerRemovalExtraRejected = $true }
-    Assert-ReleaseSelfTest -Condition $gsManagerRemovalExtraRejected `
-        -Message 'an extra GSManager recoverable-removal script outside the exact allowlist was accepted'
-    Remove-Item -LiteralPath $unexpectedGsManagerRemovalPath -Force
 
     $installRoot = Join-Path $testRoot 'deployment-install'
     $dataRoot = Join-Path $testRoot 'deployment-data'
@@ -2049,14 +1865,7 @@ export { allowedScriptPaths };
             $script:DysonArtifactRequiredApiNebulaPluginTransactionFiles.Count
         nebulaPluginTransactionApiMissingFileCases = $nebulaApiMissingFileCases
         nebulaPluginTransactionApiMissingFilesRejected = $true
-        gsManagerParallelMigrationPackaged = $true
-        migrationDocumentationPackaged = $true
-        gsManagerRecoverableRemovalPackaged = $true
-        gsManagerRemovalDocumentationPackaged = $true
-        packagedGsManagerRemovalSelfTestPassed = $true
-        gsManagerRemovalMissingFilesRejected = $true
-        gsManagerRemovalMissingFileCases = $gsManagerRemovalMissingFileCases
-        gsManagerRemovalExtraFileRejected = $true
+        deploymentDocumentationPackaged = $true
         privateAcceptanceEvidenceToolingPackaged = $true
         hostMutationLeaseToolingPackaged = $true
         hostMutationMissingFilesRejected = $true
@@ -2073,16 +1882,6 @@ export { allowedScriptPaths };
         privateNebulaBuildCandidateEvidenceExcluded = $true
         privateNebulaExcludedSourceCases = $excludedNebulaPrivateSourcePaths.Count
         privateNebulaCandidateBinaryRejected = $true
-        cutoverHostToolingPackaged = $true
-        packagedCutoverHostSelfTestPassed = $true
-        cutoverMissingFilesRejected = $true
-        cutoverMissingFileCases = $cutoverMissingFileCases
-        cutoverExtraFileRejected = $true
-        cutoverBrokerToolingPackaged = $true
-        packagedCutoverBrokerSelfTestPassed = $true
-        cutoverBrokerMissingFilesRejected = $true
-        cutoverBrokerMissingFileCases = $cutoverBrokerMissingFileCases
-        cutoverBrokerExtraFileRejected = $true
         lifecycleBrokerToolingPackaged = $true
         packagedLifecycleBrokerSelfTestPassed = $true
         lifecycleBrokerMissingFilesRejected = $true
@@ -2125,14 +1924,12 @@ export { allowedScriptPaths };
         packagedEvidenceSelfTestPassed = $true
         evidenceMissingFileRejected = $true
         evidenceExtraFileRejected = $true
-        migrationMissingFileRejected = $true
-        migrationExtraFileRejected = $true
         bridgeExtraFileRejected = $true
         bridgeMissingFileRejected = $true
         loadedSaveEvidencePublisherMissingFileRejected = $true
         powerShellRunnerAllowlistPackaged = $true
         powerShellRunnerMappedPaths = $runnerScriptPaths.Count
-        powerShellRunnerCutoverMappingsPackaged = $true
+        removedManagerRunnerMappingsRejected = $true
         powerShellRunnerNebulaMappingsPackaged = $true
         existingDeploymentAcceptedArtifact = $true
         existingDeploymentBoundArtifactProvenance = $true

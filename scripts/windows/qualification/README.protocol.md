@@ -15,8 +15,8 @@ compatible with Windows PowerShell 5.1.
 - Execution switch: `DYSON_QUALIFICATION_EXECUTE_ENABLED`
 - Required execute value: `ALLOW_BOUNDED_PRODUCTION_QUALIFICATION_V1`
 
-The plan maps all nine current production-only acceptance items: `SAV-005`,
-`PRD-001` through `PRD-005`, and `CUT-001` through `CUT-003`. Its thirteen
+The plan maps all six current production-only acceptance items: `SAV-005`,
+`PRD-001` through `PRD-005`. Its twelve
 steps separate the combined reboot/fault/soak criterion into bounded drills.
 
 ## Loading and exported functions
@@ -132,7 +132,7 @@ The protocol gate authorizes no command. It only validates an allowlisted action
 request for a separately reviewed bounded adapter. Shadow self-tests may set the
 switch in their child process. This protocol must not be treated as authority to
 execute a production reboot, storage interruption, disk-pressure allocation,
-process termination, update rollback, or GSManager switch.
+process termination or update rollback.
 The literal `SHADOW` in the v1 confirmation is intentional: this version cannot
 authorize a production adapter. A production-capable adapter must use a new,
 separately reviewed protocol version and fresh operator authorization. Protocol

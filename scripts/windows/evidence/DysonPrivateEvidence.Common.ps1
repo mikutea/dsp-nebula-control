@@ -20,10 +20,9 @@ $script:DysonPrivateEvidenceKinds = @(
     'private-proof'
 )
 $script:DysonPrivateEvidenceScopes = @(
-    'dyson-side-by-side',
+    'dyson-vm',
     'production',
-    'external-client',
-    'cutover'
+    'external-client'
 )
 
 function ConvertTo-DysonPrivateEvidenceJsonLine {

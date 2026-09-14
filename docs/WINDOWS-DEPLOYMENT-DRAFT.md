@@ -3,8 +3,7 @@
 This document describes the repository's reusable Windows Server Core deployment
 mechanism. The scripts and temporary-root self-test are implemented, but this is
 not evidence that any production host was changed. Repository self-tests do not
-install, stop, start, edit, or remove any
-DSP/Nebula/GSManager task.
+install, stop, start, edit, or remove any DSP/Nebula task.
 
 ## Prerequisites
 
@@ -100,8 +99,6 @@ C:\GameServer\Example\DysonControl\
       apps\api\dist\index.js
       apps\web\dist\...
       scripts\windows\...
-        cutover\...     # exact host evidence/action/self-test allowlist
-        cutover-broker\... # exact six-file fixed SYSTEM broker allowlist
       release-manifest.json
 
 C:\GameServer\Example\DysonControlRuntime\ # dedicated protected container
@@ -120,8 +117,6 @@ C:\GameServer\Example\DysonControlData\
     intents\             # private durable configuration transaction intents
     receipts\            # private terminal receipts chained to exact intents
   data\                 # SQLite and future persistent application state
-    cutover\            # durable cutover journal and append-only audit database
-    cutover-broker\     # fixed profile, protected channels, and install receipts
     lifecycle-broker\   # fixed profile plus retained request/receipt history
   logs\                 # application logs, never release payload
   state\
@@ -131,9 +126,6 @@ C:\GameServer\Example\DysonControlData\
     deployments\        # pointer + config captured before changes
     tasks\               # replaced startup-task XML
     bootstrap\           # replaced stable launcher files
-  migration\
-    snapshots\           # private GSManager file/task snapshots
-    restore-guards\      # private pre-restore compensation guards
   audit\
     deployment.jsonl
   runtime-task-transactions\ # durable pair intents and terminal receipts
@@ -160,7 +152,7 @@ small sidecar directory is intentionally retained after uninstall.
 checkout or an ad-hoc directory containing only the API entry point is rejected.
 The trusted packaging common defines the exact, closed runtime allowlists. Every
 accepted artifact includes these contract anchors, in addition to the complete
-specialized Bridge, migration, evidence, bootstrap, cutover, broker, recovery,
+specialized Bridge, evidence, bootstrap, broker, recovery,
 and network sets:
 
 ```text
@@ -202,29 +194,8 @@ scripts\windows\bootstrap\Resolve-DysonGameLifecycleRelease.ps1
 scripts\windows\bootstrap\SelfTest-DysonGameLifecycleBootstrap.ps1
 scripts\windows\bootstrap\Start-DysonServer.ps1
 scripts\windows\bootstrap\Stop-DysonServer.ps1
-scripts\windows\cutover\DysonCutoverHost.Common.ps1
-scripts\windows\cutover\DysonGsManagerAuthority.Common.ps1
-scripts\windows\cutover\Get-DysonCutoverEvidence.ps1
-scripts\windows\cutover\Initialize-DysonGsManagerAuthority.ps1
-scripts\windows\cutover\Invoke-DysonCutoverAction.ps1
-scripts\windows\cutover\SelfTest-DysonCutoverHost.ps1
-scripts\windows\cutover\SelfTest-DysonGsManagerAuthority.ps1
-scripts\windows\cutover-broker\DysonCutoverBroker.Common.ps1
-scripts\windows\cutover-broker\DysonCutoverBroker.TaskAcl.ps1
-scripts\windows\cutover-broker\Install-DysonCutoverBrokerTask.ps1
-scripts\windows\cutover-broker\Invoke-DysonCutoverBrokerWorker.ps1
-scripts\windows\cutover-broker\SelfTest-DysonCutoverBroker.ps1
-scripts\windows\cutover-broker\Submit-DysonCutoverBrokerRequest.ps1
 scripts\windows\bridge\Build-DysonControlBridgeCandidate.ps1
 scripts\windows\bridge\Test-DysonControlBridgeCandidate.ps1
-scripts\windows\migration\New-DysonGsManagerSnapshot.ps1
-scripts\windows\migration\Test-DysonGsManagerSnapshot.ps1
-scripts\windows\migration\Restore-DysonGsManagerSnapshot.ps1
-scripts\windows\migration\DysonGsManagerRemoval.Common.ps1
-scripts\windows\migration\Remove-DysonGsManagerInstallation.ps1
-scripts\windows\migration\Restore-DysonGsManagerRemoval.ps1
-scripts\windows\migration\SelfTest-DysonGsManagerRemoval.ps1
-scripts\windows\migration\Test-DysonGsManagerRemoval.ps1
 scripts\windows\evidence\DysonPrivateEvidence.Common.ps1
 scripts\windows\evidence\New-DysonAcceptanceEvidenceIndex.ps1
 scripts\windows\evidence\New-DysonPrivateEvidenceBundle.ps1
@@ -245,8 +216,6 @@ scripts\windows\network\Test-DysonNebulaNetwork.ps1
 integrations\dyson-control-bridge\DysonControlBridge.csproj
 integrations\dyson-control-bridge\dyson-control-bridge.cfg.example
 docs\DATAROOT-RECOVERY.md
-docs\GSM-EVALUATION.md
-docs\MIGRATION-GSMANAGER.md
 docs\NETWORK-CONNECTIVITY.md
 docs\WINDOWS-DEPLOYMENT-DRAFT.md
 ```
@@ -266,14 +235,10 @@ The production packaging job supplies built `apps/api/dist`, built
 version probe), the self-contained verifier, license/notices, only the runtime
 dependencies needed by the API, and the exact public Bridge source/build tool
 allowlist. It also carries the exact stable game-bootstrap allowlist, its
-shadow-runtime self-test, the runtime-task pair self-test, the exact cutover
-host evidence/action/authority allowlist, the exact six-file cutover-broker
-allowlist, all three offline cutover self-tests, the exact five-file DataRoot
-recovery allowlist and its Shadow fault-injection self-test, the exact GSManager
-migration script allowlist, the separate exact five-file recoverable-removal
-allowlist and its Shadow self-test, the exact seven-file Nebula network
-assessment allowlist and its zero-native-network-call Shadow self-test, and the
-migration, deployment, removal, recovery, and network operator guides. It does
+shadow-runtime self-test, the runtime-task pair self-test, the exact five-file
+DataRoot recovery allowlist and its Shadow fault-injection self-test, the exact
+Nebula network assessment allowlist and its zero-native-network-call Shadow
+self-test, and the deployment, recovery, and network operator guides. It does
 not pass a development checkout with test data or local
 `.env` files. In particular, the public artifact rejects Bridge DLL/PDB/EXE
 outputs and DSP, Unity, BepInEx, Harmony, or Nebula reference assemblies.
@@ -335,8 +300,8 @@ those results.
 
 The scripts under `scripts\windows\qualification` and
 [the production qualification runbook](PRODUCTION-QUALIFICATION.md) are review
-and rehearsal tooling for the nine open acceptance requirements. They define a
-fixed 13-step plan, exact public receipt and private-evidence reference shapes,
+and rehearsal tooling for the six open acceptance requirements. They define a
+fixed 12-step plan, exact public receipt and private-evidence reference shapes,
 challenge/timing rules, resumable checkpoints, and fail-closed interruption,
 idempotency, rollback, and manual-recovery behavior. Run the Windows PowerShell
 5.1 fixture with:
@@ -363,7 +328,7 @@ allowlist above. Any real v2 invocation requires its distinct versioned gate,
 fresh authorization, an approved maintenance window, an exact private profile,
 and a request-bound private protection-evidence record. Neither v1 environment
 gate nor the v1 `SHADOW` confirmation phrase can be reused as v2 authority. No
-v2 adapter has yet passed a target-host run, so the self-test leaves all nine
+v2 adapter has yet passed a target-host run, so the self-test leaves all six
 mapped acceptance requirements `not-started`.
 
 ## Private acceptance evidence bundles
@@ -394,7 +359,7 @@ $staging = Join-Path $data "acceptance\staging\$run"
 
 & .\scripts\windows\evidence\New-DysonPrivateEvidenceBundle.ps1 `
   -DataRoot $data -RunId $run -EvidenceId $evidence `
-  -Kind operator-run -Scope dyson-side-by-side `
+  -Kind operator-run -Scope dyson-vm `
   -SubjectCommit $commit -RuntimePayloadSha256 $payload `
   -RequirementIds @('PRD-001') -WhatIf
 ```
@@ -779,10 +744,10 @@ nonzero exit, stderr, prerelease/forged/oversized output, timeout, reparse point
 or an older major all fail closed with one fixed error that contains neither
 the executable path nor child-process output.
 
-### Explicit lifecycle- and cutover-broker installation
+### Explicit lifecycle broker installation
 
 For a controller installation that registers the startup task and installs or
-upgrades either broker, `Install-DysonControl.ps1` acquires the shared application
+upgrades the lifecycle broker, `Install-DysonControl.ps1` acquires the shared application
 host-mutation lease before stopping the previous panel task. An active game
 mutation blocks that step; the installer does not interrupt it. After the panel
 stops producing requests, existing status workers finish naturally within a
@@ -793,7 +758,7 @@ configuration publication, the lease is released before starting the new panel
 so startup recovery can acquire it. Verify this sequence and rollback on the
 target host; the implementation alone is not upgrade acceptance evidence.
 
-Neither privileged broker is installed by default. Lifecycle installation is
+The privileged lifecycle broker is not installed by default. Lifecycle installation is
 requested only with `-InstallLifecycleBrokerTask`. It requires an explicit
 `ConfigurationSource`, `-RegisterStartupTask`, `-StartAfterInstall`, a loopback
 `-ReadinessUri`, and all of `-ProjectRoot`, `-RuntimeBootstrapRoot`,
@@ -814,11 +779,6 @@ DYSON_RUNTIME_SERVICE_USER=.\ExampleGameService
 DYSON_GAME_PORT=27015
 DYSON_SERVER_TASK=Dyson-Nebula-Server
 DYSON_STOP_TASK=Dyson-Nebula-Stop
-DYSON_CUTOVER_ENABLED=true
-DYSON_CUTOVER_RECOVERY_ENABLED=true
-DYSON_CUTOVER_PROFILE_FILE=C:\GameServer\Example\DysonControlData\data\authority-inventory\authority-profile.json
-DYSON_CUTOVER_TASK_TRANSACTION_ROOT=C:\GameServer\Example\DysonControlData\runtime-task-transactions
-DYSON_CUTOVER_SERVICE_USER=.\ExampleGameService
 ```
 
 The lifecycle profile is fixed at
@@ -831,91 +791,11 @@ fixed runtime tasks, and every pinned dependency hash. Its worker is the fixed
 execution limit, and a single profile-bound PowerShell action. Profile,
 dependency, task-pair, worker-task, and ACL drift fail closed.
 
-Cutover is a dependent capability, not an alternative broker. Supplying
-`-InstallCutoverBrokerTask` without `-InstallLifecycleBrokerTask` in the same
-deployment transaction is rejected. Its project, bootstrap, service-user, and
-game-port arguments must equal the lifecycle values. The configuration must
-also enable both cutover gates and bind the exact authority profile and runtime
-task transaction root. The cutover profile binds the newly active release's
-`scripts\windows` and exact `cutover-broker` child, and its bundle binding hashes
-the exact broker directory. Missing, redirected, extra, or mismatched members
-fail closed.
-
-Preview the complete transaction before applying it:
-
-```powershell
-$installRoot = 'C:\GameServer\Example\DysonControl'
-$dataRoot = 'C:\GameServer\Example\DysonControlData'
-$projectRoot = 'C:\GameServer\Example\DSP'
-$bootstrapRoot = 'C:\GameServer\Example\DysonControl\bootstrap'
-$authorityProfile = 'C:\GameServer\Example\DysonControlData\data\authority-inventory\authority-profile.json'
-$taskTransactions = Join-Path $dataRoot 'runtime-task-transactions' # deployment data root
-$serviceUser = '.\ExampleGameService'
-$gamePort = 27015
-
-& "$artifact\scripts\windows\deployment\Install-DysonControl.ps1" `
-  -SourcePath $artifact -Version '0.2.0' `
-  -ExpectedArtifactPayloadSha256 $expectedArtifactPayloadSha256 `
-  -RuntimeRoot $runtimeRoot `
-  -NodeExecutable $node `
-  -ExpectedNodeSha256 $expectedNodeSha256 `
-  -InstallRoot $installRoot -DataRoot $dataRoot `
-  -ConfigurationSource $config -RegisterStartupTask -StartAfterInstall `
-  -ReadinessUri 'http://127.0.0.1:13010/readyz' -ReadinessTimeoutSeconds 45 `
-  -InstallLifecycleBrokerTask -ProjectRoot $projectRoot `
-  -RuntimeBootstrapRoot $bootstrapRoot -ServiceUser $serviceUser `
-  -GamePort $gamePort -DispatchReadyTimeout 30 `
-  -InstallCutoverBrokerTask -CutoverProjectRoot $projectRoot `
-  -CutoverAuthorityProfileFile $authorityProfile `
-  -CutoverAuthorityInventoryRevision ('a' * 64) `
-  -CutoverRuntimeTaskTransactionRoot $taskTransactions `
-  -CutoverServiceUser $serviceUser -CutoverGamePort $gamePort `
-  -CutoverRuntimeBootstrapRoot $bootstrapRoot `
-  -WhatIf
-```
-
-`-WhatIf` validates the artifact, paths, complete environment bindings, and
-requested broker modes and returns a bounded JSON plan without running Node,
-registering tasks, publishing profiles, starting services, or probing readiness.
-Remove only `-WhatIf` after reviewing that plan.
-
-The real transaction has one non-negotiable order:
-
-1. verify and stage the immutable release, atomically activate it, publish the
-   stable bootstrap and configuration, and register the control task without
-   starting it;
-2. install, upgrade, or exactly reuse the lifecycle broker;
-3. install, upgrade, or exactly reuse the cutover broker, if requested;
-4. start the control task and require exact-version loopback readiness with the
-   `lifecycleBroker` check and, for cutover, `cutoverRecovery`.
-
-Cross-release lifecycle changes require
-`-UpgradeLifecycleBrokerExisting`; cross-release cutover changes additionally
-require `-UpgradeCutoverBrokerExisting`. Same-release replay returns `reused`
-after proving the captured profile, dependencies, ACLs, and task are unchanged;
-it never needs either upgrade switch and is never compensated.
-
-Those broker upgrade switches do not override the configuration boundary:
-cross-version control-plane replacement must first bind and snapshot the exact
-configuration associated with the verified old active release.
-
-Later failure compensation follows the receipt, not a guess:
-
-| Lifecycle receipt | Required recovery |
-| --- | --- |
-| `installed` | Invoke the candidate lifecycle installer with `-CompensateFirstInstall`; remove only the fixed profile and worker task while preserving durable requests and receipts. |
-| `reused` | Revalidate the exact preimage; perform no compensation. |
-| `upgraded` | Restore the captured broker preimage only after protected configuration B has been restored and release/bootstrap state has rolled back. |
-
-Cutover compensation is completed before lifecycle recovery begins for a fresh
-install. Deferred cross-release broker restoration runs only after the protected
-configuration predecessor and release/bootstrap state are restored successfully.
-On the first configuration creation path, a later readiness or broker failure compensates new
-broker/task state but deliberately retains the coherent release, bootstrap, and
-protected configuration; the control task remains absent and the error reports
-`protected-configuration-restore-executor-unavailable`. Never bypass this state
-by editing a profile, bundle binding, task action, DACL, or immutable release
-directory.
+The installer validates the lifecycle broker preimage before publication and
+retains the captured file bytes, ACLs and task definition for compensation.
+Uninstall preserves durable lifecycle receipts and requires an idle broker.
+Validate upgrade, failure recovery and uninstall on the target host before
+relying on this deployment for unattended operation.
 
 ### Production upgrade
 
@@ -953,27 +833,16 @@ $upgrade = @{
   ServiceUser = '.\ExampleGameService'
   GamePort = 27015
   DispatchReadyTimeout = 30
-  InstallCutoverBrokerTask = $true
-  UpgradeCutoverBrokerExisting = $true
-  CutoverProjectRoot = 'C:\GameServer\Example\DSP'
-  CutoverAuthorityProfileFile = 'C:\GameServer\Example\DysonControlData\data\authority-inventory\authority-profile.json'
-  CutoverAuthorityInventoryRevision = ('b' * 64)
-  CutoverRuntimeTaskTransactionRoot = 'C:\GameServer\Example\DysonControlData\runtime-task-transactions'
-  CutoverServiceUser = '.\ExampleGameService'
-  CutoverGamePort = 27015
-  CutoverRuntimeBootstrapRoot = 'C:\GameServer\Example\DysonControl\bootstrap'
 }
 
 & "$newArtifact\scripts\windows\deployment\Install-DysonControl.ps1" @upgrade -WhatIf
 ```
 
 After reviewing the preview, run the same command without `-WhatIf`. It obeys
-the release/bootstrap/config/control-task -> lifecycle broker -> cutover broker
--> task start/readiness order above. The readiness response must have HTTP
+the release/bootstrap/config/control-task -> lifecycle broker -> task
+start/readiness order above. The readiness response must have HTTP
 success, `status=ready`, the exact target version in both JSON and
-`X-Dyson-Control-Release`, and passing `lifecycleBroker` and `cutoverRecovery`
-checks. If this is a lifecycle-only installation, omit all cutover parameters
-and `-UpgradeCutoverBrokerExisting`, but keep the lifecycle upgrade switch.
+`X-Dyson-Control-Release`, and a passing `lifecycleBroker` check.
 
 The staged failed version remains inactive for diagnosis. It is never retried
 implicitly and does not alter persistent data.
@@ -1006,7 +875,7 @@ current state. If the requested snapshot or readiness validation fails, the scri
 restores that guard. The output reports `guardSnapshotId`, making the rollback
 itself reversible.
 
-This standalone command applies only when no lifecycle or cutover broker profile
+This standalone command applies only when no lifecycle broker profile
 is installed. Once a lifecycle broker exists, changing the active release also
 requires broker-aware handling; the lower-level rollback command alone would
 leave a release-bound profile inconsistent. Failed top-level upgrades use the
@@ -1033,8 +902,8 @@ environment, stable bootstrap, project/data roots, service user, game port,
 pinned dependencies, runtime task pair, and exact worker task, with no pending,
 orphaned, or unknown broker state. When lifecycle is disabled, a residual profile,
 task, pending item, orphan, or unknown entry fails the `disabled-clean` check.
-Supplying `-ReadinessUri` additionally requires the deep `lifecycleBroker` and
-`cutoverRecovery` checks. The command does not modify the host. Run the isolated
+Supplying `-ReadinessUri` additionally requires the deep `lifecycleBroker` check.
+The command does not modify the host. Run the isolated
 contract gate with `npm run deployment:status-selftest`.
 
 ### Uninstall
@@ -1050,9 +919,8 @@ contract gate with `npm run deployment:status-selftest`.
 ```
 
 The default real run holds the same deployment lease used by install and upgrade.
-Before any mutation it validates both installed brokers. Cutover must have no
-pending request/intent/work and must match the active release, profile, bundle,
-task, and DACL. Lifecycle must match the same active release, pinned dependency
+Before any mutation it validates the installed lifecycle broker. It must match
+the active release, pinned dependency
 hashes, runtime task pair, profile/profile ACL, and worker task/task ACL, and its
 request and receipt directories must contain only closed pairs with an empty
 intent directory and no orphaned or unknown entry. Drift or pending/unknown state
@@ -1068,15 +936,12 @@ hash is mandatory and those switches are mutually exclusive with
 preimage, it removes only the fixed lifecycle profile and worker task and returns
 the bounded `DYSON_CONTROL_LIFECYCLE_BROKER_REMOVAL_RECEIPT_V1`. Requests,
 receipts, the empty intents directory, installation/removal evidence, deployment
-audit, recovery sentinels, cutover/authority evidence, and game-manager data are
-preserved. Cutover normal removal likewise removes only its fixed task/profile/
-binding.
+audit and recovery sentinels are preserved.
 
-After both read-only broker preflights succeed, uninstall requires the fixed
+After the read-only broker preflight succeeds, uninstall requires the fixed
 control task to be globally unique at its fixed root task path, then stops and
 removes only that task first. This quiesces the request entry point so no new work
-can arrive while broker state is being removed. It next invokes cutover
-`RemoveCurrent`, invokes lifecycle
+can arrive while broker state is being removed. It next invokes lifecycle
 `-RemoveCurrent -ExpectedProfileHash <captured-lowercase-sha256>`, and only then
 moves the install tree into a
 timestamped `<DataRoot>\snapshots\uninstall-releases\<id>` directory, and
@@ -1087,19 +952,15 @@ Restoring those exact artifacts is the defined uninstall rollback. InstallRoot
 and DataRoot must be on the same volume for this atomic, recoverable move;
 otherwise uninstall fails without removing the existing layout.
 
-The early control-task step is request-entry quiescence, not a reversal of broker
-dependency order. Among brokers, the dependent cutover broker is still removed
-before lifecycle.
-
 If task removal stops the task but a later unregister or filesystem step fails,
 the rollback restores the release tree, active pointer, bootstrap/configuration,
-and data ACL first; restores and verifies lifecycle; then restores and verifies
-cutover; and only then restores the exact control-task XML and its prior Running
+and data ACL first; restores and verifies lifecycle; and only then restores the
+exact control-task XML and its prior Running
 or non-Running state. A broker restoration failure blocks the control-task
 restart. It never restarts the old task against an incompletely restored state.
 
 `-RemoveData` is a separate, explicit destructive choice. It is rejected while
-retained lifecycle-broker, cutover-broker, or authority evidence exists; that
+retained lifecycle-broker evidence exists; that
 evidence is never implicitly deleted by control-plane uninstall. Otherwise it
 removes the complete data root, including the recoverable release copy, after the
 uninstall audit is written while the external deployment lease is still held. It does not
@@ -1121,140 +982,6 @@ an injected or observed failure.
 See [Dyson Control DataRoot recovery bundles](DATAROOT-RECOVERY.md) for the exact
 bundle format, fictional commands, manifest-digest handling, and the boundary
 between repository Shadow validation and private production acceptance.
-
-## GSManager parallel-migration snapshot and restore
-
-The verified release artifact includes the exact scripts under
-`scripts\windows\migration` plus this guide and `docs\GSM-EVALUATION.md`. These
-scripts prepare a recoverable parallel deployment. They do not disable, remove,
-or switch away from GSManager and they do not authorize production cutover.
-
-Use fictional paths below to understand the contract. On a real host, obtain the
-opaque ID and SHA-256 digest from an independently completed Dyson Control
-paired-save protection point. The migration snapshot only verifies that manifest;
-it never opens or copies the `.dsv`/`.server` pair.
-
-```powershell
-$artifact = 'C:\GameServer\Example\Packages\DysonControl-v0.2.0'
-$project = 'C:\GameServer\Example\DSP'
-$gsm = 'C:\GameServer\Example\DSP\tools\ExampleGameManager'
-$deploymentDataRoot = 'C:\GameServer\Example\DysonControlData'
-$appDataRoot = Join-Path $deploymentDataRoot 'data'
-$recoverySnapshotRoot = Join-Path $appDataRoot 'migration\snapshots'
-$protectionId = 'save:00000000-0000-4000-8000-000000000001'
-$protectionDigest = '0000000000000000000000000000000000000000000000000000000000000000'
-$migration = "$artifact\scripts\windows\migration"
-
-& "$migration\Get-DysonGsManagerMigration.ps1" `
-  -ProjectRoot $project -GsManagerRoot $gsm
-
-& "$migration\New-DysonGsManagerSnapshot.ps1" `
-  -ProjectRoot $project -GsManagerRoot $gsm -DataRoot $appDataRoot `
-  -PairedSaveProtectionPointId $protectionId `
-  -PairedSaveProtectionManifestSha256 $protectionDigest `
-  -WhatIf
-```
-
-Review the redacted preview, then run the same snapshot command without
-`-WhatIf`. Preserve its opaque `snapshotId` and `snapshotManifestSha256` outside
-the snapshot tree. Verification rehashes every byte and requires the exact
-schema and exact file set:
-
-```powershell
-& "$migration\Test-DysonGsManagerSnapshot.ps1" `
-  -DataRoot $appDataRoot `
-  -SnapshotId '<opaque snapshot UUID>' `
-  -ExpectedSnapshotManifestSha256 '<64-character snapshot manifest SHA-256>'
-```
-
-The fixed snapshot layout is `$recoverySnapshotRoot\<snapshotId>`, or
-`<application DataRoot>\migration\snapshots\<snapshotId>`. Snapshot creation,
-verification, restoration, and the later GSManager removal procedure must all
-use the same `$appDataRoot`; the deployment root is not the snapshot lookup root.
-A same-parent private staging tree
-is completely copied, re-inventoried, manifested, and self-verified before one
-directory rename publishes it. Failure removes the bounded partial directory and
-never publishes a half snapshot. Its protected ACL admits only the creating
-identity, local Administrators, and SYSTEM. GSManager settings and scheduled-task
-XML remain inside that private tree. JSON output contains only opaque IDs,
-counts, SHA-256 values, and statuses—never a path, command, account, XML, or file
-content.
-
-Both source and destination must be ordinary non-reparse paths. `GsManagerRoot`
-is required to be a strict child of `ProjectRoot`; it cannot be a filesystem root
-or overlap `DataRoot\migration`. The snapshot refuses reparse points, source
-changes during copy, `.dsv`/`.server`, unknown entries, more than the configured
-file count, more than the configured total bytes, or a file above the configured
-single-file bound. The verifier repeats the complete inventory and rejects a
-changed manifest, payload byte, extra file, missing file, or redirected entry.
-
-Restore has a stronger gate. Start with `-WhatIf`; it does not create a guard or
-write the target:
-
-```powershell
-& "$migration\Restore-DysonGsManagerSnapshot.ps1" `
-  -ProjectRoot $project -GsManagerRoot $gsm -DataRoot $appDataRoot `
-  -SnapshotId '<opaque snapshot UUID>' `
-  -ExpectedSnapshotManifestSha256 '<64-character snapshot manifest SHA-256>' `
-  -PairedSaveProtectionPointId $protectionId `
-  -PairedSaveProtectionManifestSha256 $protectionDigest `
-  -Confirmation 'RESTORE_GSMANAGER_SNAPSHOT' `
-  -WhatIf
-```
-
-An actual restore requires an elevated Administrator PowerShell process. It also
-requires the `Dyson-Control-Plane` scheduled task to exist but not be running,
-rejects any running or ambiguous `DSPGAME.exe`, and rejects a running GSManager
-task (default name `Dyson-GSManager`). The caller may supply another bounded task
-name explicitly. The target must be missing, empty, or already byte-identical to
-the verified snapshot; a non-empty different GSManager tree is never overwritten.
-
-Before root or task mutation, restore atomically publishes a private guard below
-`DataRoot\migration\restore-guards\<guardId>` containing the prior bounded root
-and task XML/state. The root is staged beside its destination for atomic rename.
-If task registration/state restoration or a later phase fails, task and root are
-compensated from the guard. A successful restore retains the opaque guard for
-manual recovery and does not start DSP, Dyson Control, or GSManager. Restoring an
-absent/disabled task state is possible only as part of this explicit,
-digest-bound restore; there is no standalone silent remove/disable/switch mode.
-
-Run the temporary, non-production fixture before clean-host evaluation:
-
-```powershell
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-  -File "$migration\SelfTest-DysonGsManagerMigration.ps1"
-```
-
-The fixture covers no-write previews, atomic publication, protection binding,
-tamper/extra/reparse and limit rejection, save exclusion, output redaction,
-restore conflict, guard verification, injected failure compensation, and proof
-that fictional GSM/game/save markers survive. It shadows Task Scheduler and does
-not verify a real host. Clean-host and target-host restore rehearsals remain
-required; `OSS-001` therefore stays `implemented`, not `verified`.
-
-## GSManager recoverable removal
-
-The release also packages a separate, fixed-root GSManager removal transaction.
-It is not part of snapshot creation and it is not an automatic cutover action.
-Only after the candidate authority is healthy, the old authority is disabled and
-inactive, the GSManager snapshot and paired-save protection point verify, and all
-cutover/authority/runtime/removal mutations are terminal can an elevated operator
-preview the removal. The real operation additionally requires the literal
-`REMOVE_GSMANAGER_INSTALLATION` confirmation phrase.
-
-The tool moves the installation into a private same-volume guard, preserves the
-exact tree and ACL intent plus scheduled-task XML/enabled state/DACL, unregisters
-the already-disabled old task, and writes bounded idempotent receipts.
-Any later failure compensates the exact bytes, ACLs, and task preimage. A
-separate, receipt-bound restore requires the candidate to be quiesced and the
-literal `RESTORE_GSMANAGER_REMOVAL` phrase. It restores the old task only as
-disabled and reports `activationRequired`; it never starts or re-enables either
-authority.
-
-See [Recoverable GSManager removal](MIGRATION-GSMANAGER.md) for the complete
-fictional `-WhatIf`, confirmed removal, inspection, rollback, and
-restore-disabled procedure. The repository self-test is Shadow-only; no target
-host or production removal is evidenced, so `CUT-003` remains `not-started`.
 
 ## Bridge source-to-private-candidate deployment
 
@@ -1353,7 +1080,7 @@ identities before retrying installation.
 `Test-DysonControlBridgeInstallation.ps1` is read-only. The uninstall script is
 dry-run capable, snapshots the current DLL/config/state, preserves the secret,
 and returns a snapshot ID that its explicit `-RestoreSnapshotId` mode can verify
-and restore. Neither path deletes saves, the game, Nebula, BepInEx, GSM/GSManager,
+and restore. Neither path deletes saves, the game, Nebula, or BepInEx,
 or Bridge control data. The repository Bridge self-test uses only temporary
 controlled assemblies; a successful full plugin compilation remains a
 target-host boundary because proprietary references are intentionally absent.
@@ -1408,7 +1135,7 @@ a real Local Service token remains an elevated target-VM qualification gate and
 is not claimed by the repository-only self-test.
 
 The task description explicitly records that it does not start or stop the game.
-No task named `Dyson-Nebula-Server`, `Dyson-Nebula-Stop`, or any GSManager task is
+No unrelated game task is
 queried or changed by this deployment directory.
 
 The installer atomically creates `bootstrap\bootstrap-layout.json` with an exact,
@@ -1463,37 +1190,6 @@ binding and request. If its byte, ACL, or full-field recovery rules cannot prove
 one unambiguous state, leave the runtime fail closed and retain the private
 artifacts for investigation.
 
-For a parallel installation while GSManager still owns production, preview and
-apply only `PrepareDisabled` from an administrator PowerShell session:
-
-Initialize the separate GSManager authority before replacing its legacy task
-definitions. Use the application data directory for authority initialization:
-
-| Command or setting | Data directory in the example layout |
-| --- | --- |
-| `Install-DysonControl.ps1 -DataRoot` | `C:\GameServer\Example\DysonControlData` |
-| `DYSON_DATA_DIR` | `C:\GameServer\Example\DysonControlData\data` |
-| `Initialize-DysonGsManagerAuthority.ps1 -DataRoot` | `C:\GameServer\Example\DysonControlData\data` |
-| Authority profile consumed by the API | `C:\GameServer\Example\DysonControlData\data\authority-inventory\authority-profile.json` |
-| Runtime-task transaction root (default) | `C:\GameServer\Example\DysonControlData\runtime-task-transactions` |
-| GSManager recovery snapshot directory | `C:\GameServer\Example\DysonControlData\data\migration\snapshots` |
-
-The top-level installer derives this application directory by appending `data`
-to its deployment data root. Keep the runtime-task transaction root identical
-across authority initialization, the API configuration, and broker installation.
-
-If the candidate pair has already been prepared, the initializer
-also accepts `-PreparedLegacyTemplateRoot` and
-`-ExpectedLegacyTemplateSha256`. That directory must contain only
-`legacy-server.xml` and `legacy-stop.xml`, defining the fixed legacy scripts
-under the configured project. The digest is SHA-256 of the UTF-8 text
-`<lowercase server byte hash>:<lowercase stop byte hash>`. The initializer
-checks that both current candidate tasks are disabled and match the installed
-bootstrap, retains their real preimages, and creates separate GSManager task
-entries from the templates. It records `authoritySource=reconstructed-template`
-and the template digest; these templates are new desired definitions, not
-historical task backups. Preview the same request with `-WhatIf` before applying.
-
 The lifecycle broker can be installed while both candidate tasks are Disabled.
 Installation validates their complete definitions and records the expected
 active definitions without enabling the tasks. Mixed enabled/disabled pairs
@@ -1529,14 +1225,8 @@ $bootstrap = 'C:\GameServer\Example\DysonControl\bootstrap'
   -RequestId $runtimeRequest
 ```
 
-`PrepareDisabled` publishes both final definitions as Disabled from their first
-native registration; it never starts a task. Do not manually run `Activate`
-while GSManager has any task, service, startup entry, process, or port authority.
-Activation belongs inside the later cutover transaction, after it has durably
-captured the old authority, protected the paired save, disabled every old
-startup source, and proved zero managed processes and zero game-port listeners.
-That coordinator passes the same `DataRoot` and borrows its already-held global
-host-mutation lease with the fixed `-LeaseInstanceId/-LeaseToken` pair.
+PrepareDisabled publishes both final definitions as Disabled; Activate requires the
+game to be proved stopped and runs under the existing host-mutation lease.
 
 If the command reports that explicit recovery is required, repeat the exact
 request and arguments with `-Recover`; do not invent a new request ID. The
@@ -1553,27 +1243,12 @@ rollback receipt and preserves the original evidence. It restores the archived
 Enabled state, so an old enabled task becomes enabled again. For an interrupted
 rollback, repeat its new request ID and exact arguments with `-Recover`.
 Older installations without a completed archive cannot be restored from a
-receipt alone. The isolated regression gates are:
-
-```powershell
-npm run runtime-tasks:selftest
-npm run game-bootstrap:selftest
-npm run game-bootstrap:access-selftest
-npm run cutover:selftest
-```
-
-The access suite uses real ACLs on temporary local directories. The other suites
-use file-backed fake scheduler/runtime fixtures and temporary fictional
-roots only; they do not touch the native Task Scheduler, Steam, DSP, saves,
-GSManager, or production processes. `cutover:selftest` includes the authority,
-host, and 38-case cutover-broker suites. The broker suite covers cross-release
-commit, exact-request and same-release idempotence, six injected rollback
-stages, restored-old-broker usability, first-install compensation, safe current
-removal with pending/drift refusal and failure rollback, bundle tamper, and
-reparse rejection.
-Release self-testing additionally runs
-the broker self-test from inside the assembled artifact and rejects each missing
-member or any extra member of the exact six-file broker directory.
+receipt alone. The isolated regression gates are
+pm run runtime-tasks:selftest,
+pm run
+game-bootstrap:selftest, and
+pm run game-bootstrap:access-selftest. They use
+temporary fictional roots and do not touch the native scheduler or game process.
 
 This no-RDP guarantee applies to the Dyson Control API/web task only. The
 separate game-runtime installer currently defines an interactive
@@ -1647,8 +1322,8 @@ the current scripts before the approved reboot drill.
 Both checkpoint creation and resume require the lifecycle broker's static state
 to be `ready`, including its active-release/environment/profile/task/dependency
 bindings and clean durable channel. Both also call `/readyz` with the required
-checks `lifecycleBroker` and `cutoverRecovery`; an HTTP-ready application with
-either check absent or failing is rejected. This gate is stricter than the
+check `lifecycleBroker`; an HTTP-ready application with that check absent or
+failing is rejected. This gate is stricter than the
 ordinary read-only status command's lifecycle-disabled `disabled-clean` state.
 
 Preview first, then create the checkpoint only on the intended validation host:
@@ -1756,8 +1431,7 @@ It verifies:
   after Stop, and when a later uninstall filesystem step fails.
 - broker-aware uninstall `-WhatIf` non-mutation, pending/drift refusal, exact
   active release/profile/task/DACL restoration when a later control-task step
-  fails, and successful fixed broker removal with retained receipts, authority,
-  and GSManager data.
+  fails, and successful lifecycle-broker removal with retained receipts.
 
 The deployment self-tests validate PowerShell 5.1 behavior but cannot prove
 Task Scheduler, service-account ACL inheritance, boot startup, process
@@ -1777,12 +1451,12 @@ self-test are repository evidence only; neither command changes a target host.
 
 ## Required production verification
 
-Before replacing another panel or declaring deployment ready, run these gates on a
+Before declaring deployment ready, run these gates on a
 non-production Windows Server Core VM and then on the target during an approved
 maintenance window:
 
 1. Parse every shipped PowerShell script and run the deployment, deployment
-   status, deployment reboot, lifecycle-broker, cutover-broker, and release-package
+   status, deployment reboot, lifecycle-broker, and release-package
    self-tests.
 2. Install from an independently authenticated Node ZIP into a separate protected
    RuntimeRoot, then install with a complete local production configuration and
@@ -1800,26 +1474,24 @@ maintenance window:
    `-CompensateFirstInstall`, removes only the fixed profile/task, and preserves
    request/receipt/audit evidence.
 7. Prove same-release replay returns `reused` and performs no compensation.
-8. Perform a healthy A-to-B upgrade with the explicit broker upgrade switches.
+8. Perform a healthy A-to-B upgrade with the explicit lifecycle-broker upgrade switch.
 9. Deploy an intentionally unready fictional B-to-C build and prove the old
    active release is restored before the old release's lifecycle installer runs
    with `-UpgradeExisting`; verify the old profile/task/ACL and both deep
    readiness checks.
 10. Exercise the exact-snapshot lower-level rollback only in a lifecycle-disabled
     fixture and prove configuration and SQLite state remain consistent.
-11. Uninstall without `-RemoveData`; verify both broker profiles/tasks are removed,
-    durable requests/receipts/audit/authority evidence and DataRoot remain, and
+11. Uninstall without `-RemoveData`; verify the lifecycle-broker profile/task is removed,
+    durable requests/receipts/audit evidence and DataRoot remain, and
     the release/task can be restored from the reported backups.
-12. Only after the control plane passes the project's complete acceptance and soak
-    gates should a separate approved cutover remove GSManager.
 
 ## Operator inputs still required after release packaging
 
 Qualified-client storage rollback restores an adopted empty directory's captured
 owner, group, DACL, and inheritance control bits exactly. The rollback uses
 `SetFileSecurityW` for the captured directory descriptor; the ordinary ACL
-installer retains its existing inheritance behavior. Lifecycle and cutover
-broker rollback use the same primitive for their captured directory preimages,
+installer retains its existing inheritance behavior. Lifecycle-broker rollback
+uses the same primitive for its captured directory preimages,
 without propagating changes to descendants. This avoids the automatic
 `SE_DACL_AUTO_INHERITED` conversion described in Microsoft's Win32 documentation,
 "Automatic Propagation of Inheritable ACEs".
@@ -1851,16 +1523,11 @@ operator must still provide or decide:
   matching environment bindings;
 - `-UpgradeLifecycleBrokerExisting` for a cross-release lifecycle change;
   same-release replay is idempotent without it;
-- optional dependent cutover installation: `-InstallCutoverBrokerTask` in the
-  same transaction as lifecycle, plus the authority profile/revision, runtime
-  task transaction root, and matching project/bootstrap/user/port bindings;
-- `-UpgradeCutoverBrokerExisting` for a cross-release cutover change;
 - the artifact retention policy for inactive releases and deployment snapshots.
 
 Release automation must continue to preserve the recursive PowerShell parser,
-deployment/status/reboot and broker self-tests, exact artifact/package
+deployment/status/reboot and lifecycle-broker self-tests, exact artifact/package
 verifiers, and public-release scan.
 The real clean-host and target-host commands above have not yet been executed as
 production evidence. Until those runs exist, `OSS-001` and `SRV-002` are
-`implemented`, not `verified`, and this mechanism is not authorization to replace
-GSManager.
+`implemented`, not `verified`.

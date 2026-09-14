@@ -19,12 +19,11 @@ the tools require all of the following:
 - the exact `Dyson-Control-Plane` scheduled task exists at `\` and is `Ready`
   or `Disabled`, never `Running` or `Queued`;
 - the shared host-mutation lease is empty or released;
-- lifecycle- and cutover-broker intents are empty, cutover work is empty, and
-  every retained broker request has a matching terminal receipt with the same
+- lifecycle-broker intents are empty, and every retained broker request has a matching terminal receipt with the same
   ID, fingerprint, and capability;
 - no interrupted DataRoot recovery intent is present;
 - the DataRoot contains only `acceptance`, `audit`, `config`, `data`, `logs`,
-  `migration`, `runtime-task-transactions`, `snapshots`, and `state` at its top
+  `runtime-task-transactions`, `snapshots`, and `state` at its top
   level;
 - the entire selected tree consists only of ordinary files and directories,
   with no junction, symlink, mount point, or other reparse point;

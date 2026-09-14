@@ -22,7 +22,7 @@ Current release gates:
 
 Package/installer self-tests use fictional payloads and isolated temporary roots.
 Their success does not constitute a new live installation, a real DSP update,
-an external player join, GSManager removal or whole-project completion.
+an external player join or whole-project completion.
 
 ## Confirmed findings
 
@@ -81,12 +81,12 @@ requires a stopped proof before restoring files; this is a guard that exists,
 not a missing check. The U05 freshness failure still applies to the production
 callback supplying that proof.
 
-Repository acceptance inventory remains 48 requirements: 39 `implemented`,
-9 `not-started`, zero `verified`. These are registry states, not a claim that no
+Repository acceptance inventory contains 45 requirements: 39 `implemented`,
+6 `not-started`, zero `verified`. These are registry states, not a claim that no
 private production work exists. Reconcile private evidence before changing them.
-The nine open entries cover production restore, side-by-side deployment, TLS,
-game routing/bypass, external join, reboot/fault/soak, recovery package, cutover,
-and removal. No update-only test batch satisfies these broader release gates.
+The six open entries cover production restore, independent deployment, TLS,
+game routing/bypass, external join, and reboot/fault/soak. No update-only test
+batch satisfies these broader release gates.
 
 ## Consolidated implementation batch
 

@@ -114,6 +114,7 @@ $script:DysonArtifactRequiredConfigurationFiles = @(
     'scripts/windows/configuration/Test-DysonControlConfiguration.ps1',
     'scripts/windows/configuration/SelfTest-DysonControlConfiguration.ps1',
     'scripts/windows/configuration/dyson-control.environment-contract.json',
+    'scripts/windows/configuration/dyson-control.environment-contract.rc26.json',
     'scripts/windows/configuration/README.md'
 )
 $script:DysonArtifactRequiredSessionScripts = @(
@@ -174,21 +175,8 @@ if ($script:DysonArtifactRequiredBridgeReferenceSpecifications.Count -ne 8 -or
     @($script:DysonArtifactRequiredBridgeReferenceSpecifications.relativePath | Select-Object -Unique).Count -ne 8) {
     throw 'The exact Bridge fixed reference package is inconsistent.'
 }
-$script:DysonArtifactRequiredMigrationScripts = @(
-    'scripts/windows/migration/DysonGsManagerMigration.Common.ps1',
-    'scripts/windows/migration/Get-DysonGsManagerMigration.ps1',
-    'scripts/windows/migration/New-DysonGsManagerSnapshot.ps1',
-    'scripts/windows/migration/Restore-DysonGsManagerSnapshot.ps1',
-    'scripts/windows/migration/SelfTest-DysonGsManagerMigration.ps1',
-    'scripts/windows/migration/Test-DysonGsManagerSnapshot.ps1'
-)
-$script:DysonArtifactRequiredGsManagerRemovalScripts = @(
-    'scripts/windows/migration/DysonGsManagerRemoval.Common.ps1',
-    'scripts/windows/migration/Remove-DysonGsManagerInstallation.ps1',
-    'scripts/windows/migration/Restore-DysonGsManagerRemoval.ps1',
-    'scripts/windows/migration/SelfTest-DysonGsManagerRemoval.ps1',
-    'scripts/windows/migration/Test-DysonGsManagerRemoval.ps1'
-)
+
+
 $script:DysonArtifactRequiredEvidenceScripts = @(
     'scripts/windows/evidence/DysonPrivateEvidence.Common.ps1',
     'scripts/windows/evidence/New-DysonAcceptanceEvidenceIndex.ps1',
@@ -245,23 +233,8 @@ $script:DysonArtifactRequiredGameBootstrapScripts = @(
     'scripts/windows/bootstrap/Start-DysonServer.ps1',
     'scripts/windows/bootstrap/Stop-DysonServer.ps1'
 )
-$script:DysonArtifactRequiredCutoverScripts = @(
-    'scripts/windows/cutover/DysonCutoverHost.Common.ps1',
-    'scripts/windows/cutover/DysonGsManagerAuthority.Common.ps1',
-    'scripts/windows/cutover/Get-DysonCutoverEvidence.ps1',
-    'scripts/windows/cutover/Initialize-DysonGsManagerAuthority.ps1',
-    'scripts/windows/cutover/Invoke-DysonCutoverAction.ps1',
-    'scripts/windows/cutover/SelfTest-DysonCutoverHost.ps1',
-    'scripts/windows/cutover/SelfTest-DysonGsManagerAuthority.ps1'
-)
-$script:DysonArtifactRequiredCutoverBrokerScripts = @(
-    'scripts/windows/cutover-broker/DysonCutoverBroker.Common.ps1',
-    'scripts/windows/cutover-broker/DysonCutoverBroker.TaskAcl.ps1',
-    'scripts/windows/cutover-broker/Install-DysonCutoverBrokerTask.ps1',
-    'scripts/windows/cutover-broker/Invoke-DysonCutoverBrokerWorker.ps1',
-    'scripts/windows/cutover-broker/SelfTest-DysonCutoverBroker.ps1',
-    'scripts/windows/cutover-broker/Submit-DysonCutoverBrokerRequest.ps1'
-)
+
+
 $script:DysonArtifactRequiredLifecycleBrokerScripts = @(
     'scripts/windows/lifecycle-broker/DysonLifecycleBroker.Common.ps1',
     'scripts/windows/lifecycle-broker/DysonLifecycleBroker.TaskAcl.ps1',
@@ -345,11 +318,6 @@ if ($script:DysonArtifactRequiredQualificationFrameworkFiles.Count -ne 16 -or
     throw 'The exact qualification V1/V2 framework package is inconsistent.'
 }
 $script:DysonArtifactRequiredStrictQualificationV2Files = @(
-    'scripts/windows/qualification/Qualification.SideBySideV2.ps1',
-    'scripts/windows/qualification/New-DysonSideBySideObservationV2.ps1',
-    'scripts/windows/qualification/Test-DysonSideBySideObservationV2.ps1',
-    'scripts/windows/qualification/SelfTest-DysonSideBySideObservationV2.ps1',
-    'scripts/windows/qualification/README.SideBySideV2.md',
     'scripts/windows/qualification/Qualification.PairedSaveLoad.ps1',
     'scripts/windows/qualification/New-DysonQualificationPairedSaveLoadObservationV2.ps1',
     'scripts/windows/qualification/Test-DysonQualificationPairedSaveLoadObservationV2.ps1',
@@ -366,18 +334,6 @@ $script:DysonArtifactRequiredStrictQualificationV2Files = @(
     'scripts/windows/qualification/SelfTest-DysonExternalJoinObservationV2.ps1',
     'scripts/windows/qualification/dyson-external-join-observation-v2.schema.json',
     'scripts/windows/qualification/README.ExternalJoinObservationV2.md',
-    'scripts/windows/qualification/Qualification.ReversibleCutover.ps1',
-    'scripts/windows/qualification/New-DysonQualificationReversibleCutoverObservationV2.ps1',
-    'scripts/windows/qualification/Test-DysonQualificationReversibleCutoverObservationV2.ps1',
-    'scripts/windows/qualification/SelfTest-DysonQualificationReversibleCutoverObservationV2.ps1',
-    'scripts/windows/qualification/reversible-cutover-observation.v2.schema.json',
-    'scripts/windows/qualification/README-ReversibleCutover.md',
-    'scripts/windows/qualification/PostGsManagerRemovalObservationV2.Common.ps1',
-    'scripts/windows/qualification/New-DysonPostGsManagerRemovalObservationV2.ps1',
-    'scripts/windows/qualification/Test-DysonPostGsManagerRemovalObservationV2.ps1',
-    'scripts/windows/qualification/SelfTest-DysonPostGsManagerRemovalObservationV2.ps1',
-    'scripts/windows/qualification/dyson-post-gsmanager-removal-observation-v2.schema.json',
-    'scripts/windows/qualification/README.PostGsManagerRemovalObservationV2.md',
     'scripts/windows/qualification/SoakObservationV2.Common.ps1',
     'scripts/windows/qualification/New-DysonSoakObservationV2.ps1',
     'scripts/windows/qualification/Test-DysonSoakObservationV2.ps1',
@@ -385,8 +341,8 @@ $script:DysonArtifactRequiredStrictQualificationV2Files = @(
     'scripts/windows/qualification/dyson-soak-observation-v2.schema.json',
     'scripts/windows/qualification/README.SoakObservationV2.md'
 )
-if ($script:DysonArtifactRequiredStrictQualificationV2Files.Count -ne 39 -or
-    @($script:DysonArtifactRequiredStrictQualificationV2Files | Select-Object -Unique).Count -ne 39) {
+if ($script:DysonArtifactRequiredStrictQualificationV2Files.Count -ne 22 -or
+    @($script:DysonArtifactRequiredStrictQualificationV2Files | Select-Object -Unique).Count -ne 22) {
     throw 'The exact strict qualification V2 protocol package is inconsistent.'
 }
 $script:DysonArtifactRequiredQualificationRuntimeFiles = @(
@@ -395,8 +351,8 @@ $script:DysonArtifactRequiredQualificationRuntimeFiles = @(
     $script:DysonArtifactRequiredQualificationFrameworkFiles +
     $script:DysonArtifactRequiredStrictQualificationV2Files
 )
-if ($script:DysonArtifactRequiredQualificationRuntimeFiles.Count -ne 65 -or
-    @($script:DysonArtifactRequiredQualificationRuntimeFiles | Select-Object -Unique).Count -ne 65) {
+if ($script:DysonArtifactRequiredQualificationRuntimeFiles.Count -ne 48 -or
+    @($script:DysonArtifactRequiredQualificationRuntimeFiles | Select-Object -Unique).Count -ne 48) {
     throw 'The aggregate qualification runtime package is inconsistent.'
 }
 $script:DysonArtifactRequiredNebulaHostnameWssSources = @(
@@ -407,13 +363,10 @@ if ($script:DysonArtifactRequiredNebulaHostnameWssSources.Count -ne 2 -or
     @($script:DysonArtifactRequiredNebulaHostnameWssSources | Select-Object -Unique).Count -ne 2) {
     throw 'The exact public hostname-WSS source contract package is inconsistent.'
 }
-$script:DysonArtifactRequiredMigrationDocs = @(
-    'docs/GSM-EVALUATION.md',
+$script:DysonArtifactRequiredDeploymentDocs = @(
     'docs/WINDOWS-DEPLOYMENT-DRAFT.md'
 )
-$script:DysonArtifactRequiredGsManagerRemovalDocs = @(
-    'docs/MIGRATION-GSMANAGER.md'
-)
+
 $script:DysonArtifactRequiredRecoveryDocs = @(
     'docs/DATAROOT-RECOVERY.md'
 )
@@ -473,20 +426,15 @@ $script:DysonArtifactRepositoryOnlyApiJavaScriptSuffixes = @(
         $script:DysonArtifactRequiredSessionScripts +
         $script:DysonArtifactRequiredBridgeSources +
         $script:DysonArtifactRequiredBridgeScripts +
-        $script:DysonArtifactRequiredMigrationScripts +
-        $script:DysonArtifactRequiredGsManagerRemovalScripts +
         $script:DysonArtifactRequiredEvidenceScripts +
         $script:DysonArtifactRequiredHostMutationScripts +
         $script:DysonArtifactRequiredGameBootstrapScripts +
-        $script:DysonArtifactRequiredCutoverScripts +
-        $script:DysonArtifactRequiredCutoverBrokerScripts +
         $script:DysonArtifactRequiredLifecycleBrokerScripts +
         $script:DysonArtifactRequiredDataRecoveryScripts +
         $script:DysonArtifactRequiredNetworkFiles +
         $script:DysonArtifactRequiredQualificationRuntimeFiles +
         $script:DysonArtifactRequiredNebulaHostnameWssSources +
-        $script:DysonArtifactRequiredMigrationDocs +
-        $script:DysonArtifactRequiredGsManagerRemovalDocs +
+        $script:DysonArtifactRequiredDeploymentDocs +
         $script:DysonArtifactRequiredRecoveryDocs +
         $script:DysonArtifactRequiredNetworkDocs +
         $script:DysonArtifactRequiredQualificationDocs
@@ -669,6 +617,9 @@ function Assert-DysonArtifactAllowedFile {
     Assert-DysonArtifactRelativePath -Path $RelativePath
     $normalized = $RelativePath.Replace('\', '/')
     $lower = $normalized.ToLowerInvariant()
+    if ($lower -match '^apps/api/dist/(cutover/|providers/windows-cutover(?:-host)?(?:\.|$))') {
+        throw "Removed manager-switching runtime is forbidden in a release artifact: $RelativePath"
+    }
     $segments = @($lower.Split('/'))
     $name = $segments[$segments.Count - 1]
     $extension = [System.IO.Path]::GetExtension($name).ToLowerInvariant()
@@ -708,8 +659,7 @@ function Assert-DysonArtifactAllowedFile {
     $allowedDeploymentScripts = @($script:DysonArtifactRequiredDeploymentScripts | ForEach-Object { $_.ToLowerInvariant() })
     $allowedConfigurationFiles = @($script:DysonArtifactRequiredConfigurationFiles | ForEach-Object { $_.ToLowerInvariant() })
     $allowedSessionScripts = @($script:DysonArtifactRequiredSessionScripts | ForEach-Object { $_.ToLowerInvariant() })
-    $allowedMigrationScripts = @(($script:DysonArtifactRequiredMigrationScripts +
-        $script:DysonArtifactRequiredGsManagerRemovalScripts) | ForEach-Object { $_.ToLowerInvariant() })
+
     $allowedEvidenceScripts = @($script:DysonArtifactRequiredEvidenceScripts | ForEach-Object { $_.ToLowerInvariant() })
     $allowedHostMutationScripts = @($script:DysonArtifactRequiredHostMutationScripts | ForEach-Object { $_.ToLowerInvariant() })
     $allowedNebulaPluginTransactionFiles = @(
@@ -717,8 +667,8 @@ function Assert-DysonArtifactAllowedFile {
             ForEach-Object { $_.ToLowerInvariant() }
     )
     $allowedGameBootstrapScripts = @($script:DysonArtifactRequiredGameBootstrapScripts | ForEach-Object { $_.ToLowerInvariant() })
-    $allowedCutoverScripts = @($script:DysonArtifactRequiredCutoverScripts | ForEach-Object { $_.ToLowerInvariant() })
-    $allowedCutoverBrokerScripts = @($script:DysonArtifactRequiredCutoverBrokerScripts | ForEach-Object { $_.ToLowerInvariant() })
+
+
     $allowedLifecycleBrokerScripts = @($script:DysonArtifactRequiredLifecycleBrokerScripts | ForEach-Object { $_.ToLowerInvariant() })
     $allowedDataRecoveryScripts = @($script:DysonArtifactRequiredDataRecoveryScripts | ForEach-Object { $_.ToLowerInvariant() })
     $allowedNetworkFiles = @($script:DysonArtifactRequiredNetworkFiles | ForEach-Object { $_.ToLowerInvariant() })
@@ -728,8 +678,8 @@ function Assert-DysonArtifactAllowedFile {
     $allowedNebulaHostnameWssSources = @(
         $script:DysonArtifactRequiredNebulaHostnameWssSources | ForEach-Object { $_.ToLowerInvariant() }
     )
-    $allowedMigrationDocs = @($script:DysonArtifactRequiredMigrationDocs | ForEach-Object { $_.ToLowerInvariant() })
-    $allowedGsManagerRemovalDocs = @($script:DysonArtifactRequiredGsManagerRemovalDocs | ForEach-Object { $_.ToLowerInvariant() })
+    $allowedDeploymentDocs = @($script:DysonArtifactRequiredDeploymentDocs | ForEach-Object { $_.ToLowerInvariant() })
+
     $allowedRecoveryDocs = @($script:DysonArtifactRequiredRecoveryDocs | ForEach-Object { $_.ToLowerInvariant() })
     $allowedNetworkDocs = @($script:DysonArtifactRequiredNetworkDocs | ForEach-Object { $_.ToLowerInvariant() })
     $allowedQualificationDocs = @(
@@ -737,9 +687,9 @@ function Assert-DysonArtifactAllowedFile {
     )
     $allowedWindowsScripts = @(
         $allowedTopLevelWindowsScripts + $allowedReleaseScripts + $allowedDeploymentScripts +
-        $allowedSessionScripts + $allowedBridgeScripts + $allowedMigrationScripts +
+        $allowedSessionScripts + $allowedBridgeScripts +
         $allowedEvidenceScripts + $allowedHostMutationScripts + $allowedGameBootstrapScripts +
-        $allowedCutoverScripts + $allowedCutoverBrokerScripts + $allowedLifecycleBrokerScripts +
+        $allowedLifecycleBrokerScripts +
         $allowedDataRecoveryScripts + $allowedNetworkFiles + $allowedQualificationRuntimeFiles +
         $allowedConfigurationFiles
     )
@@ -771,9 +721,7 @@ function Assert-DysonArtifactAllowedFile {
     if ($lower.StartsWith('scripts/windows/session/') -and $lower -notin $allowedSessionScripts) {
         throw "The interactive-session tools contain a path outside their exact allowlist: $RelativePath"
     }
-    if ($lower.StartsWith('scripts/windows/migration/') -and $lower -notin $allowedMigrationScripts) {
-        throw "The GSManager migration tools contain a path outside their exact allowlist: $RelativePath"
-    }
+
     if ($lower.StartsWith('scripts/windows/evidence/') -and $lower -notin $allowedEvidenceScripts) {
         throw "The private acceptance evidence tools contain a path outside their exact allowlist: $RelativePath"
     }
@@ -788,12 +736,8 @@ function Assert-DysonArtifactAllowedFile {
     if ($lower.StartsWith('scripts/windows/bootstrap/') -and $lower -notin $allowedGameBootstrapScripts) {
         throw "The stable game bootstrap contains a path outside its exact allowlist: $RelativePath"
     }
-    if ($lower.StartsWith('scripts/windows/cutover/') -and $lower -notin $allowedCutoverScripts) {
-        throw "The cutover host tools contain a path outside their exact allowlist: $RelativePath"
-    }
-    if ($lower.StartsWith('scripts/windows/cutover-broker/') -and $lower -notin $allowedCutoverBrokerScripts) {
-        throw "The cutover broker tools contain a path outside their exact allowlist: $RelativePath"
-    }
+
+
     if ($lower.StartsWith('scripts/windows/lifecycle-broker/') -and $lower -notin $allowedLifecycleBrokerScripts) {
         throw "The lifecycle broker tools contain a path outside their exact allowlist: $RelativePath"
     }
@@ -810,12 +754,7 @@ function Assert-DysonArtifactAllowedFile {
     if ($lower.StartsWith('scripts/windows/') -and $lower -notin $allowedWindowsScripts) {
         throw "The Windows runtime tools contain a path outside their exact allowlist: $RelativePath"
     }
-    if ($lower.StartsWith('docs/') -and $lower -notin @(
-            $allowedMigrationDocs + $allowedGsManagerRemovalDocs + $allowedRecoveryDocs +
-                $allowedNetworkDocs + $allowedQualificationDocs
-        )) {
-        throw "The release documentation contains a path outside its exact allowlist: $RelativePath"
-    }
+
     if ($lower.StartsWith('integrations/dyson-control-bridge/') -and $extension -in @('.dll', '.pdb', '.exe')) {
         throw "A compiled or proprietary assembly entered the public Bridge source package: $RelativePath"
     }
@@ -827,7 +766,7 @@ function Assert-DysonArtifactAllowedFile {
         $lower.StartsWith('apps/web/dist/') -or $lower.StartsWith('scripts/windows/') -or
         $lower -in $allowedBridgeSources -or
         $lower -in $allowedNebulaHostnameWssSources -or
-        $lower -in @($allowedMigrationDocs + $allowedGsManagerRemovalDocs + $allowedRecoveryDocs +
+        $lower -in @($allowedDeploymentDocs + $allowedRecoveryDocs +
             $allowedNetworkDocs + $allowedQualificationDocs)
     if (-not $allowed) { throw "The artifact contains a path outside the release allowlist: $RelativePath" }
 
@@ -1276,21 +1215,8 @@ function Test-DysonControlReleaseArtifactCore {
     [void](Assert-DysonArtifactBridgeFixedReferenceContract `
         -ProjectPath (Join-Path $root 'integrations\dyson-control-bridge\DysonControlBridge.csproj') `
         -CommonScriptPath (Join-Path $root 'scripts\windows\bridge\DysonBridge.Common.ps1'))
-    foreach ($requiredMigrationPath in @($script:DysonArtifactRequiredMigrationScripts + $script:DysonArtifactRequiredMigrationDocs)) {
-        $requiredMigrationFile = Get-DysonArtifactFullPath -Path (Join-Path $root $requiredMigrationPath.Replace('/', '\'))
-        if (-not (Test-DysonArtifactPathWithin -Candidate $requiredMigrationFile -Parent $root) -or
-            -not (Test-Path -LiteralPath $requiredMigrationFile -PathType Leaf)) {
-            throw 'The GSManager parallel-migration delivery package is incomplete.'
-        }
-    }
-    foreach ($requiredRemovalPath in @($script:DysonArtifactRequiredGsManagerRemovalScripts +
-        $script:DysonArtifactRequiredGsManagerRemovalDocs)) {
-        $requiredRemovalFile = Get-DysonArtifactFullPath -Path (Join-Path $root $requiredRemovalPath.Replace('/', '\'))
-        if (-not (Test-DysonArtifactPathWithin -Candidate $requiredRemovalFile -Parent $root) -or
-            -not (Test-Path -LiteralPath $requiredRemovalFile -PathType Leaf)) {
-            throw 'The GSManager recoverable-removal delivery package is incomplete.'
-        }
-    }
+
+
     foreach ($requiredEvidencePath in $script:DysonArtifactRequiredEvidenceScripts) {
         $requiredEvidenceFile = Get-DysonArtifactFullPath -Path (Join-Path $root $requiredEvidencePath.Replace('/', '\'))
         if (-not (Test-DysonArtifactPathWithin -Candidate $requiredEvidenceFile -Parent $root) -or
@@ -1319,20 +1245,8 @@ function Test-DysonControlReleaseArtifactCore {
             throw 'The stable game bootstrap delivery package is incomplete.'
         }
     }
-    foreach ($requiredCutoverPath in $script:DysonArtifactRequiredCutoverScripts) {
-        $requiredCutoverFile = Get-DysonArtifactFullPath -Path (Join-Path $root $requiredCutoverPath.Replace('/', '\'))
-        if (-not (Test-DysonArtifactPathWithin -Candidate $requiredCutoverFile -Parent $root) -or
-            -not (Test-Path -LiteralPath $requiredCutoverFile -PathType Leaf)) {
-            throw 'The cutover host delivery package is incomplete.'
-        }
-    }
-    foreach ($requiredBrokerPath in $script:DysonArtifactRequiredCutoverBrokerScripts) {
-        $requiredBrokerFile = Get-DysonArtifactFullPath -Path (Join-Path $root $requiredBrokerPath.Replace('/', '\'))
-        if (-not (Test-DysonArtifactPathWithin -Candidate $requiredBrokerFile -Parent $root) -or
-            -not (Test-Path -LiteralPath $requiredBrokerFile -PathType Leaf)) {
-            throw 'The cutover broker delivery package is incomplete.'
-        }
-    }
+
+
     foreach ($requiredBrokerPath in $script:DysonArtifactRequiredLifecycleBrokerScripts) {
         $requiredBrokerFile = Get-DysonArtifactFullPath -Path (Join-Path $root $requiredBrokerPath.Replace('/', '\'))
         if (-not (Test-DysonArtifactPathWithin -Candidate $requiredBrokerFile -Parent $root) -or
@@ -1422,10 +1336,7 @@ function Test-DysonControlReleaseArtifactCore {
         observabilityRuntimeApiPackaged = $true
         windowsUpdateRuntimeApiPackaged = $true
         nebulaPluginTransactionApiPackaged = $true
-        gsManagerParallelMigrationPackaged = $true
-        migrationDocumentationPackaged = $true
-        gsManagerRecoverableRemovalPackaged = $true
-        gsManagerRemovalDocumentationPackaged = $true
+        deploymentDocumentationPackaged = $true
         privateAcceptanceEvidenceToolingPackaged = $true
         hostMutationLeaseToolingPackaged = $true
         nebulaPluginTransactionRuntimePackaged = $true
@@ -1433,8 +1344,6 @@ function Test-DysonControlReleaseArtifactCore {
             $script:DysonArtifactRequiredNebulaPluginTransactionRunnerFiles.Count
         privateNebulaCandidateBinariesPackaged = $false
         stableGameBootstrapPackaged = $true
-        cutoverHostToolingPackaged = $true
-        cutoverBrokerToolingPackaged = $true
         lifecycleBrokerToolingPackaged = $true
         dataRootRecoveryToolingPackaged = $true
         dataRootRecoveryDocumentationPackaged = $true

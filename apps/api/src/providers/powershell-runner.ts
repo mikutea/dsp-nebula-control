@@ -3,10 +3,6 @@ import { StringDecoder } from 'node:string_decoder'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import type {
-  WindowsCutoverHostScriptName,
-  WindowsCutoverPowerShellRunner
-} from './windows-cutover-host.js'
-import type {
   WindowsNebulaPluginTransactionPowerShellRunner,
   WindowsNebulaPluginTransactionScriptName
 } from './windows-nebula-plugin-transaction.js'
@@ -24,7 +20,6 @@ const lifecycleScriptNames = [
 export type LifecycleScriptName = (typeof lifecycleScriptNames)[number]
 type AllowedPowerShellScriptName =
   | LifecycleScriptName
-  | WindowsCutoverHostScriptName
   | WindowsNebulaPluginTransactionScriptName
   | HostnameWssQualificationScriptName
 
@@ -33,10 +28,6 @@ const allowedScriptPaths = {
   'Get-DysonManagedPluginVersion.ps1': ['Get-DysonManagedPluginVersion.ps1'],
   'Submit-DysonLifecycleBrokerRequest.ps1': [
     'lifecycle-broker', 'Submit-DysonLifecycleBrokerRequest.ps1'
-  ],
-  'Get-DysonCutoverEvidence.ps1': ['cutover', 'Get-DysonCutoverEvidence.ps1'],
-  'Submit-DysonCutoverBrokerRequest.ps1': [
-    'cutover-broker', 'Submit-DysonCutoverBrokerRequest.ps1'
   ],
   'New-NebulaPluginCutoverPlan.ps1': [
     'nebula-private-build', 'New-NebulaPluginCutoverPlan.ps1'
@@ -126,7 +117,6 @@ if (-not $?) { exit 1 }
 }
 export class PowerShellLifecycleRunner implements
   LifecycleScriptRunner,
-  WindowsCutoverPowerShellRunner,
   WindowsNebulaPluginTransactionPowerShellRunner,
   WindowsHostnameWssQualificationPowerShellRunner {
   readonly #scriptRoot: string
@@ -146,7 +136,6 @@ export class PowerShellLifecycleRunner implements
   }
 
   run(scriptName: LifecycleScriptName, scriptArguments: string[], signal: AbortSignal): Promise<string>
-  run(scriptName: WindowsCutoverHostScriptName, scriptArguments: string[], signal: AbortSignal): Promise<string>
   run(
     scriptName: WindowsNebulaPluginTransactionScriptName,
     scriptArguments: string[],

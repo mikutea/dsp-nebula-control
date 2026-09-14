@@ -55,7 +55,7 @@ if ($WhatIfPreference) {
         sourceConfigurationSha256 = [string]$sourceSnapshot.configurationSha256
         targetConfigurationSha256 = [string]$target.sha256
         sourceBindingsSha256 = [string]$sourceSnapshot.bindingsSha256
-        contractSha256 = [string]$contract.sha256
+        contractSha256 = [string]$sourceSnapshot.contractSha256
         wouldReplace = [string]$target.sha256 -cne [string]$sourceSnapshot.configurationSha256
         mutationPerformed = $false
     }
@@ -92,7 +92,7 @@ $transaction = Invoke-DysonConfigurationMutationTransaction -Storage $storage `
     configurationLength = [int64]$transaction.configurationLength
     configurationAclFingerprint = [string]$transaction.configurationAclFingerprint
     bindingsSha256 = [string]$sourceSnapshot.bindingsSha256
-    contractSha256 = [string]$contract.sha256
+    contractSha256 = [string]$sourceSnapshot.contractSha256
     chainHeadSha256 = [string]$transaction.chainHeadSha256
     completedTransactionCount = [int]$transaction.completedTransactionCount
     mutationPerformed = $true

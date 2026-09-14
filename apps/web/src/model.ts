@@ -152,112 +152,12 @@ export type ControlPermission =
   | 'configuration.read' | 'configuration.preview' | 'configuration.apply'
   | 'updates.read' | 'updates.stage' | 'updates.activate'
   | 'mods.read' | 'mods.mutate'
-  | 'cutover.read' | 'cutover.execute'
   | 'client-profile.generate'
 
 export interface SessionUser {
   name: string
   role: ControlRole
   permissions: ControlPermission[]
-}
-
-export type CutoverDesiredAuthority = 'previous' | 'candidate'
-export type CutoverRollbackMode = 'immediate-compensation' | 'later-operator-rollback'
-export type CutoverPreviewOperation = 'prepare' | 'activate' | 'rollback'
-export type CutoverPreviewRequest =
-  | Readonly<{ requestId: string; operation: 'prepare' }>
-  | Readonly<{ requestId: string; operation: 'activate' }>
-  | Readonly<{ requestId: string; operation: 'rollback'; mode: CutoverRollbackMode }>
-export type CutoverPublicPhase =
-  | 'prepared' | 'activated'
-  | 'rolled-back-immediate' | 'rolled-back-later'
-  | 'recovered-candidate' | 'recovered-previous'
-export type CutoverPublicStatus = 'succeeded' | 'rolled-back' | 'failed-safe'
-export type CutoverRecoveryPhase =
-  | 'pending' | 'reconciling' | 'ready' | 'recovery-required' | 'unavailable'
-export type CutoverRecoveryState =
-  | 'ready' | 'interrupted' | 'terminal-pending-release' | 'evidence-invalid'
-  | 'pending' | 'reconciling' | 'unavailable'
-
-export type CutoverErrorCode =
-  | 'CUTOVER_REQUEST_INVALID'
-  | 'CUTOVER_CONFIRMATION_REQUIRED'
-  | 'CUTOVER_ROLLBACK_CONFIRMATION_REQUIRED'
-  | 'CUTOVER_PREVIEW_REQUIRED'
-  | 'CUTOVER_PREVIEW_CONFLICT'
-  | 'CUTOVER_IDEMPOTENCY_CONFLICT'
-  | 'CUTOVER_NOT_PREPARED'
-  | 'CUTOVER_NOT_CANDIDATE_ACTIVE'
-  | 'CUTOVER_RECOVERY_REQUIRED'
-  | 'CUTOVER_RECOVERY_NOT_REQUIRED'
-  | 'CUTOVER_RECOVERY_TARGET_NOT_ALLOWED'
-  | 'CUTOVER_RECOVERY_EVIDENCE_INVALID'
-  | 'CUTOVER_DURABLE_STATE_INVALID'
-  | 'CUTOVER_DURABLE_STORE_FAILED'
-  | 'CUTOVER_AUTHORITY_DRIFT'
-  | 'CUTOVER_RUNTIME_DRIFT'
-  | 'CUTOVER_PREPARE_INVARIANT_FAILED'
-  | 'CUTOVER_SAVE_PROTECTION_FAILED'
-  | 'CUTOVER_SAVE_RESTORE_FAILED'
-  | 'CUTOVER_STOP_GATE_FAILED'
-  | 'CUTOVER_HEALTH_GATE_FAILED'
-  | 'CUTOVER_UNIQUE_AUTHORITY_FAILED'
-  | 'CUTOVER_ADAPTER_FAILED'
-  | 'CUTOVER_HOST_LEASE_BUSY'
-  | 'CUTOVER_HOST_LEASE_DIRTY'
-  | 'CUTOVER_HOST_LEASE_RECOVERY_REQUIRED'
-  | 'CUTOVER_HOST_LEASE_RECOVERY_NOT_REQUIRED'
-  | 'CUTOVER_HOST_LEASE_RECOVERY_MISMATCH'
-  | 'CUTOVER_HOST_LEASE_LOST'
-  | 'CUTOVER_HOST_LEASE_UNAVAILABLE'
-
-export interface CutoverPublicSummary {
-  candidateDefined: boolean
-  candidateDisabled: boolean
-  previousAuthorityEnabled: boolean
-  candidateAuthorityEnabled: boolean
-  previousRuntimeHealthy: boolean
-  candidateRuntimeHealthy: boolean
-  processesStopped: boolean
-  portClosed: boolean
-  uniqueAuthority: boolean
-  saveProtected: boolean
-  baselineRestored: boolean
-  currentProgressProtected: boolean
-  reused: boolean
-}
-
-export interface CutoverReceipt {
-  requestId: string
-  phase: CutoverPublicPhase
-  status: CutoverPublicStatus
-  allowedDesired: CutoverDesiredAuthority[]
-  summary: CutoverPublicSummary
-  errorCode: CutoverErrorCode | null
-}
-
-export interface CutoverPreviewReceipt {
-  format: 'dyson-control-cutover-preview'
-  schemaVersion: 1
-  operation: CutoverPreviewOperation
-  requestId: string
-  rollbackMode: CutoverRollbackMode | null
-  stateRevision: string
-  evidenceDigest: string
-  planFingerprint: string
-  summary: CutoverPublicSummary
-}
-
-export interface CutoverRecoveryStatus {
-  schemaVersion: 1
-  phase: CutoverRecoveryPhase
-  status: CutoverRecoveryState
-  mutationBlocked: boolean
-  recoveryRequired: boolean
-  requestId: string | null
-  allowedDesired: CutoverDesiredAuthority[]
-  summary: CutoverPublicSummary
-  errorCode: string | null
 }
 
 export type LifecycleAction = 'start' | 'save' | 'graceful-stop' | 'restart'
@@ -2219,4 +2119,4 @@ export interface ObservabilityQualificationEnvelope {
 
 export type NavKey =
   | 'overview' | 'game' | 'console' | 'players' | 'versions' | 'mods'
-  | 'saves' | 'client' | 'server' | 'config' | 'cutover' | 'tasks'
+  | 'saves' | 'client' | 'server' | 'config' | 'tasks'

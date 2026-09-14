@@ -54,13 +54,14 @@ $lockPath = Assert-DysonConfigurationPlainFilePath -Path $storage.lockPath -Maxi
 [void](Assert-DysonConfigurationAcl -Path $lockPath -Kind PrivateFile)
 $healthLock = Enter-DysonConfigurationMutationLock -Storage $storage
 try {
-    $configuration = Read-DysonControlEnvironmentFile -Path $storage.configurationPath `
-        -Contract $contract -ExpectedLauncherBindings $bindings -SkipSourceAcl
-    $configurationAcl = Assert-DysonConfigurationAcl -Path $storage.configurationPath `
-        -Kind ConfigFile -ServiceSid $serviceSid
     $transactionState = Get-DysonConfigurationTransactionState -Storage $storage `
         -ServiceSid $serviceSid -Contract $contract -ExpectedLauncherBindings $bindings -LockHeld
     if (-not $transactionState.clean) { throw 'DYSON_CONFIGURATION_TRANSACTION_NOT_CLEAN' }
+    $recordContract = Resolve-DysonConfigurationRecordedContract -Contract $contract -RecordedSha256 ([string]$transactionState.terminalContractSha256)
+    $configuration = Read-DysonControlEnvironmentFile -Path $storage.configurationPath `
+        -Contract $recordContract -ExpectedLauncherBindings $bindings -SkipSourceAcl
+    $configurationAcl = Assert-DysonConfigurationAcl -Path $storage.configurationPath `
+        -Kind ConfigFile -ServiceSid $serviceSid
     if ($transactionState.receipts.Count -lt 1 -or
         -not [bool]$transactionState.terminalTargetPresent -or
         [string]$transactionState.terminalTargetSha256 -cne [string]$configuration.sha256 -or
@@ -69,7 +70,7 @@ try {
             [string]$configurationAcl.fingerprint -or
         [string]$transactionState.terminalBindingsSha256 -cne
             [string]$configuration.bindingsSha256 -or
-        [string]$transactionState.terminalContractSha256 -cne [string]$contract.sha256 -or
+        [string]$transactionState.terminalContractSha256 -cne [string]$recordContract.sha256 -or
         [string]$transactionState.terminalTargetPathSha256 -cne
             (Get-DysonConfigurationPathBindingSha256 $storage.configurationPath)) {
         throw 'DYSON_CONFIGURATION_TERMINAL_EVIDENCE_MISMATCH'
@@ -99,7 +100,7 @@ try {
         configurationLength = [int64]$configuration.length
         namesSha256 = [string]$configuration.namesSha256
         bindingsSha256 = [string]$configuration.bindingsSha256
-        contractSha256 = [string]$contract.sha256
+        contractSha256 = [string]$recordContract.sha256
         configurationAclFingerprint = [string]$configurationAcl.fingerprint
         parentAclFingerprint = [string]$dataRootAcl.fingerprint
         completedTransactionCount = [int]$transactionState.receipts.Count

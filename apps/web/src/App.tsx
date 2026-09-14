@@ -53,10 +53,6 @@ const ObservabilityAlertPanel = lazy(async () => {
   const module = await import('./ObservabilityAlertPanel')
   return { default: module.ObservabilityAlertPanel }
 })
-const CutoverWorkspace = lazy(async () => {
-  const module = await import('./CutoverWorkspace')
-  return { default: module.CutoverWorkspace }
-})
 const TasksAuditWorkspace = lazy(async () => {
   const module = await import('./TasksAuditWorkspace')
   return { default: module.TasksAuditWorkspace }
@@ -78,7 +74,6 @@ const navGroups: Array<{ label: string; items: Array<{ key: NavKey; label: strin
   { label: '系统', items: [
     { key: 'server', label: '服务器管理', icon: Server },
     { key: 'config', label: '配置管理', icon: FileCog },
-    { key: 'cutover', label: '权威切换', icon: GitBranch },
     { key: 'tasks', label: '任务与审计', icon: ClipboardList }
   ] }
 ]
@@ -1246,7 +1241,6 @@ const featureDefinitions: Record<Exclude<NavKey, 'overview'>, { title: string; d
   client: { title: '客户端包', description: '签发资格绑定的客户端运行包，或预览公开的确定性配置资料。', primaryTitle: '客户端交付', phase: 'V2 资格门禁已接入', icon: Archive, scope: ['生产资格签发', '客户端运行包', 'Parity 报告', 'Profile 与版本', '运行时绑定清单'], safety: '生产签发只接受受保护资格 ID；三个下载都会绑定持久化回执并由服务端重新验哈希，不包含 Steam 凭据、服务器密码、存档或玩家资料。' },
   server: { title: '服务器管理', description: '查看 Windows 主机、DSP 进程、端口与可信性能轨迹。', primaryTitle: '主机与进程', phase: '实时观测已接入', icon: Server, scope: ['主机总 CPU 与内存', 'DSP 核等值、工作集与线程', '端口状态矛盾', '实际 UPS/TPS 可用性', '短历史与瓶颈提示'], safety: '不提供通用进程终止或主机重启；缺失指标明确标为不可用，目标 UPS 不会伪装成实测值。' },
   config: { title: '配置管理', description: '通过固定 Schema 与内容寻址历史管理四个受控配置文件。', primaryTitle: '配置域', phase: '事务与历史恢复已接入', icon: FileCog, scope: ['Nebula 服务端字段', '星系与黑雾参数', 'BepInEx 控制台开关', '游戏桥配置', '脱敏差异与恢复对账'], safety: 'secret 只显示 configured 状态；恢复必须依次取得最新 revision、只读预演、dry-run 和精确确认，服务端仍独立执行停止态门禁。' },
-  cutover: { title: '权威切换', description: '在 GSManager 与 Dyson 控制链之间执行持久、可恢复的唯一权威切换。', primaryTitle: 'Cutover 事务控制面', phase: '状态、回执与恢复已接入', icon: GitBranch, scope: ['持久恢复状态', '准备与激活事务', '两类显式回退', '服务端 request ID 恢复', '不可变回执与审计'], safety: '仅提供固定能力和精确确认；没有主机、路径或命令输入。普通切换与恢复门禁默认关闭，任何不确定状态都会保持 fail-closed。' },
   tasks: { title: '任务与审计', description: '追踪每个读取、修改、更新、备份和回滚动作。', primaryTitle: '任务记录', phase: '分页与审计导出已接入', icon: ClipboardList, scope: ['稳定游标分页', '类型与状态过滤', '操作人与失败代码', 'JSON / NDJSON 预演', '管理员确认导出'], safety: '审计信息不记录密码、令牌、完整路径、玩家密钥或存档内容；导出只接受固定参数和精确确认。' }
 }
 
@@ -1276,7 +1270,6 @@ function featureBody(
   if (active === 'client') return <ClientPackageWorkspace demo={provider === 'demo'} canGenerate={hasPermission(user, 'client-profile.generate')} />
   if (active === 'server') return <ServerObservabilityWorkspace
     canAcknowledge={hasPermission(user, 'observability.acknowledge')} />
-  if (active === 'cutover') return <CutoverWorkspace user={user} demo={provider === 'demo'} />
   if (active === 'game') return <GameLifecyclePanel status={status} onRefresh={onRefresh}
     provider={provider} initialAction={lifecycleIntent} canOperate={hasPermission(user, 'lifecycle.execute')} />
   if (active === 'config') return <ConfigurationWorkspace

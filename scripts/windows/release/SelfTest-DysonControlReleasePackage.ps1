@@ -100,20 +100,15 @@ try {
         $script:DysonArtifactRequiredSessionScripts +
         $script:DysonArtifactRequiredBridgeSources +
         $script:DysonArtifactRequiredBridgeScripts +
-        $script:DysonArtifactRequiredMigrationScripts +
-        $script:DysonArtifactRequiredGsManagerRemovalScripts +
         $script:DysonArtifactRequiredEvidenceScripts +
         $script:DysonArtifactRequiredHostMutationScripts +
         $script:DysonArtifactRequiredGameBootstrapScripts +
-        $script:DysonArtifactRequiredCutoverScripts +
-        $script:DysonArtifactRequiredCutoverBrokerScripts +
         $script:DysonArtifactRequiredLifecycleBrokerScripts +
         $script:DysonArtifactRequiredDataRecoveryScripts +
         $script:DysonArtifactRequiredNetworkFiles +
         $script:DysonArtifactRequiredQualificationRuntimeFiles +
         $script:DysonArtifactRequiredNebulaHostnameWssSources +
-        $script:DysonArtifactRequiredMigrationDocs +
-        $script:DysonArtifactRequiredGsManagerRemovalDocs +
+        $script:DysonArtifactRequiredDeploymentDocs +
         $script:DysonArtifactRequiredRecoveryDocs +
         $script:DysonArtifactRequiredNetworkDocs +
         $script:DysonArtifactRequiredQualificationDocs
@@ -223,6 +218,18 @@ function Get-DysonBridgeReferenceSpecifications {
         'integrations/dyson-control-bridge/LoadedSaveEvidencePublisher.cs') `
         -Message 'LoadedSaveEvidencePublisher.cs was omitted from the release archive'
 
+    foreach ($relative in @('apps/api/dist/cutover/service.js',
+        'apps/api/dist/providers/windows-cutover.js',
+        'apps/api/dist/providers/windows-cutover-host.js.map')) {
+        $obsoletePath = Join-Path $artifactRoot $relative.Replace('/', '\')
+        Write-FixtureText -Path $obsoletePath -Value "export const obsolete = true`n"
+        try {
+            Assert-PackageSelfTest -Condition (Test-CommandRejected {
+                Assert-DysonArtifactAllowedFile -RelativePath $relative -FullPath $obsoletePath
+            }) -Message "a stale removed manager runtime was accepted: $relative"
+        }
+        finally { Remove-Item -LiteralPath $obsoletePath -Force }
+    }
     $observabilityMissingCases = 0
     foreach ($relative in $script:DysonArtifactRequiredApiObservabilityRuntimeFiles) {
         $requiredPath = Join-Path $artifactRoot $relative.Replace('/', '\')
@@ -327,12 +334,9 @@ function Get-DysonBridgeReferenceSpecifications {
     }
     $strictQualificationRepresentativeMissingCases = 0
     foreach ($relative in @(
-        'scripts/windows/qualification/SelfTest-DysonSideBySideObservationV2.ps1',
         'scripts/windows/qualification/SelfTest-DysonQualificationPairedSaveLoadRecordV2.ps1',
         'scripts/windows/qualification/dyson-control-panel-observation-v2.schema.json',
         'scripts/windows/qualification/README.ExternalJoinObservationV2.md',
-        'scripts/windows/qualification/Qualification.ReversibleCutover.ps1',
-        'scripts/windows/qualification/dyson-post-gsmanager-removal-observation-v2.schema.json',
         'scripts/windows/qualification/SelfTest-DysonSoakObservationV2.ps1'
     )) {
         $requiredPath = Join-Path $artifactRoot $relative.Replace('/', '\')
@@ -581,7 +585,6 @@ function Get-DysonBridgeReferenceSpecifications {
         manifestPathSeparatorDriftRejected = $true
         windowsUpdateRuntimeApiIncluded = $true
         updateRuntimeApiRequiredFiles = $script:DysonArtifactRequiredApiUpdateRuntimeFiles.Count
-        gsManagerRecoverableRemovalIncluded = $true
         nebulaNetworkAssessmentIncluded = $true
         hostnameWssQualificationRuntimeIncluded = $true
         hostnameWssQualificationRuntimeRequiredFiles = `

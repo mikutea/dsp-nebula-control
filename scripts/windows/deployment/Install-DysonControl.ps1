@@ -19,15 +19,6 @@ param(
     [string]$ServiceUser,
     [Nullable[int]]$GamePort,
     [Nullable[int]]$DispatchReadyTimeout,
-    [switch]$InstallCutoverBrokerTask,
-    [switch]$UpgradeCutoverBrokerExisting,
-    [string]$CutoverProjectRoot,
-    [string]$CutoverAuthorityProfileFile,
-    [string]$CutoverAuthorityInventoryRevision,
-    [string]$CutoverRuntimeTaskTransactionRoot,
-    [string]$CutoverServiceUser,
-    [Nullable[int]]$CutoverGamePort,
-    [string]$CutoverRuntimeBootstrapRoot,
     [ValidatePattern('^[\p{L}\p{N}_. -]{1,128}$')][string]$TaskName = 'Dyson-Control-Plane',
     [ValidateSet('NT AUTHORITY\LOCAL SERVICE')]
     [string]$ServiceAccount = 'NT AUTHORITY\LOCAL SERVICE',
@@ -36,7 +27,6 @@ param(
     [ValidateRange(1, 120)][int]$LockTimeoutSeconds = 30,
     [Parameter(DontShow)][switch]$SelfTestSkipAdministratorCheck,
     [Parameter(DontShow)][string]$SelfTestShadow,
-    [Parameter(DontShow)][string]$SelfTestCutoverBrokerShadowRoot,
     [Parameter(DontShow)][string]$SelfTestConfigurationShadowRoot
 )
 
@@ -271,80 +261,11 @@ function Assert-DysonDeploymentPlainFile {
     catch { throw $Message }
 }
 
-function Get-DysonCutoverBrokerDeploymentTasks {
-    try {
-        # A missing named task is surfaced with localized/provider-specific
-        # error identifiers on different Windows builds. Query the scheduler
-        # once and apply the shared exact-name validator so absence is an
-        # empty preimage while genuine query failures still fail closed.
-        return @(Get-DysonScheduledTasksByExactName `
-            -TaskName 'Dyson-Control-Cutover-Broker')
-    }
-    catch {
-        throw 'The fixed cutover broker task state could not be queried.'
-    }
-}
 
-function Get-DysonCutoverBrokerDeploymentBundle {
-    param([Parameter(Mandatory)][string]$BrokerScriptRoot)
 
-    $names = @(
-        'DysonCutoverBroker.Common.ps1',
-        'DysonCutoverBroker.TaskAcl.ps1',
-        'Install-DysonCutoverBrokerTask.ps1',
-        'Invoke-DysonCutoverBrokerWorker.ps1',
-        'SelfTest-DysonCutoverBroker.ps1',
-        'Submit-DysonCutoverBrokerRequest.ps1'
-    )
-    $root = Assert-DysonPlainDirectory -Path $BrokerScriptRoot
-    $items = @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop)
-    $actualNames = @($items | ForEach-Object { $_.Name } | Sort-Object -CaseSensitive)
-    $expectedNames = @($names | Sort-Object -CaseSensitive)
-    if ($items.Count -ne $names.Count -or
-        [string]::Join("`n", $actualNames) -cne [string]::Join("`n", $expectedNames)) {
-        throw 'The cutover broker script bundle inventory is inconsistent with the fixed contract.'
-    }
-    $files = @(
-        foreach ($name in $names) {
-            $path = Assert-DysonDeploymentPlainFile -Path (Join-Path $root $name) -MaximumBytes 16777216 `
-                -Message 'A cutover broker dependency is unavailable, redirected, empty, or too large.'
-            [pscustomobject][ordered]@{
-                name = $name
-                sha256 = Get-DysonCutoverBrokerSha256File $path
-            }
-        }
-    )
-    $descriptor = [pscustomobject][ordered]@{
-        protocol = 'DYSON_CONTROL_CUTOVER_BROKER_SCRIPT_BUNDLE_V1'
-        schemaVersion = 1
-        files = $files
-    }
-    return [pscustomobject][ordered]@{
-        descriptor = $descriptor
-        sha256 = Get-DysonCutoverBrokerSha256Text (ConvertTo-DysonCutoverBrokerJson $descriptor)
-    }
-}
 
-function ConvertTo-DysonCutoverBrokerDeploymentBinding {
-    param([Parameter(Mandatory)]$Raw)
 
-    $message = 'The cutover broker bundle binding is invalid.'
-    Assert-DysonLifecycleBrokerDeploymentExactProperties -Value $Raw -Names @(
-        'protocol', 'schemaVersion', 'profileFingerprint', 'brokerBundleSha256', 'createdAt'
-    ) -Message $message
-    $createdAt = [datetimeoffset]::MinValue
-    if ([string]$Raw.protocol -cne 'DYSON_CONTROL_CUTOVER_BROKER_BUNDLE_BINDING_V1' -or
-        [int]$Raw.schemaVersion -ne 1 -or
-        [string]$Raw.profileFingerprint -cnotmatch '^[0-9a-f]{64}$' -or
-        [string]$Raw.brokerBundleSha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        -not [datetimeoffset]::TryParseExact(
-            [string]$Raw.createdAt, 'o', [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::RoundtripKind, [ref]$createdAt
-        )) {
-        throw $message
-    }
-    return $Raw
-}
+
 
 function Stop-DysonDeploymentControlTaskForBrokerUpgrade {
     param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][string]$TaskName)
@@ -379,11 +300,11 @@ function Wait-DysonDeploymentBrokerWorkersIdle {
     $quietSamples = 0
     do {
         $lifecycle = @(Get-DysonLifecycleBrokerStaticWorkerTasks)
-        $cutover = @(Get-DysonCutoverBrokerDeploymentTasks)
-        if ($lifecycle.Count -gt 1 -or $cutover.Count -gt 1) {
+
+        if ($lifecycle.Count -gt 1) {
             throw 'A fixed broker task identity is ambiguous during quiescence.'
         }
-        $running = @(@($lifecycle) + @($cutover) | Where-Object { [string]$_.State -ceq 'Running' })
+        $running = @(@($lifecycle) | Where-Object { [string]$_.State -ceq 'Running' })
         if ($running.Count -eq 0) { $quietSamples += 1 } else { $quietSamples = 0 }
         if ($quietSamples -ge 2) { return }
         Start-Sleep -Milliseconds 500
@@ -391,88 +312,15 @@ function Wait-DysonDeploymentBrokerWorkersIdle {
     throw 'The fixed broker workers did not become idle before the deployment deadline.'
 }
 
-function Assert-DysonCutoverBrokerDeploymentNoPendingWork {
-    param([Parameter(Mandatory)]$Storage)
 
-    foreach ($root in @($Storage.requestsRoot, $Storage.intentsRoot, $Storage.workRoot)) {
-        if (@(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop).Count -ne 0) {
-            throw 'The cutover broker has pending request, intent, or work state.'
-        }
-    }
-}
 
-function Get-DysonCutoverBrokerDeploymentDirectoryAclIntent {
-    return @(
-        [pscustomobject][ordered]@{ kind = 'root'; protected = $true; system = 'full'; administrators = 'full'; localService = 'read-execute' }
-        [pscustomobject][ordered]@{ kind = 'requests'; protected = $true; system = 'full'; administrators = 'full'; localService = 'modify' }
-        [pscustomobject][ordered]@{ kind = 'receipts'; protected = $true; system = 'full'; administrators = 'full'; localService = 'read-execute' }
-        [pscustomobject][ordered]@{ kind = 'private'; protected = $true; system = 'full'; administrators = 'full'; localService = 'none' }
-    )
-}
 
-function Assert-DysonCutoverBrokerDeploymentTask {
-    param(
-        [Parameter(Mandatory)]$Profile,
-        [string]$ShadowRoot,
-        [string]$TaskIntentPath,
-        [string]$DirectoryAclIntentPath
-    )
 
-    if ($ShadowRoot) {
-        $taskIntent = Read-DysonCutoverBrokerJson -Path $TaskIntentPath -MaximumBytes 131072 `
-            -InvalidCode 'DYSON_CONTROL_CUTOVER_BROKER_TASK_INVALID'
-        $expectedTaskIntent = [pscustomobject][ordered]@{
-            taskName = [string]$Profile.taskName
-            taskPath = [string]$Profile.taskPath
-            principal = 'S-1-5-18'
-            runLevel = 'Highest'
-            executable = [IO.Path]::GetFullPath(
-                (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
-            )
-            arguments = Get-DysonCutoverBrokerTaskArguments $Profile
-            multipleInstances = 'IgnoreNew'
-            enabled = $true
-            acl = Get-DysonFixedTaskReadExecuteAclIntent
-        }
-        if ((ConvertTo-DysonCutoverBrokerJson $taskIntent) -cne
-            (ConvertTo-DysonCutoverBrokerJson $expectedTaskIntent)) {
-            throw 'The cutover broker shadow task is inconsistent with its active profile.'
-        }
-        $directoryIntent = Read-DysonCutoverBrokerJson -Path $DirectoryAclIntentPath -MaximumBytes 131072 `
-            -InvalidCode 'DYSON_CONTROL_CUTOVER_BROKER_ACCESS_CONTROL_FAILED'
-        if ((ConvertTo-DysonCutoverBrokerJson $directoryIntent) -cne
-            (ConvertTo-DysonCutoverBrokerJson (Get-DysonCutoverBrokerDeploymentDirectoryAclIntent))) {
-            throw 'The cutover broker shadow storage ACL intent is inconsistent.'
-        }
-        return
-    }
 
-    $tasks = @(Get-DysonCutoverBrokerDeploymentTasks)
-    $actions = @(if ($tasks.Count -eq 1) { $tasks[0].Actions | Where-Object { $null -ne $_ } })
-    $triggers = @(if ($tasks.Count -eq 1) { $tasks[0].Triggers | Where-Object { $null -ne $_ } })
-    $expectedPowerShell = [IO.Path]::GetFullPath(
-        (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
-    )
-    if ($tasks.Count -ne 1 -or [string]$tasks[0].TaskPath -cne '\' -or
-        [string]$tasks[0].Principal.UserId -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -or
-        [string]$tasks[0].Principal.LogonType -cne 'ServiceAccount' -or
-        [string]$tasks[0].Principal.RunLevel -cne 'Highest' -or $actions.Count -ne 1 -or
-        -not [string]::Equals(
-            [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$actions[0].Execute)),
-            $expectedPowerShell, [StringComparison]::OrdinalIgnoreCase
-        ) -or [string]$actions[0].Arguments -cne (Get-DysonCutoverBrokerTaskArguments $Profile) -or
-        -not [string]::IsNullOrWhiteSpace([string]$actions[0].WorkingDirectory) -or $triggers.Count -ne 0 -or
-        [string]$tasks[0].Settings.MultipleInstances -cne 'IgnoreNew' -or
-        [string]$tasks[0].Settings.ExecutionTimeLimit -cne 'PT10M' -or
-        $tasks[0].Settings.Enabled -isnot [bool] -or -not [bool]$tasks[0].Settings.Enabled -or
-        [string]$tasks[0].Description -cne 'Fixed SYSTEM mutation broker for Dyson Control cutover operations.') {
-        throw 'The fixed cutover broker task is inconsistent with its active profile.'
-    }
-}
 
 function Assert-DysonBrokerUpgradeIntent {
     param(
-        [Parameter(Mandatory)][ValidateSet('lifecycle', 'cutover')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('lifecycle')][string]$Kind,
         [Parameter(Mandatory)][bool]$Requested,
         [Parameter(Mandatory)][bool]$UpgradeRequested,
         $State,
@@ -496,7 +344,7 @@ function Assert-DysonBrokerUpgradeIntent {
 }
 
 function Assert-DysonBrokerPreflightStateUnchanged {
-    param($Before, $After, [Parameter(Mandatory)][ValidateSet('lifecycle', 'cutover')][string]$Kind)
+    param($Before, $After, [Parameter(Mandatory)][ValidateSet('lifecycle')][string]$Kind)
 
     if (($null -eq $Before) -ne ($null -eq $After)) {
         throw "The $Kind broker deployment state changed before the deployment lock was acquired."
@@ -541,424 +389,21 @@ function Assert-DysonLifecycleBrokerDeploymentBinding {
     }
 }
 
-function Assert-DysonCutoverBrokerDeploymentBinding {
-    param(
-        $State,
-        [string]$ProjectRoot,
-        [string]$DataRoot,
-        [string]$AuthorityProfileFile,
-        [string]$AuthorityInventoryRevision,
-        [string]$RuntimeBootstrapRoot,
-        [string]$RuntimeTaskTransactionRoot,
-        [string]$ServiceUser,
-        [Nullable[int]]$GamePort
-    )
 
-    if ($null -eq $State) { return }
-    if ([string]::IsNullOrWhiteSpace($ProjectRoot) -or
-        [string]::IsNullOrWhiteSpace($DataRoot) -or
-        [string]::IsNullOrWhiteSpace($AuthorityProfileFile) -or
-        [string]::IsNullOrWhiteSpace($AuthorityInventoryRevision) -or
-        [string]::IsNullOrWhiteSpace($RuntimeBootstrapRoot) -or
-        [string]::IsNullOrWhiteSpace($RuntimeTaskTransactionRoot) -or
-        [string]::IsNullOrWhiteSpace($ServiceUser) -or $null -eq $GamePort -or
-        -not (Test-DysonDeploymentSamePath ([string]$State.profile.projectRoot) $ProjectRoot) -or
-        -not (Test-DysonDeploymentSamePath ([string]$State.profile.dataRoot) $DataRoot) -or
-        -not (Test-DysonDeploymentSamePath ([string]$State.profile.authorityProfileFile) $AuthorityProfileFile) -or
-        [string]$State.installArguments.AuthorityInventoryRevision -cne $AuthorityInventoryRevision -or
-        -not (Test-DysonDeploymentSamePath ([string]$State.profile.runtimeBootstrapRoot) $RuntimeBootstrapRoot) -or
-        -not (Test-DysonDeploymentSamePath ([string]$State.profile.runtimeTaskTransactionRoot) `
-            $RuntimeTaskTransactionRoot) -or
-        [string]$State.profile.serviceUser -cne $ServiceUser -or
-        [int]$State.profile.gamePort -ne [int]$GamePort) {
-        throw 'The existing cutover broker profile does not match the production environment binding.'
-    }
-}
 
-function Get-DysonCutoverBrokerDeploymentPreimage {
-    param(
-        [Parameter(Mandatory)][string]$DeploymentDataRoot,
-        $ActiveRelease,
-        [string]$ShadowRoot
-    )
 
-    $brokerRoot = Join-Path (Join-Path $DeploymentDataRoot 'data') 'cutover-broker'
-    $profilePath = Join-Path $brokerRoot 'broker-profile.json'
-    $bindingPath = Join-Path $brokerRoot 'broker-bundle.json'
-    if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) {
-        $taskResidual = if ($ShadowRoot) {
-            Test-Path -LiteralPath (Join-Path $ShadowRoot 'task-intent.json')
-        }
-        else { @(Get-DysonCutoverBrokerDeploymentTasks).Count -ne 0 }
-        if ((Test-Path -LiteralPath $profilePath) -or (Test-Path -LiteralPath $bindingPath) -or $taskResidual) {
-            throw 'A cutover broker bundle or task exists without its fixed profile.'
-        }
-        if ($ShadowRoot) {
-            $durableDirectoryAclIntent = Join-Path $ShadowRoot 'directory-acl-intent.json'
-            if (Test-Path -LiteralPath $durableDirectoryAclIntent) {
-                $intentFile = Assert-DysonDeploymentPlainFile -Path $durableDirectoryAclIntent `
-                    -MaximumBytes 131072 -Message 'The retained cutover broker storage ACL intent is redirected or invalid.'
-                $actualIntent = [IO.File]::ReadAllText(
-                    $intentFile, [Text.UTF8Encoding]::new($false, $true)
-                ) | ConvertFrom-Json -ErrorAction Stop
-                if (($actualIntent | ConvertTo-Json -Depth 8 -Compress) -cne
-                    ((Get-DysonCutoverBrokerDeploymentDirectoryAclIntent) |
-                        ConvertTo-Json -Depth 8 -Compress)) {
-                    throw 'The retained cutover broker storage ACL intent is inconsistent.'
-                }
-            }
-        }
-        return $null
-    }
-    if ($null -eq $ActiveRelease) {
-        throw 'A cutover broker profile exists without an active immutable release.'
-    }
-    $expectedCutoverRoot = Join-Path ([string]$ActiveRelease.releaseRoot) 'scripts\windows'
-    $expectedBrokerScriptRoot = Join-Path $expectedCutoverRoot 'cutover-broker'
-    $commonPath = Assert-DysonDeploymentPlainFile `
-        -Path (Join-Path $expectedBrokerScriptRoot 'DysonCutoverBroker.Common.ps1') `
-        -MaximumBytes 1048576 -Message 'The active-release cutover broker common helper is unavailable or redirected.'
-    $taskAclScript = Assert-DysonDeploymentPlainFile `
-        -Path (Join-Path $expectedBrokerScriptRoot 'DysonCutoverBroker.TaskAcl.ps1') `
-        -MaximumBytes 262144 -Message 'The active-release cutover broker task ACL helper is unavailable or redirected.'
-    $null = . $commonPath
-    $null = . $taskAclScript
-    $profileFile = Assert-DysonDeploymentPlainFile -Path $profilePath -MaximumBytes 32768 `
-        -Message 'The existing cutover broker profile is unavailable, redirected, empty, or too large.'
-    $bindingFile = Assert-DysonDeploymentPlainFile -Path $bindingPath -MaximumBytes 32768 `
-        -Message 'The existing cutover broker bundle binding is unavailable, redirected, empty, or too large.'
-    $profile = Read-DysonCutoverBrokerProfile -BrokerRoot $brokerRoot -BrokerProfileFile $profileFile
-    $bundle = Get-DysonCutoverBrokerDeploymentBundle -BrokerScriptRoot $expectedBrokerScriptRoot
-    $binding = ConvertTo-DysonCutoverBrokerDeploymentBinding (
-        Read-DysonCutoverBrokerJson -Path $bindingFile -MaximumBytes 32768 `
-            -InvalidCode 'DYSON_CONTROL_CUTOVER_BROKER_PROFILE_BINDING_MISMATCH'
-    )
-    if ([string]$binding.profileFingerprint -cne [string]$profile.profileFingerprint -or
-        [string]$binding.brokerBundleSha256 -cne [string]$bundle.sha256 -or
-        -not (Test-DysonDeploymentSamePath -Left ([string]$profile.brokerRoot) -Right $brokerRoot) -or
-        -not (Test-DysonDeploymentSamePath -Left ([string]$profile.cutoverScriptRoot) -Right $expectedCutoverRoot) -or
-        -not (Test-DysonDeploymentSamePath -Left ([string]$profile.brokerScriptRoot) -Right $expectedBrokerScriptRoot)) {
-        throw 'The existing cutover broker profile is not bound to the active immutable release.'
-    }
-    $storage = Get-DysonCutoverBrokerStorage -BrokerRoot $brokerRoot
-    [void](Assert-DysonCutoverBrokerDeploymentNoPendingWork -Storage $storage)
-    $leaseCommon = Assert-DysonDeploymentPlainFile `
-        -Path (Join-Path $expectedCutoverRoot 'DysonHostMutationLease.Common.ps1') -MaximumBytes 2097152 `
-        -Message 'The active-release cutover lease helper is unavailable or redirected.'
-    $hostCommon = Assert-DysonDeploymentPlainFile `
-        -Path (Join-Path $expectedCutoverRoot 'cutover\DysonCutoverHost.Common.ps1') -MaximumBytes 2097152 `
-        -Message 'The active-release cutover host helper is unavailable or redirected.'
-    $null = . $leaseCommon
-    $null = . $hostCommon
-    $authority = ConvertTo-CutoverHostValidatedProfile (
-        Read-DysonCutoverBrokerJson -Path ([string]$profile.authorityProfileFile) -MaximumBytes 262144 `
-            -InvalidCode 'DYSON_CONTROL_CUTOVER_BROKER_PROFILE_BINDING_MISMATCH'
-    )
-    $authorityRoot = [IO.Path]::GetDirectoryName([string]$profile.authorityProfileFile)
-    if ([string]$authority.projectRootIdentity -cne (Get-CutoverHostPathIdentity ([string]$profile.projectRoot)) -or
-        [string]$authority.dataRootIdentity -cne (Get-DysonHostMutationDataRootIdentity ([string]$profile.dataRoot)) -or
-        [string]$authority.authorityRootIdentity -cne (Get-CutoverHostPathIdentity $authorityRoot) -or
-        [string]$authority.runtimeBootstrapIdentity -cne
-            (Get-CutoverHostPathIdentity ([string]$profile.runtimeBootstrapRoot)) -or
-        [string]$authority.runtimeTaskTransactionRootIdentity -cne
-            (Get-CutoverHostPathIdentity ([string]$profile.runtimeTaskTransactionRoot)) -or
-        -not [string]::Equals(
-            [string]$authority.serviceUser, [string]$profile.serviceUser, [StringComparison]::OrdinalIgnoreCase
-        ) -or [int]$authority.gamePort -ne [int]$profile.gamePort -or
-        [string]$authority.runtimeBootstrapStartSha256 -cne
-            (Get-CutoverHostSha256File (Join-Path ([string]$profile.runtimeBootstrapRoot) 'Start-DysonServer.ps1')) -or
-        [string]$authority.runtimeBootstrapStopSha256 -cne
-            (Get-CutoverHostSha256File (Join-Path ([string]$profile.runtimeBootstrapRoot) 'Stop-DysonServer.ps1'))) {
-        throw 'The existing cutover broker authority profile is inconsistent with the broker profile.'
-    }
-    $installer = Assert-DysonDeploymentPlainFile `
-        -Path (Join-Path $expectedBrokerScriptRoot 'Install-DysonCutoverBrokerTask.ps1') `
-        -MaximumBytes 1048576 `
-        -Message 'The existing active-release cutover broker installer is unavailable, redirected, empty, or too large.'
-    $taskIntentPath = $null
-    $taskIntentBytes = $null
-    $directoryAclIntentPath = $null
-    $directoryAclIntentBytes = $null
-    $taskXml = $null
-    $taskSddl = $null
-    if (-not [string]::IsNullOrWhiteSpace($ShadowRoot)) {
-        $taskIntentPath = Assert-DysonDeploymentPlainFile -Path (Join-Path $ShadowRoot 'task-intent.json') `
-            -MaximumBytes 131072 -Message 'The cutover broker shadow task preimage is unavailable or redirected.'
-        $taskIntentBytes = [System.IO.File]::ReadAllBytes($taskIntentPath)
-        $directoryAclIntentPath = Assert-DysonDeploymentPlainFile `
-            -Path (Join-Path $ShadowRoot 'directory-acl-intent.json') -MaximumBytes 131072 `
-            -Message 'The cutover broker shadow ACL preimage is unavailable or redirected.'
-        $directoryAclIntentBytes = [System.IO.File]::ReadAllBytes($directoryAclIntentPath)
-    }
-    else {
-        $taskXml = [string](Export-ScheduledTask -TaskName 'Dyson-Control-Cutover-Broker' `
-            -TaskPath '\' -ErrorAction Stop)
-        $taskSddl = Get-DysonFixedTaskSecurityDescriptor `
-            -TaskName 'Dyson-Control-Cutover-Broker' -TaskPath '\'
-        [void](Assert-DysonFixedTaskReadExecuteAclIntent $taskSddl)
-    }
-    [void](Assert-DysonCutoverBrokerDeploymentTask -Profile $profile -ShadowRoot $ShadowRoot `
-        -TaskIntentPath $taskIntentPath -DirectoryAclIntentPath $directoryAclIntentPath)
-    $brokerDirectoryAcls = @(
-        foreach ($directoryPath in @(
-            $brokerRoot,
-            (Join-Path $brokerRoot 'requests'),
-            (Join-Path $brokerRoot 'receipts'),
-            (Join-Path $brokerRoot 'intents'),
-            (Join-Path $brokerRoot 'work'),
-            (Join-Path $brokerRoot 'installation-receipts'),
-            (Join-Path $brokerRoot 'installation-transactions')
-        )) {
-            if (Test-Path -LiteralPath $directoryPath -PathType Container) {
-                $plainDirectory = Assert-DysonPlainDirectory -Path $directoryPath
-                [pscustomobject][ordered]@{
-                    path = $plainDirectory
-                    sddl = (Microsoft.PowerShell.Security\Get-Acl `
-                        -LiteralPath $plainDirectory -ErrorAction Stop).Sddl
-                }
-            }
-        }
-    )
-    return [pscustomobject][ordered]@{
-        activeVersion = [string]$ActiveRelease.pointer.version
-        activeReleaseRoot = [string]$ActiveRelease.releaseRoot
-        brokerRoot = $brokerRoot
-        profilePath = $profileFile
-        profile = $profile
-        profileBytes = [System.IO.File]::ReadAllBytes($profileFile)
-        profileSddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $profileFile -ErrorAction Stop).Sddl
-        bindingPath = $bindingFile
-        binding = $binding
-        bindingBytes = [System.IO.File]::ReadAllBytes($bindingFile)
-        bindingSddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $bindingFile -ErrorAction Stop).Sddl
-        cutoverScriptRoot = $expectedCutoverRoot
-        brokerScriptRoot = $expectedBrokerScriptRoot
-        installer = $installer
-        taskIntentPath = $taskIntentPath
-        taskIntentBytes = $taskIntentBytes
-        directoryAclIntentPath = $directoryAclIntentPath
-        directoryAclIntentBytes = $directoryAclIntentBytes
-        directoryAcls = $brokerDirectoryAcls
-        taskXml = $taskXml
-        taskSddl = $taskSddl
-        installArguments = @{
-            RequestId = [guid]::NewGuid().ToString('D')
-            BrokerRoot = [string]$profile.brokerRoot
-            BrokerScriptRoot = [string]$profile.brokerScriptRoot
-            ProjectRoot = [string]$profile.projectRoot
-            DataRoot = [string]$profile.dataRoot
-            AuthorityProfileFile = [string]$profile.authorityProfileFile
-            AuthorityInventoryRevision = [string]$authority.inventoryRevision
-            CutoverScriptRoot = [string]$profile.cutoverScriptRoot
-            RuntimeBootstrapRoot = [string]$profile.runtimeBootstrapRoot
-            RuntimeTaskTransactionRoot = [string]$profile.runtimeTaskTransactionRoot
-            ServiceUser = [string]$profile.serviceUser
-            GamePort = [int]$profile.gamePort
-            TaskName = [string]$profile.taskName
-            SchedulerBackend = if ($ShadowRoot) { 'Shadow' } else { 'Windows' }
-            ShadowRoot = $ShadowRoot
-            Confirm = $false
-        }
-    }
-}
 
-function ConvertFrom-DysonCutoverBrokerInstallerOutput {
-    param([Parameter(Mandatory)]$Output)
 
-    $lines = @(
-        ($Output | Out-String) -split "`r?`n" |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    )
-    if ($lines.Count -eq 0) { throw 'The cutover broker installer returned no receipt.' }
-    return $lines[$lines.Count - 1] | ConvertFrom-Json -ErrorAction Stop
-}
 
-function Assert-DysonCutoverBrokerDeploymentPreimageRestored {
-    param(
-        [Parameter(Mandatory)][string]$DeploymentDataRoot,
-        $State,
-        [string]$ShadowRoot,
-        [switch]$DeferFullContract
-    )
 
-    $brokerRoot = Join-Path (Join-Path $DeploymentDataRoot 'data') 'cutover-broker'
-    $profilePath = Join-Path $brokerRoot 'broker-profile.json'
-    $bindingPath = Join-Path $brokerRoot 'broker-bundle.json'
-    if ($null -eq $State) {
-        $taskResidual = if ($ShadowRoot) {
-            Test-Path -LiteralPath (Join-Path $ShadowRoot 'task-intent.json')
-        }
-        else { @(Get-DysonCutoverBrokerDeploymentTasks).Count -ne 0 }
-        if ((Test-Path -LiteralPath $profilePath) -or (Test-Path -LiteralPath $bindingPath) -or $taskResidual) {
-            throw 'A first-install cutover broker task/profile survived compensation.'
-        }
-        if ($ShadowRoot) {
-            $durableDirectoryAclIntent = Join-Path $ShadowRoot 'directory-acl-intent.json'
-            if (Test-Path -LiteralPath $durableDirectoryAclIntent) {
-                $intentFile = Assert-DysonDeploymentPlainFile -Path $durableDirectoryAclIntent `
-                    -MaximumBytes 131072 `
-                    -Message 'The retained cutover broker storage ACL intent is redirected or invalid.'
-                $actualIntent = [IO.File]::ReadAllText(
-                    $intentFile, [Text.UTF8Encoding]::new($false, $true)
-                ) | ConvertFrom-Json -ErrorAction Stop
-                if (($actualIntent | ConvertTo-Json -Depth 8 -Compress) -cne
-                    ((Get-DysonCutoverBrokerDeploymentDirectoryAclIntent) |
-                        ConvertTo-Json -Depth 8 -Compress)) {
-                    throw 'The retained cutover broker storage ACL intent is inconsistent.'
-                }
-            }
-        }
-        return
-    }
-    if ([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($profilePath)) -cne
-            [Convert]::ToBase64String([byte[]]$State.profileBytes) -or
-        (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $profilePath -ErrorAction Stop).Sddl -cne
-            [string]$State.profileSddl) {
-        throw 'The cutover broker profile did not return to its byte-exact ACL preimage.'
-    }
-    foreach ($directoryAcl in @($State.directoryAcls)) {
-        $directoryPath = Assert-DysonPlainDirectory -Path ([string]$directoryAcl.path)
-        if ((Microsoft.PowerShell.Security\Get-Acl -LiteralPath $directoryPath -ErrorAction Stop).Sddl -cne
-            [string]$directoryAcl.sddl) {
-            throw 'A cutover broker storage directory did not return to its exact ACL preimage.'
-        }
-    }
-    $binding = [System.IO.File]::ReadAllText(
-        $bindingPath, [System.Text.UTF8Encoding]::new($false, $true)
-    ) | ConvertFrom-Json -ErrorAction Stop
-    if ([string]$binding.profileFingerprint -cne [string]$State.profile.profileFingerprint -or
-        [string]$binding.brokerBundleSha256 -cne [string]$State.binding.brokerBundleSha256 -or
-        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($bindingPath)) -cne
-            [Convert]::ToBase64String([byte[]]$State.bindingBytes) -or
-        (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $bindingPath -ErrorAction Stop).Sddl -cne
-            [string]$State.bindingSddl) {
-        throw 'The cutover broker bundle binding did not return to its previous release.'
-    }
-    if (-not [string]::IsNullOrWhiteSpace($ShadowRoot)) {
-        if ([Convert]::ToBase64String([System.IO.File]::ReadAllBytes([string]$State.taskIntentPath)) -cne
-                [Convert]::ToBase64String([byte[]]$State.taskIntentBytes) -or
-            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes([string]$State.directoryAclIntentPath)) -cne
-                [Convert]::ToBase64String([byte[]]$State.directoryAclIntentBytes)) {
-            throw 'The cutover broker shadow task/enabled/ACL preimage was not restored exactly.'
-        }
-    }
-    else {
-        $tasks = @(Get-ScheduledTask -TaskName 'Dyson-Control-Cutover-Broker' `
-            -TaskPath '\' -ErrorAction Stop)
-        $taskXml = [string](Export-ScheduledTask -TaskName 'Dyson-Control-Cutover-Broker' `
-            -TaskPath '\' -ErrorAction Stop)
-        $taskSddl = Get-DysonFixedTaskSecurityDescriptor `
-            -TaskName 'Dyson-Control-Cutover-Broker' -TaskPath '\'
-        if ($tasks.Count -ne 1 -or [string]$tasks[0].TaskPath -cne '\' -or
-            $tasks[0].Settings.Enabled -ne $true -or
-            $taskXml -cne [string]$State.taskXml -or $taskSddl -cne [string]$State.taskSddl) {
-            throw 'The cutover broker task definition/enabled/DACL preimage was not restored exactly.'
-        }
-    }
-    if ($DeferFullContract) { return }
-    $validationActiveRelease = [pscustomobject][ordered]@{
-        pointer = [pscustomobject][ordered]@{ version = [string]$State.activeVersion }
-        releaseRoot = [string]$State.activeReleaseRoot
-    }
-    $validatedState = Get-DysonCutoverBrokerDeploymentPreimage -DeploymentDataRoot $DeploymentDataRoot `
-        -ActiveRelease $validationActiveRelease -ShadowRoot $ShadowRoot
-    if ($null -eq $validatedState -or
-        [string]$validatedState.profile.profileFingerprint -cne [string]$State.profile.profileFingerprint -or
-        [string]$validatedState.binding.brokerBundleSha256 -cne [string]$State.binding.brokerBundleSha256) {
-        throw 'The restored cutover broker state did not pass the full profile/bundle/pending/task contract.'
-    }
-}
 
-function Set-DysonCutoverBrokerDeploymentFileBytesAtomic {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$Bytes)
 
-    $destination = Assert-DysonDeploymentPlainFile -Path $Path -MaximumBytes 32768 `
-        -Message 'A restored cutover broker state file is unavailable or redirected.'
-    $temporary = $destination + '.rollback-' + [guid]::NewGuid().ToString('N')
-    $backup = $destination + '.superseded-' + [guid]::NewGuid().ToString('N')
-    try {
-        [System.IO.File]::WriteAllBytes($temporary, $Bytes)
-        [System.IO.File]::Replace($temporary, $destination, $backup)
-    }
-    finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
-        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
-    }
-}
 
-function Restore-DysonCutoverBrokerDeploymentFileAcls {
-    param([Parameter(Mandatory)]$State)
 
-    foreach ($directoryAcl in @($State.directoryAcls)) {
-        $path = Assert-DysonPlainDirectory -Path ([string]$directoryAcl.path)
-        Restore-DysonDeploymentDirectorySecurityPreimage -Path $path -Sddl ([string]$directoryAcl.sddl)
-        if ((Microsoft.PowerShell.Security\Get-Acl -LiteralPath $path -ErrorAction Stop).Sddl -cne
-            [string]$directoryAcl.sddl) {
-            throw 'A restored cutover broker storage directory did not return to its exact ACL preimage.'
-        }
-    }
-    foreach ($binding in @(
-        @([string]$State.profilePath, [byte[]]$State.profileBytes, [string]$State.profileSddl),
-        @([string]$State.bindingPath, [byte[]]$State.bindingBytes, [string]$State.bindingSddl)
-    )) {
-        Set-DysonCutoverBrokerDeploymentFileBytesAtomic `
-            -Path ([string]$binding[0]) -Bytes ([byte[]]$binding[1])
-        $path = Assert-DysonDeploymentPlainFile -Path ([string]$binding[0]) -MaximumBytes 32768 `
-            -Message 'A restored cutover broker state file is unavailable or redirected.'
-        Restore-DysonDeploymentFileSecurityPreimage -Path $path -Sddl ([string]$binding[2])
-        $restoredSddl = (Microsoft.PowerShell.Security\Get-Acl -LiteralPath $path -ErrorAction Stop).Sddl
-        if ($restoredSddl -cne [string]$binding[2]) {
-            throw 'A restored cutover broker state file did not return to its exact ACL preimage.'
-        }
-    }
-}
 
-function Restore-DysonCutoverBrokerDeploymentTaskPreimage {
-    param([Parameter(Mandatory)]$State, [string]$ShadowRoot)
 
-    if (-not [string]::IsNullOrWhiteSpace($ShadowRoot)) { return }
-    Register-ScheduledTask -TaskName 'Dyson-Control-Cutover-Broker' -TaskPath '\' `
-        -Xml ([string]$State.taskXml) -Force -ErrorAction Stop | Out-Null
-    Restore-DysonFixedTaskSecurityDescriptor -TaskName 'Dyson-Control-Cutover-Broker' `
-        -TaskPath '\' -Sddl ([string]$State.taskSddl)
-}
 
-function Invoke-DysonCutoverBrokerDeploymentInstaller {
-    param(
-        [Parameter(Mandatory)][string]$Installer,
-        [Parameter(Mandatory)][hashtable]$Arguments,
-        [string]$ShadowRoot
-    )
 
-    $previousSelfTestMarker = [System.Environment]::GetEnvironmentVariable(
-        'DYSON_CUTOVER_BROKER_SELFTEST', [System.EnvironmentVariableTarget]::Process
-    )
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($ShadowRoot)) {
-            [System.Environment]::SetEnvironmentVariable(
-                'DYSON_CUTOVER_BROKER_SELFTEST', '1', [System.EnvironmentVariableTarget]::Process
-            )
-        }
-        $output = & $Installer @Arguments
-    }
-    finally {
-        if (-not [string]::IsNullOrWhiteSpace($ShadowRoot)) {
-            [System.Environment]::SetEnvironmentVariable(
-                'DYSON_CUTOVER_BROKER_SELFTEST', $previousSelfTestMarker,
-                [System.EnvironmentVariableTarget]::Process
-            )
-        }
-    }
-    $receipt = ConvertFrom-DysonCutoverBrokerInstallerOutput $output
-    if ($receipt.PSObject.Properties.Name -contains 'ok' -and $receipt.ok -eq $false) {
-        $code = [string]$receipt.error.code
-        if ($code -notmatch '^DYSON_CONTROL_CUTOVER_BROKER_[A-Z0-9_]+$') {
-            $code = 'DYSON_CONTROL_CUTOVER_BROKER_INTERNAL_ERROR'
-        }
-        throw "Cutover broker compensation failed: $code."
-    }
-    return $receipt
-}
 
 function Test-DysonLifecycleBrokerDeploymentBytesEqual {
     param([Parameter(Mandatory)][byte[]]$Left, [Parameter(Mandatory)][byte[]]$Right)
@@ -1502,55 +947,7 @@ function Read-DysonDeploymentEnvironmentFile {
     return $configured
 }
 
-function Assert-DysonCutoverBrokerEnvironment {
-    param(
-        [Parameter(Mandatory)][hashtable]$Configured,
-        [Parameter(Mandatory)][string]$ExpectedProjectRoot,
-        [Parameter(Mandatory)][string]$ExpectedDataDirectory,
-        [Parameter(Mandatory)][string]$ExpectedAuthorityProfileFile,
-        [Parameter(Mandatory)][string]$ExpectedRuntimeTaskTransactionRoot,
-        [Parameter(Mandatory)][string]$ExpectedServiceUser,
-        [Parameter(Mandatory)][int]$ExpectedGamePort
-    )
 
-    foreach ($required in @(
-        'DYSON_PROVIDER',
-        'DYSON_LIFECYCLE_ENABLED',
-        'DYSON_CUTOVER_ENABLED',
-        'DYSON_CUTOVER_RECOVERY_ENABLED',
-        'DYSON_PROJECT_ROOT',
-        'DYSON_DATA_DIR',
-        'DYSON_CUTOVER_PROFILE_FILE',
-        'DYSON_CUTOVER_TASK_TRANSACTION_ROOT',
-        'DYSON_CUTOVER_SERVICE_USER',
-        'DYSON_GAME_PORT'
-    )) {
-        if (-not $Configured.ContainsKey($required) -or [string]::IsNullOrWhiteSpace([string]$Configured[$required])) {
-            throw "Cutover broker installation requires an explicit $required value."
-        }
-    }
-    if ([string]$Configured['DYSON_PROVIDER'] -cne 'windows' -or
-        [string]$Configured['DYSON_LIFECYCLE_ENABLED'] -cne 'true' -or
-        [string]$Configured['DYSON_CUTOVER_ENABLED'] -cne 'true' -or
-        [string]$Configured['DYSON_CUTOVER_RECOVERY_ENABLED'] -cne 'true') {
-        throw 'Cutover broker installation requires the Windows lifecycle, CUTOVER, and CUTOVER_RECOVERY configuration gates.'
-    }
-    foreach ($binding in @(
-        @('DYSON_PROJECT_ROOT', $ExpectedProjectRoot),
-        @('DYSON_DATA_DIR', $ExpectedDataDirectory),
-        @('DYSON_CUTOVER_PROFILE_FILE', $ExpectedAuthorityProfileFile),
-        @('DYSON_CUTOVER_TASK_TRANSACTION_ROOT', $ExpectedRuntimeTaskTransactionRoot)
-    )) {
-        if (-not (Test-DysonDeploymentSamePath -Left ([string]$Configured[[string]$binding[0]]) -Right ([string]$binding[1]))) {
-            throw "Cutover broker installation configuration does not match $($binding[0])."
-        }
-    }
-    if ([string]$Configured['DYSON_CUTOVER_SERVICE_USER'] -cne $ExpectedServiceUser -or
-        [string]$Configured['DYSON_GAME_PORT'] -cnotmatch '^[1-9][0-9]{0,4}$' -or
-        [int]$Configured['DYSON_GAME_PORT'] -ne $ExpectedGamePort) {
-        throw 'Cutover broker installation configuration does not match the service-user or game-port binding.'
-    }
-}
 
 function Assert-DysonLifecycleBrokerEnvironment {
     param(
@@ -1602,6 +999,7 @@ $dataFull = Assert-DysonSafeRoot -Path $DataRoot -Name 'DataRoot'
 # Installation must use a layout that its rollback and uninstall can also
 # handle. Reject unsupported roots before artifact reads or filesystem writes.
 [void](Assert-DysonDeploymentDestructiveRootLayout -InstallRoot $installFull -DataRoot $dataFull)
+[void](Assert-DysonRetiredPrivilegedRuntimeAbsent)
 $sourceFull = Assert-DysonPlainDirectory -Path $SourcePath
 Assert-DysonVersion -Version $Version
 Assert-DysonRelativePath -Path $EntryPointRelativePath -Name 'EntryPointRelativePath'
@@ -1700,9 +1098,7 @@ if (-not $InstallLifecycleBrokerTask) {
         }
     }
 }
-if ($InstallCutoverBrokerTask -and -not $InstallLifecycleBrokerTask) {
-    throw 'Cutover broker installation requires lifecycle broker installation in the same deployment transaction.'
-}
+
 $lifecycleProfileCandidate = Join-Path $dataFull 'data\lifecycle-broker\broker-profile.json'
 if ((Test-Path -LiteralPath $lifecycleProfileCandidate) -and -not $InstallLifecycleBrokerTask) {
     throw 'An installed lifecycle broker requires explicit lifecycle broker handling for a control-plane release change.'
@@ -1783,108 +1179,15 @@ if ($InstallLifecycleBrokerTask) {
     }
 }
 
-$cutoverBrokerParameterNames = @(
-    'CutoverProjectRoot',
-    'CutoverAuthorityProfileFile',
-    'CutoverAuthorityInventoryRevision',
-    'CutoverRuntimeTaskTransactionRoot',
-    'CutoverServiceUser',
-    'CutoverGamePort',
-    'CutoverRuntimeBootstrapRoot',
-    'UpgradeCutoverBrokerExisting',
-    'SelfTestCutoverBrokerShadowRoot'
-)
-if (-not $InstallCutoverBrokerTask) {
-    foreach ($parameterName in $cutoverBrokerParameterNames) {
-        if ($PSBoundParameters.ContainsKey($parameterName)) {
-            throw 'Cutover broker installation parameters require -InstallCutoverBrokerTask.'
-        }
-    }
-}
 
-$cutoverProjectFull = $null
-$cutoverAuthorityProfileFull = $null
-$cutoverRuntimeTaskTransactionFull = $null
-$cutoverRuntimeBootstrapFull = $null
-$cutoverBrokerShadowFull = $null
-if ($InstallCutoverBrokerTask) {
-    if (-not $configurationFull) {
-        throw 'Cutover broker installation requires an explicit ConfigurationSource.'
-    }
-    foreach ($requiredParameter in @(
-        @('CutoverProjectRoot', $CutoverProjectRoot),
-        @('CutoverAuthorityProfileFile', $CutoverAuthorityProfileFile),
-        @('CutoverAuthorityInventoryRevision', $CutoverAuthorityInventoryRevision),
-        @('CutoverRuntimeTaskTransactionRoot', $CutoverRuntimeTaskTransactionRoot),
-        @('CutoverServiceUser', $CutoverServiceUser),
-        @('CutoverRuntimeBootstrapRoot', $CutoverRuntimeBootstrapRoot)
-    )) {
-        if ([string]::IsNullOrWhiteSpace([string]$requiredParameter[1])) {
-            throw "Cutover broker installation requires an explicit $($requiredParameter[0])."
-        }
-    }
-    if ($null -eq $CutoverGamePort -or [int]$CutoverGamePort -lt 1 -or [int]$CutoverGamePort -gt 65535) {
-        throw 'Cutover broker installation requires an explicit CutoverGamePort from 1 through 65535.'
-    }
-    if ($CutoverAuthorityInventoryRevision -cnotmatch '^[0-9a-f]{64}$') {
-        throw 'CutoverAuthorityInventoryRevision must be a lowercase SHA-256 value.'
-    }
-    if ($CutoverServiceUser -notmatch '^[^"\r\n]{3,128}$' -or $CutoverServiceUser.Trim() -cne $CutoverServiceUser) {
-        throw 'CutoverServiceUser is invalid.'
-    }
-    $cutoverProjectFull = Assert-DysonPlainDirectory -Path $CutoverProjectRoot
-    $cutoverAuthorityProfileFull = Assert-DysonDeploymentPlainFile -Path $CutoverAuthorityProfileFile `
-        -MaximumBytes 262144 -Message 'CutoverAuthorityProfileFile must be a plain, non-empty file no larger than 262144 bytes.'
-    $cutoverRuntimeTaskTransactionFull = Assert-DysonPlainDirectory -Path $CutoverRuntimeTaskTransactionRoot
-    $cutoverRuntimeBootstrapFull = Get-DysonFullPath -Path $CutoverRuntimeBootstrapRoot
-    $expectedRuntimeBootstrapRoot = Join-Path $installFull 'bootstrap'
-    if (-not (Test-DysonDeploymentSamePath -Left $cutoverRuntimeBootstrapFull -Right $expectedRuntimeBootstrapRoot)) {
-        throw 'CutoverRuntimeBootstrapRoot must be the stable bootstrap directory under InstallRoot.'
-    }
-    if (Test-Path -LiteralPath $cutoverRuntimeBootstrapFull) {
-        [void](Assert-DysonPlainDirectory -Path $cutoverRuntimeBootstrapFull)
-    }
 
-    $sourceEnvironment = Read-DysonDeploymentEnvironmentFile -Path $configurationFull
-    $brokerEnvironmentArguments = @{
-        ExpectedProjectRoot = $cutoverProjectFull
-        ExpectedDataDirectory = (Join-Path $dataFull 'data')
-        ExpectedAuthorityProfileFile = $cutoverAuthorityProfileFull
-        ExpectedRuntimeTaskTransactionRoot = $cutoverRuntimeTaskTransactionFull
-        ExpectedServiceUser = $CutoverServiceUser
-        ExpectedGamePort = [int]$CutoverGamePort
-    }
-    Assert-DysonCutoverBrokerEnvironment -Configured $sourceEnvironment @brokerEnvironmentArguments
-    if ((Test-Path -LiteralPath $prospectiveConfigurationPath -PathType Leaf) -and
-        (Test-Path -LiteralPath (Join-Path $dataFull 'data\cutover-broker\broker-profile.json') -PathType Leaf)) {
-        $installedEnvironment = Read-DysonDeploymentEnvironmentFile -Path $prospectiveConfigurationPath
-        Assert-DysonCutoverBrokerEnvironment -Configured $installedEnvironment @brokerEnvironmentArguments
-    }
 
-    if ($SelfTestCutoverBrokerShadowRoot) {
-        if (-not $SelfTestSkipAdministratorCheck) {
-            throw 'The cutover broker shadow scheduler is reserved for the isolated deployment self-test.'
-        }
-        $cutoverBrokerShadowFull = Assert-DysonPlainDirectory -Path $SelfTestCutoverBrokerShadowRoot
-        $temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
-        $requiredPrefix = $temporaryRoot + [System.IO.Path]::DirectorySeparatorChar + 'dyson-control-deployment-selftest-'
-        if (-not $cutoverBrokerShadowFull.TrimEnd('\', '/').StartsWith(
-            $requiredPrefix,
-            [System.StringComparison]::OrdinalIgnoreCase
-        ) -or -not (Test-Path -LiteralPath (Join-Path $cutoverBrokerShadowFull '.dyson-cutover-broker-selftest') -PathType Leaf)) {
-            throw 'The cutover broker shadow scheduler is outside the isolated deployment self-test root.'
-        }
-    }
-    elseif ($SelfTestSkipAdministratorCheck) {
-        throw 'The isolated cutover broker deployment self-test requires a shadow scheduler root.'
-    }
-    if (-not (Test-DysonDeploymentSamePath $cutoverProjectFull $lifecycleProjectFull) -or
-        -not (Test-DysonDeploymentSamePath $cutoverRuntimeBootstrapFull $lifecycleRuntimeBootstrapFull) -or
-        [string]$CutoverServiceUser -cne [string]$ServiceUser -or
-        [int]$CutoverGamePort -ne [int]$GamePort) {
-        throw 'Cutover and lifecycle broker parameters must share the same project, bootstrap, service-user, and game-port binding.'
-    }
-}
+
+
+
+
+
+
 
 $preflightActiveRelease = Get-DysonActiveRelease -InstallRoot $installFull -DataRoot $dataFull
 $lifecycleBrokerPreflightState = Get-DysonLifecycleBrokerDeploymentPreimage `
@@ -1901,22 +1204,10 @@ Assert-DysonLifecycleBrokerDeploymentBinding -State $lifecycleBrokerPreflightSta
     -ProjectRoot $lifecycleProjectFull -RuntimeBootstrapRoot $lifecycleRuntimeBootstrapFull `
     -ServiceUser $ServiceUser -GamePort $GamePort -DispatchReadyTimeout $DispatchReadyTimeout
 
-$cutoverBrokerPreflightState = Get-DysonCutoverBrokerDeploymentPreimage `
-    -DeploymentDataRoot $dataFull -ActiveRelease $preflightActiveRelease `
-    -ShadowRoot $cutoverBrokerShadowFull
-if ($null -ne $cutoverBrokerPreflightState -and -not $InstallCutoverBrokerTask) {
-    throw 'An installed cutover broker requires explicit broker handling for a control-plane release change.'
-}
-Assert-DysonBrokerUpgradeIntent -Kind cutover -Requested ([bool]$InstallCutoverBrokerTask) `
-    -UpgradeRequested ([bool]$UpgradeCutoverBrokerExisting) `
-    -State $cutoverBrokerPreflightState -TargetVersion $Version
-Assert-DysonCutoverBrokerDeploymentBinding -State $cutoverBrokerPreflightState `
-    -ProjectRoot $cutoverProjectFull -DataRoot (Join-Path $dataFull 'data') `
-    -AuthorityProfileFile $cutoverAuthorityProfileFull `
-    -AuthorityInventoryRevision $CutoverAuthorityInventoryRevision `
-    -RuntimeBootstrapRoot $cutoverRuntimeBootstrapFull `
-    -RuntimeTaskTransactionRoot $cutoverRuntimeTaskTransactionFull `
-    -ServiceUser $CutoverServiceUser -GamePort $CutoverGamePort
+
+
+
+
 
 if (-not $PSCmdlet.ShouldProcess("$installFull; $dataFull", "install and activate Dyson Control $Version")) {
     [ordered]@{
@@ -1963,14 +1254,9 @@ if (-not $PSCmdlet.ShouldProcess("$installFull; $dataFull", "install and activat
         lifecycleBrokerUpgradeExistingRequested = [bool]$UpgradeLifecycleBrokerExisting
         lifecycleBrokerConfigurationValidated = [bool]$InstallLifecycleBrokerTask
         lifecycleBrokerTaskName = if ($InstallLifecycleBrokerTask) { 'Dyson-Control-Lifecycle-Broker' } else { $null }
-        cutoverBrokerTaskRequested = [bool]$InstallCutoverBrokerTask
-        cutoverBrokerUpgradeExistingRequested = [bool]$UpgradeCutoverBrokerExisting
-        cutoverBrokerConfigurationValidated = [bool]$InstallCutoverBrokerTask
-        cutoverBrokerTaskName = if ($InstallCutoverBrokerTask) { 'Dyson-Control-Cutover-Broker' } else { $null }
         existingConfigurationProtectedForRollback = [bool](
             $null -ne $configurationPreflight.existing
         )
-        persistentCutoverDataWillBeCreated = $true
         gameTasksChanged = $false
     } | ConvertTo-DysonJsonLine
     exit 0
@@ -1980,7 +1266,7 @@ if (-not $PSCmdlet.ShouldProcess("$installFull; $dataFull", "install and activat
     -ExpectedNodeSha256 $ExpectedNodeSha256 -InstallRoot $installFull -DataRoot $dataFull `
     -MinimumMajor $sourceArtifactVerification.nodeMinimumMajor)
 
-if (($RegisterStartupTask -or $InstallLifecycleBrokerTask -or $InstallCutoverBrokerTask -or
+if (($RegisterStartupTask -or $InstallLifecycleBrokerTask -or
         [bool]$qualifiedClientStoragePlan.configured) -and
     -not $SelfTestSkipAdministratorCheck) {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -2056,13 +1342,13 @@ $lifecycleBrokerInstallAttempted = $false
 $lifecycleBrokerInstallArguments = $null
 $lifecycleBrokerInstaller = $null
 $lifecycleBrokerPreviousState = $null
-$cutoverBrokerInstallReceipt = $null
-$cutoverBrokerInstallArguments = $null
-$cutoverBrokerInstaller = $null
-$cutoverBrokerPreviousState = $null
+
+
+
+
 $activeReleaseBeforeInstall = $null
 try {
-    if ($RegisterStartupTask -and ($InstallLifecycleBrokerTask -or $InstallCutoverBrokerTask)) {
+    if ($RegisterStartupTask -and ($InstallLifecycleBrokerTask)) {
         # This runs only after ShouldProcess and under the deployment lock. The
         # shared application lease rejects active mutations before stopping the
         # old panel; status workers do not require that lease and may drain.
@@ -2114,24 +1400,11 @@ try {
     Assert-DysonLifecycleBrokerDeploymentBinding -State $lifecycleBrokerPreviousState `
         -ProjectRoot $lifecycleProjectFull -RuntimeBootstrapRoot $lifecycleRuntimeBootstrapFull `
         -ServiceUser $ServiceUser -GamePort $GamePort -DispatchReadyTimeout $DispatchReadyTimeout
-    $cutoverBrokerPreviousState = Get-DysonCutoverBrokerDeploymentPreimage `
-        -DeploymentDataRoot $dataFull -ActiveRelease $activeReleaseBeforeInstall `
-        -ShadowRoot $cutoverBrokerShadowFull
-    Assert-DysonBrokerPreflightStateUnchanged -Before $cutoverBrokerPreflightState `
-        -After $cutoverBrokerPreviousState -Kind cutover
-    if ($null -ne $cutoverBrokerPreviousState -and -not $InstallCutoverBrokerTask) {
-        throw 'An installed cutover broker requires explicit broker handling for a control-plane release change.'
-    }
-    Assert-DysonBrokerUpgradeIntent -Kind cutover -Requested ([bool]$InstallCutoverBrokerTask) `
-        -UpgradeRequested ([bool]$UpgradeCutoverBrokerExisting) `
-        -State $cutoverBrokerPreviousState -TargetVersion $Version
-    Assert-DysonCutoverBrokerDeploymentBinding -State $cutoverBrokerPreviousState `
-        -ProjectRoot $cutoverProjectFull -DataRoot (Join-Path $dataFull 'data') `
-        -AuthorityProfileFile $cutoverAuthorityProfileFull `
-        -AuthorityInventoryRevision $CutoverAuthorityInventoryRevision `
-        -RuntimeBootstrapRoot $cutoverRuntimeBootstrapFull `
-        -RuntimeTaskTransactionRoot $cutoverRuntimeTaskTransactionFull `
-        -ServiceUser $CutoverServiceUser -GamePort $CutoverGamePort
+
+
+
+
+
     [void](New-DysonDirectory -Path $installFull)
     $brokerQuiescenceCompleted = $brokerQuiescenceAttempted
     if ($configurationReplacementRequired) {
@@ -2150,7 +1423,7 @@ try {
             throw 'The protected configuration preimage snapshot does not match the under-lock target.'
         }
     }
-    foreach ($relative in @('data', 'data\cutover', 'logs', 'state', 'snapshots', 'audit')) {
+    foreach ($relative in @('data', 'logs', 'state', 'snapshots', 'audit')) {
         [void](New-DysonDirectory -Path (Join-Path $dataFull $relative))
     }
     $qualifiedClientStorageEvidence = Install-DysonQualifiedClientStorage `
@@ -2200,6 +1473,7 @@ try {
         [ordered]@{ source = Join-Path $activeConfigurationSourceRoot 'Restore-DysonControlConfiguration.ps1'; destination = 'configuration\Restore-DysonControlConfiguration.ps1' },
         [ordered]@{ source = Join-Path $activeConfigurationSourceRoot 'Test-DysonControlConfiguration.ps1'; destination = 'configuration\Test-DysonControlConfiguration.ps1' },
         [ordered]@{ source = Join-Path $activeConfigurationSourceRoot 'dyson-control.environment-contract.json'; destination = 'configuration\dyson-control.environment-contract.json' },
+        [ordered]@{ source = Join-Path $activeConfigurationSourceRoot 'dyson-control.environment-contract.rc26.json'; destination = 'configuration\dyson-control.environment-contract.rc26.json' },
         [ordered]@{ source = Join-Path $gameBootstrapSourceRoot 'DysonGameLifecycleBootstrap.Common.ps1'; destination = 'DysonGameLifecycleBootstrap.Common.ps1' },
         [ordered]@{ source = Join-Path $gameBootstrapSourceRoot 'DysonStoppedSaveCapture.ps1'; destination = 'DysonStoppedSaveCapture.ps1' },
         [ordered]@{ source = Join-Path $gameBootstrapSourceRoot 'Resolve-DysonGameLifecycleRelease.ps1'; destination = 'Resolve-DysonGameLifecycleRelease.ps1' },
@@ -2400,147 +1674,7 @@ try {
         }
         $lifecycleBrokerInstallReceipt = $candidateLifecycleBrokerReceipt
     }
-    if ($InstallCutoverBrokerTask) {
-        $activeRelease = Get-DysonActiveRelease -InstallRoot $installFull -DataRoot $dataFull
-        if ($null -eq $activeRelease -or [string]$activeRelease.pointer.version -cne $Version) {
-            throw 'The cutover broker cannot bind to an unverified active release.'
-        }
-        $cutoverScriptRoot = Assert-DysonPlainDirectory -Path (Join-Path $activeRelease.releaseRoot 'scripts\windows')
-        $cutoverBrokerScriptRoot = Assert-DysonPlainDirectory -Path (Join-Path $cutoverScriptRoot 'cutover-broker')
-        $cutoverBrokerInstaller = Assert-DysonDeploymentPlainFile `
-            -Path (Join-Path $cutoverBrokerScriptRoot 'Install-DysonCutoverBrokerTask.ps1') `
-            -MaximumBytes 1048576 `
-            -Message 'The active release cutover broker installer is unavailable, redirected, empty, or too large.'
-        $cutoverBrokerRequestId = [guid]::NewGuid().ToString('D')
-        $cutoverBrokerDataRoot = Join-Path $dataFull 'data'
-        $cutoverBrokerRoot = Join-Path $cutoverBrokerDataRoot 'cutover-broker'
-        $cutoverBrokerInstallArguments = @{
-            RequestId = $cutoverBrokerRequestId
-            BrokerRoot = $cutoverBrokerRoot
-            BrokerScriptRoot = $cutoverBrokerScriptRoot
-            ProjectRoot = $cutoverProjectFull
-            DataRoot = $cutoverBrokerDataRoot
-            AuthorityProfileFile = $cutoverAuthorityProfileFull
-            AuthorityInventoryRevision = $CutoverAuthorityInventoryRevision
-            CutoverScriptRoot = $cutoverScriptRoot
-            RuntimeBootstrapRoot = $cutoverRuntimeBootstrapFull
-            RuntimeTaskTransactionRoot = $cutoverRuntimeTaskTransactionFull
-            ServiceUser = $CutoverServiceUser
-            GamePort = [int]$CutoverGamePort
-            TaskName = 'Dyson-Control-Cutover-Broker'
-            Confirm = $false
-        }
-        if ($UpgradeCutoverBrokerExisting) {
-            $cutoverBrokerInstallArguments['UpgradeExisting'] = $true
-        }
-        if ($cutoverBrokerShadowFull) {
-            $cutoverBrokerInstallArguments['SchedulerBackend'] = 'Shadow'
-            $cutoverBrokerInstallArguments['ShadowRoot'] = $cutoverBrokerShadowFull
-        }
 
-        $previousBrokerSelfTestMarker = [System.Environment]::GetEnvironmentVariable(
-            'DYSON_CUTOVER_BROKER_SELFTEST',
-            [System.EnvironmentVariableTarget]::Process
-        )
-        try {
-            if ($cutoverBrokerShadowFull) {
-                [System.Environment]::SetEnvironmentVariable(
-                    'DYSON_CUTOVER_BROKER_SELFTEST',
-                    '1',
-                    [System.EnvironmentVariableTarget]::Process
-                )
-            }
-            $cutoverBrokerOutput = & $cutoverBrokerInstaller @cutoverBrokerInstallArguments
-        }
-        finally {
-            if ($cutoverBrokerShadowFull) {
-                [System.Environment]::SetEnvironmentVariable(
-                    'DYSON_CUTOVER_BROKER_SELFTEST',
-                    $previousBrokerSelfTestMarker,
-                    [System.EnvironmentVariableTarget]::Process
-                )
-            }
-        }
-        $cutoverBrokerLines = @(
-            ($cutoverBrokerOutput | Out-String) -split "`r?`n" |
-                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-        )
-        if ($cutoverBrokerLines.Count -eq 0) { throw 'The cutover broker task installer returned no receipt.' }
-        $candidateCutoverBrokerInstallReceipt = $cutoverBrokerLines[$cutoverBrokerLines.Count - 1] |
-            ConvertFrom-Json -ErrorAction Stop
-        if ($candidateCutoverBrokerInstallReceipt.PSObject.Properties.Name -contains 'ok' -and
-            $candidateCutoverBrokerInstallReceipt.ok -eq $false) {
-            $brokerFailureCode = [string]$candidateCutoverBrokerInstallReceipt.error.code
-            if ($brokerFailureCode -notmatch '^DYSON_CONTROL_CUTOVER_BROKER_[A-Z0-9_]+$') {
-                $brokerFailureCode = 'DYSON_CONTROL_CUTOVER_BROKER_INTERNAL_ERROR'
-            }
-            if ($cutoverBrokerShadowFull) {
-                $brokerStageLog = Join-Path $cutoverBrokerShadowFull 'install-stage.log'
-                $brokerLastStage = if (Test-Path -LiteralPath $brokerStageLog -PathType Leaf) {
-                    @([System.IO.File]::ReadAllLines($brokerStageLog, [System.Text.Encoding]::UTF8) |
-                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })[-1]
-                }
-                else { 'before-dependencies-loaded' }
-                throw "Cutover broker task installation failed: $brokerFailureCode at isolated self-test stage $brokerLastStage."
-            }
-            throw "Cutover broker task installation failed: $brokerFailureCode."
-        }
-        Assert-DysonLifecycleBrokerDeploymentExactProperties -Value $candidateCutoverBrokerInstallReceipt `
-            -Names @(
-                'protocol', 'schemaVersion', 'requestId', 'operation', 'profileFingerprint',
-                'brokerBundleSha256', 'taskName', 'taskPath', 'taskSddlSha256', 'status',
-                'reused', 'upgraded', 'previousProfileFingerprint', 'transactionId', 'completedAt'
-            ) -Message 'The cutover broker task installer returned an unsupported receipt.'
-        $completedAt = [datetimeoffset]::MinValue
-        if ([string]$candidateCutoverBrokerInstallReceipt.protocol -cne 'DYSON_CONTROL_CUTOVER_BROKER_INSTALL_RECEIPT_V1' -or
-            [int]$candidateCutoverBrokerInstallReceipt.schemaVersion -ne 1 -or
-            [string]$candidateCutoverBrokerInstallReceipt.requestId -cne $cutoverBrokerRequestId -or
-            [string]$candidateCutoverBrokerInstallReceipt.operation -cnotin @('installed', 'upgraded', 'reused') -or
-            [string]$candidateCutoverBrokerInstallReceipt.profileFingerprint -cnotmatch '^[0-9a-f]{64}$' -or
-            [string]$candidateCutoverBrokerInstallReceipt.brokerBundleSha256 -cnotmatch '^[0-9a-f]{64}$' -or
-            [string]$candidateCutoverBrokerInstallReceipt.taskName -cne 'Dyson-Control-Cutover-Broker' -or
-            [string]$candidateCutoverBrokerInstallReceipt.taskPath -cne '\' -or
-            [string]$candidateCutoverBrokerInstallReceipt.taskSddlSha256 -cnotmatch '^[0-9a-f]{64}$' -or
-            [string]$candidateCutoverBrokerInstallReceipt.status -cne 'succeeded' -or
-            $candidateCutoverBrokerInstallReceipt.reused -isnot [bool] -or
-            $candidateCutoverBrokerInstallReceipt.upgraded -isnot [bool] -or
-            ([string]$candidateCutoverBrokerInstallReceipt.operation -ceq 'installed' -and
-                ([bool]$candidateCutoverBrokerInstallReceipt.reused -or [bool]$candidateCutoverBrokerInstallReceipt.upgraded)) -or
-            ([string]$candidateCutoverBrokerInstallReceipt.operation -ceq 'upgraded' -and
-                (-not [bool]$candidateCutoverBrokerInstallReceipt.upgraded -or [bool]$candidateCutoverBrokerInstallReceipt.reused)) -or
-            ([string]$candidateCutoverBrokerInstallReceipt.operation -ceq 'reused' -and
-                (-not [bool]$candidateCutoverBrokerInstallReceipt.reused -or [bool]$candidateCutoverBrokerInstallReceipt.upgraded)) -or
-            ([bool]$candidateCutoverBrokerInstallReceipt.upgraded -and
-                ([string]$candidateCutoverBrokerInstallReceipt.previousProfileFingerprint -cnotmatch '^[0-9a-f]{64}$' -or
-                    [string]$candidateCutoverBrokerInstallReceipt.transactionId -cne $cutoverBrokerRequestId)) -or
-            -not [datetimeoffset]::TryParseExact(
-                [string]$candidateCutoverBrokerInstallReceipt.completedAt,
-                'o',
-                [Globalization.CultureInfo]::InvariantCulture,
-                [Globalization.DateTimeStyles]::RoundtripKind,
-                [ref]$completedAt
-            )) {
-            throw 'The cutover broker task installer returned an unsupported receipt.'
-        }
-        $expectedCutoverBrokerOperation = if ($null -eq $cutoverBrokerPreviousState) {
-            'installed'
-        }
-        elseif ([string]$cutoverBrokerPreviousState.activeVersion -ceq $Version) {
-            'reused'
-        }
-        else { 'upgraded' }
-        if ([string]$candidateCutoverBrokerInstallReceipt.operation -cne $expectedCutoverBrokerOperation -or
-            ($expectedCutoverBrokerOperation -ceq 'upgraded' -and
-                [string]$candidateCutoverBrokerInstallReceipt.previousProfileFingerprint -cne
-                    [string]$cutoverBrokerPreviousState.profile.profileFingerprint)) {
-            throw 'The cutover broker installer operation does not match the captured deployment preimage and upgrade intent.'
-        }
-        if ($expectedCutoverBrokerOperation -ceq 'reused') {
-            Assert-DysonCutoverBrokerDeploymentPreimageRestored -DeploymentDataRoot $dataFull `
-                -State $cutoverBrokerPreviousState -ShadowRoot $cutoverBrokerShadowFull
-        }
-        $cutoverBrokerInstallReceipt = $candidateCutoverBrokerInstallReceipt
-    }
     if ($StartAfterInstall) {
         # Startup recovery may use the same host lease. Broker/configuration
         # publication is complete; release it before launching the new panel.
@@ -2551,7 +1685,7 @@ try {
         Start-ScheduledTask -TaskName $TaskName -TaskPath $script:DysonControlTaskPath -ErrorAction Stop
         $requiredReadinessChecks = @()
         if ($InstallLifecycleBrokerTask) { $requiredReadinessChecks += 'lifecycleBroker' }
-        if ($InstallCutoverBrokerTask) { $requiredReadinessChecks += 'cutoverRecovery' }
+
         [void](Test-DysonLoopbackReadiness -ReadinessUri $ReadinessUri -ExpectedVersion $Version `
             -RequiredChecks $requiredReadinessChecks -TimeoutSeconds $ReadinessTimeoutSeconds)
     }
@@ -2611,72 +1745,10 @@ catch {
         }
     }
 
-    $cutoverBrokerStateRestored = $null -eq $cutoverBrokerInstallReceipt
-    $cutoverBrokerRestoreDeferred = $false
-    $cutoverBrokerFullValidationDeferred = $false
-    if ($null -ne $cutoverBrokerInstallReceipt) {
-        switch ([string]$cutoverBrokerInstallReceipt.operation) {
-            'reused' {
-                try {
-                    Assert-DysonCutoverBrokerDeploymentPreimageRestored -DeploymentDataRoot $dataFull `
-                        -State $cutoverBrokerPreviousState -ShadowRoot $cutoverBrokerShadowFull
-                    $cutoverBrokerStateRestored = $true
-                }
-                catch { $rollbackFailures.Add('cutover-broker-reused-verification') }
-            }
-            'installed' {
-                try {
-                    $compensationArguments = @{}
-                    foreach ($key in $cutoverBrokerInstallArguments.Keys) {
-                        $compensationArguments[$key] = $cutoverBrokerInstallArguments[$key]
-                    }
-                    [void]$compensationArguments.Remove('UpgradeExisting')
-                    $compensationArguments['RequestId'] = [guid]::NewGuid().ToString('D')
-                    $compensationArguments['Operation'] = 'CompensateFirstInstall'
-                    $compensationArguments['CompensateInstallRequestId'] = `
-                        [string]$cutoverBrokerInstallReceipt.requestId
-                    $compensationReceipt = Invoke-DysonCutoverBrokerDeploymentInstaller `
-                        -Installer $cutoverBrokerInstaller -Arguments $compensationArguments `
-                        -ShadowRoot $cutoverBrokerShadowFull
-                    if ([string]$compensationReceipt.protocol -cne `
-                            'DYSON_CONTROL_CUTOVER_BROKER_COMPENSATION_RECEIPT_V1' -or
-                        [int]$compensationReceipt.schemaVersion -ne 1 -or
-                        [string]$compensationReceipt.operation -cne 'compensated-first-install' -or
-                        [string]$compensationReceipt.installRequestId -cne `
-                            [string]$cutoverBrokerInstallReceipt.requestId -or
-                        [string]$compensationReceipt.profileFingerprint -cne `
-                            [string]$cutoverBrokerInstallReceipt.profileFingerprint -or
-                        -not [bool]$compensationReceipt.removed -or
-                        [string]$compensationReceipt.status -cne 'succeeded') {
-                        throw 'The cutover broker first-install compensation receipt is invalid.'
-                    }
-                    Assert-DysonCutoverBrokerDeploymentPreimageRestored -DeploymentDataRoot $dataFull `
-                        -State $cutoverBrokerPreviousState -ShadowRoot $cutoverBrokerShadowFull
-                    $cutoverBrokerStateRestored = $true
-                }
-                catch { $rollbackFailures.Add('cutover-broker-first-install-compensation') }
-            }
-            'upgraded' {
-                if ($null -eq $cutoverBrokerPreviousState) {
-                    $rollbackFailures.Add('cutover-broker-upgrade-preimage')
-                }
-                else { $cutoverBrokerRestoreDeferred = $true }
-            }
-            default { $rollbackFailures.Add('cutover-broker-operation') }
-        }
-    }
-    elseif ($InstallCutoverBrokerTask) {
-        try {
-            $deferFullContract = $null -ne $cutoverBrokerPreviousState -and
-                [string]$cutoverBrokerPreviousState.activeVersion -cne $Version
-            Assert-DysonCutoverBrokerDeploymentPreimageRestored -DeploymentDataRoot $dataFull `
-                -State $cutoverBrokerPreviousState -ShadowRoot $cutoverBrokerShadowFull `
-                -DeferFullContract:$deferFullContract
-            $cutoverBrokerStateRestored = $true
-            $cutoverBrokerFullValidationDeferred = $deferFullContract
-        }
-        catch { $rollbackFailures.Add('cutover-broker-install-rollback-verification') }
-    }
+
+
+
+
 
     $lifecycleBrokerStateRestored = $null -eq $lifecycleBrokerInstallReceipt
     $lifecycleBrokerRestoreDeferred = $false
@@ -2845,7 +1917,6 @@ catch {
 
     $deploymentStateRestored = -not [bool]($deploymentResult -and $deploymentResult.snapshotId)
     if ($configurationStateRestored -and $replacementTaskRemoved -and
-        ($cutoverBrokerStateRestored -or $cutoverBrokerRestoreDeferred) -and
         ($lifecycleBrokerStateRestored -or $lifecycleBrokerRestoreDeferred)) {
         try {
             if ($deploymentResult -and $deploymentResult.snapshotId) {
@@ -2867,9 +1938,7 @@ catch {
             $rollbackFailures.Add('deployment-state-blocked-by-protected-configuration')
         }
         if (-not $replacementTaskRemoved) { $rollbackFailures.Add('deployment-state-blocked-by-task') }
-        if (-not $cutoverBrokerStateRestored -and -not $cutoverBrokerRestoreDeferred) {
-            $rollbackFailures.Add('deployment-state-blocked-by-cutover-broker')
-        }
+
         if (-not $lifecycleBrokerStateRestored -and -not $lifecycleBrokerRestoreDeferred) {
             $rollbackFailures.Add('deployment-state-blocked-by-lifecycle-broker')
         }
@@ -2932,12 +2001,7 @@ catch {
                     -RuntimeBootstrapRoot $existingConfigurationBootstrapRoot `
                     -DeploymentVersion $existingConfigurationDeploymentVersion `
                     -ServiceAccount $ServiceAccount `
-                    -ConfigurationModuleRoot $(
-                        if ($SelfTestConfigurationShadowRoot) {
-                            $configurationApplyModuleRoot
-                        }
-                        else { Join-Path $bootstrapRoot 'configuration' }
-                    )
+                    -ConfigurationModuleRoot $configurationApplyModuleRoot
                 if ([string]$restoredConfigurationEvidence.configurationSha256 -cne
                         [string]$configurationPreimageSnapshot.configurationSha256 -or
                     [int64]$restoredConfigurationEvidence.configurationLength -ne
@@ -2950,6 +2014,14 @@ catch {
                         [string]$configurationPreimageSnapshot.configurationAclFingerprint) {
                     throw 'The restored protected configuration changed after release/bootstrap rollback.'
                 }
+                if (-not $SelfTestConfigurationShadowRoot) {
+                    $restoredRuntimeEvidence = Invoke-DysonDeploymentConfigurationTest -DataRoot $dataFull -ScriptRoot $existingConfigurationScriptRoot -RuntimeBootstrapRoot $existingConfigurationBootstrapRoot -DeploymentVersion $existingConfigurationDeploymentVersion -ServiceAccount $ServiceAccount -ConfigurationModuleRoot (Join-Path $bootstrapRoot 'configuration') -RuntimeOnly
+                    if ([string]$restoredRuntimeEvidence.configurationSha256 -cne [string]$configurationPreimageSnapshot.configurationSha256 -or
+                        [string]$restoredRuntimeEvidence.configurationBindingsSha256 -cne [string]$configurationPreimageSnapshot.configurationBindingsSha256 -or
+                        [string]$restoredRuntimeEvidence.configurationContractSha256 -cne [string]$configurationPreimageSnapshot.configurationContractSha256) {
+                        throw 'The restored launcher did not accept the original configuration approval.'
+                    }
+                }
                 $configurationRollbackFinalVerified = $true
             }
             catch { $rollbackFailures.Add('protected-configuration-final-verification:' + $_.Exception.Message) }
@@ -2959,25 +2031,7 @@ catch {
 
     $taskDataAclPreimageRestored = $true
 
-    if ($cutoverBrokerFullValidationDeferred) {
-        if ($replacementTaskRemoved -and $deploymentStateRestored -and $bootstrapConfigurationRestored -and
-            $configurationRollbackFinalVerified -and
-            $taskDataAclPreimageRestored) {
-            try {
-                Assert-DysonCutoverBrokerDeploymentPreimageRestored -DeploymentDataRoot $dataFull `
-                    -State $cutoverBrokerPreviousState -ShadowRoot $cutoverBrokerShadowFull
-                $cutoverBrokerFullValidationDeferred = $false
-            }
-            catch {
-                $cutoverBrokerStateRestored = $false
-                $rollbackFailures.Add('cutover-broker-full-contract')
-            }
-        }
-        else {
-            $cutoverBrokerStateRestored = $false
-            $rollbackFailures.Add('cutover-broker-full-contract-blocked')
-        }
-    }
+
 
     if ($lifecycleBrokerRestoreDeferred) {
         if ($replacementTaskRemoved -and $deploymentStateRestored -and $bootstrapConfigurationRestored -and
@@ -3014,48 +2068,12 @@ catch {
         else { $rollbackFailures.Add('lifecycle-broker-upgrade-compensation-blocked') }
     }
 
-    if ($cutoverBrokerRestoreDeferred) {
-        if ($replacementTaskRemoved -and $deploymentStateRestored -and $bootstrapConfigurationRestored -and
-            $configurationRollbackFinalVerified -and
-            $taskDataAclPreimageRestored -and $lifecycleBrokerStateRestored) {
-            try {
-                $restoreArguments = @{}
-                foreach ($key in $cutoverBrokerPreviousState.installArguments.Keys) {
-                    $restoreArguments[$key] = $cutoverBrokerPreviousState.installArguments[$key]
-                }
-                $restoreArguments['RequestId'] = [guid]::NewGuid().ToString('D')
-                $restoreArguments['UpgradeExisting'] = $true
-                [void]$restoreArguments.Remove('Operation')
-                [void]$restoreArguments.Remove('CompensateInstallRequestId')
-                $restoreReceipt = Invoke-DysonCutoverBrokerDeploymentInstaller `
-                    -Installer ([string]$cutoverBrokerPreviousState.installer) `
-                    -Arguments $restoreArguments -ShadowRoot $cutoverBrokerShadowFull
-                if ([string]$restoreReceipt.protocol -cne 'DYSON_CONTROL_CUTOVER_BROKER_INSTALL_RECEIPT_V1' -or
-                    [int]$restoreReceipt.schemaVersion -ne 1 -or
-                    [string]$restoreReceipt.operation -cne 'upgraded' -or
-                    -not [bool]$restoreReceipt.upgraded -or [bool]$restoreReceipt.reused -or
-                    [string]$restoreReceipt.profileFingerprint -cne `
-                        [string]$cutoverBrokerPreviousState.profile.profileFingerprint -or
-                    [string]$restoreReceipt.previousProfileFingerprint -cne `
-                        [string]$cutoverBrokerInstallReceipt.profileFingerprint) {
-                    throw 'The cutover broker rollback-to-previous-release receipt is invalid.'
-                }
-                Restore-DysonCutoverBrokerDeploymentFileAcls -State $cutoverBrokerPreviousState
-                Restore-DysonCutoverBrokerDeploymentTaskPreimage -State $cutoverBrokerPreviousState `
-                    -ShadowRoot $cutoverBrokerShadowFull
-                Assert-DysonCutoverBrokerDeploymentPreimageRestored -DeploymentDataRoot $dataFull `
-                    -State $cutoverBrokerPreviousState -ShadowRoot $cutoverBrokerShadowFull
-                $cutoverBrokerStateRestored = $true
-            }
-            catch { $rollbackFailures.Add('cutover-broker-upgrade-compensation:' + $_.Exception.Message) }
-        }
-        else { $rollbackFailures.Add('cutover-broker-upgrade-compensation-blocked') }
-    }
+
 
     if ($taskRollbackPrepared -and $replacementTaskRemoved -and $deploymentStateRestored -and
         $bootstrapConfigurationRestored -and $configurationRollbackFinalVerified -and
         $taskDataAclPreimageRestored -and
-        $lifecycleBrokerStateRestored -and $cutoverBrokerStateRestored) {
+        $lifecycleBrokerStateRestored) {
         try {
             if ($null -ne $brokerQuiescenceLease) {
                 Exit-DysonHostMutationLease -Lease $brokerQuiescenceLease | Out-Null
@@ -3118,7 +2136,6 @@ Write-DysonDeploymentAudit -DataRoot $dataFull -Operation 'install' -Outcome 'su
     readinessVerified = [bool]$StartAfterInstall
     loopbackForcedByLauncher = $true
     persistentDataReady = Test-Path -LiteralPath (Join-Path $dataFull 'data') -PathType Container
-    persistentCutoverDataReady = Test-Path -LiteralPath (Join-Path $dataFull 'data\cutover') -PathType Container
     lifecycleBrokerTaskRequested = [bool]$InstallLifecycleBrokerTask
     lifecycleBrokerOperation = if ($lifecycleBrokerInstallReceipt) { [string]$lifecycleBrokerInstallReceipt.operation } else { $null }
     lifecycleBrokerTaskInstalled = [bool]($null -ne $lifecycleBrokerInstallReceipt)
@@ -3127,17 +2144,6 @@ Write-DysonDeploymentAudit -DataRoot $dataFull -Operation 'install' -Outcome 'su
     lifecycleBrokerReused = if ($lifecycleBrokerInstallReceipt) { [bool]$lifecycleBrokerInstallReceipt.reused } else { $null }
     lifecycleBrokerUpgraded = if ($lifecycleBrokerInstallReceipt) { [bool]$lifecycleBrokerInstallReceipt.upgraded } else { $null }
     lifecycleBrokerDataReady = Test-Path -LiteralPath (Join-Path $dataFull 'data\lifecycle-broker') -PathType Container
-    cutoverBrokerTaskRequested = [bool]$InstallCutoverBrokerTask
-    cutoverBrokerOperation = if ($cutoverBrokerInstallReceipt) { [string]$cutoverBrokerInstallReceipt.operation } else { $null }
-    cutoverBrokerTaskInstalled = [bool]($null -ne $cutoverBrokerInstallReceipt)
-    cutoverBrokerTaskName = if ($cutoverBrokerInstallReceipt) { [string]$cutoverBrokerInstallReceipt.taskName } else { $null }
-    cutoverBrokerRequestId = if ($cutoverBrokerInstallReceipt) { [string]$cutoverBrokerInstallReceipt.requestId } else { $null }
-    cutoverBrokerProfileFingerprint = if ($cutoverBrokerInstallReceipt) { [string]$cutoverBrokerInstallReceipt.profileFingerprint } else { $null }
-    cutoverBrokerBundleSha256 = if ($cutoverBrokerInstallReceipt) { [string]$cutoverBrokerInstallReceipt.brokerBundleSha256 } else { $null }
-    cutoverBrokerTaskSddlSha256 = if ($cutoverBrokerInstallReceipt) { [string]$cutoverBrokerInstallReceipt.taskSddlSha256 } else { $null }
-    cutoverBrokerReused = if ($cutoverBrokerInstallReceipt) { [bool]$cutoverBrokerInstallReceipt.reused } else { $null }
-    cutoverBrokerUpgraded = if ($cutoverBrokerInstallReceipt) { [bool]$cutoverBrokerInstallReceipt.upgraded } else { $null }
-    cutoverBrokerDataReady = Test-Path -LiteralPath (Join-Path $dataFull 'data\cutover-broker') -PathType Container
     gameTasksChanged = $false
     } | ConvertTo-DysonJsonLine
 }

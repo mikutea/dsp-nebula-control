@@ -74,6 +74,28 @@ Do not mix evidence between rows. For example, a successful HTTPS dashboard
 request does not prove the game WebSocket path, and an open TCP port does not
 prove that Nebula owns the listener or that its application handshake succeeds.
 
+## Management plane through a separate Tunnel host
+
+Keep the Dyson Control Node listener on `127.0.0.1`. When `cloudflared` runs on
+another private host, expose a dedicated private forwarding port on the Windows
+server that terminates at the loopback listener. Restrict that port's inbound
+firewall rule to the Tunnel host's exact private address and add an explicit
+block for every other source. The Tunnel's management ingress points to this
+private forwarding port; the application still binds only to loopback.
+
+Set `DYSON_PUBLIC_ORIGIN` to the public HTTPS management origin before starting
+the release. The same-origin check must reject the old local preview origin once
+the public route is active. Keep the Nebula `/socket` ingress before the default
+management ingress so the game and panel cannot consume each other's route.
+
+If the Windows address comes from DHCP, use a router reservation bound to the
+VM's stable virtual NIC identity or a separately verified internal name that the
+Tunnel host resolves. A hard-coded, unreserved lease is not a durable deployment.
+Production evidence must include the reservation/name resolution, Tunnel-host
+origin request, external authenticated panel session, and rejection from a
+different private client. None of these observations proves the Nebula join;
+the game path retains its separate external-client acceptance sequence.
+
 ## Candidate A: DNS-only DDNS and NAT port mapping
 
 Use this pattern when the host has a publicly routable address that may change,

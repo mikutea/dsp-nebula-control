@@ -30,8 +30,6 @@ export const controlPermissions = [
   'updates.activate',
   'mods.read',
   'mods.mutate',
-  'cutover.read',
-  'cutover.execute',
   'client-profile.generate'
 ] as const
 export type ControlPermission = (typeof controlPermissions)[number]
@@ -53,7 +51,6 @@ const viewerPermissions = [
   'configuration.read',
   'updates.read',
   'mods.read',
-  'cutover.read'
 ] as const satisfies readonly ControlPermission[]
 
 const operatorPermissions = [

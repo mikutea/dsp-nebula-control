@@ -7,11 +7,8 @@ Set-StrictMode -Version 2.0
 . (Join-Path $PSScriptRoot 'Qualification.ProtocolV2.ps1')
 . (Join-Path $PSScriptRoot 'Qualification.Protocol.ps1')
 . (Join-Path $PSScriptRoot 'PanelObservationV2.Common.ps1')
-. (Join-Path $PSScriptRoot 'Qualification.SideBySideV2.ps1')
 . (Join-Path $PSScriptRoot 'ExternalJoinObservationV2.Common.ps1')
 . (Join-Path $PSScriptRoot 'Qualification.PairedSaveLoad.ps1')
-. (Join-Path $PSScriptRoot 'Qualification.ReversibleCutover.ps1')
-. (Join-Path $PSScriptRoot 'PostGsManagerRemovalObservationV2.Common.ps1')
 . (Join-Path $PSScriptRoot 'SoakObservationV2.Common.ps1')
 . (Join-Path (Split-Path $PSScriptRoot -Parent) 'evidence\DysonPrivateEvidence.Common.ps1')
 
@@ -33,9 +30,7 @@ $script:DysonOrchestrationV2Actions = @(
     'paired-save-restore',
     'windows-reboot-recovery',
     'update-rollback',
-    'side-by-side-deployment',
-    'gsmanager-recoverable-switch',
-    'gsmanager-removal',
+    'independent-deployment',
     'six-hour-soak',
     'seventy-two-hour-soak',
     'authenticated-panel',
@@ -165,6 +160,22 @@ function Test-DysonOrchestrationV2Identifier {
 function Test-DysonOrchestrationV2Commit {
     param([AllowNull()][string]$Value)
     return -not [string]::IsNullOrWhiteSpace($Value) -and $Value -cmatch '^[0-9a-f]{40}$'
+}
+
+function Test-DysonOrchestrationV2DeploymentSnapshotId {
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value) -or
+        $Value -cnotmatch '^(?<timestamp>[0-9]{8}-[0-9]{9})-(?<nonce>[0-9a-f]{8})$') {
+        return $false
+    }
+    $parsed = [datetime]::MinValue
+    return [datetime]::TryParseExact(
+        [string]$Matches.timestamp,
+        'yyyyMMdd-HHmmssfff',
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::AssumeUniversal,
+        [ref]$parsed
+    )
 }
 
 function Test-DysonOrchestrationV2Hmac {
@@ -635,56 +646,106 @@ function Assert-DysonOrchestrationV2ArtifactSemantics {
         }
         return
     }
-    if ($role -ceq 'candidate-isolation-observation') {
-        $key = $null
-        try {
-            $expectation = [pscustomobject][ordered]@{
-                protocol = 'DYSON_QUALIFICATION_SIDE_BY_SIDE_EXPECTATION_V2'
-                schemaVersion = 2
-                runId = [string]$Evidence.runId
-                actionTargetId = [string]$Evidence.actionTargetId
-                targetIdentity = [string]$Evidence.targetIdentity
-                releaseId = [string]$Value.deploymentReceipt.releaseId
-                subjectCommit = [string]$Evidence.subjectCommit
-                artifactHashes = $Value.deploymentReceipt.artifactHashes
-                deploymentReceiptSha256 = [string]$Value.deploymentReceipt.receiptSha256
-                candidateRootIdentitySha256 = [string]$Value.isolation.candidateRoot.rootIdentitySha256
-                gsManagerSnapshotId = [string]$Value.gsManagerSnapshot.snapshotId
-                gsManagerSnapshotManifestSha256 = [string]$Value.gsManagerSnapshot.snapshotManifestSha256
-                productionPort = [int]$Value.authority.productionPort
-                candidatePort = [int]$Value.authority.candidatePort
-                keyId = $ExpectedKeyId
-            }
-            $key = [byte[]](& $KeyResolver $ExpectedKeyId)
-            [void](Assert-DysonSideBySideV2Observation -Observation $Value -Expectation $expectation `
-                -Key $key -NowUtc $NowUtc)
-            if ([string]$Value.receiptId -cne [string]$Artifact.receiptId -or
-                [string]$Value.subjectCommit -cne [string]$Evidence.subjectCommit -or
-                [string]$Value.runtimePayloadSha256 -cne [string]$Evidence.runtimePayloadSha256 -or
-                [string]$Value.protection.keyId -cne $ExpectedKeyId) {
-                Throw-DysonOrchestrationV2Error -Code $code
-            }
-            $sourceObserved = ConvertFrom-DysonQualificationV2Utc `
-                -Value ([string]$Value.observationWindow.observedAtUtc) -Code $code
-            $sourceExpires = ConvertFrom-DysonQualificationV2Utc `
-                -Value ([string]$Value.observationWindow.expiresAtUtc) -Code $code
-            $evidenceObserved = ConvertFrom-DysonQualificationV2Utc `
-                -Value ([string]$Evidence.observedAtUtc) -Code $code
-            $evidenceExpires = ConvertFrom-DysonQualificationV2Utc `
-                -Value ([string]$Evidence.expiresAtUtc) -Code $code
-            if ([Math]::Abs(($sourceObserved - $evidenceObserved).TotalSeconds) -gt 5 -or
-                [Math]::Abs(($sourceExpires - $evidenceExpires).TotalSeconds) -gt 5) {
-                Throw-DysonOrchestrationV2Error -Code $code
-            }
+    if ($role -ceq 'deployment-receipt') {
+        Assert-DysonQualificationV2ExactProperties -Value $Value -Names @(
+            'protocol','state','version','artifactPayloadSha256','artifactProvenanceBound',
+            'sourceArtifactScriptsExecuted','runtimeRootIdentity','nodeExecutableSha256',
+            'nodeRuntimeProtected','runtimeChanged','deploymentSnapshotId','configurationCreated',
+            'configurationReplaced','configurationReady','configurationSha256','configurationLength',
+            'configurationNamesSha256','configurationBindingsSha256','configurationContractSha256',
+            'configurationAclFingerprint','configurationParentAclFingerprint',
+            'configurationReplacementSupported','qualifiedClientStorageConfigured',
+            'qualifiedClientProfileEnabled','qualifiedClientStorageReady',
+            'qualifiedClientStorageLayoutSha256','qualifiedClientStorageDirectoryCount',
+            'startupTaskInstalled','readinessVerified','loopbackForcedByLauncher','persistentDataReady',
+            'lifecycleBrokerTaskRequested','lifecycleBrokerOperation','lifecycleBrokerTaskInstalled',
+            'lifecycleBrokerTaskName','lifecycleBrokerProfileHash','lifecycleBrokerReused',
+            'lifecycleBrokerUpgraded','lifecycleBrokerDataReady','gameTasksChanged'
+        ) -Code $code
+        foreach ($booleanName in @(
+                'artifactProvenanceBound','sourceArtifactScriptsExecuted','nodeRuntimeProtected','runtimeChanged',
+                'configurationCreated','configurationReplaced','configurationReady','configurationReplacementSupported',
+                'qualifiedClientStorageConfigured','qualifiedClientProfileEnabled','qualifiedClientStorageReady',
+                'startupTaskInstalled','readinessVerified','loopbackForcedByLauncher','persistentDataReady',
+                'lifecycleBrokerTaskRequested','lifecycleBrokerTaskInstalled','lifecycleBrokerReused',
+                'lifecycleBrokerUpgraded','lifecycleBrokerDataReady','gameTasksChanged')) {
+            if ($Value.$booleanName -isnot [bool]) { Throw-DysonOrchestrationV2Error -Code $code }
         }
-        catch {
-            if ($_.Exception.Data.Contains('Code') -and
-                [string]$_.Exception.Data['Code'] -ceq $code) { throw }
+        if ([string]$Value.protocol -cne [string]$Artifact.protocol -or
+            [string]$Value.state -cne 'installed' -or
+            [string]$Value.version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$' -or
+            [string]$Value.artifactPayloadSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            -not (Test-DysonQualificationV2Digest -Value ([string]$Value.runtimeRootIdentity)) -or
+            [string]$Value.nodeExecutableSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            -not (Test-DysonOrchestrationV2DeploymentSnapshotId -Value ([string]$Value.deploymentSnapshotId)) -or
+            [string]$Value.configurationSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$Value.configurationNamesSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$Value.configurationBindingsSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$Value.configurationContractSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$Value.configurationAclFingerprint -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$Value.configurationParentAclFingerprint -cnotmatch '^[0-9a-f]{64}$' -or
+            -not (Test-DysonQualificationV2Integer -Value $Value.configurationLength) -or
+            [int64]$Value.configurationLength -lt 1 -or [int64]$Value.configurationLength -gt 65536 -or
+            $Value.artifactProvenanceBound -isnot [bool] -or -not [bool]$Value.artifactProvenanceBound -or
+            $Value.sourceArtifactScriptsExecuted -isnot [bool] -or [bool]$Value.sourceArtifactScriptsExecuted -or
+            $Value.nodeRuntimeProtected -isnot [bool] -or -not [bool]$Value.nodeRuntimeProtected -or
+            $Value.runtimeChanged -isnot [bool] -or [bool]$Value.runtimeChanged -or
+            $Value.configurationReady -isnot [bool] -or -not [bool]$Value.configurationReady -or
+            $Value.configurationReplacementSupported -isnot [bool] -or -not [bool]$Value.configurationReplacementSupported -or
+            $Value.startupTaskInstalled -isnot [bool] -or -not [bool]$Value.startupTaskInstalled -or
+            $Value.readinessVerified -isnot [bool] -or -not [bool]$Value.readinessVerified -or
+            $Value.loopbackForcedByLauncher -isnot [bool] -or -not [bool]$Value.loopbackForcedByLauncher -or
+            $Value.persistentDataReady -isnot [bool] -or -not [bool]$Value.persistentDataReady -or
+            $Value.lifecycleBrokerTaskRequested -isnot [bool] -or -not [bool]$Value.lifecycleBrokerTaskRequested -or
+            [string]$Value.lifecycleBrokerOperation -cnotin @('installed','upgraded','reused') -or
+            $Value.lifecycleBrokerTaskInstalled -isnot [bool] -or -not [bool]$Value.lifecycleBrokerTaskInstalled -or
+            [string]$Value.lifecycleBrokerTaskName -cne 'Dyson-Control-Lifecycle-Broker' -or
+            [string]$Value.lifecycleBrokerProfileHash -cnotmatch '^[0-9a-f]{64}$' -or
+            ($Value.lifecycleBrokerReused -and $Value.lifecycleBrokerUpgraded) -or
+            ([string]$Value.lifecycleBrokerOperation -ceq 'reused' -and -not $Value.lifecycleBrokerReused) -or
+            ([string]$Value.lifecycleBrokerOperation -ceq 'upgraded' -and -not $Value.lifecycleBrokerUpgraded) -or
+            ([string]$Value.lifecycleBrokerOperation -ceq 'installed' -and ($Value.lifecycleBrokerReused -or $Value.lifecycleBrokerUpgraded)) -or
+            $Value.lifecycleBrokerDataReady -isnot [bool] -or -not [bool]$Value.lifecycleBrokerDataReady -or
+            $Value.gameTasksChanged -isnot [bool] -or [bool]$Value.gameTasksChanged) {
             Throw-DysonOrchestrationV2Error -Code $code
         }
-        finally { if ($null -ne $key) { [Array]::Clear($key, 0, $key.Length) } }
+        if (-not (Test-DysonQualificationV2Integer -Value $Value.qualifiedClientStorageDirectoryCount) -or
+            [int64]$Value.qualifiedClientStorageDirectoryCount -lt 0 -or
+            ($Value.qualifiedClientStorageConfigured -and
+                ([string]$Value.qualifiedClientStorageLayoutSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                    [int64]$Value.qualifiedClientStorageDirectoryCount -lt 1)) -or
+            (-not $Value.qualifiedClientStorageConfigured -and
+                ($null -ne $Value.qualifiedClientStorageLayoutSha256 -or
+                    [int64]$Value.qualifiedClientStorageDirectoryCount -ne 0)) -or
+            ($Value.configurationCreated -and $Value.configurationReplaced)) {
+            Throw-DysonOrchestrationV2Error -Code $code
+        }
         return
     }
+    if ($role -ceq 'deployment-rollback-receipt') {
+        Assert-DysonQualificationV2ExactProperties -Value $Value -Names @(
+            'protocol','state','operation','snapshotId','restoredVersion','configRestored',
+            'guardSnapshotId','readinessVerified','rollback','runtimeRootIdentity',
+            'nodeExecutableSha256','nodeRuntimeProtected','runtimeChanged'
+        ) -Code $code
+        if ([string]$Value.protocol -cne [string]$Artifact.protocol -or
+            [string]$Value.state -cne 'rolled-back' -or [string]$Value.operation -cne 'rollback' -or
+            -not (Test-DysonOrchestrationV2DeploymentSnapshotId -Value ([string]$Value.snapshotId)) -or
+            -not (Test-DysonOrchestrationV2DeploymentSnapshotId -Value ([string]$Value.guardSnapshotId)) -or
+            [string]$Value.snapshotId -ceq [string]$Value.guardSnapshotId -or
+            [string]$Value.restoredVersion -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$' -or
+            $Value.configRestored -isnot [bool] -or
+            $Value.readinessVerified -isnot [bool] -or -not [bool]$Value.readinessVerified -or
+            [string]$Value.rollback -cne ('Restore guard snapshot ' + [string]$Value.guardSnapshotId + '.') -or
+            -not (Test-DysonQualificationV2Digest -Value ([string]$Value.runtimeRootIdentity)) -or
+            [string]$Value.nodeExecutableSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $Value.nodeRuntimeProtected -isnot [bool] -or -not [bool]$Value.nodeRuntimeProtected -or
+            $Value.runtimeChanged -isnot [bool] -or [bool]$Value.runtimeChanged) {
+            Throw-DysonOrchestrationV2Error -Code $code
+        }
+        return
+    }
+
     if ($role -ceq 'external-join-observation') {
         try {
             [void](Assert-DysonExternalJoinObservationV2 -Observation $Value `
@@ -718,58 +779,7 @@ function Assert-DysonOrchestrationV2ArtifactSemantics {
         }
         return
     }
-    if ($role -ceq 'post-removal-observation') {
-        try {
-            $removalArtifacts = @($Evidence.artifacts | Where-Object { [string]$_.role -ceq 'removal-receipt' })
-            if ($removalArtifacts.Count -ne 1) { Throw-DysonOrchestrationV2Error -Code $code }
-            $removalArtifact = $removalArtifacts[0]
-            [void](Assert-DysonPostGsManagerRemovalObservationV2 -Observation $Value `
-                -ExpectedObservationId ([string]$Artifact.receiptId) `
-                -ExpectedRunId ([string]$Evidence.runId) `
-                -ExpectedTargetIdentity ([string]$Evidence.targetIdentity) `
-                -ExpectedReleaseVersion ([string]$Value.releaseIdentity.releaseVersion) `
-                -ExpectedSubjectCommit ([string]$Evidence.subjectCommit) `
-                -ExpectedRuntimePayloadSha256 ([string]$Evidence.runtimePayloadSha256) `
-                -ExpectedReleaseManifestSha256 ([string]$Value.releaseIdentity.releaseManifestSha256) `
-                -NowUtc $NowUtc)
-            if ([string]$Value.removalReceipt.receiptId -cne [string]$removalArtifact.receiptId -or
-                [string]$Value.removalReceipt.receiptSha256 -cne [string]$removalArtifact.receiptSha256) {
-                Throw-DysonOrchestrationV2Error -Code $code
-            }
-            $sourceObserved = ConvertFrom-DysonQualificationV2Utc -Value ([string]$Value.observedAtUtc) -Code $code
-            $sourceExpires = ConvertFrom-DysonQualificationV2Utc -Value ([string]$Value.expiresAtUtc) -Code $code
-            $sourceStarted = ConvertFrom-DysonQualificationV2Utc -Value ([string]$Value.observationWindow.startedAtUtc) -Code $code
-            $sourceCompleted = ConvertFrom-DysonQualificationV2Utc -Value ([string]$Value.observationWindow.completedAtUtc) -Code $code
-            $evidenceObserved = ConvertFrom-DysonQualificationV2Utc -Value ([string]$Evidence.observedAtUtc) -Code $code
-            $evidenceExpires = ConvertFrom-DysonQualificationV2Utc -Value ([string]$Evidence.expiresAtUtc) -Code $code
-            $evidenceStarted = ConvertFrom-DysonQualificationV2Utc -Value ([string]$Evidence.assertions.startedAtUtc) -Code $code
-            $evidenceCompleted = ConvertFrom-DysonQualificationV2Utc -Value ([string]$Evidence.assertions.completedAtUtc) -Code $code
-            $sampleTimes = @(
-                $Value.inventory.scannedAtUtc,$Value.management.observedAtUtc,$Value.game.observedAtUtc,
-                $Value.reboot.observedAtUtc,$Value.save.observedAtUtc,$Value.recoveryPackage.observedAtUtc,
-                $Value.deliverables.observedAtUtc
-            ) | ForEach-Object { ConvertFrom-DysonQualificationV2Utc -Value ([string]$_) -Code $code }
-            $maximumGap = [int64]0
-            for ($sampleIndex = 1; $sampleIndex -lt $sampleTimes.Count; $sampleIndex++) {
-                $gap = [int64][Math]::Ceiling(($sampleTimes[$sampleIndex] - $sampleTimes[$sampleIndex - 1]).TotalSeconds)
-                if ($gap -gt $maximumGap) { $maximumGap = $gap }
-            }
-            if ([Math]::Abs(($sourceObserved - $evidenceObserved).TotalSeconds) -gt 5 -or
-                [Math]::Abs(($sourceExpires - $evidenceExpires).TotalSeconds) -gt 5 -or
-                [Math]::Abs(($sourceStarted - $evidenceStarted).TotalSeconds) -gt 5 -or
-                [Math]::Abs(($sourceCompleted - $evidenceCompleted).TotalSeconds) -gt 5 -or
-                [int64]$Value.observationWindow.elapsedMonotonicSeconds -ne [int64]$Evidence.assertions.elapsedMonotonicSeconds -or
-                [int64]$Evidence.assertions.sampleCount -ne $sampleTimes.Count -or
-                [int64]$Evidence.assertions.maximumSampleGapSeconds -ne $maximumGap) {
-                Throw-DysonOrchestrationV2Error -Code $code
-            }
-        }
-        catch {
-            if ($_.Exception.Data.Contains('Code') -and [string]$_.Exception.Data['Code'] -ceq $code) { throw }
-            Throw-DysonOrchestrationV2Error -Code $code
-        }
-        return
-    }
+
     if ($role -ceq 'soak-observation') {
         try {
             $expectedKind = switch -CaseSensitive ([string]$Evidence.action) {
@@ -823,13 +833,7 @@ function Assert-DysonOrchestrationV2ArtifactSemantics {
         # Cross-artifact validation is deferred until all three paired-restore artifacts are bound.
         return
     }
-    if ($role -ceq 'reversible-cutover-observation') {
-        if ([string]$Evidence.action -cne 'gsmanager-recoverable-switch') {
-            Throw-DysonOrchestrationV2Error -Code $code
-        }
-        # The strict record is checked after both directional switch receipts are loaded.
-        return
-    }
+
     if ($role -ceq 'reboot-resume-observation') {
         Assert-DysonOrchestrationV2ControlledObservation -Value $Value -Artifact $Artifact -Evidence $Evidence
         return
@@ -856,22 +860,9 @@ function Assert-DysonOrchestrationV2ArtifactSemantics {
             -not [bool]$Value.rollbackVerified -or $Value.recoveryRequired -isnot [bool] -or
             [bool]$Value.recoveryRequired) { Throw-DysonOrchestrationV2Error -Code $code }
     }
-    elseif ($role -in @('cutover-receipt','cutover-rollback-receipt')) {
-        try {
-            $phase = if ($role -ceq 'cutover-receipt') { 'to-dyson-control' } else { 'back-to-gsmanager' }
-            [void](ConvertTo-ReversibleCutoverSwitchReceipt -Raw $Value -ExpectedPhase $phase)
-        }
-        catch { Throw-DysonOrchestrationV2Error -Code 'DYSON_QUALIFICATION_ORCHESTRATION_V2_REVERSIBLE_CUTOVER_INVALID' }
-    }
-    elseif ($role -ceq 'removal-receipt') {
-        if ([string]$Value.status -cne 'removed') { Throw-DysonOrchestrationV2Error -Code $code }
-    }
-    elseif ($role -ceq 'removal-restore-receipt') {
-        if ([string]$Value.status -cnotin @('restored-disabled','rolled-back') -or
-            $Value.activationRequired -isnot [bool] -or -not [bool]$Value.activationRequired) {
-            Throw-DysonOrchestrationV2Error -Code $code
-        }
-    }
+
+
+
     elseif ($role -ceq 'reboot-checkpoint') {
         if ([string]$Value.state -cne 'pre-reboot-checkpoint') { Throw-DysonOrchestrationV2Error -Code $code }
     }
@@ -983,9 +974,6 @@ function Assert-DysonOrchestrationV2Evidence {
     $externalObservation = $null
     $pairedObservation = $null
     $pairedObservationArtifact = $null
-    $reversibleCutoverObservation = $null
-    $reversibleCutoverArtifact = $null
-    $postRemovalObservation = $null
     $soakObservation = $null
     $artifactFileDigests = @{}
     $artifactValues = @{}
@@ -1063,16 +1051,13 @@ function Assert-DysonOrchestrationV2Evidence {
             Assert-DysonOrchestrationV2ArtifactSemantics -Artifact $artifact -Value $value -Evidence $Evidence `
                 -NowUtc $NowUtc -KeyResolver $KeyResolver -ExpectedKeyId ([string]$configuration.keyId)
             if ([string]$artifact.role -ceq 'external-join-observation') { $externalObservation = $value }
-            if ([string]$artifact.role -ceq 'post-removal-observation') { $postRemovalObservation = $value }
+
             if ([string]$artifact.role -ceq 'soak-observation') { $soakObservation = $value }
             if ([string]$artifact.role -ceq 'restored-world-observation') {
                 $pairedObservation = $value
                 $pairedObservationArtifact = $artifact
             }
-            if ([string]$artifact.role -ceq 'reversible-cutover-observation') {
-                $reversibleCutoverObservation = $value
-                $reversibleCutoverArtifact = $artifact
-            }
+
         }
         $artifactFileDigests[[string]$artifact.role] = $fileDigest
         $artifactValues[[string]$artifact.role] = $value
@@ -1130,58 +1115,19 @@ function Assert-DysonOrchestrationV2Evidence {
         }
         catch { Throw-DysonOrchestrationV2Error -Code 'DYSON_QUALIFICATION_ORCHESTRATION_V2_PAIRED_SAVE_INVALID' }
     }
-    if ([string]$Evidence.action -ceq 'gsmanager-recoverable-switch') {
-        $reversibleCode = 'DYSON_QUALIFICATION_ORCHESTRATION_V2_REVERSIBLE_CUTOVER_INVALID'
-        if ($null -eq $reversibleCutoverObservation -or $null -eq $reversibleCutoverArtifact -or
-            -not $artifactValues.ContainsKey('cutover-receipt') -or
-            -not $artifactValues.ContainsKey('cutover-rollback-receipt')) {
-            Throw-DysonOrchestrationV2Error -Code $reversibleCode
+
+    if ([string]$Evidence.action -ceq 'independent-deployment') {
+        $deployment = $artifactValues['deployment-receipt']
+        $rollback = $artifactValues['deployment-rollback-receipt']
+        $panel = $artifactValues['panel-observation']
+        if ($null -eq $deployment -or $null -eq $rollback -or $null -eq $panel -or
+            ('sha256:' + [string]$deployment.artifactPayloadSha256) -cne [string]$Evidence.runtimePayloadSha256 -or
+            [string]$deployment.version -cne [string]$panel.releaseIdentity.releaseVersion -or
+            [string]$rollback.snapshotId -cne [string]$deployment.deploymentSnapshotId) {
+            Throw-DysonOrchestrationV2Error -Code 'DYSON_QUALIFICATION_ORCHESTRATION_V2_DEPLOYMENT_BINDING_INVALID'
         }
-        try {
-            $switchTo = ConvertTo-ReversibleCutoverSwitchReceipt `
-                -Raw $artifactValues['cutover-receipt'] -ExpectedPhase 'to-dyson-control'
-            $switchBack = ConvertTo-ReversibleCutoverSwitchReceipt `
-                -Raw $artifactValues['cutover-rollback-receipt'] -ExpectedPhase 'back-to-gsmanager'
-            foreach ($bindingName in @(
-                    'qualificationRunId','targetIdentity','controlRelease','subjectCommit','runtimePayloadSha256',
-                    'releaseManifestSha256','dataRootIdentity','saveGenerationId','authorityInventoryRevision')) {
-                if ([string]$switchBack.$bindingName -cne [string]$switchTo.$bindingName) {
-                    Throw-DysonOrchestrationV2Error -Code $reversibleCode
-                }
-            }
-            $reversibleResult = Assert-ReversibleCutoverObservationRecordV2 `
-                -Observation $reversibleCutoverObservation `
-                -ExpectedWindowId ([string]$reversibleCutoverArtifact.receiptId) `
-                -ExpectedApprovalId ([string]$Evidence.approvalId) `
-                -ExpectedQualificationRunId ([string]$Evidence.runId) `
-                -ExpectedTargetIdentity ([string]$Evidence.targetIdentity) `
-                -ExpectedControlRelease ([string]$switchTo.controlRelease) `
-                -ExpectedSubjectCommit ([string]$Evidence.subjectCommit) `
-                -ExpectedRuntimePayloadSha256 ([string]$Evidence.runtimePayloadSha256) `
-                -ExpectedReleaseManifestSha256 ([string]$switchTo.releaseManifestSha256) `
-                -ExpectedDataRootIdentity ([string]$switchTo.dataRootIdentity) `
-                -ExpectedSaveGenerationId ([string]$switchTo.saveGenerationId) `
-                -ExpectedAuthorityInventoryRevision ([string]$switchTo.authorityInventoryRevision) `
-                -ExpectedSwitchToReceiptId ([string]$switchTo.receiptId) `
-                -ExpectedSwitchToSourceSha256 ([string]$artifactFileDigests['cutover-receipt']) `
-                -ExpectedSwitchBackReceiptId ([string]$switchBack.receiptId) `
-                -ExpectedSwitchBackSourceSha256 ([string]$artifactFileDigests['cutover-rollback-receipt']) `
-                -ExpectedProtectionSourceSha256 ([string]$Evidence.assertions.protectionPointSha256) `
-                -ExpectedObservationSha256 ([string]$reversibleCutoverArtifact.receiptSha256) `
-                -ExpectedObservedAtUtc $observed -ExpectedExpiresAtUtc $expires -NowUtc $NowUtc
-            if ((ConvertTo-ReversibleCutoverExpectedRawSha256 ([string]$Evidence.assertions.rollbackReceiptSha256)) -cne
-                    [string]$reversibleResult.switchBackReceiptSha256 -or
-                [Math]::Abs(((ConvertFrom-DysonQualificationV2Utc -Value ([string]$Evidence.assertions.startedAtUtc) -Code $code) -
-                    [datetimeoffset]$reversibleResult.startedAtUtc).TotalSeconds) -gt 5 -or
-                [Math]::Abs(((ConvertFrom-DysonQualificationV2Utc -Value ([string]$Evidence.assertions.completedAtUtc) -Code $code) -
-                    [datetimeoffset]$reversibleResult.completedAtUtc).TotalSeconds) -gt 5 -or
-                [int64]$Evidence.assertions.sampleCount -ne [int64]$reversibleResult.auditSampleCount -or
-                [int64]$Evidence.assertions.maximumSampleGapSeconds -ne [int64]$reversibleResult.auditMaximumGapSeconds) {
-                Throw-DysonOrchestrationV2Error -Code $reversibleCode
-            }
-        }
-        catch { Throw-DysonOrchestrationV2Error -Code $reversibleCode }
     }
+
     if ([string]$Evidence.action -ceq 'external-client-e2e') {
         if ($null -eq $externalObservation) {
             Throw-DysonOrchestrationV2Error -Code 'DYSON_QUALIFICATION_ORCHESTRATION_V2_EXTERNAL_BINDING_INVALID'
@@ -1216,22 +1162,8 @@ function Assert-DysonOrchestrationV2Evidence {
             Throw-DysonOrchestrationV2Error -Code 'DYSON_QUALIFICATION_ORCHESTRATION_V2_PAIRED_SAVE_INVALID'
         }
     }
-    elseif ([string]$Evidence.action -ceq 'gsmanager-recoverable-switch') {
-        if ([string]$Evidence.assertions.initialJoinReceiptSha256 -cne $script:DysonOrchestrationV2ZeroDigest -or
-            [string]$Evidence.assertions.reconnectReceiptSha256 -cne $script:DysonOrchestrationV2ZeroDigest -or
-            [string]$Evidence.assertions.terminalReceiptSha256 -cne
-                ('sha256:' + [string]$reversibleCutoverObservation.observationSha256)) {
-            Throw-DysonOrchestrationV2Error -Code 'DYSON_QUALIFICATION_ORCHESTRATION_V2_REVERSIBLE_CUTOVER_INVALID'
-        }
-    }
-    elseif ([string]$Evidence.action -ceq 'gsmanager-removal') {
-        if ($null -eq $postRemovalObservation -or
-            [string]$Evidence.assertions.initialJoinReceiptSha256 -cne ([string]$postRemovalObservation.game.joinReceiptSha256) -or
-            [string]$Evidence.assertions.reconnectReceiptSha256 -cne ([string]$postRemovalObservation.game.reconnectReceiptSha256) -or
-            [string]$Evidence.assertions.terminalReceiptSha256 -cne ([string]$postRemovalObservation.observationSha256)) {
-            Throw-DysonOrchestrationV2Error -Code 'DYSON_QUALIFICATION_ORCHESTRATION_V2_SOURCE_INVALID'
-        }
-    }
+
+
     elseif ([string]$Evidence.action -in @('six-hour-soak','seventy-two-hour-soak')) {
         if ($null -eq $soakObservation -or
             [string]$Evidence.assertions.initialJoinReceiptSha256 -cne [string]$soakObservation.externalSession.initialJoinReceiptSha256 -or

@@ -780,8 +780,8 @@
       "id": "OSS-001",
       "area": "opensource",
       "priority": "P1",
-      "title": "Reusable installer, upgrader, migrator, and uninstaller",
-      "criterion": "A clean supported Windows host can install, upgrade, migrate, roll back, and uninstall without production-specific paths or credentials.",
+      "title": "Reusable installer, upgrader, rollback, and uninstaller",
+      "criterion": "A clean supported Windows host can install, upgrade, roll back, and uninstall without production-specific paths or credentials.",
       "state": "implemented",
       "evidence": [
         { "kind": "implementation", "ref": "scripts/windows/deployment/DysonDeployment.Common.ps1" },
@@ -794,20 +794,8 @@
         { "kind": "implementation", "ref": "scripts/windows/bridge/Test-DysonControlBridgeCandidate.ps1" },
         { "kind": "self-test", "ref": "scripts/windows/bridge/SelfTest-DysonControlBridge.ps1" },
         { "kind": "implementation", "ref": "scripts/windows/lifecycle-broker/Install-DysonLifecycleBrokerTask.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/Get-DysonGsManagerMigration.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/New-DysonGsManagerSnapshot.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/Test-DysonGsManagerSnapshot.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/Restore-DysonGsManagerSnapshot.ps1" },
-        { "kind": "self-test", "ref": "scripts/windows/migration/SelfTest-DysonGsManagerMigration.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/DysonGsManagerRemoval.Common.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/Remove-DysonGsManagerInstallation.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/Restore-DysonGsManagerRemoval.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/Test-DysonGsManagerRemoval.ps1" },
-        { "kind": "self-test", "ref": "scripts/windows/migration/SelfTest-DysonGsManagerRemoval.ps1" },
         { "kind": "self-test", "ref": "scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1" },
-        { "kind": "contract", "ref": "docs/WINDOWS-DEPLOYMENT-DRAFT.md" },
-        { "kind": "contract", "ref": "docs/GSM-EVALUATION.md" },
-        { "kind": "contract", "ref": "docs/MIGRATION-GSMANAGER.md" }
+        { "kind": "contract", "ref": "docs/WINDOWS-DEPLOYMENT-DRAFT.md" }
       ]
     },
     {
@@ -826,7 +814,6 @@
         { "kind": "contract", "ref": "docs/SAVES.md" },
         { "kind": "contract", "ref": "docs/UPDATES-CLIENTS.md" },
         { "kind": "contract", "ref": "docs/WINDOWS-DEPLOYMENT-DRAFT.md" },
-        { "kind": "contract", "ref": "docs/MIGRATION-GSMANAGER.md" },
         { "kind": "contract", "ref": "docs/NETWORK-CONNECTIVITY.md" },
         { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
       ]
@@ -863,15 +850,15 @@
       "id": "PRD-001",
       "area": "production",
       "priority": "P0",
-      "title": "Side-by-side Dyson deployment",
-      "criterion": "A release candidate runs on the Dyson VM against the configured data boundary while GSManager remains recoverable and production responsibilities are unchanged.",
+      "title": "Independent Dyson Control deployment",
+      "criterion": "The exact release runs on the Dyson VM against the configured data boundary, publishes a verified deployment receipt, passes authenticated panel observation, and retains a verified deployment rollback receipt.",
       "state": "not-started",
       "evidence": [
-        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.SideBySideV2.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/qualification/New-DysonSideBySideObservationV2.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/qualification/Test-DysonSideBySideObservationV2.ps1" },
-        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonSideBySideObservationV2.ps1" },
-        { "kind": "contract", "ref": "scripts/windows/qualification/README.SideBySideV2.md" },
+        { "kind": "implementation", "ref": "scripts/windows/deployment/Install-DysonControl.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/deployment/Uninstall-DysonControl.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1" },
+        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.OrchestrationV2.ps1" },
+        { "kind": "self-test", "ref": "scripts/windows/qualification/Invoke-QualificationOrchestrationV2SelfTest.ps1" },
         { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
       ]
     },
@@ -978,63 +965,6 @@
         { "kind": "self-test", "ref": "scripts/windows/qualification/Invoke-QualificationV2SelfTest.ps1" },
         { "kind": "self-test", "ref": "scripts/windows/qualification/Invoke-QualificationOrchestrationV2SelfTest.ps1" },
         { "kind": "contract", "ref": "scripts/windows/qualification/README.production-v2.md" },
-        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
-      ]
-    },
-    {
-      "id": "CUT-001",
-      "area": "cutover",
-      "priority": "P0",
-      "title": "GSManager and production recovery package",
-      "criterion": "GSManager, tasks, configuration, control data, and paired saves have a verified pre-cutover backup and documented restoration procedure.",
-      "state": "not-started",
-      "evidence": [
-        { "kind": "implementation", "ref": "scripts/windows/data-recovery/New-DysonDataRootRecoveryBundle.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/data-recovery/Test-DysonDataRootRecoveryBundle.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/data-recovery/Restore-DysonDataRootRecoveryBundle.ps1" },
-        { "kind": "self-test", "ref": "scripts/windows/data-recovery/SelfTest-DysonDataRootRecovery.ps1" },
-        { "kind": "contract", "ref": "docs/DATAROOT-RECOVERY.md" },
-        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
-      ]
-    },
-    {
-      "id": "CUT-002",
-      "area": "cutover",
-      "priority": "P0",
-      "title": "Reversible production cutover",
-      "criterion": "A declared maintenance window transfers domain and runtime responsibilities to Dyson Control, verifies service, and can revert without save loss.",
-      "state": "not-started",
-      "evidence": [
-        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.ReversibleCutover.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/qualification/New-DysonQualificationReversibleCutoverObservationV2.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/qualification/Test-DysonQualificationReversibleCutoverObservationV2.ps1" },
-        { "kind": "contract", "ref": "scripts/windows/qualification/reversible-cutover-observation.v2.schema.json" },
-        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonQualificationReversibleCutoverObservationV2.ps1" },
-        { "kind": "contract", "ref": "scripts/windows/qualification/README-ReversibleCutover.md" },
-        { "kind": "implementation", "ref": "scripts/windows/qualification/Qualification.Executor.ps1" },
-        { "kind": "self-test", "ref": "scripts/windows/qualification/Invoke-QualificationSelfTest.ps1" },
-        { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
-      ]
-    },
-    {
-      "id": "CUT-003",
-      "area": "cutover",
-      "priority": "P0",
-      "title": "GSManager removal and post-cutover acceptance",
-      "criterion": "GSManager is removed only after observation and rollback drills pass; the final release, deployment baseline, evidence index, limitations, and runbook are delivered.",
-      "state": "not-started",
-      "evidence": [
-        { "kind": "implementation", "ref": "scripts/windows/qualification/PostGsManagerRemovalObservationV2.Common.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/qualification/New-DysonPostGsManagerRemovalObservationV2.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/qualification/Test-DysonPostGsManagerRemovalObservationV2.ps1" },
-        { "kind": "contract", "ref": "scripts/windows/qualification/dyson-post-gsmanager-removal-observation-v2.schema.json" },
-        { "kind": "self-test", "ref": "scripts/windows/qualification/SelfTest-DysonPostGsManagerRemovalObservationV2.ps1" },
-        { "kind": "contract", "ref": "scripts/windows/qualification/README.PostGsManagerRemovalObservationV2.md" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/Remove-DysonGsManagerInstallation.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/Restore-DysonGsManagerRemoval.ps1" },
-        { "kind": "implementation", "ref": "scripts/windows/migration/Test-DysonGsManagerRemoval.ps1" },
-        { "kind": "self-test", "ref": "scripts/windows/migration/SelfTest-DysonGsManagerRemoval.ps1" },
-        { "kind": "contract", "ref": "docs/MIGRATION-GSMANAGER.md" },
         { "kind": "contract", "ref": "docs/PRODUCTION-QUALIFICATION.md" }
       ]
     }
