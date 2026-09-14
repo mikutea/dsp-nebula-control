@@ -887,6 +887,7 @@ try {
         $script:Contract = $currentContract
         $legacyState = Get-DysonConfigurationTransactionState -Storage $legacyFixture.storage -ServiceSid $script:ServiceSid -Contract $script:Contract -ExpectedLauncherBindings $legacyFixture.bindings
         Assert-SelfTest ($legacyState.clean -and $legacyState.receipts.Count -eq 1) 'LEGACY_CONTRACT_HISTORY_READ'
+        $currentBytes = ConvertTo-TestBytes (New-TestEnvironmentText $legacyFixture.bindings)
         $snapshotCheck = Assert-DysonConfigurationSnapshot -SnapshotPath $legacySnapshot.path -Contract $script:Contract -ServiceSid $script:ServiceSid -ExpectedDataRoot $legacyFixture.dataRoot
         Assert-SelfTest $snapshotCheck.valid 'LEGACY_CONTRACT_SNAPSHOT_READ'
         if ($script:AclIntegration) {
@@ -913,10 +914,42 @@ try {
                 $snapshotScriptSource.Contains('-Contract $terminalContract')) `
                 'LEGACY_CONTRACT_PUBLIC_SNAPSHOT_SCRIPT'
         }
+        if ($script:AclIntegration) {
+            $crossVersionSourcePath = Join-Path $script:TestRoot 'legacy-current-source.env'
+            [void](Write-DysonConfigurationStagedFile -Path $crossVersionSourcePath `
+                -Bytes $currentBytes -ServiceSid $script:ServiceSid)
+            [void](Set-DysonConfigurationAcl -Path $crossVersionSourcePath -Kind SourceFile `
+                -SourceOwnerSid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value))
+            . (Join-Path $PSScriptRoot '..\deployment\DysonDeployment.Common.ps1')
+            . (Join-Path $PSScriptRoot '..\deployment\DysonDeployment.Configuration.ps1')
+            $crossVersionPreflight = Get-DysonDeploymentConfigurationPreflight `
+                -ConfigurationSource $crossVersionSourcePath -DataRoot $legacyFixture.dataRoot `
+                -ScriptRoot ([string]$legacyFixture.bindings['DYSON_SCRIPT_ROOT']) `
+                -RuntimeBootstrapRoot ([string]$legacyFixture.bindings['DYSON_RUNTIME_BOOTSTRAP_ROOT']) `
+                -DeploymentVersion ([string]$legacyFixture.bindings['DYSON_DEPLOYMENT_VERSION']) `
+                -ExistingScriptRoot ([string]$legacyFixture.bindings['DYSON_SCRIPT_ROOT']) `
+                -ExistingRuntimeBootstrapRoot ([string]$legacyFixture.bindings['DYSON_RUNTIME_BOOTSTRAP_ROOT']) `
+                -ExistingDeploymentVersion ([string]$legacyFixture.bindings['DYSON_DEPLOYMENT_VERSION']) `
+                -ServiceAccount 'NT AUTHORITY\LOCAL SERVICE' -ConfigurationModuleRoot $PSScriptRoot
+            Assert-SelfTest ([string]$crossVersionPreflight.contractSha256 -ceq [string]$script:Contract.sha256 -and
+                [string]$crossVersionPreflight.existing.contractSha256 -ceq
+                    '5386f42df066b3d5ce4fa26f3346baf4311b0ec8efb1eb4d83bdf488c14786dc' -and
+                [string]$crossVersionPreflight.existing.configurationSha256 -ceq
+                    [string]$legacyState.terminalTargetSha256) 'LEGACY_CONTRACT_DEPLOYMENT_PREFLIGHT'
+        }
+        else {
+            $deploymentConfigurationSource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot `
+                '..\deployment\DysonDeployment.Configuration.ps1'))
+            $stateIndex = $deploymentConfigurationSource.IndexOf('$transactionState = Get-DysonConfigurationTransactionState')
+            $resolverIndex = $deploymentConfigurationSource.IndexOf('$installedContract = Resolve-DysonConfigurationRecordedContract')
+            $readerIndex = $deploymentConfigurationSource.IndexOf('$installed = Read-DysonControlEnvironmentFile', $resolverIndex)
+            Assert-SelfTest ($stateIndex -ge 0 -and $resolverIndex -gt $stateIndex -and $readerIndex -gt $resolverIndex -and
+                $deploymentConfigurationSource.Contains('contractSha256 = [string]$installedContract.sha256')) `
+                'LEGACY_CONTRACT_DEPLOYMENT_PREFLIGHT'
+        }
         $legacyParentAcl = Assert-DysonConfigurationParentAcl -Path $legacyFixture.dataRoot -ServiceSid $script:ServiceSid
         Assert-SelfTestRejected { Test-DysonConfigurationRuntimeApproval -Storage $legacyFixture.storage -Contract $script:Contract -ExpectedLauncherBindings $legacyFixture.bindings -ServiceSid $script:ServiceSid -ParentAcl $legacyParentAcl } 'LEGACY_APPROVAL_NOT_CURRENT' 'DYSON_CONFIGURATION_CONTENT_INVALID'
         Assert-SelfTestRejected { Get-DysonConfigurationTransactionState -Storage $legacyPendingFixture.storage -ServiceSid $script:ServiceSid -Contract $script:Contract -ExpectedLauncherBindings $legacyPendingFixture.bindings } 'LEGACY_PENDING_CONTRACT_REJECTED'
-        $currentBytes = ConvertTo-TestBytes (New-TestEnvironmentText $legacyFixture.bindings)
         $newSource = Read-DysonControlEnvironmentBytes -Bytes $currentBytes -Contract $script:Contract -ExpectedLauncherBindings $legacyFixture.bindings
         $upgradePreimage = Read-DysonConfigurationSnapshotInternal -SnapshotPath $legacySnapshot.path -Contract $script:Contract -ServiceSid $script:ServiceSid -ExpectedDataRoot $legacyFixture.dataRoot
         [void](Invoke-DysonConfigurationMutationTransaction -Storage $legacyFixture.storage -Source $newSource -Contract $script:Contract -ExpectedLauncherBindings $legacyFixture.bindings -ServiceSid $script:ServiceSid -Operation replace -SourceKind configuration-source -SourcePathSha256 (Get-DysonConfigurationSha256Text 'contract-upgrade-fixture') -PreimageSnapshot $upgradePreimage)

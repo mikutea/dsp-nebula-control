@@ -355,9 +355,10 @@ function Get-DysonDeploymentConfigurationPreflight {
                     [void](Assert-DysonConfigurationAcl -Path $directory -Kind PrivateDirectory)
                 }
             }
-            $installed = Read-DysonControlEnvironmentFile -Path $storage.configurationPath `
-                -Contract $contract -ExpectedLauncherBindings $existingBindings -SkipSourceAcl
             if ($AllowSelfTestAdministrator) {
+                $installedContract = $contract
+                $installed = Read-DysonControlEnvironmentFile -Path $storage.configurationPath `
+                    -Contract $installedContract -ExpectedLauncherBindings $existingBindings -SkipSourceAcl
                 $installedAcl = [pscustomobject]@{
                     fingerprint = Get-DysonConfigurationSha256Text `
                         ((Get-Acl -LiteralPath $storage.configurationPath -ErrorAction Stop).Sddl)
@@ -371,13 +372,20 @@ function Get-DysonDeploymentConfigurationPreflight {
                     -ServiceSid $serviceSid -Contract $contract `
                     -ExpectedLauncherBindings $existingBindings
                 if (-not $transactionState.clean) { throw 'DYSON_CONFIGURATION_TRANSACTION_NOT_CLEAN' }
+                $installedContract = Resolve-DysonConfigurationRecordedContract -Contract $contract `
+                    -RecordedSha256 ([string]$transactionState.terminalContractSha256)
+                $installed = Read-DysonControlEnvironmentFile -Path $storage.configurationPath `
+                    -Contract $installedContract -ExpectedLauncherBindings $existingBindings -SkipSourceAcl
+                if ([string]$installed.contractSha256 -cne [string]$installedContract.sha256) {
+                    throw 'DYSON_CONFIGURATION_TERMINAL_TARGET_INVALID'
+                }
             }
             $existing = [pscustomobject][ordered]@{
                 configurationSha256 = [string]$installed.sha256
                 configurationLength = [int64]$installed.length
                 namesSha256 = [string]$installed.namesSha256
                 bindingsSha256 = [string]$installed.bindingsSha256
-                contractSha256 = [string]$contract.sha256
+                contractSha256 = [string]$installedContract.sha256
                 configurationAclFingerprint = [string]$installedAcl.fingerprint
                 parentAclFingerprint = [string]$parentAcl.fingerprint
                 completedTransactionCount = [int]$transactionState.receipts.Count

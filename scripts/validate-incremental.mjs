@@ -548,7 +548,7 @@ const reviewedContractMigrationSources = new Map([
   ],
   [
     "scripts/windows/configuration/SelfTest-DysonControlConfiguration.ps1",
-    "505d2b23a881a0c4b91cb9ccc66ff9d621e8fe6b55fa833270bfc1c3776e300c"
+    "3075950d9254642eff017f12b650e8e1ea664809c53a897cc2c9ba6c5f890ddc"
   ],
   [
     "scripts/windows/configuration/Test-DysonControlConfiguration.ps1",
@@ -561,6 +561,10 @@ const reviewedContractMigrationSources = new Map([
   [
     "scripts/windows/configuration/dyson-control.environment-contract.rc26.json",
     "5386f42df066b3d5ce4fa26f3346baf4311b0ec8efb1eb4d83bdf488c14786dc"
+  ],
+  [
+    "scripts/windows/deployment/DysonDeployment.Configuration.ps1",
+    "a55954187175d62f80650504f09c469b6dd86d7acbbb2156c5350c477acb9023"
   ],
   [
     "scripts/windows/deployment/Install-DysonControl.ps1",
