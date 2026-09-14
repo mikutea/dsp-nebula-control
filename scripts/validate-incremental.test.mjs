@@ -314,6 +314,8 @@ test('manager removal never permits an unreviewed deletion and retains applicati
     assert.ok(plan.commands.some(([, args]) => args.includes(name)))
   }
   assert.ok(plan.commands.some(([, args]) => args.includes('apps/web/tsconfig.json')))
+  const apiBuild = plan.commands.find(([, args]) => args.includes('apps/api') && args.includes('build'))
+  assert.equal(apiBuild?.[0], process.platform === 'win32' ? 'npm.cmd' : 'npm')
   assert.ok(plan.commands.some(([, args]) => args.includes('scripts/public-release/scanner.test.mjs')))
   for (const name of ['SelfTest-DysonDataRootRecovery.ps1', 'SelfTest-DysonLifecycleBroker.ps1',
     'Invoke-QualificationSelfTest.ps1', 'SelfTest-DysonControlReleaseArtifact.ps1',
