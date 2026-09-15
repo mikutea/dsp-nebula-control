@@ -74,7 +74,6 @@ $plan = [ordered]@{
     gameWillBeRestarted = $false
     savesWillBeChanged = $false
     nebulaWillBeChanged = $false
-    gsmWillBeChanged = $false
     productionChanged = $false
 }
 if (-not $PSCmdlet.ShouldProcess($script:DysonBridgeGuid, "install private Bridge candidate $($candidate.version) disabled by default")) {
@@ -316,5 +315,4 @@ catch {
     gameRestarted = $false
     savesChanged = $false
     nebulaChanged = $false
-    gsmChanged = $false
 } | ConvertTo-DysonBridgeJsonLine

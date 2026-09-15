@@ -829,7 +829,7 @@ public static class ControlledDotnetFixture
         privateNtfsInstanceIsolationValidated = $true
         privateNtfsUninstallRestoreValidated = $true
         uninstallWasRecoverable = $true
-        saveGameNebulaAndGsmWereUntouched = $true
+        saveGameAndNebulaWereUntouched = $true
         productionChanged = $false
     } | ConvertTo-Json -Depth 8 -Compress
 }

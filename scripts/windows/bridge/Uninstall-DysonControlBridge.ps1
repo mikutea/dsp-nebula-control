@@ -79,7 +79,7 @@ if ($RestoreSnapshotId) {
     }
     $audit = [ordered]@{ protocol = $script:DysonBridgeInstallProtocol; operation = 'restore-uninstall'; outcome = 'succeeded'; snapshotId = $RestoreSnapshotId; atUtc = (Get-Date).ToUniversalTime().ToString('o') } | ConvertTo-Json -Compress
     [System.IO.File]::AppendAllText($auditPath, $audit + "`r`n", [System.Text.UTF8Encoding]::new($false))
-    [ordered]@{ protocol = $script:DysonBridgeInstallProtocol; state = 'restored'; snapshotId = $RestoreSnapshotId; gameRestarted = $false; savesChanged = $false; nebulaChanged = $false; gsmChanged = $false } |
+    [ordered]@{ protocol = $script:DysonBridgeInstallProtocol; state = 'restored'; snapshotId = $RestoreSnapshotId; gameRestarted = $false; savesChanged = $false; nebulaChanged = $false } |
         ConvertTo-DysonBridgeJsonLine
     exit 0
 }
@@ -149,5 +149,4 @@ catch {
     gameRestarted = $false
     savesChanged = $false
     nebulaChanged = $false
-    gsmChanged = $false
 } | ConvertTo-DysonBridgeJsonLine

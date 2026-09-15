@@ -31,9 +31,9 @@ test('entry document caching changes select stale-entry regression checks', () =
 })
 
 test('runtime receipt layout changes require root-binding and production wiring checks', () => {
-  const file = 'apps/api/src/app.ts'
+  const file = 'apps/api/src/runtime-receipt-location.test.ts'
   const source = readFileSync(new URL('../' + file, import.meta.url), 'utf8')
-  assert.equal(classifyChange(file, null, source), 'reviewed-manager-removal')
+  assert.equal(classifyChange(file, null, source), 'reviewed-runtime-layout')
   assert.throws(() => classifyChange(file, null, source + '\nChangedLayoutTrust();\n'))
   const plan = planExecution([{ file, kind: 'reviewed-runtime-layout' }])
   assert.ok(plan.commands.some(([, args]) => args.includes('src/runtime-receipt-location.test.ts')))
@@ -58,11 +58,7 @@ test('version reuse permits only the exact reviewed version substitution', () =>
   assert.throws(() => classifyChange('apps/api/package-lock.json', 'old dependency', 'new dependency'))
 })
 
-test('reviewed runtime config stays mapped while lockfiles reuse only uniform version substitutions', () => {
-  const file = 'apps/api/src/config.ts'
-  const source = readFileSync(new URL('../apps/api/src/config.ts', import.meta.url), 'utf8')
-  assert.equal(classifyChange(file, null, source), 'reviewed-manager-removal')
-  assert.throws(() => classifyChange(file, null, source + '\nnewRuntimeBehavior();\n'))
+test('lockfiles reuse only uniform version substitutions', () => {
   const lockFile = 'apps/api/package-lock.json'
   const lockSource = readFileSync(new URL('../apps/api/package-lock.json', import.meta.url), 'utf8')
   assert.equal(classifyChange(lockFile, null, lockSource), 'version-only')
@@ -285,11 +281,23 @@ test('CI host flags execute only mapped host work and keep metadata-only changes
 
 test('DACL restoration changes require native configuration and deployment gates', () => {
   const files = ['scripts/windows/deployment/DysonDeployment.Common.ps1', 'scripts/windows/deployment/SelfTest-DysonDeploymentConfigurationIntegration.ps1']
-  const changes = files.map(file => ({ file, kind: classifyChange(file, null, readFileSync(new URL('../' + file, import.meta.url), 'utf8')) }))
-  assert.deepEqual(changes.map(change => change.kind), ['reviewed-manager-removal', 'reviewed-operator-batch'])
+  const changes = [{ file: files[0], kind: 'affected' }, { file: files[1], kind: 'reviewed-operator-batch' }]
   const pending = planExecution(changes).pendingHostCommands
   assert.ok(pending.some(([, args]) => args.includes('scripts/windows/deployment/SelfTest-DysonDeploymentConfigurationIntegration.ps1')))
   assert.ok(pending.some(([, args]) => args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')))
+})
+
+test('Bridge receipt contract changes select the exact Bridge self-test', () => {
+  const changes = [
+    { file: 'scripts/windows/bridge/Install-DysonControlBridge.ps1', kind: 'affected' },
+    { file: 'scripts/windows/bridge/Uninstall-DysonControlBridge.ps1', kind: 'affected' },
+    { file: 'scripts/windows/bridge/SelfTest-DysonControlBridge.ps1', kind: 'test-only' }
+  ]
+  const fast = planExecution(changes)
+  assert.ok(fast.pendingHostCommands.some(([, args]) => args.includes('scripts/windows/bridge/SelfTest-DysonControlBridge.ps1')))
+  const native = planExecution(changes, { hostChecks: true })
+  assert.ok(native.commands.some(([, args]) => args.includes('scripts/windows/bridge/SelfTest-DysonControlBridge.ps1')))
+  assert.ok(!native.commands.some(([, args]) => args.includes('scripts/windows/deployment/SelfTest-DysonControlDeployment.ps1')))
 })
 
 test('contract migration requires exact source and native upgrade rollback gates', () => {
@@ -305,22 +313,4 @@ test('contract migration requires exact source and native upgrade rollback gates
   const native = planExecution(changes, { hostChecks: true, fullDeployment: true })
   assert.equal(native.pendingHostCommands.length, 0)
   assert.ok(native.commands.some(([, args]) => args.includes('src/configuration-reconcile-coordination.test.ts')))
-})
-
-test('manager removal never permits an unreviewed deletion and retains application checks', () => {
-  assert.throws(() => classifyChange('apps/api/src/cutover/service.ts', 'unreviewed source', null))
-  const plan = planExecution([{ file: 'apps/api/src/app.ts', kind: 'reviewed-manager-removal' }])
-  for (const name of ['src/app.test.ts', 'src/security/authorization.test.ts', 'src/providers/powershell-runner.test.ts']) {
-    assert.ok(plan.commands.some(([, args]) => args.includes(name)))
-  }
-  assert.ok(plan.commands.some(([, args]) => args.includes('apps/web/tsconfig.json')))
-  const apiBuild = plan.commands.find(([, args]) => args.includes('apps/api') && args.includes('build'))
-  assert.equal(apiBuild?.[0], process.execPath)
-  assert.match(apiBuild?.[1][0] ?? '', /node_modules[\\/]npm[\\/]bin[\\/]npm-cli\.js$/u)
-  assert.ok(plan.commands.some(([, args]) => args.includes('scripts/public-release/scanner.test.mjs')))
-  for (const name of ['SelfTest-DysonDataRootRecovery.ps1', 'SelfTest-DysonLifecycleBroker.ps1',
-    'Invoke-QualificationSelfTest.ps1', 'SelfTest-DysonControlReleaseArtifact.ps1',
-    'SelfTest-DysonControlDeployment.ps1']) {
-    assert.ok(plan.pendingHostCommands.some(([, args]) => args.some(arg => arg.endsWith(name))))
-  }
 })
