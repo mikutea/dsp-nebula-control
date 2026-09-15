@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/dyson-soak-observation-v2.schema.json",
+  "title": "Dyson six-hour and seventy-two-hour soak observation v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "schemaVersion", "observationId", "kind", "runId", "targetIdentity", "releaseIdentity", "subjectBindingSha256", "workloadProfile", "saveBaseline", "observationWindow", "telemetry", "health", "externalSession", "saves", "outcome", "alerts", "observedAtUtc", "expiresAtUtc", "observationSha256"],
+  "properties": {
+    "protocol": { "const": "DYSON_SOAK_OBSERVATION_V2" },
+    "schemaVersion": { "const": 2 },
+    "observationId": { "$ref": "#/$defs/uuid" },
+    "kind": { "enum": ["six-hour", "seventy-two-hour"] },
+    "runId": { "$ref": "#/$defs/uuid" },
+    "targetIdentity": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "releaseIdentity": { "$ref": "#/$defs/release" },
+    "subjectBindingSha256": { "$ref": "#/$defs/digest" },
+    "workloadProfile": { "$ref": "#/$defs/workload" },
+    "saveBaseline": { "$ref": "#/$defs/saveBaseline" },
+    "observationWindow": { "$ref": "#/$defs/window" },
+    "telemetry": { "$ref": "#/$defs/telemetry" },
+    "health": { "$ref": "#/$defs/health" },
+    "externalSession": { "$ref": "#/$defs/external" },
+    "saves": { "$ref": "#/$defs/saves" },
+    "outcome": { "$ref": "#/$defs/outcome" },
+    "alerts": { "$ref": "#/$defs/alerts" },
+    "observedAtUtc": { "$ref": "#/$defs/utc" },
+    "expiresAtUtc": { "$ref": "#/$defs/utc" },
+    "observationSha256": { "$ref": "#/$defs/digest" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "six-hour" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "observationWindow": { "properties": { "elapsedMonotonicSeconds": { "minimum": 21600 } } },
+          "telemetry": { "properties": { "sampleCount": { "minimum": 1441 } } },
+          "saves": { "properties": { "acknowledgementCount": { "minimum": 37 } } }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "seventy-two-hour" } }, "required": ["kind"] },
+      "then": {
+        "properties": {
+          "observationWindow": { "properties": { "elapsedMonotonicSeconds": { "minimum": 259200 } } },
+          "telemetry": { "properties": { "sampleCount": { "minimum": 17281 } } },
+          "saves": { "properties": { "acknowledgementCount": { "minimum": 433 } } }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "hostname": { "type": "string", "pattern": "^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$" },
+    "release": {
+      "type": "object", "additionalProperties": false,
+      "required": ["releaseVersion", "subjectCommit", "runtimePayloadSha256", "releaseManifestSha256"],
+      "properties": {
+        "releaseVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" },
+        "subjectCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "runtimePayloadSha256": { "$ref": "#/$defs/digest" },
+        "releaseManifestSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "workload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["profileId", "profileSha256", "representativeLateGame", "normalMultiplayer", "simulationPaused", "workloadReduced", "targetUps", "modLockSha256", "vmAllocationSha256", "subjectBindingSha256"],
+      "properties": {
+        "profileId": { "const": "late-game-6h-v1" }, "profileSha256": { "$ref": "#/$defs/digest" },
+        "representativeLateGame": { "const": true }, "normalMultiplayer": { "const": true }, "simulationPaused": { "const": false }, "workloadReduced": { "const": false }, "targetUps": { "const": 60 },
+        "modLockSha256": { "$ref": "#/$defs/digest" }, "vmAllocationSha256": { "$ref": "#/$defs/digest" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "saveBaseline": {
+      "type": "object", "additionalProperties": false,
+      "required": ["worldBindingSha256", "savePairSha256", "saveManifestSha256", "pairedFilesIntact", "representativeLateGame", "subjectBindingSha256"],
+      "properties": { "worldBindingSha256": { "$ref": "#/$defs/digest" }, "savePairSha256": { "$ref": "#/$defs/digest" }, "saveManifestSha256": { "$ref": "#/$defs/digest" }, "pairedFilesIntact": { "const": true }, "representativeLateGame": { "const": true }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "window": {
+      "type": "object", "additionalProperties": false,
+      "required": ["observerClass", "clockClass", "clockSource", "clockMode", "virtualClock", "boundedClock", "continuousObserver", "startedAtUtc", "completedAtUtc", "monotonicFrequencyHz", "firstMonotonicTicks", "lastMonotonicTicks", "accumulatedMonotonicTicks", "elapsedMonotonicSeconds", "clockAttestationSha256", "subjectBindingSha256"],
+      "properties": {
+        "observerClass": { "const": "independent-monotonic-observer" }, "clockClass": { "const": "real-monotonic" }, "clockSource": { "const": "host-monotonic-counter" }, "clockMode": { "const": "real-elapsed" },
+        "virtualClock": { "const": false }, "boundedClock": { "const": false }, "continuousObserver": { "const": true }, "startedAtUtc": { "$ref": "#/$defs/utc" }, "completedAtUtc": { "$ref": "#/$defs/utc" },
+        "monotonicFrequencyHz": { "type": "integer", "minimum": 1000, "maximum": 1000000000 }, "firstMonotonicTicks": { "type": "integer", "minimum": 0 }, "lastMonotonicTicks": { "type": "integer", "minimum": 1 }, "accumulatedMonotonicTicks": { "type": "integer", "minimum": 1 },
+        "elapsedMonotonicSeconds": { "type": "integer", "minimum": 21600, "maximum": 1209600 }, "clockAttestationSha256": { "$ref": "#/$defs/digest" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "segment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["segmentIndex", "firstSampleSequence", "lastSampleSequence", "sampleCount", "firstMonotonicTicks", "lastMonotonicTicks", "maximumGapSeconds", "segmentPayloadSha256", "subjectBindingSha256", "previousSegmentSha256", "segmentSha256"],
+      "properties": {
+        "segmentIndex": { "type": "integer", "minimum": 0 }, "firstSampleSequence": { "type": "integer", "minimum": 0 }, "lastSampleSequence": { "type": "integer", "minimum": 0 }, "sampleCount": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "firstMonotonicTicks": { "type": "integer", "minimum": 0 }, "lastMonotonicTicks": { "type": "integer", "minimum": 0 }, "maximumGapSeconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "segmentPayloadSha256": { "$ref": "#/$defs/digest" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" }, "previousSegmentSha256": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/digest" }] }, "segmentSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "telemetry": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sampleCount", "firstSampleSequence", "lastSampleSequence", "firstMonotonicTicks", "lastMonotonicTicks", "maximumGapSeconds", "segmentCount", "segments", "segmentsRootSha256", "subjectBindingSha256"],
+      "properties": {
+        "sampleCount": { "type": "integer", "minimum": 1441, "maximum": 1000000 }, "firstSampleSequence": { "const": 0 }, "lastSampleSequence": { "type": "integer", "minimum": 1440 },
+        "firstMonotonicTicks": { "type": "integer", "minimum": 0 }, "lastMonotonicTicks": { "type": "integer", "minimum": 1 }, "maximumGapSeconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "segmentCount": { "type": "integer", "minimum": 1, "maximum": 512 }, "segments": { "type": "array", "minItems": 1, "maxItems": 512, "items": { "$ref": "#/$defs/segment" } },
+        "segmentsRootSha256": { "$ref": "#/$defs/digest" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "upsHealth": {
+      "type": "object", "additionalProperties": false, "required": ["coveredSamples", "runningSamples", "atOrAbove55UpsSamples", "targetUps", "minimumQualifiedUps"],
+      "properties": { "coveredSamples": { "type": "integer", "minimum": 0 }, "runningSamples": { "type": "integer", "minimum": 0 }, "atOrAbove55UpsSamples": { "type": "integer", "minimum": 0 }, "targetUps": { "const": 60 }, "minimumQualifiedUps": { "const": 55 } }
+    },
+    "cpuHealth": {
+      "type": "object", "additionalProperties": false, "required": ["coveredSamples", "hostCpuP95BasisPoints", "hottestCoreAtOrAbove97Samples", "eligibleBottleneckSamples", "singleCoreBottleneckSamples"],
+      "properties": { "coveredSamples": { "type": "integer", "minimum": 0 }, "hostCpuP95BasisPoints": { "type": "integer", "minimum": 0, "maximum": 9000 }, "hottestCoreAtOrAbove97Samples": { "type": "integer", "minimum": 0 }, "eligibleBottleneckSamples": { "type": "integer", "minimum": 0 }, "singleCoreBottleneckSamples": { "type": "integer", "minimum": 0 } }
+    },
+    "memoryHealth": {
+      "type": "object", "additionalProperties": false, "required": ["coveredSamples", "peakUsedBasisPoints"],
+      "properties": { "coveredSamples": { "type": "integer", "minimum": 0 }, "peakUsedBasisPoints": { "type": "integer", "minimum": 0, "maximum": 9000 } }
+    },
+    "diskHealth": {
+      "type": "object", "additionalProperties": false, "required": ["coveredSamples", "projectPeakUsedBasisPoints", "projectMinimumFreeMiB", "savePeakUsedBasisPoints", "saveMinimumFreeMiB"],
+      "properties": { "coveredSamples": { "type": "integer", "minimum": 0 }, "projectPeakUsedBasisPoints": { "type": "integer", "minimum": 0, "maximum": 9000 }, "projectMinimumFreeMiB": { "type": "integer", "minimum": 10240 }, "savePeakUsedBasisPoints": { "type": "integer", "minimum": 0, "maximum": 9000 }, "saveMinimumFreeMiB": { "type": "integer", "minimum": 10240 } }
+    },
+    "gameHealth": {
+      "type": "object", "additionalProperties": false, "required": ["coveredSamples", "healthySamples", "presentSamples", "unexpectedRestartCount"],
+      "properties": { "coveredSamples": { "type": "integer", "minimum": 0 }, "healthySamples": { "type": "integer", "minimum": 0 }, "presentSamples": { "type": "integer", "minimum": 0 }, "unexpectedRestartCount": { "const": 0 } }
+    },
+    "serviceHealth": {
+      "type": "object", "additionalProperties": false, "required": ["coveredSamples", "healthySamples", "unexpectedRestartCount"],
+      "properties": { "coveredSamples": { "type": "integer", "minimum": 0 }, "healthySamples": { "type": "integer", "minimum": 0 }, "unexpectedRestartCount": { "const": 0 } }
+    },
+    "bridgeHealth": {
+      "type": "object", "additionalProperties": false, "required": ["coveredSamples", "healthySamples", "generationStable", "unexpectedRestartCount"],
+      "properties": { "coveredSamples": { "type": "integer", "minimum": 0 }, "healthySamples": { "type": "integer", "minimum": 0 }, "generationStable": { "const": true }, "unexpectedRestartCount": { "const": 0 } }
+    },
+    "health": {
+      "type": "object", "additionalProperties": false, "required": ["ups", "cpu", "memory", "disk", "gameProcess", "controlPlane", "bridge", "subjectBindingSha256"],
+      "properties": { "ups": { "$ref": "#/$defs/upsHealth" }, "cpu": { "$ref": "#/$defs/cpuHealth" }, "memory": { "$ref": "#/$defs/memoryHealth" }, "disk": { "$ref": "#/$defs/diskHealth" }, "gameProcess": { "$ref": "#/$defs/gameHealth" }, "controlPlane": { "$ref": "#/$defs/serviceHealth" }, "bridge": { "$ref": "#/$defs/bridgeHealth" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "external": {
+      "type": "object", "additionalProperties": false,
+      "required": ["publicHost", "networkClass", "protocol", "reachabilityOnly", "clientPseudonym", "initialJoinReceiptSha256", "reconnectReceiptSha256", "initialJoinAtUtc", "reconnectAtUtc", "sameWorld", "worldBindingSha256", "savePairSha256", "subjectBindingSha256"],
+      "properties": { "publicHost": { "$ref": "#/$defs/hostname" }, "networkClass": { "const": "public-external" }, "protocol": { "const": "nebula" }, "reachabilityOnly": { "const": false }, "clientPseudonym": { "type": "string", "pattern": "^client:sha256:[0-9a-f]{64}$" }, "initialJoinReceiptSha256": { "$ref": "#/$defs/digest" }, "reconnectReceiptSha256": { "$ref": "#/$defs/digest" }, "initialJoinAtUtc": { "$ref": "#/$defs/utc" }, "reconnectAtUtc": { "$ref": "#/$defs/utc" }, "sameWorld": { "const": true }, "worldBindingSha256": { "$ref": "#/$defs/digest" }, "savePairSha256": { "$ref": "#/$defs/digest" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "saves": {
+      "type": "object", "additionalProperties": false,
+      "required": ["acknowledgementCount", "maximumAcknowledgementGapSeconds", "firstAcknowledgementAtUtc", "lastAcknowledgementAtUtc", "firstAcknowledgementSha256", "lastAcknowledgementSha256", "acknowledgementChainSha256", "allAcknowledged", "pairStable", "worldBindingSha256", "savePairSha256", "subjectBindingSha256"],
+      "properties": { "acknowledgementCount": { "type": "integer", "minimum": 37 }, "maximumAcknowledgementGapSeconds": { "type": "integer", "minimum": 1, "maximum": 600 }, "firstAcknowledgementAtUtc": { "$ref": "#/$defs/utc" }, "lastAcknowledgementAtUtc": { "$ref": "#/$defs/utc" }, "firstAcknowledgementSha256": { "$ref": "#/$defs/digest" }, "lastAcknowledgementSha256": { "$ref": "#/$defs/digest" }, "acknowledgementChainSha256": { "$ref": "#/$defs/digest" }, "allAcknowledged": { "const": true }, "pairStable": { "const": true }, "worldBindingSha256": { "$ref": "#/$defs/digest" }, "savePairSha256": { "$ref": "#/$defs/digest" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "outcome": {
+      "type": "object", "additionalProperties": false, "required": ["crashCount", "recoveryRequiredCount", "dataLossEventCount", "workloadInterruptionCount", "clockAnomalyCount", "criticalHealthSamples", "mandatoryHealthChecksPassed", "subjectBindingSha256"],
+      "properties": { "crashCount": { "const": 0 }, "recoveryRequiredCount": { "const": 0 }, "dataLossEventCount": { "const": 0 }, "workloadInterruptionCount": { "const": 0 }, "clockAnomalyCount": { "const": 0 }, "criticalHealthSamples": { "type": "integer", "minimum": 0 }, "mandatoryHealthChecksPassed": { "const": true }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    },
+    "alerts": {
+      "type": "object", "additionalProperties": false, "required": ["criticalAlertCount", "unresolvedAlertCount", "conclusion", "alertLedgerSha256", "subjectBindingSha256"],
+      "properties": { "criticalAlertCount": { "const": 0 }, "unresolvedAlertCount": { "const": 0 }, "conclusion": { "const": "no-actionable-alerts" }, "alertLedgerSha256": { "$ref": "#/$defs/digest" }, "subjectBindingSha256": { "$ref": "#/$defs/digest" } }
+    }
+  }
+}

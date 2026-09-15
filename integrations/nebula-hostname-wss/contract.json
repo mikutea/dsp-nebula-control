@@ -1,0 +1,56 @@
+{
+  "format": "dyson-control-nebula-source-patch-contract",
+  "schemaVersion": 2,
+  "id": "nebula-v0.9.22-hostname-wss-v2",
+  "upstream": {
+    "repository": "https://github.com/NebulaModTeam/nebula.git",
+    "tag": "v0.9.22",
+    "commit": "3cdf95c594a2f8010b0e87a43be828e6ba2f657f",
+    "license": "GPL-3.0-only",
+    "licensePath": "LICENSE",
+    "licenseGitBlob": "f288702d2fa16d3cdf0035b15a9fcbc552cd88e7",
+    "licenseSha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+    "licenseSizeBytes": 35149
+  },
+  "sources": [
+    {
+      "path": "NebulaNetwork/Client.cs",
+      "gitBlob": "84763fc54a4d01df1dc257efa24ecb6757557587",
+      "sha256": "a93a5f17738ef95c4c26db055d4a88da5341c1ad4fda1c5fde6edac011192082",
+      "sizeBytes": 14871
+    },
+    {
+      "path": "NebulaPatcher/Patches/Dynamic/UIMainMenu_Patch.cs",
+      "gitBlob": "90cd938877af1976784baa3426a7127b64d4d7f4",
+      "sha256": "71360c4b2982cb23f3cb6a8e7be5f4e784acfa24738fc1512372cb8bd42f71cb",
+      "sizeBytes": 17132
+    }
+  ],
+  "patch": {
+    "path": "integrations/nebula-hostname-wss/patches/nebula-v0.9.22-hostname-wss.patch",
+    "sha256": "f99aa853122fd83be714f6ee2a7c065dcf298661a1331a639648130fd2ea778b",
+    "sizeBytes": 4068
+  },
+  "candidate": {
+    "patchedSources": [
+      {
+        "path": "NebulaNetwork/Client.cs",
+        "sha256": "79984f61943dd0f908a47b1b0d97d02f4f27526d4fcd8203444157991ff68bd0",
+        "sizeBytes": 15286
+      },
+      {
+        "path": "NebulaPatcher/Patches/Dynamic/UIMainMenu_Patch.cs",
+        "sha256": "61665fcce7edf86d5774cd5a723564570385c88cba69b51b37d8084e20f3326e",
+        "sizeBytes": 17338
+      }
+    ],
+    "allowedFiles": [
+      "LICENSE",
+      "NebulaNetwork/Client.cs",
+      "NebulaPatcher/Patches/Dynamic/UIMainMenu_Patch.cs",
+      "candidate-manifest.json",
+      "nebula-v0.9.22-hostname-wss.contract.json",
+      "nebula-v0.9.22-hostname-wss.patch"
+    ]
+  }
+}

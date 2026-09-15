@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/dyson-external-join-observation-v2.schema.json",
+  "title": "Dyson external join observation v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "schemaVersion", "observationId", "runId", "releaseIdentity", "releaseBindingSha256", "publicEndpoint", "endpointBindingSha256", "client", "sessionBinding", "saveBinding", "events", "observedAtUtc", "expiresAtUtc", "observationSha256"],
+  "properties": {
+    "protocol": { "const": "DYSON_EXTERNAL_JOIN_OBSERVATION_V2" },
+    "schemaVersion": { "const": 2 },
+    "observationId": { "$ref": "#/$defs/uuid" },
+    "runId": { "$ref": "#/$defs/uuid" },
+    "releaseIdentity": { "$ref": "#/$defs/releaseIdentity" },
+    "releaseBindingSha256": { "$ref": "#/$defs/digest" },
+    "publicEndpoint": { "$ref": "#/$defs/publicEndpoint" },
+    "endpointBindingSha256": { "$ref": "#/$defs/digest" },
+    "client": { "$ref": "#/$defs/client" },
+    "sessionBinding": { "$ref": "#/$defs/sessionBinding" },
+    "saveBinding": { "$ref": "#/$defs/saveBinding" },
+    "events": {
+      "type": "array",
+      "minItems": 12,
+      "maxItems": 12,
+      "prefixItems": [
+        { "$ref": "#/$defs/eventDns" },
+        { "$ref": "#/$defs/eventTls" },
+        { "$ref": "#/$defs/eventWss" },
+        { "$ref": "#/$defs/eventNebulaTransport" },
+        { "$ref": "#/$defs/eventAuthentication" },
+        { "$ref": "#/$defs/eventJoin" },
+        { "$ref": "#/$defs/eventInteraction" },
+        { "$ref": "#/$defs/eventSaveRequested" },
+        { "$ref": "#/$defs/eventSaveVerified" },
+        { "$ref": "#/$defs/eventDisconnect" },
+        { "$ref": "#/$defs/eventReconnectTransport" },
+        { "$ref": "#/$defs/eventRejoin" }
+      ],
+      "items": false
+    },
+    "observedAtUtc": { "$ref": "#/$defs/utc" },
+    "expiresAtUtc": { "$ref": "#/$defs/utc" },
+    "observationSha256": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "hostname": { "type": "string", "pattern": "^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$" },
+    "pseudonym": { "type": "string", "pattern": "^client:sha256:[0-9a-f]{64}$" },
+    "releaseIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["releaseVersion", "subjectCommit", "runtimePayloadSha256", "releaseManifestSha256", "serverManifestSha256", "clientManifestSha256"],
+      "properties": {
+        "releaseVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" },
+        "subjectCommit": { "$ref": "#/$defs/commit" },
+        "runtimePayloadSha256": { "$ref": "#/$defs/digest" },
+        "releaseManifestSha256": { "$ref": "#/$defs/digest" },
+        "serverManifestSha256": { "$ref": "#/$defs/digest" },
+        "clientManifestSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "publicEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "publicHost", "port", "websocketPath", "dnsAnswerSetSha256", "tlsCertificateSha256"],
+      "properties": {
+        "scheme": { "const": "wss" },
+        "publicHost": { "$ref": "#/$defs/hostname" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "websocketPath": { "const": "/socket" },
+        "dnsAnswerSetSha256": { "$ref": "#/$defs/digest" },
+        "tlsCertificateSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "client": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clientPseudonym", "pseudonymScope", "networkClass", "sourceAddressCollected", "displayNameCollected", "accountIdCollected", "deviceIdCollected", "clientBuildSha256", "clientManifestSha256", "externalNetworkAttestationSha256"],
+      "properties": {
+        "clientPseudonym": { "$ref": "#/$defs/pseudonym" },
+        "pseudonymScope": { "const": "one-run" },
+        "networkClass": { "const": "public-external" },
+        "sourceAddressCollected": { "const": false },
+        "displayNameCollected": { "const": false },
+        "accountIdCollected": { "const": false },
+        "deviceIdCollected": { "const": false },
+        "clientBuildSha256": { "$ref": "#/$defs/digest" },
+        "clientManifestSha256": { "$ref": "#/$defs/digest" },
+        "externalNetworkAttestationSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "sessionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initialQualificationSessionId", "reconnectQualificationSessionId", "initialChallengeId", "reconnectChallengeId", "worldBindingSha256", "bindingSha256"],
+      "properties": {
+        "initialQualificationSessionId": { "$ref": "#/$defs/uuid" },
+        "reconnectQualificationSessionId": { "$ref": "#/$defs/uuid" },
+        "initialChallengeId": { "$ref": "#/$defs/uuid" },
+        "reconnectChallengeId": { "$ref": "#/$defs/uuid" },
+        "worldBindingSha256": { "$ref": "#/$defs/digest" },
+        "bindingSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "saveBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["saveRequestId", "worldBindingSha256", "saveReceiptSha256", "savePairSha256", "saveManifestSha256"],
+      "properties": {
+        "saveRequestId": { "$ref": "#/$defs/uuid" },
+        "worldBindingSha256": { "$ref": "#/$defs/digest" },
+        "saveReceiptSha256": { "$ref": "#/$defs/digest" },
+        "savePairSha256": { "$ref": "#/$defs/digest" },
+        "saveManifestSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "eventBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "event", "observerClass", "qualificationSessionId", "clientPseudonym", "observedAtUtc", "expiresAtUtc", "releaseBindingSha256", "endpointBindingSha256", "sessionBindingSha256", "evidence", "evidenceSha256", "predecessorSha256", "eventSha256"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1, "maximum": 12 },
+        "event": { "enum": ["dns-resolved", "tls-established", "wss-established", "nebula-transport-established", "nebula-authenticated", "nebula-joined", "interaction-observed", "save-requested", "save-verified", "disconnected", "reconnect-transport-established", "nebula-rejoined"] },
+        "observerClass": { "enum": ["external-network", "external-client", "server-authoritative", "independent-save"] },
+        "qualificationSessionId": { "$ref": "#/$defs/uuid" },
+        "clientPseudonym": { "$ref": "#/$defs/pseudonym" },
+        "observedAtUtc": { "$ref": "#/$defs/utc" },
+        "expiresAtUtc": { "$ref": "#/$defs/utc" },
+        "releaseBindingSha256": { "$ref": "#/$defs/digest" },
+        "endpointBindingSha256": { "$ref": "#/$defs/digest" },
+        "sessionBindingSha256": { "$ref": "#/$defs/digest" },
+        "evidence": { "type": "object" },
+        "evidenceSha256": { "$ref": "#/$defs/digest" },
+        "predecessorSha256": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/digest" }] },
+        "eventSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "dnsEvidence": { "type": "object", "additionalProperties": false, "required": ["publicHost", "answerSetSha256", "classification", "externalResolverObserved"], "properties": { "publicHost": { "$ref": "#/$defs/hostname" }, "answerSetSha256": { "$ref": "#/$defs/digest" }, "classification": { "const": "public-routable" }, "externalResolverObserved": { "const": true } } },
+    "tlsEvidence": { "type": "object", "additionalProperties": false, "required": ["sniAuthority", "negotiatedProtocol", "certificateSha256", "certificateValid", "dnsNameMatched"], "properties": { "sniAuthority": { "$ref": "#/$defs/hostname" }, "negotiatedProtocol": { "enum": ["tls12", "tls13"] }, "certificateSha256": { "$ref": "#/$defs/digest" }, "certificateValid": { "const": true }, "dnsNameMatched": { "const": true } } },
+    "wssEvidence": { "type": "object", "additionalProperties": false, "required": ["hostHeaderAuthority", "path", "httpStatusCode", "transport"], "properties": { "hostHeaderAuthority": { "type": "string", "minLength": 1, "maxLength": 260 }, "path": { "const": "/socket" }, "httpStatusCode": { "const": 101 }, "transport": { "const": "wss" } } },
+    "nebulaTransportEvidence": { "type": "object", "additionalProperties": false, "required": ["protocol", "transportEstablished", "serverHandshakeSha256"], "properties": { "protocol": { "const": "nebula" }, "transportEstablished": { "const": true }, "serverHandshakeSha256": { "$ref": "#/$defs/digest" } } },
+    "authenticationEvidence": { "type": "object", "additionalProperties": false, "required": ["authenticated", "authenticationReceiptSha256"], "properties": { "authenticated": { "const": true }, "authenticationReceiptSha256": { "$ref": "#/$defs/digest" } } },
+    "joinEvidence": { "type": "object", "additionalProperties": false, "required": ["joined", "serverAuthoritative", "worldBindingSha256", "joinReceiptSha256"], "properties": { "joined": { "const": true }, "serverAuthoritative": { "const": true }, "worldBindingSha256": { "$ref": "#/$defs/digest" }, "joinReceiptSha256": { "$ref": "#/$defs/digest" } } },
+    "interactionEvidence": { "type": "object", "additionalProperties": false, "required": ["interactionClass", "serverObserved", "worldBindingSha256", "interactionReceiptSha256"], "properties": { "interactionClass": { "const": "server-observed-gameplay" }, "serverObserved": { "const": true }, "worldBindingSha256": { "$ref": "#/$defs/digest" }, "interactionReceiptSha256": { "$ref": "#/$defs/digest" } } },
+    "saveRequestedEvidence": { "type": "object", "additionalProperties": false, "required": ["saveRequestId", "requested", "worldBindingSha256"], "properties": { "saveRequestId": { "$ref": "#/$defs/uuid" }, "requested": { "const": true }, "worldBindingSha256": { "$ref": "#/$defs/digest" } } },
+    "saveVerifiedEvidence": { "type": "object", "additionalProperties": false, "required": ["saveRequestId", "serverAcknowledged", "saveReceiptSha256", "savePairSha256", "saveManifestSha256"], "properties": { "saveRequestId": { "$ref": "#/$defs/uuid" }, "serverAcknowledged": { "const": true }, "saveReceiptSha256": { "$ref": "#/$defs/digest" }, "savePairSha256": { "$ref": "#/$defs/digest" }, "saveManifestSha256": { "$ref": "#/$defs/digest" } } },
+    "disconnectEvidence": { "type": "object", "additionalProperties": false, "required": ["cleanDisconnect", "serverObserved", "disconnectReceiptSha256"], "properties": { "cleanDisconnect": { "const": true }, "serverObserved": { "const": true }, "disconnectReceiptSha256": { "$ref": "#/$defs/digest" } } },
+    "reconnectTransportEvidence": { "type": "object", "additionalProperties": false, "required": ["publicHost", "transportStack", "freshQualificationSession", "reconnectChallengeId"], "properties": { "publicHost": { "$ref": "#/$defs/hostname" }, "transportStack": { "const": "tls-wss-nebula" }, "freshQualificationSession": { "const": true }, "reconnectChallengeId": { "$ref": "#/$defs/uuid" } } },
+    "rejoinEvidence": { "type": "object", "additionalProperties": false, "required": ["rejoined", "serverAuthoritative", "worldBindingSha256", "savePairSha256", "rejoinReceiptSha256"], "properties": { "rejoined": { "const": true }, "serverAuthoritative": { "const": true }, "worldBindingSha256": { "$ref": "#/$defs/digest" }, "savePairSha256": { "$ref": "#/$defs/digest" }, "rejoinReceiptSha256": { "$ref": "#/$defs/digest" } } },
+    "eventDns": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 1 }, "event": { "const": "dns-resolved" }, "observerClass": { "const": "external-network" }, "predecessorSha256": { "type": "null" }, "evidence": { "$ref": "#/$defs/dnsEvidence" } } }] },
+    "eventTls": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 2 }, "event": { "const": "tls-established" }, "observerClass": { "const": "external-client" }, "evidence": { "$ref": "#/$defs/tlsEvidence" } } }] },
+    "eventWss": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 3 }, "event": { "const": "wss-established" }, "observerClass": { "const": "external-client" }, "evidence": { "$ref": "#/$defs/wssEvidence" } } }] },
+    "eventNebulaTransport": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 4 }, "event": { "const": "nebula-transport-established" }, "observerClass": { "const": "server-authoritative" }, "evidence": { "$ref": "#/$defs/nebulaTransportEvidence" } } }] },
+    "eventAuthentication": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 5 }, "event": { "const": "nebula-authenticated" }, "observerClass": { "const": "server-authoritative" }, "evidence": { "$ref": "#/$defs/authenticationEvidence" } } }] },
+    "eventJoin": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 6 }, "event": { "const": "nebula-joined" }, "observerClass": { "const": "server-authoritative" }, "evidence": { "$ref": "#/$defs/joinEvidence" } } }] },
+    "eventInteraction": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 7 }, "event": { "const": "interaction-observed" }, "observerClass": { "const": "server-authoritative" }, "evidence": { "$ref": "#/$defs/interactionEvidence" } } }] },
+    "eventSaveRequested": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 8 }, "event": { "const": "save-requested" }, "observerClass": { "const": "server-authoritative" }, "evidence": { "$ref": "#/$defs/saveRequestedEvidence" } } }] },
+    "eventSaveVerified": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 9 }, "event": { "const": "save-verified" }, "observerClass": { "const": "independent-save" }, "evidence": { "$ref": "#/$defs/saveVerifiedEvidence" } } }] },
+    "eventDisconnect": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 10 }, "event": { "const": "disconnected" }, "observerClass": { "const": "server-authoritative" }, "evidence": { "$ref": "#/$defs/disconnectEvidence" } } }] },
+    "eventReconnectTransport": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 11 }, "event": { "const": "reconnect-transport-established" }, "observerClass": { "const": "external-client" }, "evidence": { "$ref": "#/$defs/reconnectTransportEvidence" } } }] },
+    "eventRejoin": { "allOf": [{ "$ref": "#/$defs/eventBase" }, { "properties": { "sequence": { "const": 12 }, "event": { "const": "nebula-rejoined" }, "observerClass": { "const": "server-authoritative" }, "evidence": { "$ref": "#/$defs/rejoinEvidence" } } }] }
+  }
+}

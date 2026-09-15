@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dyson-control:schema:nebula-hostname-wss-qualification:v1",
+  "title": "Dyson Nebula hostname-preserving WSS qualification v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "schemaVersion",
+    "qualificationId",
+    "runId",
+    "issuedAtUtc",
+    "expiresAtUtc",
+    "subject",
+    "contractBinding",
+    "binaryBinding",
+    "transportBinding",
+    "routeBinding",
+    "externalClientBinding",
+    "receiptChain",
+    "documentSha256",
+    "protection"
+  ],
+  "properties": {
+    "protocol": { "const": "DYSON_NEBULA_HOSTNAME_WSS_QUALIFICATION_V1" },
+    "schemaVersion": { "const": 1 },
+    "qualificationId": { "$ref": "#/$defs/uuid" },
+    "runId": { "$ref": "#/$defs/uuid" },
+    "issuedAtUtc": { "$ref": "#/$defs/utc" },
+    "expiresAtUtc": { "$ref": "#/$defs/utc" },
+    "subject": { "$ref": "#/$defs/subject" },
+    "contractBinding": { "$ref": "#/$defs/contractBinding" },
+    "binaryBinding": { "$ref": "#/$defs/binaryBinding" },
+    "transportBinding": { "$ref": "#/$defs/transportBinding" },
+    "routeBinding": { "$ref": "#/$defs/routeBinding" },
+    "externalClientBinding": { "$ref": "#/$defs/externalClientBinding" },
+    "receiptChain": { "$ref": "#/$defs/receiptChain" },
+    "documentSha256": { "$ref": "#/$defs/digest" },
+    "protection": { "$ref": "#/$defs/protection" }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "utc": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^(?!.*\\.\\.)(?!(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\\.|$))[a-z0-9][a-z0-9._-]{6,126}[a-z0-9]$"
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "topology",
+        "transport",
+        "authority",
+        "port",
+        "websocketPath",
+        "authoritySemantics"
+      ],
+      "properties": {
+        "topology": { "const": "http-websocket-tunnel" },
+        "transport": { "const": "wss" },
+        "authority": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 253,
+          "pattern": "^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])$"
+        },
+        "port": { "const": 443 },
+        "websocketPath": { "const": "/socket" },
+        "authoritySemantics": { "const": "hostname-preserved" }
+      }
+    },
+    "contractBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourcePatchContractSha256",
+        "privateBuildContractSha256",
+        "upstreamCommit",
+        "patchSha256",
+        "binaryMetadataASha256",
+        "binaryMetadataBSha256",
+        "candidateManifestSha256",
+        "candidateTreeSha256",
+        "clientManifestSha256",
+        "clientPackageSha256",
+        "profileInputSha256",
+        "serverLockSha256",
+        "clientParitySha256",
+        "compatibilityPolicySha256"
+      ],
+      "properties": {
+        "sourcePatchContractSha256": { "$ref": "#/$defs/digest" },
+        "privateBuildContractSha256": { "$ref": "#/$defs/digest" },
+        "upstreamCommit": { "$ref": "#/$defs/commit" },
+        "patchSha256": { "$ref": "#/$defs/digest" },
+        "binaryMetadataASha256": { "$ref": "#/$defs/digest" },
+        "binaryMetadataBSha256": { "$ref": "#/$defs/digest" },
+        "candidateManifestSha256": { "$ref": "#/$defs/digest" },
+        "candidateTreeSha256": { "$ref": "#/$defs/digest" },
+        "clientManifestSha256": { "$ref": "#/$defs/digest" },
+        "clientPackageSha256": { "$ref": "#/$defs/digest" },
+        "profileInputSha256": { "$ref": "#/$defs/digest" },
+        "serverLockSha256": { "$ref": "#/$defs/digest" },
+        "clientParitySha256": { "$ref": "#/$defs/digest" },
+        "compatibilityPolicySha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "fileName", "sha256", "mvid"],
+      "properties": {
+        "role": { "enum": ["nebula-network", "nebula-patcher"] },
+        "fileName": { "enum": ["NebulaNetwork.dll", "NebulaPatcher.dll"] },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "mvid": { "$ref": "#/$defs/uuid" }
+      }
+    },
+    "binaryPair": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/binary" },
+            {
+              "type": "object",
+              "properties": {
+                "role": { "const": "nebula-network" },
+                "fileName": { "const": "NebulaNetwork.dll" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/binary" },
+            {
+              "type": "object",
+              "properties": {
+                "role": { "const": "nebula-patcher" },
+                "fileName": { "const": "NebulaPatcher.dll" }
+              }
+            }
+          ]
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2,
+      "items": false
+    },
+    "binaryBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate", "client"],
+      "properties": {
+        "candidate": { "$ref": "#/$defs/binaryPair" },
+        "client": { "$ref": "#/$defs/binaryPair" }
+      }
+    },
+    "transportBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sniAuthority",
+        "hostHeaderAuthority",
+        "websocketPath",
+        "tlsProtocol",
+        "httpStatusCode",
+        "ingressProvider",
+        "ingressConfigSha256",
+        "originBindingSha256",
+        "websocketTranscriptSha256",
+        "sessionBindingSha256"
+      ],
+      "properties": {
+        "sniAuthority": { "type": "string", "minLength": 4, "maxLength": 253 },
+        "hostHeaderAuthority": { "type": "string", "minLength": 8, "maxLength": 257 },
+        "websocketPath": { "const": "/socket" },
+        "tlsProtocol": { "enum": ["tls12", "tls13"] },
+        "httpStatusCode": { "const": 101 },
+        "ingressProvider": { "const": "cloudflare-tunnel" },
+        "ingressConfigSha256": { "$ref": "#/$defs/digest" },
+        "originBindingSha256": { "$ref": "#/$defs/digest" },
+        "websocketTranscriptSha256": { "$ref": "#/$defs/digest" },
+        "sessionBindingSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packetsBefore", "packetsAfter", "bytesBefore", "bytesAfter"],
+      "properties": {
+        "packetsBefore": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "packetsAfter": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "bytesBefore": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "bytesAfter": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "routeBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ruleRevisionBefore",
+        "ruleRevisionAfter",
+        "ruleIdentitySha256",
+        "flowBindingSha256",
+        "sessionBindingSha256",
+        "directCounters",
+        "proxyCounters"
+      ],
+      "properties": {
+        "ruleRevisionBefore": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "ruleRevisionAfter": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "ruleIdentitySha256": { "$ref": "#/$defs/digest" },
+        "flowBindingSha256": { "$ref": "#/$defs/digest" },
+        "sessionBindingSha256": { "$ref": "#/$defs/digest" },
+        "directCounters": { "$ref": "#/$defs/counters" },
+        "proxyCounters": { "$ref": "#/$defs/counters" }
+      }
+    },
+    "externalClientBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receiptChainSha256",
+        "receiptCount",
+        "terminalReceiptSha256",
+        "joinReceiptSha256",
+        "reconnectReceiptSha256",
+        "initialChallengeId",
+        "reconnectChallengeId",
+        "transcriptBindingSha256",
+        "sessionBindingSha256",
+        "observedAtUtc",
+        "expiresAtUtc"
+      ],
+      "properties": {
+        "receiptChainSha256": { "$ref": "#/$defs/digest" },
+        "receiptCount": { "const": 11 },
+        "terminalReceiptSha256": { "$ref": "#/$defs/digest" },
+        "joinReceiptSha256": { "$ref": "#/$defs/digest" },
+        "reconnectReceiptSha256": { "$ref": "#/$defs/digest" },
+        "initialChallengeId": { "$ref": "#/$defs/uuid" },
+        "reconnectChallengeId": { "$ref": "#/$defs/uuid" },
+        "transcriptBindingSha256": { "$ref": "#/$defs/digest" },
+        "sessionBindingSha256": { "$ref": "#/$defs/digest" },
+        "observedAtUtc": { "$ref": "#/$defs/utc" },
+        "expiresAtUtc": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "challengeIds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initial", "reconnect"],
+      "properties": {
+        "initial": { "$ref": "#/$defs/uuid" },
+        "reconnect": { "$ref": "#/$defs/uuid" }
+      }
+    },
+    "collectorReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "schemaVersion",
+        "receiptId",
+        "qualificationId",
+        "runId",
+        "collectorId",
+        "keyId",
+        "sequence",
+        "evidenceType",
+        "challengeIds",
+        "sessionId",
+        "nonce",
+        "observedAtUtc",
+        "expiresAtUtc",
+        "previousReceiptSha256",
+        "evidenceSha256",
+        "receiptSha256",
+        "hmacSha256"
+      ],
+      "properties": {
+        "protocol": { "const": "DYSON_NEBULA_HOSTNAME_WSS_COLLECTOR_RECEIPT_V1" },
+        "schemaVersion": { "const": 1 },
+        "receiptId": { "$ref": "#/$defs/uuid" },
+        "qualificationId": { "$ref": "#/$defs/uuid" },
+        "runId": { "$ref": "#/$defs/uuid" },
+        "collectorId": { "$ref": "#/$defs/identifier" },
+        "keyId": { "$ref": "#/$defs/identifier" },
+        "sequence": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "evidenceType": { "enum": ["build-binary", "wss-transport", "passwall-route", "external-client"] },
+        "challengeIds": { "$ref": "#/$defs/challengeIds" },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "nonce": { "$ref": "#/$defs/nonce" },
+        "observedAtUtc": { "$ref": "#/$defs/utc" },
+        "expiresAtUtc": { "$ref": "#/$defs/utc" },
+        "previousReceiptSha256": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/digest" }]
+        },
+        "evidenceSha256": { "$ref": "#/$defs/digest" },
+        "receiptSha256": { "$ref": "#/$defs/digest" },
+        "hmacSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "receiptChain": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/collectorReceipt" },
+            {
+              "type": "object",
+              "properties": {
+                "sequence": { "const": 1 },
+                "evidenceType": { "const": "build-binary" },
+                "collectorId": { "const": "nebula-private-build" },
+                "previousReceiptSha256": { "type": "null" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/collectorReceipt" },
+            {
+              "type": "object",
+              "properties": {
+                "sequence": { "const": 2 },
+                "evidenceType": { "const": "wss-transport" },
+                "collectorId": { "const": "wss-edge-observer" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/collectorReceipt" },
+            {
+              "type": "object",
+              "properties": {
+                "sequence": { "const": 3 },
+                "evidenceType": { "const": "passwall-route" },
+                "collectorId": { "const": "passwall-route-observer" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/collectorReceipt" },
+            {
+              "type": "object",
+              "properties": {
+                "sequence": { "const": 4 },
+                "evidenceType": { "const": "external-client" },
+                "collectorId": { "const": "external-client-coordinator" }
+              }
+            }
+          ]
+        }
+      ],
+      "minItems": 4,
+      "maxItems": 4,
+      "items": false
+    },
+    "protection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "keyId", "hmacSha256"],
+      "properties": {
+        "algorithm": { "const": "hmac-sha256" },
+        "keyId": { "$ref": "#/$defs/identifier" },
+        "hmacSha256": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

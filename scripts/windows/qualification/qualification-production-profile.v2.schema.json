@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/dyson-control/qualification-production-profile.v2.schema.json",
+  "title": "Dyson Control qualification production profile v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "schemaVersion", "profileId", "profileLabel", "enabled", "targetIdentity", "expiresAtUtc", "stateRoot", "protectedRoots", "actions"],
+  "properties": {
+    "protocol": { "const": "DYSON_QUALIFICATION_PRODUCTION_PROFILE_V2" },
+    "schemaVersion": { "const": 2 },
+    "profileId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "profileLabel": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,63}$" },
+    "enabled": { "type": "boolean", "default": false },
+    "targetIdentity": { "$ref": "#/$defs/digest" },
+    "expiresAtUtc": { "$ref": "#/$defs/utc" },
+    "stateRoot": { "$ref": "#/$defs/localPath" },
+    "protectedRoots": { "type": "array", "minItems": 5, "maxItems": 16, "uniqueItems": true, "items": { "$ref": "#/$defs/localPath" } },
+    "actions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["controlPlaneRestart", "dspCrashRecovery", "storageInterruption", "diskPressure"],
+      "properties": {
+        "controlPlaneRestart": { "$ref": "#/$defs/processAction" },
+        "dspCrashRecovery": { "$ref": "#/$defs/processAction" },
+        "storageInterruption": { "$ref": "#/$defs/storageAction" },
+        "diskPressure": { "$ref": "#/$defs/diskAction" }
+      }
+    }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "targetId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,63}$" },
+    "localPath": { "type": "string", "pattern": "^[A-Za-z]:\\\\" },
+    "taskName": { "type": "string", "pattern": "^\\\\[A-Za-z0-9_. -]+(?:\\\\[A-Za-z0-9_. -]+)*$" },
+    "processAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "targetId", "executablePath", "executableSha256", "commandLineSha256", "releaseSha256", "runtimeSha256", "pidFilePath", "startTaskName", "startTaskSha256", "readinessFilePath", "timeoutSeconds"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "targetId": { "$ref": "#/$defs/targetId" },
+        "executablePath": { "$ref": "#/$defs/localPath" },
+        "executableSha256": { "$ref": "#/$defs/digest" },
+        "commandLineSha256": { "$ref": "#/$defs/digest" },
+        "releaseSha256": { "$ref": "#/$defs/digest" },
+        "runtimeSha256": { "$ref": "#/$defs/digest" },
+        "pidFilePath": { "$ref": "#/$defs/localPath" },
+        "startTaskName": { "$ref": "#/$defs/taskName" },
+        "startTaskSha256": { "$ref": "#/$defs/digest" },
+        "readinessFilePath": { "$ref": "#/$defs/localPath" },
+        "timeoutSeconds": { "type": "integer", "minimum": 30, "maximum": 900 }
+      }
+    },
+    "storageAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "targetId", "dependencyKind", "localPath", "remotePath", "restoreTaskName", "restoreTaskSha256", "maximumInterruptionSeconds", "timeoutSeconds"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "targetId": { "$ref": "#/$defs/targetId" },
+        "dependencyKind": { "const": "smb-global-mapping" },
+        "localPath": { "type": "string", "pattern": "^[A-Z]:$" },
+        "remotePath": { "type": "string", "pattern": "^\\\\\\\\[A-Za-z0-9.-]+\\\\[A-Za-z0-9$_. -]+$" },
+        "restoreTaskName": { "$ref": "#/$defs/taskName" },
+        "restoreTaskSha256": { "$ref": "#/$defs/digest" },
+        "maximumInterruptionSeconds": { "type": "integer", "minimum": 10, "maximum": 300 },
+        "timeoutSeconds": { "type": "integer", "minimum": 40, "maximum": 900 }
+      }
+    },
+    "diskAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "targetId", "directoryPath", "volumeRoot", "markerValue", "maximumAllocationBytes", "minimumFreeBytes", "maximumUsedPercent", "maximumHoldSeconds", "timeoutSeconds"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "targetId": { "$ref": "#/$defs/targetId" },
+        "directoryPath": { "$ref": "#/$defs/localPath" },
+        "volumeRoot": { "type": "string", "pattern": "^[A-Z]:\\\\$" },
+        "markerValue": { "const": "DYSON_QUALIFICATION_DISPOSABLE_V2" },
+        "maximumAllocationBytes": { "type": "integer", "minimum": 1048576, "maximum": 68719476736 },
+        "minimumFreeBytes": { "type": "integer", "minimum": 10737418240 },
+        "maximumUsedPercent": { "type": "integer", "minimum": 1, "maximum": 85 },
+        "maximumHoldSeconds": { "type": "integer", "minimum": 0, "maximum": 300 },
+        "timeoutSeconds": { "type": "integer", "minimum": 30, "maximum": 900 }
+      }
+    }
+  }
+}

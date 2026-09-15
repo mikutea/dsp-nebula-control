@@ -6,4 +6,4 @@
 - Treat `.dsv` and `.server` as one atomic Nebula save unit.
 - Production defaults must fail closed: loopback binding, authenticated access, and lifecycle operations disabled until explicitly configured.
 - Examples must use `example.com`, RFC 5737 addresses, and fictional paths.
-- Run `npm run check` before committing.
+- Before committing, reuse the verified baseline and run the affected checks described in `docs/incremental-validation.md`. Do not automatically repeat `npm run check`, including for a final release. Unmapped changes require an updated impact/test plan; missing real-host acceptance evidence must still be obtained.

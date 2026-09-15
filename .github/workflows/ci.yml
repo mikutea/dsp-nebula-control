@@ -8,16 +8,43 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 24
+          node-version: 24.20.0
           cache: npm
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.424
+      - name: Verify pinned CI runtimes and Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          $nodeVersion = (& node --version).Trim().TrimStart('v')
+          if ($LASTEXITCODE -ne 0 -or $nodeVersion -cne '24.20.0') {
+            throw 'Node.js 24.20.0 is required by the reproducible CI gate.'
+          }
+          $dotnetVersion = (& dotnet --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $dotnetVersion -cne '8.0.424') {
+            throw '.NET SDK 8.0.424 is required by the reproducible CI gate.'
+          }
+          $powerShellVersion = (& powershell.exe -NoLogo -NoProfile -NonInteractive `
+            -Command '$PSVersionTable.PSVersion.ToString()').Trim()
+          if ($LASTEXITCODE -ne 0 -or $powerShellVersion -notmatch '^5\.1\.') {
+            throw 'Windows PowerShell 5.1 is required by the complete gate.'
+          }
       - run: npm ci
       - run: npm ci --prefix apps/api
       - run: npm ci --prefix apps/web
-      - run: npm run check
+      - run: node scripts/validate-incremental.mjs --host-checks --full-deployment

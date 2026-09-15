@@ -2,6 +2,7 @@ import { createHmac, randomBytes } from 'node:crypto'
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import type { AppConfig } from '../config.js'
 import { ControlDatabase } from '../storage/database.js'
+import { authenticatedUserFor, type ControlRole } from './authorization.js'
 import { hashPassword, verifyPassword } from './password.js'
 
 const sessionCookie = 'dyson_session'
@@ -29,11 +30,25 @@ export class AuthService {
     this.#database.purgeExpiredSessions()
   }
 
-  async login(password: string, reply: FastifyReply): Promise<boolean> {
-    if (!this.#passwordHash || !(await verifyPassword(password, this.#passwordHash))) return false
+  async login(
+    password: string,
+    reply: FastifyReply,
+    role: ControlRole = 'administrator'
+  ): Promise<boolean> {
+    const passwordHash = role === 'administrator'
+      ? this.#passwordHash
+      : role === 'operator'
+        ? this.#config.operatorPasswordHash
+        : this.#config.viewerPasswordHash
+    if (!passwordHash || !(await verifyPassword(password, passwordHash))) return false
     const token = randomBytes(32).toString('base64url')
     const expiresAt = new Date(Date.now() + sessionLifetimeMs)
-    this.#database.createSession(this.#digest(token), 'Administrator', expiresAt.toISOString())
+    this.#database.createSession(
+      this.#digest(token),
+      authenticatedUserFor(role).name,
+      expiresAt.toISOString(),
+      role
+    )
     reply.setCookie(sessionCookie, token, {
       httpOnly: true,
       secure: this.#config.nodeEnv === 'production',
@@ -44,11 +59,11 @@ export class AuthService {
     return true
   }
 
-  session(request: FastifyRequest): { username: string; expiresAt: string } | null {
+  session(request: FastifyRequest): { username: string; role: ControlRole; expiresAt: string } | null {
     const token = request.cookies[sessionCookie]
     if (!token) return null
     const row = this.#database.getSession(this.#digest(token))
-    return row ? { username: row.username, expiresAt: row.expires_at } : null
+    return row ? { username: row.username, role: row.role, expiresAt: row.expires_at } : null
   }
 
   logout(request: FastifyRequest, reply: FastifyReply): void {
@@ -64,6 +79,7 @@ export class AuthService {
       return
     }
     request.actor = session.username
+    request.actorRole = session.role
   }
 
   assertSameOrigin(request: FastifyRequest): boolean {

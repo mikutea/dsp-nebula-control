@@ -1,0 +1,39 @@
+{
+  "protocol": "DYSON_NEBULA_HOSTNAME_WSS_MOD_MANIFEST_DIGEST_FIXTURE_V1",
+  "schemaVersion": 1,
+  "serverLock": {
+    "format": "dyson-control-server-mod-lock",
+    "schemaVersion": 1,
+    "mods": [
+      {
+        "dependencyId": "Example_Mod-ExamplePlugin-1.2.3",
+        "sourceId": "thunderstore:Example_Mod/ExamplePlugin",
+        "version": "1.2.3",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "dependencies": [],
+        "loadOrder": 0,
+        "root": true,
+        "serverRequired": true,
+        "clientRequirement": "required"
+      }
+    ]
+  },
+  "clientParity": {
+    "format": "dyson-control-client-parity",
+    "schemaVersion": 1,
+    "serverLockSha256": "062650ea6a31624e46fbfbc81f7f528eb25385749a0a5187dbd41c7bf170206e",
+    "mods": [
+      {
+        "sourceId": "thunderstore:Example_Mod/ExamplePlugin",
+        "version": "1.2.3",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "serverRequired": true,
+        "clientRequirement": "required"
+      }
+    ]
+  },
+  "expectedServerText": "{\n  \"format\": \"dyson-control-server-mod-lock\",\n  \"schemaVersion\": 1,\n  \"mods\": [\n    {\n      \"dependencyId\": \"Example_Mod-ExamplePlugin-1.2.3\",\n      \"sourceId\": \"thunderstore:Example_Mod/ExamplePlugin\",\n      \"version\": \"1.2.3\",\n      \"sha256\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n      \"dependencies\": [],\n      \"loadOrder\": 0,\n      \"root\": true,\n      \"serverRequired\": true,\n      \"clientRequirement\": \"required\"\n    }\n  ]\n}\n",
+  "expectedClientText": "{\n  \"format\": \"dyson-control-client-parity\",\n  \"schemaVersion\": 1,\n  \"serverLockSha256\": \"062650ea6a31624e46fbfbc81f7f528eb25385749a0a5187dbd41c7bf170206e\",\n  \"mods\": [\n    {\n      \"sourceId\": \"thunderstore:Example_Mod/ExamplePlugin\",\n      \"version\": \"1.2.3\",\n      \"sha256\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n      \"serverRequired\": true,\n      \"clientRequirement\": \"required\"\n    }\n  ]\n}\n",
+  "serverLockSha256": "sha256:062650ea6a31624e46fbfbc81f7f528eb25385749a0a5187dbd41c7bf170206e",
+  "clientParitySha256": "sha256:d9743d873f7ada199751f0d9bd51a1b4f20c9ba48962ace3b17b567348835d48"
+}

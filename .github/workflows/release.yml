@@ -1,0 +1,170 @@
+name: Release Windows package
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Check out the exact tag
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.20.0
+          cache: npm
+
+      - name: Set up the pinned .NET SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.424
+
+      - name: Validate immutable release source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tagPattern = '^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.(?:0|[1-9][0-9]*))?$'
+          if ($env:GITHUB_EVENT_NAME -cne 'push' -or $env:GITHUB_REF_TYPE -cne 'tag') {
+            throw 'Releases are accepted only from a pushed Git tag.'
+          }
+          if ($env:RELEASE_TAG -cnotmatch $tagPattern -or $env:RELEASE_COMMIT -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'The release tag or commit is not canonical.'
+          }
+          if ($env:GITHUB_REF -cne "refs/tags/$($env:RELEASE_TAG)") {
+            throw 'The checked Git reference is not the requested release tag.'
+          }
+          $version = $env:RELEASE_TAG.Substring(1)
+          $packageVersion = [string]((Get-Content -LiteralPath 'package.json' -Raw | ConvertFrom-Json).version)
+          if (-not [string]::Equals($packageVersion, $version, [System.StringComparison]::Ordinal)) {
+            throw 'The tag version does not exactly match package.json.'
+          }
+          $headCommit = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'HEAD could not be resolved.' }
+          $tagCommit = (& git rev-list -n 1 "refs/tags/$($env:RELEASE_TAG)").Trim()
+          if ($LASTEXITCODE -ne 0 -or
+              -not [string]::Equals($headCommit, $env:RELEASE_COMMIT, [System.StringComparison]::Ordinal) -or
+              -not [string]::Equals($tagCommit, $env:RELEASE_COMMIT, [System.StringComparison]::Ordinal)) {
+            throw 'The tag, checkout, and workflow commit do not identify the same commit.'
+          }
+          if ((& git status --porcelain=v1 --untracked-files=all).Count -ne 0) {
+            throw 'The release checkout is not clean.'
+          }
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Validate repository version consistency
+        shell: pwsh
+        run: |
+          npm run version:check -- --expected-version $env:RELEASE_VERSION --tag $env:RELEASE_TAG
+          if ($LASTEXITCODE -ne 0) { throw 'Repository package versions or lockfile identities are inconsistent.' }
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Root npm ci failed.' }
+          npm ci --prefix apps/api
+          if ($LASTEXITCODE -ne 0) { throw 'API npm ci failed.' }
+          npm ci --prefix apps/web
+          if ($LASTEXITCODE -ne 0) { throw 'Web npm ci failed.' }
+
+      - name: Build current source
+        shell: pwsh
+        run: |
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'The release build failed.' }
+
+      - name: Run affected regressions against the verified baseline
+        shell: pwsh
+        run: |
+          node scripts/validate-incremental.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'The incremental validation gate failed.' }
+
+      - name: Assemble and exactly verify runtime artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactDirectory = Join-Path $env:RUNNER_TEMP 'dyson-release-artifact'
+          npm run release:artifact -- -Version $env:RELEASE_VERSION -OutputPath $artifactDirectory
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime artifact assembly failed.' }
+          npm run release:artifact-check -- -ArtifactPath $artifactDirectory -ExpectedVersion $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime artifact verification failed.' }
+          "RELEASE_ARTIFACT_DIRECTORY=$artifactDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify exact candidate acceptance evidence
+        shell: pwsh
+        run: |
+          npm run acceptance:gate -- --release-commit $env:RELEASE_COMMIT `
+            --artifact-manifest (Join-Path $env:RELEASE_ARTIFACT_DIRECTORY 'artifact-manifest.json')
+          if ($LASTEXITCODE -ne 0) { throw 'The production acceptance gate rejected this release.' }
+
+      - name: Scan repository history and runtime artifact for public release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidencePath = Join-Path $env:RUNNER_TEMP "DysonControl-$($env:RELEASE_TAG).public-release.json"
+          node scripts/public-release/check.mjs --history --artifact $env:RELEASE_ARTIFACT_DIRECTORY --evidence $evidencePath
+          if ($LASTEXITCODE -ne 0) { throw 'Public release hygiene rejected the source or artifact.' }
+          "PUBLIC_RELEASE_EVIDENCE=$evidencePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Create and verify deterministic release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageDirectory = Join-Path $env:RUNNER_TEMP 'dyson-release-package'
+          $nodeVersion = (& node --version).TrimStart('v')
+          if ($LASTEXITCODE -ne 0) { throw 'The Node.js builder version could not be resolved.' }
+          npm run release:package -- -ArtifactPath $env:RELEASE_ARTIFACT_DIRECTORY -OutputDirectory $packageDirectory `
+            -Tag $env:RELEASE_TAG -Commit $env:RELEASE_COMMIT -NodeVersion $nodeVersion
+          if ($LASTEXITCODE -ne 0) { throw 'Deterministic release packaging failed.' }
+          npm run release:package-check -- -PackageDirectory $packageDirectory `
+            -ExpectedTag $env:RELEASE_TAG -ExpectedCommit $env:RELEASE_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw 'Deterministic release package verification failed.' }
+          if ((& git status --porcelain=v1 --untracked-files=all).Count -ne 0) {
+            throw 'The release source changed during build or packaging.'
+          }
+          "RELEASE_PACKAGE_DIRECTORY=$packageDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Create GitHub Release and upload fixed assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assetBase = "DysonControl-$($env:RELEASE_TAG)"
+          $archive = Join-Path $env:RELEASE_PACKAGE_DIRECTORY "$assetBase.zip"
+          $checksum = Join-Path $env:RELEASE_PACKAGE_DIRECTORY "$assetBase.zip.sha256"
+          $provenance = Join-Path $env:RELEASE_PACKAGE_DIRECTORY "$assetBase.provenance.json"
+          foreach ($asset in @($archive, $checksum, $provenance, $env:PUBLIC_RELEASE_EVIDENCE)) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw 'A fixed release asset is missing.' }
+          }
+          & gh release view $env:RELEASE_TAG --json tagName *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'A GitHub Release already exists for this tag.' }
+          $releaseArguments = @(
+            'release', 'create', $env:RELEASE_TAG,
+            $archive, $checksum, $provenance, $env:PUBLIC_RELEASE_EVIDENCE,
+            '--verify-tag', '--generate-notes', '--title', "Dyson Control $($env:RELEASE_TAG)"
+          )
+          if ($env:RELEASE_TAG -match '-rc\.') {
+            $releaseArguments += @('--prerelease', '--latest=false')
+          }
+          & gh @releaseArguments
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation or asset upload failed closed.' }

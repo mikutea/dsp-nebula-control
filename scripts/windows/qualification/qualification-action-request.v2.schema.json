@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/dyson-control/qualification-action-request.v2.schema.json",
+  "title": "Dyson Control qualification action request v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol", "schemaVersion", "requestId", "approvalId", "profileId",
+    "profileSha256", "action", "actionTargetId", "mode", "executionScope",
+    "targetIdentity", "issuedAtUtc", "maintenanceWindow", "protectionPoint",
+    "confirmationPhrase", "parameters", "predecessorReceiptSha256", "previewSha256"
+  ],
+  "properties": {
+    "protocol": { "const": "DYSON_QUALIFICATION_ACTION_REQUEST_V2" },
+    "schemaVersion": { "const": 2 },
+    "requestId": { "$ref": "#/$defs/uuid" },
+    "approvalId": { "$ref": "#/$defs/uuid" },
+    "profileId": { "$ref": "#/$defs/uuid" },
+    "profileSha256": { "$ref": "#/$defs/digest" },
+    "action": {
+      "enum": ["control-plane-restart", "dsp-crash-recovery", "storage-interruption", "disk-pressure"]
+    },
+    "actionTargetId": { "$ref": "#/$defs/targetId" },
+    "mode": { "enum": ["preview", "execute"] },
+    "executionScope": { "enum": ["production", "fake"] },
+    "targetIdentity": { "$ref": "#/$defs/digest" },
+    "issuedAtUtc": { "$ref": "#/$defs/utc" },
+    "maintenanceWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startAtUtc", "endAtUtc"],
+      "properties": {
+        "startAtUtc": { "$ref": "#/$defs/utc" },
+        "endAtUtc": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "protectionPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol", "schemaVersion", "protectionPointId", "targetIdentity",
+        "createdAtUtc", "expiresAtUtc", "savePairSha256", "evidenceSha256"
+      ],
+      "properties": {
+        "protocol": { "const": "DYSON_QUALIFICATION_PROTECTION_POINT_V2" },
+        "schemaVersion": { "const": 2 },
+        "protectionPointId": { "$ref": "#/$defs/uuid" },
+        "targetIdentity": { "$ref": "#/$defs/digest" },
+        "createdAtUtc": { "$ref": "#/$defs/utc" },
+        "expiresAtUtc": { "$ref": "#/$defs/utc" },
+        "savePairSha256": { "$ref": "#/$defs/digest" },
+        "evidenceSha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "confirmationPhrase": { "type": "string", "maxLength": 512 },
+    "parameters": { "type": "object" },
+    "predecessorReceiptSha256": { "$ref": "#/$defs/digest" },
+    "previewSha256": { "$ref": "#/$defs/digest" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mode": { "const": "preview" } }, "required": ["mode"] },
+      "then": { "properties": { "confirmationPhrase": { "const": "" } } }
+    },
+    {
+      "if": { "properties": { "mode": { "const": "execute" } }, "required": ["mode"] },
+      "then": {
+        "properties": {
+          "confirmationPhrase": {
+            "pattern": "^EXECUTE DYSON QUALIFICATION (?:PRODUCTION|FAKE) V2 (?:CONTROL-PLANE-RESTART|DSP-CRASH-RECOVERY|STORAGE-INTERRUPTION|DISK-PRESSURE) [0-9a-f-]{36} [0-9a-f-]{36} sha256:[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "action": { "enum": ["control-plane-restart", "dsp-crash-recovery"] } },
+        "required": ["action"]
+      },
+      "then": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["expectedPid"],
+            "properties": { "expectedPid": { "type": "integer", "minimum": 4, "maximum": 2147483647 } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "action": { "const": "storage-interruption" } }, "required": ["action"] },
+      "then": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["durationSeconds"],
+            "properties": { "durationSeconds": { "type": "integer", "minimum": 1, "maximum": 295 } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "action": { "const": "disk-pressure" } }, "required": ["action"] },
+      "then": {
+        "properties": {
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["allocationBytes", "holdSeconds"],
+            "properties": {
+              "allocationBytes": { "type": "integer", "minimum": 1048576, "maximum": 68719476736 },
+              "holdSeconds": { "type": "integer", "minimum": 0, "maximum": 300 }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "targetId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,63}$" },
+    "utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" }
+  }
+}

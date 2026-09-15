@@ -1,6 +1,8 @@
 node_modules/
 dist/
 coverage/
+**/bin/
+**/obj/
 *.tsbuildinfo
 apps/web/vite.config.js
 apps/web/vite.config.d.ts
@@ -10,6 +12,7 @@ apps/web/vite.config.d.ts
 data/
 runtime/
 *.log
+*.binlog
 *.dsv
 *.server
 *.zip

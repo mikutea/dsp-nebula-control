@@ -1,0 +1,775 @@
+import { z } from 'zod'
+import type { JobRecord } from '../domain.js'
+import {
+  HostMutationOperationCoordinatorError,
+  hostMutationReturn,
+  type HostMutationDisposition,
+  type HostMutationOperationCoordinator,
+  type HostMutationRecoveryOperationCoordinator,
+  type HostMutationOperationOutcome,
+  type HostMutationOperationScope
+} from '../host-mutation/operation-coordinator.js'
+import {
+  backupIdSchema,
+  saveNameSchema
+} from '../saves/schemas.js'
+import type {
+  PersistedSaveJobRequest,
+  SaveJobErrorCode,
+  SaveJobReconciliationReason,
+  SaveJobRequest,
+  SaveJobResultSummary,
+  SaveJobRunRecord,
+  StoredSaveJobRun
+} from '../saves/job-types.js'
+import {
+  SaveRestoreMutationScopeLostError,
+  type BackupSavePairRequest,
+  type RestoreSavePairRequest,
+  type SaveRestoreMutationScope,
+  type SaveTransactionErrorCode,
+  type SaveTransactionResult,
+  type SaveTransactionService
+} from '../saves/transactions.js'
+import { ControlDatabase } from '../storage/database.js'
+import { EventHub } from './event-hub.js'
+
+const uuidSchema = z.string().uuid().transform((value) => value.toLocaleLowerCase('en-US'))
+const pairRevisionSchema = z.string().regex(/^pair-v1:[a-f0-9]{64}$/)
+const backupJobRequestSchema = z.strictObject({
+  operation: z.literal('backup'),
+  idempotencyKey: uuidSchema,
+  saveName: saveNameSchema
+})
+const restoreJobRequestSchema = z.strictObject({
+  operation: z.literal('restore'),
+  idempotencyKey: uuidSchema,
+  backupId: backupIdSchema,
+  expectedRevision: pairRevisionSchema,
+  protectionRequestId: uuidSchema
+})
+const saveJobRequestSchema = z.discriminatedUnion('operation', [backupJobRequestSchema, restoreJobRequestSchema])
+const transactionResultSchema = z.object({
+  schemaVersion: z.literal(1),
+  requestId: uuidSchema,
+  operation: z.enum(['backup', 'restore']),
+  status: z.enum([
+    'dry-run', 'succeeded', 'busy', 'rejected', 'revision-conflict',
+    'failed', 'rolled-back', 'rollback-failed'
+  ]),
+  dryRun: z.literal(false),
+  backupId: backupIdSchema,
+  protectionBackupId: backupIdSchema.optional(),
+  reused: z.boolean(),
+  rollback: z.enum(['not-required', 'succeeded', 'failed']),
+  pairBytes: z.number().int().nonnegative(),
+  cleanupPending: z.boolean(),
+  maintenanceRequired: z.boolean(),
+  errorCode: z.string().regex(/^SAVE_[A-Z0-9_]{2,63}$/).optional(),
+  auditStored: z.boolean()
+})
+
+type BoundSaveTransactionResult = SaveJobResultSummary & {
+  errorCode?: SaveTransactionErrorCode
+}
+
+type LeasedRestoreOutcome =
+  | Readonly<{ kind: 'not-claimed' }>
+  | Readonly<{ kind: 'executor-error' }>
+  | Readonly<{ kind: 'invalid-result' }>
+  | Readonly<{ kind: 'result'; result: BoundSaveTransactionResult }>
+
+export interface SaveTransactionExecutor {
+  backup(input: BackupSavePairRequest): Promise<SaveTransactionResult>
+  restore(input: RestoreSavePairRequest, mutationScope?: SaveRestoreMutationScope): Promise<SaveTransactionResult>
+}
+
+export interface SaveJobServiceOptions {
+  hostMutationCoordinator?: HostMutationOperationCoordinator
+  hostMutationRecoveryCoordinator?: HostMutationRecoveryOperationCoordinator
+  /** Bounded in-process retries; an exhausted job remains durably queued for restart. */
+  hostLeaseBusyRetryLimit?: number
+  hostLeaseBusyRetryDelayMs?: number
+  /** @internal Deterministic replacement for retry sleeping in tests. */
+  wait?: (milliseconds: number) => Promise<void>
+}
+
+export interface SaveJobExecutionResult {
+  job: JobRecord
+  run: SaveJobRunRecord
+  reused: boolean
+}
+
+export class SaveJobServiceError extends Error {
+  constructor(readonly code: SaveJobErrorCode) {
+    super(code)
+    this.name = 'SaveJobServiceError'
+  }
+}
+
+/**
+ * Durable single-worker orchestration around the already idempotent paired-save
+ * transaction service. HTTP confirmation and authorization belong to app.ts;
+ * this service accepts only validated logical identifiers.
+ */
+export class SaveJobService {
+  readonly #database: ControlDatabase
+  readonly #executor: SaveTransactionExecutor | Pick<SaveTransactionService, 'backup' | 'restore'>
+  readonly #events: EventHub
+  readonly #hostMutationCoordinator: HostMutationOperationCoordinator | null
+  readonly #hostMutationRecoveryCoordinator: HostMutationRecoveryOperationCoordinator | null
+  readonly #hostLeaseBusyRetryLimit: number
+  readonly #hostLeaseBusyRetryDelayMs: number
+  readonly #wait: (milliseconds: number) => Promise<void>
+  readonly #scheduled = new Set<string>()
+  readonly #hostLeaseBusyRetries = new Map<string, number>()
+  #queue: Promise<void> = Promise.resolve()
+  #initialized = false
+  #closed = false
+
+  constructor(
+    database: ControlDatabase,
+    executor: SaveTransactionExecutor | Pick<SaveTransactionService, 'backup' | 'restore'>,
+    events: EventHub,
+    options: SaveJobServiceOptions = {}
+  ) {
+    if (options.hostMutationCoordinator !== undefined &&
+        typeof options.hostMutationCoordinator.runExclusive !== 'function') {
+      throw new SaveJobServiceError('SAVE_JOB_REQUEST_INVALID')
+    }
+    if (options.hostLeaseBusyRetryLimit !== undefined &&
+        (!Number.isInteger(options.hostLeaseBusyRetryLimit) ||
+         options.hostLeaseBusyRetryLimit < 0 || options.hostLeaseBusyRetryLimit > 100)) {
+      throw new SaveJobServiceError('SAVE_JOB_REQUEST_INVALID')
+    }
+    if (options.hostLeaseBusyRetryDelayMs !== undefined &&
+        (!Number.isInteger(options.hostLeaseBusyRetryDelayMs) ||
+         options.hostLeaseBusyRetryDelayMs < 0 || options.hostLeaseBusyRetryDelayMs > 60_000)) {
+      throw new SaveJobServiceError('SAVE_JOB_REQUEST_INVALID')
+    }
+    this.#database = database
+    this.#executor = executor
+    this.#events = events
+    this.#hostMutationCoordinator = options.hostMutationCoordinator ?? null
+    if (options.hostMutationRecoveryCoordinator !== undefined &&
+        typeof options.hostMutationRecoveryCoordinator.runRecoveryExclusive !== 'function') {
+      throw new SaveJobServiceError('SAVE_JOB_REQUEST_INVALID')
+    }
+    this.#hostMutationRecoveryCoordinator = options.hostMutationRecoveryCoordinator ?? null
+    this.#hostLeaseBusyRetryLimit = options.hostLeaseBusyRetryLimit ?? 3
+    this.#hostLeaseBusyRetryDelayMs = options.hostLeaseBusyRetryDelayMs ?? 250
+    this.#wait = options.wait ?? (async (milliseconds) => {
+      await new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
+    })
+  }
+
+  /** Replays never-started queued work and fails closed on an unowned running attempt. */
+  initialize(): number {
+    if (this.#initialized) return 0
+    if (this.#closed) throw new SaveJobServiceError('SAVE_JOB_SERVICE_CLOSED')
+    this.#initialized = true
+    const active = this.#database.listActiveSaveRuns()
+    let handled = 0
+    for (const run of active) {
+      if (run.state === 'queued') {
+        const explicitlyReconciling = run.recoveryRequired &&
+          this.#database.getLatestSaveReconciliationReason(run.jobId) !== null
+        this.#schedule(run, explicitlyReconciling)
+        handled += 1
+        continue
+      }
+      const interrupted = this.#database.interruptRunningSaveRun(
+        run.jobId,
+        run.updatedAt,
+        '存档事务在控制面启动时仍为运行中；未自动重放，需要人工核验'
+      )
+      if (interrupted) {
+        this.#events.publish({ type: 'job.updated', data: interrupted.job })
+        handled += 1
+      }
+    }
+    return handled
+  }
+
+  enqueue(input: SaveJobRequest, actor: string): SaveJobExecutionResult {
+    if (this.#closed) throw new SaveJobServiceError('SAVE_JOB_SERVICE_CLOSED')
+    const request = parseRequest(input)
+    if (!this.#initialized) this.initialize()
+    const created = this.#database.createSaveJob(
+      request,
+      actor,
+      request.operation === 'backup' ? '配对存档备份事务已排队' : '受控存档恢复事务已排队'
+    )
+    if (created.reused && !sameRequest(created.run, request)) {
+      throw new SaveJobServiceError('SAVE_JOB_IDEMPOTENCY_CONFLICT')
+    }
+    this.#events.publish({ type: 'job.updated', data: created.job })
+    if (!created.reused && created.run.state === 'queued') {
+      this.#schedule(created.run, false)
+    }
+    return this.#snapshot(created.job.id, created.reused)
+  }
+
+  /**
+   * Explicitly retries only a previously proven post-commit cleanup/audit
+   * repair. The caller supplies no transaction fields: the durable original
+   * request is replayed under its existing idempotency key.
+   */
+  reconcile(jobId: string, actor: string): SaveJobExecutionResult {
+    if (this.#closed) throw new SaveJobServiceError('SAVE_JOB_SERVICE_CLOSED')
+    const parsedJobId = uuidSchema.safeParse(jobId)
+    if (!parsedJobId.success) throw new SaveJobServiceError('SAVE_JOB_REQUEST_INVALID')
+    if (!this.#initialized) this.initialize()
+    const current = this.#database.getSaveRun(parsedJobId.data)
+    if (!current) throw new SaveJobServiceError('SAVE_JOB_RECONCILE_NOT_ALLOWED')
+    if (current.state === 'queued' || current.state === 'running') {
+      if (!current.recoveryRequired ||
+          this.#database.getLatestSaveReconciliationReason(current.jobId) === null) {
+        throw new SaveJobServiceError('SAVE_JOB_RECONCILE_NOT_ALLOWED')
+      }
+      return this.#snapshot(current.jobId, true)
+    }
+    const reason = reconciliationReason(current)
+    if (reason === null) throw new SaveJobServiceError('SAVE_JOB_RECONCILE_NOT_ALLOWED')
+    let requeued: ReturnType<ControlDatabase['requeueSaveRunForReconciliation']>
+    try {
+      requeued = this.#database.requeueSaveRunForReconciliation(
+        current.jobId,
+        current.updatedAt,
+        actor,
+        reason,
+        '存档事务已获明确授权，正在重新执行持久化对账'
+      )
+    } catch {
+      const raced = this.#database.getSaveRun(current.jobId)
+      if (raced && ['queued', 'running'].includes(raced.state) &&
+          this.#database.getLatestSaveReconciliationReason(current.jobId) !== null) {
+        return this.#snapshot(current.jobId, true)
+      }
+      throw new SaveJobServiceError('SAVE_JOB_RECONCILE_CONFLICT')
+    }
+    this.#events.publish({ type: 'job.updated', data: requeued.job })
+    if (!requeued.reused) this.#schedule(requeued.run, true)
+    return this.#snapshot(current.jobId, requeued.reused)
+  }
+
+  get(jobId: string): SaveJobExecutionResult | null {
+    const job = this.#database.getJob(jobId)
+    const run = this.#database.getSaveRun(jobId)
+    if (!job || !run) return null
+    return { job, run: publicRun(run), reused: true }
+  }
+
+  /** Stops accepting work and drains the current serial queue without cancelling a mutation. */
+  async close(): Promise<void> {
+    this.#closed = true
+    for (;;) {
+      const pending = this.#queue
+      await pending
+      if (pending === this.#queue) return
+    }
+  }
+
+  #schedule(run: StoredSaveJobRun, reconciling: boolean, internalRetry = false): void {
+    if (this.#closed && !internalRetry) return
+    if (this.#scheduled.has(run.jobId)) return
+    this.#scheduled.add(run.jobId)
+    this.#queue = this.#queue
+      .then(async () => this.#run(run.jobId, reconciling))
+      .catch(() => 'done' as const)
+      .then(async (outcome) => {
+        this.#scheduled.delete(run.jobId)
+        if (outcome !== 'retry-host-lease-busy') {
+          this.#hostLeaseBusyRetries.delete(run.jobId)
+          return
+        }
+        const retries = (this.#hostLeaseBusyRetries.get(run.jobId) ?? 0) + 1
+        if (retries > this.#hostLeaseBusyRetryLimit) {
+          this.#hostLeaseBusyRetries.delete(run.jobId)
+          return
+        }
+        this.#hostLeaseBusyRetries.set(run.jobId, retries)
+        await this.#wait(this.#hostLeaseBusyRetryDelayMs)
+        const current = this.#database.getSaveRun(run.jobId)
+        if (current?.state === 'queued') this.#schedule(current, reconciling, true)
+      })
+  }
+
+  async #run(
+    jobId: string,
+    reconciling: boolean
+  ): Promise<'done' | 'retry-host-lease-busy'> {
+    const run = this.#database.getSaveRun(jobId)
+    if (!run || run.state !== 'queued') return 'done'
+    if (run.operation === 'restore') {
+      if (this.#hostMutationCoordinator === null) {
+        this.#complete(
+          jobId,
+          'failed',
+          '存档恢复的主机变更租约未配置',
+          'SAVE_JOB_HOST_LEASE_UNAVAILABLE',
+          false,
+          null
+        )
+        return 'done'
+      }
+      return this.#runLeasedRestore(run, reconciling)
+    }
+    const summary = reconciling ? '存档事务正在执行幂等重启对账' : '存档事务正在执行'
+    const running = this.#database.claimQueuedSaveRun(jobId, run.updatedAt, summary, reconciling)
+    if (running === null) return 'done'
+    this.#events.publish({ type: 'job.updated', data: running.job })
+
+    let rawResult: SaveTransactionResult
+    try {
+      rawResult = run.operation === 'backup'
+        ? await this.#executor.backup({
+            requestId: run.idempotencyKey,
+            saveName: required(run.saveName),
+            dryRun: false
+          })
+        : await this.#executor.restore({
+            requestId: run.idempotencyKey,
+            backupId: required(run.backupId),
+            expectedRevision: required(run.expectedRevision),
+            protectionRequestId: required(run.protectionRequestId),
+            dryRun: false
+          })
+    } catch {
+      this.#complete(
+        jobId,
+        'interrupted',
+        reconciling ? '存档事务重启对账结果不确定，已停止自动恢复' : '存档事务执行器异常，结果需要人工核验',
+        reconciling ? 'SAVE_JOB_RECONCILIATION_UNCERTAIN' : 'SAVE_JOB_EXECUTOR_FAILED',
+        true,
+        null
+      )
+      return 'done'
+    }
+
+    const result = parseAndBindResult(rawResult, run)
+    if (result === null) {
+      this.#complete(
+        jobId,
+        'interrupted',
+        '存档事务返回了无法绑定到请求的结果，已停止自动恢复',
+        'SAVE_JOB_RESULT_INVALID',
+        true,
+        null
+      )
+      return 'done'
+    }
+
+    this.#completeFromResult(run, reconciling, result)
+    return 'done'
+  }
+
+  async #runLeasedRestore(
+    run: StoredSaveJobRun,
+    reconciling: boolean
+  ): Promise<'done' | 'retry-host-lease-busy'> {
+    const coordinator = this.#hostMutationCoordinator
+    if (coordinator === null) return 'done'
+    let outcome: LeasedRestoreOutcome
+    try {
+      outcome = await this.#withRestoreLease(
+        run.idempotencyKey, reconciling,
+        async (scope) => {
+          const current = this.#database.getSaveRun(run.jobId)
+          if (!current || current.state !== 'queued') {
+            return hostMutationReturn<LeasedRestoreOutcome>({ kind: 'not-claimed' })
+          }
+          const summary = reconciling
+            ? '存档事务正在执行幂等重启对账'
+            : '存档事务正在执行'
+          const running = this.#database.claimQueuedSaveRun(
+            current.jobId, current.updatedAt, summary, reconciling
+          )
+          if (running === null) {
+            return hostMutationReturn<LeasedRestoreOutcome>({ kind: 'not-claimed' })
+          }
+          this.#events.publish({ type: 'job.updated', data: running.job })
+
+          let rawResult: SaveTransactionResult
+          try {
+            rawResult = await this.#executor.restore({
+              requestId: current.idempotencyKey,
+              backupId: required(current.backupId),
+              expectedRevision: required(current.expectedRevision),
+              protectionRequestId: required(current.protectionRequestId),
+              dryRun: false
+            }, transactionScope(scope, reconciling ? current.idempotencyKey : undefined))
+          } catch (error) {
+            if (error instanceof SaveRestoreMutationScopeLostError) {
+              throw new HostMutationOperationCoordinatorError('HOST_MUTATION_LEASE_LOST')
+            }
+            return hostMutationReturn<LeasedRestoreOutcome>(
+              { kind: 'executor-error' },
+              'abandon'
+            )
+          }
+
+          const result = parseAndBindResult(rawResult, current)
+          if (result === null) {
+            return hostMutationReturn<LeasedRestoreOutcome>(
+              { kind: 'invalid-result' },
+              'abandon'
+            )
+          }
+          return hostMutationReturn<LeasedRestoreOutcome>(
+            { kind: 'result', result },
+            hostLeaseDisposition(result)
+          )
+        }
+      )
+    } catch (error) {
+      if (error instanceof HostMutationOperationCoordinatorError) {
+        if (error.code === 'HOST_MUTATION_LEASE_BUSY') return 'retry-host-lease-busy'
+        const code = mapHostMutationCoordinatorError(error.code)
+        const recoveryRequired = error.code !== 'HOST_MUTATION_LEASE_UNAVAILABLE'
+        this.#complete(
+          run.jobId,
+          recoveryRequired ? 'interrupted' : 'failed',
+          recoveryRequired
+            ? '存档恢复的主机变更租约不可安全确认，需要人工核验'
+            : '存档恢复的主机变更租约暂不可用',
+          code,
+          recoveryRequired,
+          null
+        )
+        return 'done'
+      }
+      this.#complete(
+        run.jobId,
+        'interrupted',
+        '存档恢复的主机变更租约执行结果不确定，需要人工核验',
+        'SAVE_JOB_HOST_LEASE_LOST',
+        true,
+        null
+      )
+      return 'done'
+    }
+
+    if (outcome.kind === 'not-claimed') return 'done'
+    if (outcome.kind === 'executor-error') {
+      this.#complete(
+        run.jobId,
+        'interrupted',
+        reconciling ? '存档事务重启对账结果不确定，已停止自动恢复' : '存档事务执行器异常，结果需要人工核验',
+        reconciling ? 'SAVE_JOB_RECONCILIATION_UNCERTAIN' : 'SAVE_JOB_EXECUTOR_FAILED',
+        true,
+        null
+      )
+      return 'done'
+    }
+    if (outcome.kind === 'invalid-result') {
+      this.#complete(
+        run.jobId,
+        'interrupted',
+        '存档事务返回了无法绑定到请求的结果，已停止自动恢复',
+        'SAVE_JOB_RESULT_INVALID',
+        true,
+        null
+      )
+      return 'done'
+    }
+    this.#completeFromResult(run, reconciling, outcome.result)
+    return 'done'
+  }
+
+  async #withRestoreLease(
+    requestId: string,
+    reconciling: boolean,
+    operation: (scope: HostMutationOperationScope) => Promise<HostMutationOperationOutcome<LeasedRestoreOutcome>>
+  ): Promise<LeasedRestoreOutcome> {
+    const coordinator = this.#hostMutationCoordinator!
+    if (reconciling && this.#hostMutationRecoveryCoordinator !== null) {
+      let entered = false
+      try {
+        return await this.#hostMutationRecoveryCoordinator.runRecoveryExclusive(
+          { expectedOperation: 'save-restore', expectedRequestId: requestId },
+          async scope => { entered = true; return await operation(scope) }
+        )
+      } catch (error) {
+        // A clean host lease needs no recovery capability. Fall back only if
+        // the coordinator refused before entering any domain operation.
+        if (entered || !(error instanceof HostMutationOperationCoordinatorError) ||
+            error.code !== 'HOST_MUTATION_LEASE_RECOVERY_NOT_REQUIRED') throw error
+      }
+    }
+    return await coordinator.runExclusive({ operation: 'save-restore', requestId }, operation)
+  }
+
+  #completeFromResult(
+    run: StoredSaveJobRun,
+    reconciling: boolean,
+    result: BoundSaveTransactionResult
+  ): void {
+    const jobId = run.jobId
+
+    if (['succeeded', 'rolled-back', 'rollback-failed'].includes(result.status) && !result.auditStored) {
+      this.#complete(
+        jobId,
+        'interrupted',
+        '存档事务完成但审计记录未确认持久化，需要人工核验',
+        'SAVE_JOB_AUDIT_MISSING',
+        true,
+        result
+      )
+      return
+    }
+
+    if (result.cleanupPending) {
+      this.#complete(
+        jobId,
+        'interrupted',
+        result.status === 'succeeded'
+          ? '存档恢复已提交，但事务清理尚未完成，需要维护'
+          : '当前存档对已完成补偿恢复，但事务清理尚未完成，需要维护',
+        result.status === 'succeeded'
+          ? 'SAVE_COMMIT_CLEANUP_PENDING'
+          : 'SAVE_ROLLBACK_CLEANUP_PENDING',
+        true,
+        result
+      )
+      return
+    }
+
+    if (result.maintenanceRequired) {
+      this.#complete(
+        jobId,
+        'interrupted',
+        '存档事务检测到需要人工维护的持久化状态，已停止自动执行',
+        result.errorCode ?? 'SAVE_JOB_RECONCILIATION_UNCERTAIN',
+        true,
+        result
+      )
+      return
+    }
+
+    if (result.status === 'succeeded') {
+      this.#complete(
+        jobId,
+        'succeeded',
+        run.operation === 'backup' ? '配对存档备份事务已完成' : '受控存档恢复事务已完成',
+        null,
+        false,
+        result
+      )
+      return
+    }
+
+    if (result.status === 'rolled-back') {
+      this.#complete(
+        jobId,
+        'failed',
+        '存档事务失败，当前存档对已完成补偿恢复',
+        result.errorCode ?? fallbackErrorCode(result.status),
+        false,
+        result
+      )
+      return
+    }
+
+    if (reconciling || result.status === 'rollback-failed') {
+      this.#complete(
+        jobId,
+        'interrupted',
+        reconciling ? '存档事务重启对账无法证明终态，已停止自动恢复' : '存档恢复补偿未完成，需要人工核验',
+        reconciling ? 'SAVE_JOB_RECONCILIATION_UNCERTAIN' : (result.errorCode ?? 'SAVE_ROLLBACK_FAILED'),
+        true,
+        result
+      )
+      return
+    }
+
+    this.#complete(
+      jobId,
+      'failed',
+      '存档事务未完成且未提交可验证结果',
+      result.errorCode ?? fallbackErrorCode(result.status),
+      false,
+      result
+    )
+  }
+
+  #complete(
+    jobId: string,
+    state: 'succeeded' | 'failed' | 'interrupted',
+    summary: string,
+    errorCode: SaveTransactionErrorCode | SaveJobErrorCode | null,
+    recoveryRequired: boolean,
+    result: SaveJobResultSummary | null
+  ): void {
+    const completed = this.#database.completeSaveRun(
+      jobId,
+      state,
+      summary,
+      errorCode,
+      recoveryRequired,
+      result
+    )
+    this.#events.publish({ type: 'job.updated', data: completed.job })
+  }
+
+  #snapshot(jobId: string, reused: boolean): SaveJobExecutionResult {
+    const job = this.#database.getJob(jobId)
+    const run = this.#database.getSaveRun(jobId)
+    if (!job || !run) throw new Error(`Save job is missing: ${jobId}`)
+    return { job, run: publicRun(run), reused }
+  }
+}
+
+function parseRequest(input: SaveJobRequest): PersistedSaveJobRequest {
+  let parsed: z.infer<typeof saveJobRequestSchema>
+  try {
+    parsed = saveJobRequestSchema.parse(input)
+  } catch {
+    throw new SaveJobServiceError('SAVE_JOB_REQUEST_INVALID')
+  }
+  return parsed.operation === 'backup'
+    ? {
+        operation: 'backup', idempotencyKey: parsed.idempotencyKey,
+        saveName: parsed.saveName, backupId: null, expectedRevision: null,
+        protectionRequestId: null
+      }
+    : {
+        operation: 'restore', idempotencyKey: parsed.idempotencyKey,
+        saveName: null, backupId: parsed.backupId,
+        expectedRevision: parsed.expectedRevision,
+        protectionRequestId: parsed.protectionRequestId
+      }
+}
+
+function sameRequest(left: PersistedSaveJobRequest, right: PersistedSaveJobRequest): boolean {
+  return left.operation === right.operation && left.idempotencyKey === right.idempotencyKey &&
+    left.saveName === right.saveName && left.backupId === right.backupId &&
+    left.expectedRevision === right.expectedRevision &&
+    left.protectionRequestId === right.protectionRequestId
+}
+
+function parseAndBindResult(
+  input: SaveTransactionResult,
+  run: StoredSaveJobRun
+): BoundSaveTransactionResult | null {
+  const parsed = transactionResultSchema.safeParse(input)
+  if (!parsed.success || parsed.data.requestId !== run.idempotencyKey ||
+      parsed.data.operation !== run.operation || parsed.data.status === 'dry-run') return null
+  if (parsed.data.cleanupPending && (!parsed.data.maintenanceRequired ||
+      !['succeeded', 'rolled-back'].includes(parsed.data.status))) return null
+  if (!parsed.data.cleanupPending && parsed.data.maintenanceRequired &&
+      parsed.data.status !== 'rollback-failed' && parsed.data.status !== 'failed') return null
+  if (parsed.data.status === 'succeeded' && (
+      parsed.data.rollback !== 'not-required' ||
+      (parsed.data.cleanupPending
+        ? parsed.data.errorCode !== 'SAVE_COMMIT_CLEANUP_PENDING'
+        : parsed.data.errorCode !== undefined))) return null
+  if (parsed.data.status === 'rolled-back' &&
+      (parsed.data.errorCode === undefined || parsed.data.rollback !== 'succeeded')) return null
+  if (parsed.data.status === 'rollback-failed' &&
+      (parsed.data.errorCode === undefined || parsed.data.rollback !== 'failed' ||
+       !parsed.data.maintenanceRequired)) return null
+  if (!['succeeded', 'rolled-back', 'rollback-failed'].includes(parsed.data.status) &&
+      parsed.data.cleanupPending) return null
+  if (!['succeeded', 'rolled-back', 'rollback-failed'].includes(parsed.data.status) &&
+      parsed.data.errorCode === undefined) return null
+  if (run.operation === 'backup') {
+    if (parsed.data.backupId !== `tx-${run.idempotencyKey}` || parsed.data.protectionBackupId !== undefined) {
+      return null
+    }
+  } else if (parsed.data.backupId !== run.backupId ||
+      parsed.data.protectionBackupId !== `tx-${run.protectionRequestId}`) return null
+  return {
+    status: parsed.data.status,
+    backupId: parsed.data.backupId,
+    protectionBackupId: parsed.data.protectionBackupId ?? null,
+    pairBytes: parsed.data.pairBytes,
+    rollback: parsed.data.rollback,
+    reused: parsed.data.reused,
+    auditStored: parsed.data.auditStored,
+    cleanupPending: parsed.data.cleanupPending,
+    maintenanceRequired: parsed.data.maintenanceRequired,
+    ...(parsed.data.errorCode === undefined
+      ? {}
+      : { errorCode: parsed.data.errorCode as SaveTransactionErrorCode })
+  }
+}
+
+function transactionScope(scope: HostMutationOperationScope, recoveryRequestId?: string): SaveRestoreMutationScope {
+  return {
+    signal: scope.signal,
+    ...(recoveryRequestId === undefined ? {} : { recoveryRequestId }),
+    assertActive: () => {
+      try {
+        scope.assertActive()
+      } catch {
+        throw new SaveRestoreMutationScopeLostError()
+      }
+    }
+  }
+}
+
+function hostLeaseDisposition(result: BoundSaveTransactionResult): HostMutationDisposition {
+  return result.status === 'rollback-failed' ? 'abandon' : 'release'
+}
+
+function mapHostMutationCoordinatorError(
+  code: HostMutationOperationCoordinatorError['code']
+): SaveJobErrorCode {
+  if (code === 'HOST_MUTATION_LEASE_BUSY') return 'SAVE_JOB_HOST_LEASE_BUSY'
+  if (code === 'HOST_MUTATION_LEASE_DIRTY') return 'SAVE_JOB_HOST_LEASE_DIRTY'
+  if (code === 'HOST_MUTATION_LEASE_RECOVERY_REQUIRED') {
+    return 'SAVE_JOB_HOST_LEASE_RECOVERY_REQUIRED'
+  }
+  if (code === 'HOST_MUTATION_LEASE_LOST') return 'SAVE_JOB_HOST_LEASE_LOST'
+  return 'SAVE_JOB_HOST_LEASE_UNAVAILABLE'
+}
+
+function publicRun(run: StoredSaveJobRun): SaveJobRunRecord {
+  return {
+    jobId: run.jobId,
+    operation: run.operation,
+    state: run.state,
+    attemptCount: run.attemptCount,
+    result: run.result,
+    errorCode: run.errorCode,
+    recoveryRequired: run.recoveryRequired,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt
+  }
+}
+
+function reconciliationReason(run: StoredSaveJobRun): SaveJobReconciliationReason | null {
+  if (run.state !== 'interrupted' || run.operation !== 'restore' || !run.recoveryRequired || !run.result) {
+    return null
+  }
+  const result = run.result
+  if (run.errorCode === 'SAVE_COMMIT_CLEANUP_PENDING' && result.status === 'succeeded' &&
+      result.rollback === 'not-required' && result.auditStored && result.cleanupPending &&
+      result.maintenanceRequired) {
+    return 'committed-cleanup'
+  }
+  if (run.errorCode === 'SAVE_ROLLBACK_CLEANUP_PENDING' && result.status === 'rolled-back' &&
+      result.rollback === 'succeeded' && result.auditStored && result.cleanupPending &&
+      result.maintenanceRequired) {
+    return 'rolled-back-cleanup'
+  }
+  if (run.errorCode === 'SAVE_JOB_AUDIT_MISSING' && !result.auditStored &&
+      ((result.status === 'succeeded' && result.rollback === 'not-required') ||
+       (result.status === 'rolled-back' && result.rollback === 'succeeded'))) {
+    return 'audit-repair'
+  }
+  return null
+}
+
+function fallbackErrorCode(status: SaveJobResultSummary['status']): SaveTransactionErrorCode {
+  if (status === 'busy') return 'SAVE_TRANSACTION_BUSY'
+  if (status === 'revision-conflict') return 'SAVE_REVISION_CONFLICT'
+  if (status === 'rolled-back') return 'SAVE_COMMIT_FAILED'
+  return 'SAVE_TRANSACTION_STORAGE_UNAVAILABLE'
+}
+
+function required(value: string | null): string {
+  if (value === null) throw new SaveJobServiceError('SAVE_JOB_RESULT_INVALID')
+  return value
+}

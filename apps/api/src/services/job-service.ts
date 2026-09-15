@@ -21,6 +21,23 @@ export class JobService {
   listJobs(limit = 20): JobRecord[] { return this.#database.listJobs(limit) }
   getJob(id: string): JobRecord | null { return this.#database.getJob(id) }
 
+  recordAuditExport(actor: string, recordCount: number, format: 'json' | 'ndjson'): JobRecord {
+    const startedAt = new Date()
+    let job = this.#database.createJob(
+      'audit.export',
+      actor,
+      `导出任务审计：${recordCount} 条 ${format.toUpperCase()}`
+    )
+    job = this.#database.updateJob(job.id, {
+      state: 'succeeded',
+      startedAt: startedAt.toISOString(),
+      finishedAt: startedAt.toISOString(),
+      durationMs: 0
+    })
+    this.#events.publish({ type: 'job.updated', data: job })
+    return job
+  }
+
   enqueueRefresh(actor: string): JobRecord {
     const job = this.#database.createJob('status.refresh', actor, '刷新服务器状态')
     this.#events.publish({ type: 'job.updated', data: job })
@@ -33,13 +50,21 @@ export class JobService {
     return this.#latestStatus
   }
 
-  async previewLifecycle(action: LifecycleAction, actor: string): Promise<{ job: JobRecord; preview: LifecyclePreview }> {
+  async previewLifecycle(
+    action: LifecycleAction,
+    actor: string,
+    collectPreview: (action: LifecycleAction, signal: AbortSignal) => Promise<LifecyclePreview> =
+      (selectedAction) => this.#provider.previewLifecycle(selectedAction),
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<{ job: JobRecord; preview: LifecyclePreview }> {
     const kinds: Record<LifecycleAction, JobKind> = {
+      start: 'game.start.preview',
       save: 'game.save.preview',
       'graceful-stop': 'game.stop.preview',
       restart: 'game.restart.preview'
     }
     const labels: Record<LifecycleAction, string> = {
+      start: '启动',
       save: '保存',
       'graceful-stop': '优雅停服',
       restart: '重启'
@@ -51,7 +76,11 @@ export class JobService {
     this.#events.publish({ type: 'job.updated', data: job })
 
     try {
-      const preview = await this.#provider.previewLifecycle(action)
+      if (signal.aborted) throw abortReason(signal)
+      const preview = await waitForAbort(
+        Promise.resolve().then(async () => await collectPreview(action, signal)),
+        signal
+      )
       const finishedAt = new Date()
       job = this.#database.updateJob(job.id, {
         state: 'succeeded',
@@ -99,4 +128,29 @@ export class JobService {
       throw error
     }
   }
+}
+
+function waitForAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortReason(signal))
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      callback()
+    }
+    const onAbort = () => finish(() => reject(abortReason(signal)))
+
+    signal.addEventListener('abort', onAbort, { once: true })
+    operation.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error))
+    )
+  })
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error('LIFECYCLE_PREVIEW_ABORTED')
 }
